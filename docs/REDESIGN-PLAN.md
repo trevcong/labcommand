@@ -11,7 +11,7 @@ The main canvas shows live point clouds from both sensors, overlaid with correct
 ### Decision: Native Metal Renderer
 
 **Why Metal over alternatives**:
-- Both sensors produce ~1.35M pts/s combined (Mid-360 200k + JT128 1.15M)
+- Both sensors produce high point rates (Mid-360 ~200k pts/s, JT128 ~1M+ pts/s)
 - At ~2 GB/min, only GPU-native rendering keeps up
 - Metal renders 10M+ points at 60fps with instanced geometry
 - SceneKit/RealityKit add abstraction overhead and limit shader control
@@ -29,10 +29,12 @@ The main canvas shows live point clouds from both sensors, overlaid with correct
 Sources/LabCommand/
   PointCloudView.swift      # SwiftUI MTKView wrapper
   PointCloudRenderer.swift  # Metal pipeline: instanced points, color modes
-  PointCloudDecoder.swift   # PointCloud2 binary → GPU vertex buffer
   PointCloudCamera.swift    # Orbit (default) + fly mode
   McapReader.swift          # Recorded bag playback
   WebSocketClient.swift     # Live stream (Phase B — requires Spark)
+
+Sources/LabCommandCore/
+  PointCloudDecoder.swift   # PCD/PointCloud2 → PointCloudFrame (Foundation-only)
 ```
 
 ### Capabilities
@@ -40,8 +42,8 @@ Sources/LabCommand/
 | Feature | Implementation |
 |---------|----------------|
 | **Point coloring** | Intensity (grayscale), height (rainbow), sensor (Mid=cyan, JT=magenta) |
-| **Camera** | Orbit: trackpad rotate/zoom/pan. Fly: WASD+mouse |
-| **Dual overlay** | Static extrinsics from RigSpec (Mid-360: 11.0, 23.29, −44.12 mm). JT128 fused on Mid's IMU frame |
+| **Camera** | Orbit: click-drag rotates, scroll/pinch zooms, Option-drag pans. Fly: WASD+mouse |
+| **Dual overlay** | Mid-360 lidar-to-IMU offset (11.0, 23.29, −44.12 mm) from Livox SDK. Mid-360→JT128 mount transform TBD (must be measured/calibrated). Rig frame = Mid-360 IMU (Z-up, right-handed) |
 | **Decimation** | Every 4th point for display (~340k pts/s). Full resolution stays in bag |
 | **Bag playback** | mcap files via [mcap Swift package](https://github.com/foxglove/mcap). Timeline scrubber, pause, frame-step |
 
@@ -54,7 +56,7 @@ fixtures/
     jt128-frame.pcd          # 50k points
     dual-frame.pcd           # Both sensors, pre-transformed, 100k points
     empty.pcd                # Zero points (parked state)
-    room-scan.mcap           # Short recorded bag (~5s, ~100MB)
+    room-scan.mcap           # Short recorded bag (~5s, ~6.7 MB)
 ```
 
 PCD format for fixtures (human-readable, standard):
@@ -74,7 +76,13 @@ DATA ascii
 ...
 ```
 
-Decoder handles both PCD (fixtures) and PointCloud2 ROS binary (live/mcap).
+Decoder handles PCD ASCII (fixtures) and PointCloud2 ROS binary (live/mcap). Binary PCD is unsupported.
+
+### Conventions
+
+- **Coordinate system**: Z-up, right-handed
+- **Metal depth range**: [0, 1] (reversed-Z)
+- **Sensor IDs**: Mid-360 = 0, JT128 = 1, unknown = 2
 
 ---
 
@@ -155,16 +163,20 @@ Alerts overlay the canvas when action needed:
 | `ConnectivityService.swift` | **KEEP** | SSH/Tailscale probes |
 | `RigService.swift` | **KEEP** | Tunnels, API |
 
-**New files**:
+**New files (Views)**:
 | File | Purpose |
 |------|---------|
 | `OpsConsoleView.swift` | The single-screen layout |
 | `PointCloudView.swift` | SwiftUI wrapper for Metal canvas |
 | `PointCloudRenderer.swift` | Metal rendering |
-| `PointCloudDecoder.swift` | PointCloud2 parsing |
 | `PointCloudCamera.swift` | Orbit/fly controls |
 | `WebSocketClient.swift` | foxglove_bridge consumer |
 | `McapReader.swift` | Recorded bag playback |
+
+**New files (Core)**:
+| File | Purpose |
+|------|---------|
+| `PointCloudDecoder.swift` | PCD/PointCloud2 → PointCloudFrame (Foundation-only) |
 
 ### Core Library (Sources/LabCommandCore)
 
@@ -195,11 +207,11 @@ Alerts overlay the canvas when action needed:
 
 | | Before | After |
 |-|--------|-------|
-| Views | 17 | 9 (6 kept + 3 rewritten/new renderer) |
-| Core | 20 | 12 |
-| **Total** | 37 | 21 + 5 new = 26 |
+| Views | 17 | 8 kept + 6 new = 14 |
+| Core | 20 | 12 kept + 1 new = 13 |
+| **Total** | 37 | 20 kept + 7 new = 27 |
 
-Cut 16 files, add 5 new (renderer stack).
+Cut 17 files, add 7 new (renderer stack + decoder).
 
 ---
 
@@ -223,19 +235,18 @@ fixtures/
     jt128-frame.pcd
     dual-frame.pcd               # Both sensors overlaid
     empty.pcd
-    room-scan.mcap               # 5s recorded bag for playback testing
+    room-scan.mcap               # ~5s recorded bag (~6.7 MB) for playback testing
 ```
 
 ### Test Tiers
 
 1. **Core tests** (`swift run LabCommandCoreTestsRunner` on Linux) — decoder, gates, health, PCD parser
-2. **Renderer tests** (Mac only) — fixture → vertex buffer → render to offscreen texture → snapshot compare
-3. **Design contract tests** — typography ≤15pt, spacing tokens, banned words
+2. **Design contract tests** — typography ≤15pt, spacing tokens, banned words
 
 ### Build Verification
 
 - **Linux CI**: Core logic tests pass
-- **Trevor local**: `./build.sh` + launch with `--mock both-sensors-live` + load fixture point clouds
+- **Trevor local**: `./build.sh` + launch app + load fixture point clouds in canvas
 - **Future**: Self-hosted Mac worker for automated screenshots
 
 ---
@@ -245,6 +256,8 @@ fixtures/
 ### Phase A: No Spark Required
 
 Everything here builds and tests without Spark access.
+
+**PR → GitHub mapping**: Plan PR 1 → #3, PR 2 → #4, PR 3 → #2, PR 4 → #5, PR 5 → #6, PR 6 → #7
 
 **PR 1: Fixture infrastructure**
 - `fixtures/api/*.json` — mock command-center responses
@@ -259,8 +272,8 @@ Everything here builds and tests without Spark access.
 - Verify build + tests pass
 
 **PR 3: PCD + PointCloud2 decoder**
-- `PointCloudDecoder.swift` — parse PCD ASCII and PointCloud2 binary
-- Output: `[SIMD3<Float>]` positions + `[Float]` intensities
+- `PointCloudDecoder.swift` in LabCommandCore — parse PCD ASCII and PointCloud2 binary
+- Foundation-only, outputs `PointCloudFrame` / `Point3D` (no SIMD dependency)
 - Unit tests against fixture files
 
 **PR 4: Metal renderer**
@@ -271,11 +284,13 @@ Everything here builds and tests without Spark access.
 
 **PR 5: Camera controls**
 - `PointCloudCamera.swift` — orbit (default), fly (WASD+mouse)
-- Trackpad: two-finger rotate, pinch zoom, three-finger pan
+- Gestures: click-drag rotates, scroll/pinch zooms, Option-drag pans
 - Smooth interpolation, bounds clamping
 
 **PR 6: Dual-sensor overlay**
-- Apply static extrinsics from `RigSpec`
+- Apply Mid-360 lidar-to-IMU offset (11.0, 23.29, −44.12 mm) from Livox SDK
+- Mid-360→JT128 mount transform is **unknown** — must be measured or calibrated before fusing
+- Rig frame = Mid-360 IMU (Z-up, right-handed)
 - Load both `mid360-frame.pcd` and `jt128-frame.pcd`
 - Color: Mid-360 = cyan, JT128 = magenta
 
@@ -296,10 +311,10 @@ Everything here builds and tests without Spark access.
 - Elapsed time display, disk free
 - Red pip pulse when recording
 
-**PR 10: Polish + docs**
+**PR 10: Polish + cleanup**
 - Design contract tests (15pt cap, spacing tokens)
 - Settings sheet (gear icon)
-- README update
+- Documentation updates
 
 ### Phase B: Spark Required (Trevor runs once connected)
 
@@ -322,7 +337,7 @@ These PRs require Spark access for testing. Trevor completes locally.
 
 LabCommand becomes a single-screen ops console with a live 3D point-cloud viewer as centerpiece.
 
-- **Metal renderer** handles ~1.35M pts/s, orbit/fly camera, dual-sensor overlay, bag scrubbing
-- **16 files cut**, 6 new files (renderer + console)
+- **Metal renderer** with orbit/fly camera, dual-sensor overlay, bag scrubbing
+- **17 files cut**, 7 new files (renderer stack + decoder)
 - **10 PRs buildable without Spark**, 2 PRs require Spark connection
 - 3D viewer arrives early (PRs 3-7) — Trevor sees points on screen fast, with fixture data
