@@ -1,24 +1,10 @@
 import Foundation
 
-/// A decoded point cloud with positions, intensities, and optional sensor origin.
-public struct PointCloud: Sendable, Equatable {
-    public var positions: [SIMD3<Float>]
-    public var intensities: [Float]
-    public var sensorID: String?
-
-    public init(positions: [SIMD3<Float>] = [], intensities: [Float] = [], sensorID: String? = nil) {
-        self.positions = positions
-        self.intensities = intensities
-        self.sensorID = sensorID
-    }
-
-    public var isEmpty: Bool { positions.isEmpty }
-    public var count: Int { positions.count }
-}
-
 /// Field layout for ROS PointCloud2 binary messages.
+/// Derive from message fields using `PointCloud2Layout.from(fields:pointStep:isBigEndian:)`.
 public struct PointCloud2Layout: Sendable, Equatable {
     public var pointStep: Int
+    public var rowStep: Int
     public var xOffset: Int
     public var yOffset: Int
     public var zOffset: Int
@@ -29,15 +15,15 @@ public struct PointCloud2Layout: Sendable, Equatable {
     public var zType: FieldType
     public var intensityType: FieldType?
 
-    public enum FieldType: Sendable, Equatable {
-        case float32
-        case float64
-        case int8
-        case uint8
-        case int16
-        case uint16
-        case int32
-        case uint32
+    public enum FieldType: UInt8, Sendable, Equatable {
+        case int8 = 1
+        case uint8 = 2
+        case int16 = 3
+        case uint16 = 4
+        case int32 = 5
+        case uint32 = 6
+        case float32 = 7
+        case float64 = 8
 
         public var size: Int {
             switch self {
@@ -51,6 +37,7 @@ public struct PointCloud2Layout: Sendable, Equatable {
 
     public init(
         pointStep: Int,
+        rowStep: Int = 0,
         xOffset: Int,
         yOffset: Int,
         zOffset: Int,
@@ -62,6 +49,7 @@ public struct PointCloud2Layout: Sendable, Equatable {
         intensityType: FieldType? = nil
     ) {
         self.pointStep = pointStep
+        self.rowStep = rowStep > 0 ? rowStep : pointStep
         self.xOffset = xOffset
         self.yOffset = yOffset
         self.zOffset = zOffset
@@ -73,79 +61,169 @@ public struct PointCloud2Layout: Sendable, Equatable {
         self.intensityType = intensityType
     }
 
-    /// Common layout for Livox Mid-360 PointCloud2 messages (x y z intensity).
-    public static let livoxMid360 = PointCloud2Layout(
-        pointStep: 16,
-        xOffset: 0,
-        yOffset: 4,
-        zOffset: 8,
-        intensityOffset: 12,
-        isBigEndian: false,
-        xType: .float32,
-        yType: .float32,
-        zType: .float32,
-        intensityType: .float32
-    )
+    /// A single field descriptor from a PointCloud2 message.
+    public struct FieldDescriptor: Sendable, Equatable {
+        public var name: String
+        public var offset: Int
+        public var datatype: FieldType
+        public var count: Int
 
-    /// Common layout for Hesai JT128 PointCloud2 messages.
-    public static let hesaiJT128 = PointCloud2Layout(
-        pointStep: 32,
-        xOffset: 0,
-        yOffset: 4,
-        zOffset: 8,
-        intensityOffset: 16,
-        isBigEndian: false,
-        xType: .float32,
-        yType: .float32,
-        zType: .float32,
-        intensityType: .float32
-    )
+        public init(name: String, offset: Int, datatype: FieldType, count: Int = 1) {
+            self.name = name
+            self.offset = offset
+            self.datatype = datatype
+            self.count = count
+        }
+    }
+
+    /// Derive layout from a PointCloud2 fields array.
+    public static func from(
+        fields: [FieldDescriptor],
+        pointStep: Int,
+        rowStep: Int = 0,
+        isBigEndian: Bool = false
+    ) throws -> PointCloud2Layout {
+        var xField: FieldDescriptor?
+        var yField: FieldDescriptor?
+        var zField: FieldDescriptor?
+        var intensityField: FieldDescriptor?
+
+        for field in fields {
+            switch field.name.lowercased() {
+            case "x": xField = field
+            case "y": yField = field
+            case "z": zField = field
+            case "intensity": intensityField = field
+            default: break
+            }
+        }
+
+        guard let x = xField, let y = yField, let z = zField else {
+            throw PointCloudError.invalidHeader("Missing required x, y, or z fields")
+        }
+
+        return PointCloud2Layout(
+            pointStep: pointStep,
+            rowStep: rowStep,
+            xOffset: x.offset,
+            yOffset: y.offset,
+            zOffset: z.offset,
+            intensityOffset: intensityField?.offset,
+            isBigEndian: isBigEndian,
+            xType: x.datatype,
+            yType: y.datatype,
+            zType: z.datatype,
+            intensityType: intensityField?.datatype
+        )
+    }
 }
 
-public enum PointCloudDecoderError: Error, Equatable {
-    case invalidFormat(String)
-    case missingHeader(String)
-    case unsupportedDataFormat(String)
-    case dataSizeMismatch(expected: Int, actual: Int)
-    case invalidPointData(String)
+/// Extended PCD header with SIZE, TYPE, and COUNT metadata.
+public struct PCDHeaderExtended: Sendable, Equatable {
+    public var version: String
+    public var fields: [String]
+    public var sizes: [Int]
+    public var types: [String]
+    public var counts: [Int]
+    public var width: Int
+    public var height: Int
+    public var points: Int
+    public var dataFormat: PCDDataFormat
+
+    public init(
+        version: String = "0.7",
+        fields: [String] = [],
+        sizes: [Int] = [],
+        types: [String] = [],
+        counts: [Int] = [],
+        width: Int = 0,
+        height: Int = 1,
+        points: Int = 0,
+        dataFormat: PCDDataFormat = .ascii
+    ) {
+        self.version = version
+        self.fields = fields
+        self.sizes = sizes
+        self.types = types
+        self.counts = counts
+        self.width = width
+        self.height = height
+        self.points = points
+        self.dataFormat = dataFormat
+    }
+
+    /// Total number of values per point (sum of counts, or field count if counts empty).
+    public var valuesPerPoint: Int {
+        if counts.isEmpty {
+            return fields.count
+        }
+        return counts.reduce(0, +)
+    }
 }
 
 /// Decoder for PCD (Point Cloud Data) files and ROS PointCloud2 binary messages.
+///
+/// **Supported formats:**
+/// - PCD ASCII format (VERSION 0.7)
+/// - ROS1 PointCloud2 binary messages
+/// - ROS2 PointCloud2 binary messages (with CDR encapsulation)
+///
+/// **Not yet supported:**
+/// - PCD binary format
+/// - PCD binary_compressed format
 public enum PointCloudDecoder {
+
+    /// Maximum points to allocate (prevents DoS via malicious headers).
+    public static let maxPoints = 100_000_000
 
     // MARK: - PCD ASCII Parsing
 
+    /// Result of PCD decoding including header metadata.
+    public struct PCDResult: Sendable, Equatable {
+        public var frame: PointCloudFrame
+        public var header: PCDHeaderExtended
+    }
+
     /// Decode a PCD file (ASCII format) from raw data.
-    public static func decodePCD(from data: Data) throws -> PointCloud {
+    public static func decodePCD(from data: Data, filename: String? = nil) throws -> PointCloudFrame {
         guard let content = String(data: data, encoding: .utf8) else {
-            throw PointCloudDecoderError.invalidFormat("Data is not valid UTF-8")
+            throw PointCloudError.invalidData("Data is not valid UTF-8")
         }
-        return try decodePCD(from: content)
+        return try decodePCD(from: content, filename: filename)
+    }
+
+    /// Decode a PCD file with full header metadata.
+    public static func decodePCDWithHeader(from content: String, filename: String? = nil) throws -> PCDResult {
+        let lines = content.components(separatedBy: .newlines)
+        let header = try parsePCDHeader(lines: lines)
+        let frame = try parsePCDData(lines: lines, header: header, filename: filename)
+        return PCDResult(frame: frame, header: header)
     }
 
     /// Decode a PCD file (ASCII format) from a string.
-    public static func decodePCD(from content: String) throws -> PointCloud {
-        let lines = content.components(separatedBy: .newlines)
+    public static func decodePCD(from content: String, filename: String? = nil) throws -> PointCloudFrame {
+        let result = try decodePCDWithHeader(from: content, filename: filename)
+        return result.frame
+    }
 
+    private static func parsePCDHeader(lines: [String]) throws -> PCDHeaderExtended {
         var version: String?
         var fields: [String] = []
-        var _sizes: [Int] = []
-        var _types: [String] = []
-        var _counts: [Int] = []
+        var sizes: [Int] = []
+        var types: [String] = []
+        var counts: [Int] = []
         var width: Int?
-        var height: Int?
-        var dataFormat: String?
+        var height: Int = 1
+        var dataFormat: PCDDataFormat?
         var pointCount: Int?
-        var headerEndIndex = 0
 
-        for (index, line) in lines.enumerated() {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty || trimmed.hasPrefix("#") {
                 continue
             }
 
-            let parts = trimmed.split(separator: " ", omittingEmptySubsequences: true)
+            let parts = trimmed.split(whereSeparator: { $0.isWhitespace })
                 .map { String($0) }
             guard !parts.isEmpty else { continue }
 
@@ -158,22 +236,35 @@ public enum PointCloudDecoder {
             case "FIELDS":
                 fields = values
             case "SIZE":
-                _sizes = values.compactMap { Int($0) }
+                sizes = values.compactMap { Int($0) }
             case "TYPE":
-                _types = values
+                types = values
             case "COUNT":
-                _counts = values.compactMap { Int($0) }
+                counts = values.compactMap { Int($0) }
             case "WIDTH":
-                width = values.first.flatMap { Int($0) }
+                if let w = values.first.flatMap({ Int($0) }), w >= 0 {
+                    width = w
+                } else if let w = values.first.flatMap({ Int($0) }), w < 0 {
+                    throw PointCloudError.invalidHeader("WIDTH cannot be negative")
+                }
             case "HEIGHT":
-                height = values.first.flatMap { Int($0) }
+                if let h = values.first.flatMap({ Int($0) }), h >= 0 {
+                    height = h
+                } else if let h = values.first.flatMap({ Int($0) }), h < 0 {
+                    throw PointCloudError.invalidHeader("HEIGHT cannot be negative")
+                }
             case "VIEWPOINT":
                 break
             case "POINTS":
-                pointCount = values.first.flatMap { Int($0) }
+                if let p = values.first.flatMap({ Int($0) }), p >= 0 {
+                    pointCount = p
+                } else if let p = values.first.flatMap({ Int($0) }), p < 0 {
+                    throw PointCloudError.invalidHeader("POINTS cannot be negative")
+                }
             case "DATA":
-                dataFormat = values.first?.lowercased()
-                headerEndIndex = index + 1
+                if let format = values.first?.lowercased() {
+                    dataFormat = PCDDataFormat(rawValue: format)
+                }
             default:
                 break
             }
@@ -182,350 +273,415 @@ public enum PointCloudDecoder {
         }
 
         guard version != nil else {
-            throw PointCloudDecoderError.missingHeader("VERSION")
+            throw PointCloudError.invalidHeader("Missing VERSION header")
         }
         guard !fields.isEmpty else {
-            throw PointCloudDecoderError.missingHeader("FIELDS")
-        }
-        guard let width else {
-            throw PointCloudDecoderError.missingHeader("WIDTH")
+            throw PointCloudError.invalidHeader("Missing FIELDS header")
         }
         guard let dataFormat else {
-            throw PointCloudDecoderError.missingHeader("DATA")
+            throw PointCloudError.invalidHeader("Missing DATA header")
         }
 
-        let expectedPoints = pointCount ?? (width * (height ?? 1))
+        let effectiveWidth = width ?? pointCount ?? 0
+        let effectivePoints = pointCount ?? (effectiveWidth * height)
 
-        if expectedPoints == 0 {
-            return PointCloud(positions: [], intensities: [])
+        if effectivePoints < 0 {
+            throw PointCloudError.invalidHeader("Computed point count is negative")
         }
 
-        guard dataFormat == "ascii" else {
-            throw PointCloudDecoderError.unsupportedDataFormat(
-                "Only ASCII format is supported, got '\(dataFormat)'"
+        let (overflowCheck, overflow) = effectiveWidth.multipliedReportingOverflow(by: height)
+        if overflow || overflowCheck < 0 {
+            throw PointCloudError.invalidHeader("WIDTH * HEIGHT overflows")
+        }
+
+        return PCDHeaderExtended(
+            version: version ?? "0.7",
+            fields: fields,
+            sizes: sizes,
+            types: types,
+            counts: counts,
+            width: effectiveWidth,
+            height: height,
+            points: effectivePoints,
+            dataFormat: dataFormat
+        )
+    }
+
+    private static func parsePCDData(
+        lines: [String],
+        header: PCDHeaderExtended,
+        filename: String?
+    ) throws -> PointCloudFrame {
+        guard header.dataFormat == .ascii else {
+            throw PointCloudError.unsupportedFormat(
+                "Only ASCII format is supported. Binary PCD format is not yet implemented."
             )
         }
 
-        let xIndex = fields.firstIndex { $0.lowercased() == "x" }
-        let yIndex = fields.firstIndex { $0.lowercased() == "y" }
-        let zIndex = fields.firstIndex { $0.lowercased() == "z" }
-        let intensityIndex = fields.firstIndex { $0.lowercased() == "intensity" }
+        if header.points == 0 {
+            return PointCloudFrame(sensor: sensorFromFilename(filename))
+        }
 
-        guard let xIdx = xIndex, let yIdx = yIndex, let zIdx = zIndex else {
-            throw PointCloudDecoderError.invalidFormat("Missing x, y, or z fields")
+        guard header.points <= maxPoints else {
+            throw PointCloudError.invalidData(
+                "Point count \(header.points) exceeds maximum \(maxPoints)"
+            )
+        }
+
+        var headerEndIndex = 0
+        for (index, line) in lines.enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+            let key = trimmed.split(whereSeparator: { $0.isWhitespace }).first?.uppercased()
+            if key == "DATA" {
+                headerEndIndex = index + 1
+                break
+            }
+        }
+
+        let fieldCounts = header.counts.isEmpty
+            ? Array(repeating: 1, count: header.fields.count)
+            : header.counts
+
+        var valueIndices: [String: Int] = [:]
+        var currentIndex = 0
+        for (i, field) in header.fields.enumerated() {
+            valueIndices[field.lowercased()] = currentIndex
+            currentIndex += (i < fieldCounts.count) ? fieldCounts[i] : 1
+        }
+
+        let xIdx = valueIndices["x"]
+        let yIdx = valueIndices["y"]
+        let zIdx = valueIndices["z"]
+        let intensityIdx = valueIndices["intensity"]
+
+        guard let xIndex = xIdx, let yIndex = yIdx, let zIndex = zIdx else {
+            throw PointCloudError.invalidHeader("Missing required x, y, or z fields")
         }
 
         var positions: [SIMD3<Float>] = []
         var intensities: [Float] = []
-        positions.reserveCapacity(expectedPoints)
-        intensities.reserveCapacity(expectedPoints)
 
-        let dataLines = Array(lines.dropFirst(headerEndIndex))
+        let dataLines = lines.dropFirst(headerEndIndex)
+        var parsedPoints = 0
 
         for line in dataLines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { continue }
 
-            let values = trimmed.split(separator: " ", omittingEmptySubsequences: true)
-            guard values.count > max(xIdx, yIdx, zIdx) else { continue }
+            let values = trimmed.split(whereSeparator: { $0.isWhitespace })
+            let maxIndex = max(xIndex, yIndex, zIndex, intensityIdx ?? 0)
+            guard values.count > maxIndex else { continue }
 
-            guard let x = Float(values[xIdx]),
-                  let y = Float(values[yIdx]),
-                  let z = Float(values[zIdx]) else {
+            guard let x = Float(values[xIndex]),
+                  let y = Float(values[yIndex]),
+                  let z = Float(values[zIndex]) else {
                 continue
             }
 
-            if x.isNaN || y.isNaN || z.isNaN { continue }
+            if !x.isFinite || !y.isFinite || !z.isFinite { continue }
 
             positions.append(SIMD3<Float>(x, y, z))
 
-            if let intIdx = intensityIndex, values.count > intIdx,
-               let intensity = Float(values[intIdx]), !intensity.isNaN {
+            if let intIdx = intensityIdx, values.count > intIdx,
+               let intensity = Float(values[intIdx]), intensity.isFinite {
                 intensities.append(intensity)
             } else {
                 intensities.append(1.0)
             }
+
+            parsedPoints += 1
         }
 
-        return PointCloud(positions: positions, intensities: intensities)
+        if parsedPoints < header.points {
+            throw PointCloudError.invalidData(
+                "Truncated file: expected \(header.points) points but found \(parsedPoints)"
+            )
+        }
+
+        return PointCloudFrame(
+            positions: positions,
+            intensities: intensities,
+            sensor: sensorFromFilename(filename)
+        )
+    }
+
+    private static func sensorFromFilename(_ filename: String?) -> SensorID? {
+        guard let name = filename?.lowercased() else { return nil }
+        if name.contains("mid360") || name.contains("mid-360") || name.contains("livox") {
+            return .mid360
+        }
+        if name.contains("jt128") || name.contains("hesai") {
+            return .jt128
+        }
+        return nil
     }
 
     // MARK: - PointCloud2 Binary Parsing
 
-    /// Decode a ROS PointCloud2 binary message.
+    /// Decode a ROS PointCloud2 binary message with explicit layout.
     public static func decodePointCloud2(
         from data: Data,
-        fieldOffsets layout: PointCloud2Layout
-    ) throws -> PointCloud {
+        layout: PointCloud2Layout,
+        pointCount: Int? = nil
+    ) throws -> PointCloudFrame {
         guard layout.pointStep > 0 else {
-            throw PointCloudDecoderError.invalidFormat("pointStep must be positive")
+            throw PointCloudError.invalidData("pointStep must be positive")
         }
 
-        let pointCount = data.count / layout.pointStep
-        if pointCount == 0 {
-            return PointCloud(positions: [], intensities: [])
+        let count = pointCount ?? (data.count / layout.pointStep)
+        if count == 0 {
+            return PointCloudFrame()
+        }
+
+        guard count <= maxPoints else {
+            throw PointCloudError.invalidData(
+                "Point count \(count) exceeds maximum \(maxPoints)"
+            )
         }
 
         var positions: [SIMD3<Float>] = []
         var intensities: [Float] = []
-        positions.reserveCapacity(pointCount)
-        intensities.reserveCapacity(pointCount)
+        positions.reserveCapacity(count)
+        intensities.reserveCapacity(count)
 
-        for i in 0..<pointCount {
-            let baseOffset = i * layout.pointStep
+        try data.withUnsafeBytes { buffer in
+            let baseAddress = buffer.baseAddress!
 
-            let x = try readFloat(
-                from: data,
-                at: baseOffset + layout.xOffset,
-                type: layout.xType,
-                bigEndian: layout.isBigEndian
-            )
-            let y = try readFloat(
-                from: data,
-                at: baseOffset + layout.yOffset,
-                type: layout.yType,
-                bigEndian: layout.isBigEndian
-            )
-            let z = try readFloat(
-                from: data,
-                at: baseOffset + layout.zOffset,
-                type: layout.zType,
-                bigEndian: layout.isBigEndian
-            )
+            for i in 0..<count {
+                let baseOffset = i * layout.pointStep
 
-            if x.isNaN || y.isNaN || z.isNaN { continue }
+                guard baseOffset + layout.xOffset + layout.xType.size <= data.count,
+                      baseOffset + layout.yOffset + layout.yType.size <= data.count,
+                      baseOffset + layout.zOffset + layout.zType.size <= data.count else {
+                    break
+                }
 
-            positions.append(SIMD3<Float>(x, y, z))
-
-            if let intOffset = layout.intensityOffset, let intType = layout.intensityType {
-                let intensity = try readFloat(
-                    from: data,
-                    at: baseOffset + intOffset,
-                    type: intType,
+                let x = readFloatUnsafe(
+                    from: baseAddress,
+                    at: baseOffset + layout.xOffset,
+                    type: layout.xType,
                     bigEndian: layout.isBigEndian
                 )
-                intensities.append(intensity.isNaN ? 1.0 : intensity)
-            } else {
-                intensities.append(1.0)
+                let y = readFloatUnsafe(
+                    from: baseAddress,
+                    at: baseOffset + layout.yOffset,
+                    type: layout.yType,
+                    bigEndian: layout.isBigEndian
+                )
+                let z = readFloatUnsafe(
+                    from: baseAddress,
+                    at: baseOffset + layout.zOffset,
+                    type: layout.zType,
+                    bigEndian: layout.isBigEndian
+                )
+
+                if !x.isFinite || !y.isFinite || !z.isFinite { continue }
+
+                positions.append(SIMD3<Float>(x, y, z))
+
+                if let intOffset = layout.intensityOffset, let intType = layout.intensityType,
+                   baseOffset + intOffset + intType.size <= data.count {
+                    let intensity = readFloatUnsafe(
+                        from: baseAddress,
+                        at: baseOffset + intOffset,
+                        type: intType,
+                        bigEndian: layout.isBigEndian
+                    )
+                    intensities.append(intensity.isFinite ? intensity : 1.0)
+                } else {
+                    intensities.append(1.0)
+                }
             }
         }
 
-        return PointCloud(positions: positions, intensities: intensities)
+        return PointCloudFrame(positions: positions, intensities: intensities)
     }
 
-    /// Decode a ROS PointCloud2 message with header parsing.
-    /// The header format follows ROS message serialization:
-    /// - uint32 height
-    /// - uint32 width
-    /// - uint32 num_fields
-    /// - For each field: string name, uint32 offset, uint8 datatype, uint32 count
-    /// - bool is_bigendian
-    /// - uint32 point_step
-    /// - uint32 row_step
-    /// - byte[] data
-    /// - bool is_dense
-    public static func decodePointCloud2WithHeader(from data: Data) throws -> PointCloud {
-        var offset = 0
-
+    /// Decode a ROS1 PointCloud2 message (fields array embedded in message).
+    public static func decodeROS1PointCloud2(from data: Data) throws -> PointCloudFrame {
         guard data.count >= 12 else {
-            throw PointCloudDecoderError.invalidFormat("Data too short for PointCloud2 header")
+            throw PointCloudError.invalidData("Data too short for ROS1 PointCloud2 header")
         }
 
-        let height = readUInt32LE(from: data, at: offset)
+        var offset = 0
+
+        let height = try readUInt32Safe(from: data, at: offset)
         offset += 4
-        let width = readUInt32LE(from: data, at: offset)
+        let width = try readUInt32Safe(from: data, at: offset)
         offset += 4
 
-        let numFields = Int(readUInt32LE(from: data, at: offset))
+        let (totalPoints, overflow) = Int(width).multipliedReportingOverflow(by: Int(height))
+        if overflow {
+            throw PointCloudError.invalidHeader("width * height overflows")
+        }
+
+        let numFields = try readUInt32Safe(from: data, at: offset)
         offset += 4
 
-        var fieldMap: [String: (offset: Int, type: PointCloud2Layout.FieldType)] = [:]
+        var fields: [PointCloud2Layout.FieldDescriptor] = []
 
         for _ in 0..<numFields {
             guard offset + 4 <= data.count else {
-                throw PointCloudDecoderError.invalidFormat("Truncated field header")
+                throw PointCloudError.invalidData("Truncated field header")
             }
 
-            let nameLen = Int(readUInt32LE(from: data, at: offset))
+            let nameLen = Int(try readUInt32Safe(from: data, at: offset))
             offset += 4
 
             guard offset + nameLen + 9 <= data.count else {
-                throw PointCloudDecoderError.invalidFormat("Truncated field data")
+                throw PointCloudError.invalidData("Truncated field data")
             }
 
-            let nameData = data.subdata(in: offset..<(offset + nameLen))
-            let name = String(data: nameData, encoding: .utf8)?.lowercased() ?? ""
+            let name: String
+            if nameLen > 0 {
+                let nameData = data[data.startIndex.advanced(by: offset)..<data.startIndex.advanced(by: offset + nameLen)]
+                name = String(data: nameData, encoding: .utf8)?.lowercased() ?? ""
+            } else {
+                name = ""
+            }
             offset += nameLen
 
-            let fieldOffset = Int(readUInt32LE(from: data, at: offset))
+            let fieldOffset = Int(try readUInt32Safe(from: data, at: offset))
             offset += 4
 
-            let datatype = data[offset]
+            let datatype = data[data.startIndex.advanced(by: offset)]
             offset += 1
 
-            _ = readUInt32LE(from: data, at: offset)
+            let count = Int(try readUInt32Safe(from: data, at: offset))
             offset += 4
 
-            let fieldType = datatypeToFieldType(datatype)
-            fieldMap[name] = (fieldOffset, fieldType)
+            guard let fieldType = PointCloud2Layout.FieldType(rawValue: datatype) else {
+                throw PointCloudError.invalidData("Unknown field datatype: \(datatype)")
+            }
+
+            fields.append(PointCloud2Layout.FieldDescriptor(
+                name: name,
+                offset: fieldOffset,
+                datatype: fieldType,
+                count: count
+            ))
         }
 
-        guard offset + 13 <= data.count else {
-            throw PointCloudDecoderError.invalidFormat("Truncated PointCloud2 metadata")
+        guard offset + 10 <= data.count else {
+            throw PointCloudError.invalidData("Truncated PointCloud2 metadata")
         }
 
-        let isBigEndian = data[offset] != 0
+        let isBigEndian = data[data.startIndex.advanced(by: offset)] != 0
         offset += 1
 
-        let pointStep = Int(readUInt32LE(from: data, at: offset))
+        let pointStep = Int(try readUInt32Safe(from: data, at: offset))
         offset += 4
 
-        _ = readUInt32LE(from: data, at: offset)
+        let rowStep = Int(try readUInt32Safe(from: data, at: offset))
         offset += 4
 
-        let dataLen = Int(readUInt32LE(from: data, at: offset))
+        let dataLen = Int(try readUInt32Safe(from: data, at: offset))
         offset += 4
 
         guard offset + dataLen <= data.count else {
-            throw PointCloudDecoderError.dataSizeMismatch(
-                expected: offset + dataLen,
-                actual: data.count
+            throw PointCloudError.invalidData(
+                "Data section truncated: expected \(dataLen) bytes at offset \(offset), have \(data.count)"
             )
         }
 
-        let pointData = data.subdata(in: offset..<(offset + dataLen))
+        let pointData = data[data.startIndex.advanced(by: offset)..<data.startIndex.advanced(by: offset + dataLen)]
 
-        guard let xField = fieldMap["x"],
-              let yField = fieldMap["y"],
-              let zField = fieldMap["z"] else {
-            throw PointCloudDecoderError.invalidFormat("Missing x, y, or z fields in PointCloud2")
-        }
-
-        let intensityField = fieldMap["intensity"]
-
-        let layout = PointCloud2Layout(
+        let layout = try PointCloud2Layout.from(
+            fields: fields,
             pointStep: pointStep,
-            xOffset: xField.offset,
-            yOffset: yField.offset,
-            zOffset: zField.offset,
-            intensityOffset: intensityField?.offset,
-            isBigEndian: isBigEndian,
-            xType: xField.type,
-            yType: yField.type,
-            zType: zField.type,
-            intensityType: intensityField?.type
+            rowStep: rowStep,
+            isBigEndian: isBigEndian
         )
 
-        let cloud = try decodePointCloud2(from: pointData, fieldOffsets: layout)
-
-        let expectedPoints = Int(height) * Int(width)
-        if cloud.count != expectedPoints && expectedPoints > 0 {
-        }
-
-        return cloud
+        return try decodePointCloud2(from: Data(pointData), layout: layout, pointCount: totalPoints)
     }
 
-    // MARK: - Helper Functions
+    /// Decode a ROS2 PointCloud2 message (with CDR encapsulation header).
+    public static func decodeROS2PointCloud2(from data: Data) throws -> PointCloudFrame {
+        guard data.count >= 4 else {
+            throw PointCloudError.invalidData("Data too short for ROS2 CDR header")
+        }
 
-    private static func readFloat(
-        from data: Data,
+        let encapsulation = data[data.startIndex]
+        guard encapsulation == 0x00 else {
+            throw PointCloudError.invalidData("Invalid CDR encapsulation byte: \(encapsulation)")
+        }
+
+        let withHeader = data[data.startIndex.advanced(by: 4)...]
+        return try decodeROS1PointCloud2(from: Data(withHeader))
+    }
+
+    // MARK: - Safe Read Helpers
+
+    private static func readUInt32Safe(from data: Data, at offset: Int) throws -> UInt32 {
+        let start = data.startIndex.advanced(by: offset)
+        guard start >= data.startIndex, offset + 4 <= data.count else {
+            throw PointCloudError.invalidData("Read offset \(offset) out of bounds")
+        }
+        let b0 = UInt32(data[start])
+        let b1 = UInt32(data[data.index(after: start)])
+        let b2 = UInt32(data[data.index(start, offsetBy: 2)])
+        let b3 = UInt32(data[data.index(start, offsetBy: 3)])
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+
+    private static func readFloatUnsafe(
+        from base: UnsafeRawPointer,
         at offset: Int,
         type: PointCloud2Layout.FieldType,
         bigEndian: Bool
-    ) throws -> Float {
-        guard offset + type.size <= data.count else {
-            throw PointCloudDecoderError.invalidPointData(
-                "Offset \(offset) + size \(type.size) exceeds data length \(data.count)"
-            )
-        }
+    ) -> Float {
+        let ptr = base.advanced(by: offset)
 
         switch type {
         case .float32:
-            return readFloat32(from: data, at: offset, bigEndian: bigEndian)
+            var value = ptr.loadUnaligned(as: UInt32.self)
+            if bigEndian { value = value.byteSwapped }
+            return Float(bitPattern: value)
+
         case .float64:
-            return Float(readFloat64(from: data, at: offset, bigEndian: bigEndian))
+            var value = ptr.loadUnaligned(as: UInt64.self)
+            if bigEndian { value = value.byteSwapped }
+            return Float(Double(bitPattern: value))
+
         case .int8:
-            return Float(Int8(bitPattern: data[offset]))
+            return Float(ptr.load(as: Int8.self))
+
         case .uint8:
-            return Float(data[offset])
+            return Float(ptr.load(as: UInt8.self))
+
         case .int16:
-            return Float(readInt16(from: data, at: offset, bigEndian: bigEndian))
+            var value = ptr.loadUnaligned(as: Int16.self)
+            if bigEndian { value = Int16(bitPattern: UInt16(bitPattern: value).byteSwapped) }
+            return Float(value)
+
         case .uint16:
-            return Float(readUInt16(from: data, at: offset, bigEndian: bigEndian))
+            var value = ptr.loadUnaligned(as: UInt16.self)
+            if bigEndian { value = value.byteSwapped }
+            return Float(value)
+
         case .int32:
-            return Float(readInt32(from: data, at: offset, bigEndian: bigEndian))
+            var value = ptr.loadUnaligned(as: Int32.self)
+            if bigEndian { value = Int32(bitPattern: UInt32(bitPattern: value).byteSwapped) }
+            return Float(value)
+
         case .uint32:
-            return Float(readUInt32(from: data, at: offset, bigEndian: bigEndian))
+            var value = ptr.loadUnaligned(as: UInt32.self)
+            if bigEndian { value = value.byteSwapped }
+            return Float(value)
         }
     }
+}
 
-    private static func readFloat32(from data: Data, at offset: Int, bigEndian: Bool) -> Float {
-        let bytes = data.subdata(in: offset..<(offset + 4))
-        var value: UInt32 = 0
-        if bigEndian {
-            value = UInt32(bytes[0]) << 24 | UInt32(bytes[1]) << 16 |
-                    UInt32(bytes[2]) << 8 | UInt32(bytes[3])
-        } else {
-            value = UInt32(bytes[3]) << 24 | UInt32(bytes[2]) << 16 |
-                    UInt32(bytes[1]) << 8 | UInt32(bytes[0])
-        }
-        return Float(bitPattern: value)
-    }
+// MARK: - Convenience Extensions
 
-    private static func readFloat64(from data: Data, at offset: Int, bigEndian: Bool) -> Double {
-        let bytes = data.subdata(in: offset..<(offset + 8))
-        var value: UInt64 = 0
-        if bigEndian {
-            for i in 0..<8 { value = value << 8 | UInt64(bytes[i]) }
-        } else {
-            for i in (0..<8).reversed() { value = value << 8 | UInt64(bytes[i]) }
-        }
-        return Double(bitPattern: value)
-    }
-
-    private static func readInt16(from data: Data, at offset: Int, bigEndian: Bool) -> Int16 {
-        let u = readUInt16(from: data, at: offset, bigEndian: bigEndian)
-        return Int16(bitPattern: u)
-    }
-
-    private static func readUInt16(from data: Data, at offset: Int, bigEndian: Bool) -> UInt16 {
-        if bigEndian {
-            return UInt16(data[offset]) << 8 | UInt16(data[offset + 1])
-        } else {
-            return UInt16(data[offset + 1]) << 8 | UInt16(data[offset])
-        }
-    }
-
-    private static func readInt32(from data: Data, at offset: Int, bigEndian: Bool) -> Int32 {
-        let u = readUInt32(from: data, at: offset, bigEndian: bigEndian)
-        return Int32(bitPattern: u)
-    }
-
-    private static func readUInt32(from data: Data, at offset: Int, bigEndian: Bool) -> UInt32 {
-        if bigEndian {
-            return UInt32(data[offset]) << 24 | UInt32(data[offset + 1]) << 16 |
-                   UInt32(data[offset + 2]) << 8 | UInt32(data[offset + 3])
-        } else {
-            return UInt32(data[offset + 3]) << 24 | UInt32(data[offset + 2]) << 16 |
-                   UInt32(data[offset + 1]) << 8 | UInt32(data[offset])
-        }
-    }
-
-    private static func readUInt32LE(from data: Data, at offset: Int) -> UInt32 {
-        readUInt32(from: data, at: offset, bigEndian: false)
-    }
-
-    private static func datatypeToFieldType(_ datatype: UInt8) -> PointCloud2Layout.FieldType {
-        switch datatype {
-        case 1: return .int8
-        case 2: return .uint8
-        case 3: return .int16
-        case 4: return .uint16
-        case 5: return .int32
-        case 6: return .uint32
-        case 7: return .float32
-        case 8: return .float64
-        default: return .float32
-        }
+extension PointCloudDecoder {
+    /// Load a PCD file from disk.
+    public static func loadPCD(from path: String) throws -> PointCloudFrame {
+        let url = URL(fileURLWithPath: path)
+        let data = try Data(contentsOf: url)
+        let filename = url.lastPathComponent
+        return try decodePCD(from: data, filename: filename)
     }
 }
