@@ -1,0 +1,41 @@
+#!/bin/bash
+# Build LabCommand.app (Mac-native command center).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+APP_NAME="LabCommand"
+BUILD_DIR="${ROOT}/build"
+APP="${BUILD_DIR}/${APP_NAME}.app"
+INSTALL_DIR="${HOME}/Applications"
+INSTALL_APP="${INSTALL_DIR}/${APP_NAME}.app"
+
+mkdir -p "${BUILD_DIR}"
+rm -rf "${APP}"
+
+cd "${ROOT}"
+echo "==> swift build (release) LabCommand"
+swift build -c release --product LabCommand
+
+BIN="$(swift build -c release --product LabCommand --show-bin-path)/${APP_NAME}"
+if [[ ! -x "$BIN" ]]; then
+  echo "Binary not found at $BIN" >&2
+  exit 1
+fi
+
+mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
+cp -f "${BIN}" "${APP}/Contents/MacOS/${APP_NAME}"
+cp -f "${ROOT}/Info.plist" "${APP}/Contents/Info.plist"
+cp -f "${ROOT}/scripts/spark-capture.sh" "${APP}/Contents/Resources/spark-capture.sh"
+chmod +x "${APP}/Contents/Resources/spark-capture.sh"
+
+codesign -s - --force --deep "${APP}" 2>/dev/null || true
+
+mkdir -p "${INSTALL_DIR}"
+rm -rf "${INSTALL_APP}"
+cp -R "${APP}" "${INSTALL_APP}"
+touch "${INSTALL_APP}"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${INSTALL_APP}" 2>/dev/null || true
+
+echo "Built  ${APP}"
+echo "Installed ${INSTALL_APP}"
+echo "Open with: open \"${INSTALL_APP}\""
