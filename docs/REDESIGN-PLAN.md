@@ -12,10 +12,10 @@ The main canvas shows live point clouds from both sensors, overlaid with correct
 
 **Why Metal over alternatives**:
 - Both sensors produce high point rates (Mid-360 ~200k pts/s, JT128 ~1M+ pts/s)
-- At ~2 GB/min, only GPU-native rendering keeps up
-- Metal renders 10M+ points at 60fps with instanced geometry
+- GPU-native rendering avoids CPU bottleneck on large point counts
+- Metal supports instanced geometry for efficient point rendering
 - SceneKit/RealityKit add abstraction overhead and limit shader control
-- Embedded Foxglove (WKWebView) has 50-100ms latency and requires the tunnel — no offline use
+- Embedded Foxglove (WKWebView) adds latency and requires the tunnel — no offline use
 - Native Metal works fully offline with fixture data and recorded bags
 
 **Data sources** (in priority order):
@@ -43,8 +43,8 @@ Sources/LabCommandCore/
 |---------|----------------|
 | **Point coloring** | Intensity (grayscale), height (rainbow), sensor (Mid=cyan, JT=magenta) |
 | **Camera** | Orbit: click-drag rotates, scroll/pinch zooms, Option-drag pans. Fly: WASD+mouse |
-| **Dual overlay** | Mid-360 lidar-to-IMU offset (11.0, 23.29, −44.12 mm) from Livox SDK. Mid-360→JT128 mount transform TBD (must be measured/calibrated). Rig frame = Mid-360 IMU (Z-up, right-handed) |
-| **Decimation** | Every 4th point for display (~340k pts/s). Full resolution stays in bag |
+| **Dual overlay** | Mid-360: `p_lidar = p_imu + (11.0, 23.29, −44.12) mm`, R = I (IMU position in lidar frame per [Livox Mid-360 User Manual §IMU Data](https://terra-1-g.djicdn.com/851d20f7b9f64838a34cd02351370894/Livox/Livox_Mid-360_User_Manual_EN.pdf)). Mid-360→JT128 mount transform TBD (must be measured/calibrated). Rig frame = Mid-360 IMU (Z-up, right-handed) |
+| **Decimation** | Every 4th point for display (~300k pts/s). Full resolution stays in bag |
 | **Bag playback** | mcap files via [mcap Swift package](https://github.com/foxglove/mcap). Timeline scrubber, pause, frame-step |
 
 ### Fixtures for Testing Without Spark
@@ -54,9 +54,9 @@ fixtures/
   pointclouds/
     mid360-frame.pcd         # 50k points, PCD ASCII (easy to inspect/edit)
     jt128-frame.pcd          # 50k points
-    dual-frame.pcd           # Both sensors, pre-transformed, 100k points
+    dual-frame.pcd           # Both sensors, 100k points
     empty.pcd                # Zero points (parked state)
-    room-scan.mcap           # Short recorded bag (~5s, ~6.7 MB)
+    room-scan.mcap           # Short recorded bag (50 msgs × 100 pts, 3,744 B)
 ```
 
 PCD format for fixtures (human-readable, standard):
@@ -81,7 +81,7 @@ Decoder handles PCD ASCII (fixtures) and PointCloud2 ROS binary (live/mcap). Bin
 ### Conventions
 
 - **Coordinate system**: Z-up, right-handed
-- **Metal depth range**: [0, 1] (reversed-Z)
+- **Metal depth range**: standard Z — near→0, far→1, compare `.less`, clear depth 1.0
 - **Sensor IDs**: Mid-360 = 0, JT128 = 1, unknown = 2
 
 ---
@@ -172,11 +172,16 @@ Alerts overlay the canvas when action needed:
 | `PointCloudCamera.swift` | Orbit/fly controls |
 | `WebSocketClient.swift` | foxglove_bridge consumer |
 | `McapReader.swift` | Recorded bag playback |
+| `MockRigService.swift` | Mock data source for `--mock` launch arg |
 
 **New files (Core)**:
 | File | Purpose |
 |------|---------|
 | `PointCloudDecoder.swift` | PCD/PointCloud2 → PointCloudFrame (Foundation-only) |
+| `StatusAggregation.swift` | Combine multi-sensor health into rig status |
+| `CameraMath.swift` | Orbit/fly projection and interpolation |
+| `RigSpec.swift` | Static extrinsics and sensor metadata |
+| `DualSensorLoader.swift` | Load and fuse two PCD files |
 
 ### Core Library (Sources/LabCommandCore)
 
@@ -207,11 +212,11 @@ Alerts overlay the canvas when action needed:
 
 | | Before | After |
 |-|--------|-------|
-| Views | 17 | 8 kept + 6 new = 14 |
-| Core | 20 | 12 kept + 1 new = 13 |
-| **Total** | 37 | 20 kept + 7 new = 27 |
+| Views | 17 | 8 kept + 7 new = 15 |
+| Core | 20 | 12 kept + 5 new = 17 |
+| **Total** | 37 | 20 kept + 12 new = 32 |
 
-Cut 17 files, add 7 new (renderer stack + decoder).
+Cut 17 files, add 12 new (renderer stack, decoder, mocks, math helpers).
 
 ---
 
@@ -233,9 +238,9 @@ fixtures/
   pointclouds/                   # Static point cloud frames
     mid360-frame.pcd             # 50k points, PCD ASCII
     jt128-frame.pcd
-    dual-frame.pcd               # Both sensors overlaid
+    dual-frame.pcd               # Both sensors, 100k points
     empty.pcd
-    room-scan.mcap               # ~5s recorded bag (~6.7 MB) for playback testing
+    room-scan.mcap               # 50 msgs × 100 pts (3,744 B) for playback testing
 ```
 
 ### Test Tiers
@@ -267,7 +272,7 @@ Everything here builds and tests without Spark access.
 - Core tests for decoder round-trips
 
 **PR 2: Cut dead code**
-- Delete 16 files per inventory
+- Delete 17 files per inventory
 - Strip unused state from `AppState`
 - Verify build + tests pass
 
@@ -288,7 +293,7 @@ Everything here builds and tests without Spark access.
 - Smooth interpolation, bounds clamping
 
 **PR 6: Dual-sensor overlay**
-- Apply Mid-360 lidar-to-IMU offset (11.0, 23.29, −44.12 mm) from Livox SDK
+- Apply Mid-360 lidar↔IMU offset: `p_lidar = p_imu + (11.0, 23.29, −44.12) mm`, R = I (IMU position in lidar frame per [Livox Mid-360 User Manual §IMU Data](https://terra-1-g.djicdn.com/851d20f7b9f64838a34cd02351370894/Livox/Livox_Mid-360_User_Manual_EN.pdf))
 - Mid-360→JT128 mount transform is **unknown** — must be measured or calibrated before fusing
 - Rig frame = Mid-360 IMU (Z-up, right-handed)
 - Load both `mid360-frame.pcd` and `jt128-frame.pcd`
@@ -338,6 +343,6 @@ These PRs require Spark access for testing. Trevor completes locally.
 LabCommand becomes a single-screen ops console with a live 3D point-cloud viewer as centerpiece.
 
 - **Metal renderer** with orbit/fly camera, dual-sensor overlay, bag scrubbing
-- **17 files cut**, 7 new files (renderer stack + decoder)
+- **17 files cut**, 12 new files (renderer stack, decoder, mocks, math helpers)
 - **10 PRs buildable without Spark**, 2 PRs require Spark connection
 - 3D viewer arrives early (PRs 3-7) — Trevor sees points on screen fast, with fixture data
