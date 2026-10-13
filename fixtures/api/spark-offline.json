@@ -1,0 +1,7 @@
+{
+  "_comment": "This fixture represents the state when Spark is offline. The app cannot reach the command-center API, so it synthesizes an offline snapshot. This JSON is not returned by the real API — it documents the fields an offline snapshot contains.",
+  "sparkReachable": false,
+  "apiReachable": false,
+  "viewTunnelUp": false,
+  "blockReason": "Spark not reachable — check Tailscale"
+}

@@ -75,7 +75,7 @@ final class AppState: ObservableObject {
 
     private let service: ConnectivityService
     private let metricsPaths: LabMetricsPaths
-    private let rigIO: RigService
+    private let rigIO: RigServiceProtocol
     private var task: Task<Void, Never>?
     private var slowTimer: Timer?
     private var fastTimer: Timer?
@@ -85,7 +85,7 @@ final class AppState: ObservableObject {
     init(
         service: ConnectivityService = ConnectivityService(),
         metricsPaths: LabMetricsPaths = .resolvedDefaults(),
-        rigIO: RigService = RigService()
+        rigIO: RigServiceProtocol = MockMode.createRigService()
     ) {
         self.service = service
         self.metricsPaths = metricsPaths
@@ -403,7 +403,7 @@ final class AppState: ObservableObject {
     private func runAction(
         _ name: String,
         kind: MissionEventKind = .info,
-        work: @escaping @Sendable (RigService, CaptureSessionSpec) -> String?,
+        work: @escaping @Sendable (RigServiceProtocol, CaptureSessionSpec) -> String?,
         after: ((Bool) -> Void)? = nil
     ) {
         guard !isActing else { return }
