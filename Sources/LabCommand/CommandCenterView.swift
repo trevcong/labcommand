@@ -2,6 +2,7 @@ import SwiftUI
 import LabCommandCore
 
 /// Operator shell: top nav + one job. Focus hides chrome.
+/// Simplified for redesign — views to be rebuilt in subsequent PRs.
 struct CommandCenterView: View {
     @EnvironmentObject private var state: AppState
 
@@ -89,8 +90,6 @@ struct CommandCenterView: View {
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
-    /// Sensor chip: green live, amber powered, quiet gray dark (parking is
-    /// normal), dim unknown. Never red for a deliberate unplug.
     private func sensorChip(_ sensor: SensorReading) -> some View {
         let color: Color = {
             switch sensor.state {
@@ -147,16 +146,40 @@ struct CommandCenterView: View {
 
     private var content: some View {
         Group {
-            if state.focusMode {
-                RigView()
-            } else {
-                switch state.dest {
-                case .workspace: RigView()
-                case .devices: DevicesView()
-                case .research: ResearchView()
-                case .settings: SettingsView()
-                }
+            switch state.dest {
+            case .workspace: workspacePlaceholder
+            case .settings: SettingsView()
             }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Placeholder for the ops console view (to be built in PR 8).
+    private var workspacePlaceholder: some View {
+        VStack(spacing: 16) {
+            Text("Ops Console")
+                .font(LabTheme.t(24, .semibold))
+                .foregroundStyle(LabTheme.text)
+            Text("3D point cloud viewer coming in subsequent PRs")
+                .font(LabTheme.t(14))
+                .foregroundStyle(LabTheme.dim)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Rig Status: \(state.health.headline)")
+                    .font(LabTheme.t(13))
+                    .foregroundStyle(LabTheme.text)
+                Text("Mid-360: \(state.rig.mid360.state.displayLabel)")
+                    .font(LabTheme.t(12))
+                    .foregroundStyle(LabTheme.dim)
+                Text("JT128: \(state.rig.jt128.state.displayLabel)")
+                    .font(LabTheme.t(12))
+                    .foregroundStyle(LabTheme.dim)
+            }
+            .padding()
+            .background(
+                RoundedRectangle(cornerRadius: LabTheme.cardRadius, style: .continuous)
+                    .fill(LabTheme.well)
+            )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

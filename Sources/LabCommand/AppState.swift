@@ -2,35 +2,26 @@ import Foundation
 import Combine
 import LabCommandCore
 
-/// App destinations. Every case is reachable from the nav — a destination that
-/// renders another destination's view is scaffolding (DESIGN-VISION.md bans
-/// empty inspector columns).
+/// App destinations. Simplified for the redesign — workspace and settings only.
 enum Dest: String, CaseIterable, Identifiable {
     case workspace
-    case devices
-    case research
     case settings
 
     var id: String { rawValue }
 
-    static var navCases: [Dest] { [.workspace, .devices, .research, .settings] }
+    static var navCases: [Dest] { [.workspace, .settings] }
 
     var label: String {
         switch self {
         case .workspace: return "Rig"
-        case .devices: return "Hardware"
-        case .research: return "Takes"
         case .settings: return "Settings"
         }
     }
 
-    /// Command-number digit for menu and keyboard shortcut.
     var shortcutKey: String {
         switch self {
         case .workspace: return "1"
-        case .devices: return "2"
-        case .research: return "3"
-        case .settings: return "4"
+        case .settings: return "2"
         }
     }
 }
@@ -47,34 +38,20 @@ final class AppState: ObservableObject {
     @Published var probeIntervalSeconds: Double = 45
     @Published var autoRefreshEnabled: Bool = true
 
-    @Published private(set) var boundModules: Set<String> = []
-    @Published private(set) var metrics: LabMetricsBundle = .empty
-
     /// The rig as last honestly measured.
     @Published private(set) var rig: RigSnapshot = RigSnapshot.offline(reason: "Not probed yet")
-    @Published private(set) var history = TelemetryStore.load()
     @Published var session: CaptureSessionSpec = CaptureSessionSpec()
     @Published private(set) var missionEvents: [MissionEvent] = []
     @Published private(set) var isActing = false
     @Published private(set) var recordStartedAt: Date?
     @Published private(set) var lastActionError: String?
     @Published var focusMode = false
-    @Published private(set) var library: [SessionRecord] = []
-    @Published private(set) var tracks: [SessionTrajectory] = []
-    @Published var selectedTrack: String?
-    @Published var libraryQuery = ""
-    @Published var libraryTag: String?
-    @Published var compareLeft: String?
-    @Published var compareRight: String?
-    @Published var noteDraft = ""
-    @Published var noteTargetStem: String?
     @Published private(set) var lastStopSummary: String?
     @Published var diagnosePresented = false
     @Published var diagnoseStage: RigStage?
     @Published private(set) var lastDiagnose: RigAdvice?
 
     private let service: ConnectivityService
-    private let metricsPaths: LabMetricsPaths
     private let rigIO: RigServiceProtocol
     private var task: Task<Void, Never>?
     private var slowTimer: Timer?
@@ -84,11 +61,9 @@ final class AppState: ObservableObject {
 
     init(
         service: ConnectivityService = ConnectivityService(),
-        metricsPaths: LabMetricsPaths = .resolvedDefaults(),
         rigIO: RigServiceProtocol = MockMode.createRigService()
     ) {
         self.service = service
-        self.metricsPaths = metricsPaths
         self.rigIO = rigIO
         self.snapshot = LabStatusSnapshot(
             overall: .unknown,
@@ -102,23 +77,7 @@ final class AppState: ObservableObject {
 
     var health: RigConfidence { RigHealth.evaluate(rig) }
 
-    var filteredLibrary: [SessionRecord] {
-        SessionLibrary.filter(library, query: libraryQuery, tag: libraryTag)
-    }
-
-    var compareResult: SessionCompare? {
-        guard let lp = compareLeft, let rp = compareRight,
-              let left = library.first(where: { $0.path == lp }),
-              let right = library.first(where: { $0.path == rp }) else {
-            return nil
-        }
-        return SessionLibrary.compare(left, right)
-    }
-
     func start() {
-        loadMetrics()
-        loadLibrary()
-        loadTracks()
         refresh(manual: true)
         restartTimer()
     }
@@ -145,12 +104,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    func loadMetrics() {
-        let bundle = LabMetricsLoader.load(paths: metricsPaths)
-        metrics = bundle
-        boundModules = bundle.boundModuleIDs
-    }
-
     func refresh() { refresh(manual: false) }
 
     /// Full probe: connectivity checks (slow) + a rig poll.
@@ -161,15 +114,12 @@ final class AppState: ObservableObject {
         let io = rigIO
         task = Task.detached(priority: .userInitiated) {
             let checks = svc.runAllChecks()
-            let snap = StatusAggregator.snapshot(from: checks)
+            let snap = StatusAggregation.buildSnapshot(from: checks)
             let rig = io.fetchStatus(sparkWasReachable: snap.spark == .connected)
             await MainActor.run {
                 self.snapshot = snap
                 self.applyRig(rig)
                 self.isRefreshing = false
-                self.loadMetrics()
-                self.loadLibrary()
-                self.loadTracks()
                 if manual {
                     self.appendLog(self.health.headline, kind: .probe)
                 }
@@ -191,12 +141,9 @@ final class AppState: ObservableObject {
     private func applyRig(_ next: RigSnapshot) {
         let prev = rig
         rig = next
-        recordTelemetry(next)
         forwardWatchdogEvents(next)
-        // Observed transitions worth one honest log line each.
         if prev.recording.active && !next.recording.active {
             recordStartedAt = nil
-            loadLibrary()
         }
         if !prev.bothDark && next.bothDark && prev.apiReachable && next.apiReachable {
             appendLog("sensors went dark (unplugged or power lost)", kind: .info)
@@ -206,50 +153,10 @@ final class AppState: ObservableObject {
     private func forwardWatchdogEvents(_ s: RigSnapshot) {
         for line in s.events where !seenWatchdogLines.contains(line) {
             seenWatchdogLines.insert(line)
-            // Only surface lines from this app run's lifetime forward; the
-            // first poll seeds the seen-set silently.
             if !missionEvents.isEmpty || seenWatchdogLines.count > s.events.count {
                 appendLog("watchdog: \(line)", kind: .info)
             }
         }
-    }
-
-    private func recordTelemetry(_ s: RigSnapshot) {
-        guard s.apiReachable else { return }
-        history = history.appending(
-            TelemetrySample(
-                at: Date(),
-                pointRateHz: s.mid360.pointRateHz,
-                imuRateHz: s.mid360.imuRateHz,
-                sparkLoad: s.load1,
-                sparkMemPct: s.memPct,
-                blind: s.stackRunning && !s.anyStreaming && !s.bothDark,
-                jtPointRateHz: s.jt128.pointRateHz,
-                jtImuRateHz: s.jt128.imuRateHz,
-                midOffsetMs: s.mid360.clockOffsetMs,
-                jtOffsetMs: s.jt128.clockOffsetMs
-            )
-        )
-        TelemetryStore.save(history)
-    }
-
-    func loadTracks() {
-        tracks = SessionTrajectoryLoader.loadAll(
-            root: URL(fileURLWithPath: SessionLibrary.defaultDirectory(), isDirectory: true))
-        if selectedTrack == nil || !tracks.contains(where: { $0.session == selectedTrack }) {
-            selectedTrack = tracks.first?.session
-        }
-    }
-
-    var currentTrack: SessionTrajectory? {
-        tracks.first { $0.session == selectedTrack } ?? tracks.first
-    }
-
-    func loadLibrary() {
-        library = SessionLibrary.index(
-            directory: SessionLibrary.defaultDirectory(),
-            viewRunning: rig.viewTunnelUp
-        )
     }
 
     func toggleFocus() {
@@ -264,36 +171,6 @@ final class AppState: ObservableObject {
         diagnoseStage = advice.stage
         diagnosePresented = true
         appendLog(advice.summary, kind: .diagnose)
-    }
-
-    func attachNote(to record: SessionRecord, text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        _ = try? SessionLibrary.attachNote(
-            directory: SessionLibrary.defaultDirectory(),
-            stem: record.stem,
-            text: trimmed
-        )
-        loadLibrary()
-        noteDraft = ""
-        noteTargetStem = nil
-        appendLog("note \(record.stem)", kind: .note)
-    }
-
-    func toggleCompare(_ path: String) {
-        if compareLeft == path {
-            compareLeft = compareRight
-            compareRight = nil
-        } else if compareRight == path {
-            compareRight = nil
-        } else if compareLeft == nil {
-            compareLeft = path
-        } else if compareRight == nil {
-            compareRight = path
-        } else {
-            compareLeft = compareRight
-            compareRight = path
-        }
     }
 
     // MARK: Actions — all through the command-center API.
@@ -347,7 +224,6 @@ final class AppState: ObservableObject {
                 self.lastStopSummary = "rig stopped — drivers down, tunnels closed"
             }
             self.recordStartedAt = nil
-            self.loadLibrary()
         }
     }
 
@@ -365,8 +241,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Hand the take to the collector: it fires itself at sustained lock and
-    /// finalizes with no app or SSH session in the loop.
     func armAtLock() {
         let name = RigDesk.recordName(session)
         runAction("arm \(name)", kind: .record) { io, _ in
@@ -415,7 +289,6 @@ final class AppState: ObservableObject {
         let sparkWasUp = rig.sparkReachable
         Task.detached(priority: .userInitiated) {
             let err = work(io, spec)
-            // Give the collector one cycle to observe what the action changed.
             Thread.sleep(forTimeInterval: 3.5)
             let rig = io.fetchStatus(sparkWasReachable: sparkWasUp)
             await MainActor.run {
@@ -446,12 +319,68 @@ final class AppState: ObservableObject {
     func detail(_ id: String) -> String {
         snapshot.checks.first(where: { $0.id == id })?.detail ?? "—"
     }
+}
 
-    func isBound(_ moduleID: String) -> Bool {
-        boundModules.contains(moduleID)
+// MARK: - Status Aggregation (testable, nonisolated)
+
+/// Pure mapping from probe outcomes → UI connection states.
+/// Extracted from deleted StatusAggregator to be testable without MainActor.
+enum StatusAggregation {
+    static let sparkCheckIDs: Set<String> = ["spark_ssh", "spark_ping"]
+    static let tailscaleCheckIDs: Set<String> = ["tailscale"]
+
+    static func status(for outcome: CheckOutcome) -> ConnectionStatus {
+        switch outcome.kind {
+        case .success: return .connected
+        case .failure: return .disconnected
+        case .error: return .error
+        case .skipped: return .unknown
+        }
     }
 
-    func statusLine(_ moduleID: String) -> String? {
-        metrics.line(for: moduleID)
+    static func combine(_ statuses: [ConnectionStatus]) -> ConnectionStatus {
+        guard !statuses.isEmpty else { return .unknown }
+        if statuses.contains(.error) { return .error }
+        if statuses.contains(.disconnected) { return .disconnected }
+        if statuses.contains(.unknown) { return .unknown }
+        return .connected
+    }
+
+    static func statusPreferSuccess(from checks: [CheckOutcome], matching ids: Set<String>) -> ConnectionStatus {
+        let subset = checks.filter { ids.contains($0.id) }
+        guard !subset.isEmpty else { return .unknown }
+        let statuses = subset.map(status(for:))
+        if statuses.contains(.connected) { return .connected }
+        return combine(statuses)
+    }
+
+    static func statusFrom(checks: [CheckOutcome], matching ids: Set<String>) -> ConnectionStatus {
+        let subset = checks.filter { ids.contains($0.id) }
+        guard !subset.isEmpty else { return .unknown }
+        return combine(subset.map(status(for:)))
+    }
+
+    /// Build snapshot from check outcomes.
+    static func buildSnapshot(from checks: [CheckOutcome], now: Date = Date()) -> LabStatusSnapshot {
+        let spark = statusPreferSuccess(from: checks, matching: sparkCheckIDs)
+        let tailscale = statusFrom(checks: checks, matching: tailscaleCheckIDs)
+        let overall: ConnectionStatus = spark == .connected ? .connected : spark
+
+        let summary: String
+        switch overall {
+        case .connected: summary = "Lab link healthy — Spark reachable"
+        case .disconnected: summary = "Lab link down — Spark not reachable"
+        case .error: summary = "Lab check error — see detail cards"
+        case .unknown: summary = "Lab status unknown — run refresh"
+        }
+
+        return LabStatusSnapshot(
+            overall: overall,
+            spark: spark,
+            tailscale: tailscale,
+            checks: checks,
+            summaryLine: summary,
+            refreshedAt: now
+        )
     }
 }

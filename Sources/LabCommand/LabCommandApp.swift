@@ -61,7 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(refreshStatus) {
-            return appState.dest == .devices || appState.dest == .workspace || appState.focusMode
+            return appState.dest == .workspace || appState.focusMode
         }
         if menuItem.action == #selector(menuStartPath) {
             return RigGate.canStartRig(appState.rig).0 && !appState.isActing
@@ -228,7 +228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     @objc private func refreshStatus() {
-        guard appState.dest == .devices || appState.dest == .workspace || appState.focusMode else { return }
+        guard appState.dest == .workspace || appState.focusMode else { return }
         appState.refresh(manual: true)
     }
 
