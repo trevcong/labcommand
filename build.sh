@@ -28,10 +28,11 @@ cp -f "${ROOT}/Info.plist" "${APP}/Contents/Info.plist"
 cp -f "${ROOT}/scripts/spark-capture.sh" "${APP}/Contents/Resources/spark-capture.sh"
 chmod +x "${APP}/Contents/Resources/spark-capture.sh"
 
-# Copy fixtures for mock mode
-if [[ -d "${ROOT}/fixtures" ]]; then
-  echo "==> Copying fixtures to app bundle"
-  cp -R "${ROOT}/fixtures" "${APP}/Contents/Resources/fixtures"
+# Copy API fixtures for mock mode (pointclouds are too large for bundle)
+if [[ -d "${ROOT}/fixtures/api" ]]; then
+  echo "==> Copying API fixtures to app bundle"
+  mkdir -p "${APP}/Contents/Resources/fixtures"
+  cp -R "${ROOT}/fixtures/api" "${APP}/Contents/Resources/fixtures/api"
 fi
 
 codesign -s - --force --deep "${APP}" 2>/dev/null || true
