@@ -158,10 +158,44 @@ struct CommandCenterView: View {
     private var rigWorkspace: some View {
         HStack(alignment: .top, spacing: LabTheme.pad) {
             leftColumn
-            Spacer()
+            pointCloudCanvas
         }
         .padding(LabTheme.pad)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+    
+    private var pointCloudCanvas: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("3D View")
+                    .font(LabTheme.t(LabTheme.titleSize, .semibold))
+                    .foregroundStyle(LabTheme.text)
+                Spacer()
+                Picker("Color", selection: $state.pointCloudColorMode) {
+                    ForEach(PointCloudColorMode.allCases, id: \.rawValue) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 200)
+            }
+            
+            PointCloudView(
+                frame: $state.currentFrame,
+                colorMode: state.pointCloudColorMode,
+                pointSize: 3.0
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: LabTheme.radius, style: .continuous)
+                    .fill(LabTheme.surface)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: LabTheme.radius, style: .continuous)
+                    .stroke(LabTheme.line, lineWidth: 1)
+            )
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var leftColumn: some View {

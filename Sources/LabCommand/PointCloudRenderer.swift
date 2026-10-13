@@ -185,6 +185,15 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             }
         }()
         
+        // Find intensity range for per-frame normalization
+        var minI: Float = .greatestFiniteMagnitude
+        var maxI: Float = -.greatestFiniteMagnitude
+        for i in frame.intensities {
+            minI = min(minI, i)
+            maxI = max(maxI, i)
+        }
+        let intensityRange = maxI - minI
+        
         var minZ: Float = .greatestFiniteMagnitude
         var maxZ: Float = -.greatestFiniteMagnitude
         
@@ -195,11 +204,9 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             let p = frame.positions[i]
             var intensity: Float = 1.0
             if i < frame.intensities.count {
-                intensity = frame.intensities[i]
-                // Normalize 0-255 range to 0-1
-                if intensity > 1.0 {
-                    intensity = intensity / 255.0
-                }
+                let raw = frame.intensities[i]
+                // Normalize to [0, 1] using per-frame min/max
+                intensity = intensityRange > 0.001 ? (raw - minI) / intensityRange : 1.0
             }
             
             vertices.append(PointVertex(
@@ -244,14 +251,21 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
                 }
             }()
             
+            // Find intensity range for per-frame normalization
+            var minI: Float = .greatestFiniteMagnitude
+            var maxI: Float = -.greatestFiniteMagnitude
+            for i in frame.intensities {
+                minI = min(minI, i)
+                maxI = max(maxI, i)
+            }
+            let intensityRange = maxI - minI
+            
             for i in 0..<frame.count {
                 let p = frame.positions[i]
                 var intensity: Float = 1.0
                 if i < frame.intensities.count {
-                    intensity = frame.intensities[i]
-                    if intensity > 1.0 {
-                        intensity = intensity / 255.0
-                    }
+                    let raw = frame.intensities[i]
+                    intensity = intensityRange > 0.001 ? (raw - minI) / intensityRange : 1.0
                 }
                 
                 allVertices.append(PointVertex(
@@ -340,6 +354,7 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         renderPassDescriptor.colorAttachments[0].storeAction = .store
         
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            bufferSemaphore.signal()
             return
         }
         

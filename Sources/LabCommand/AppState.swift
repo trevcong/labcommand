@@ -50,6 +50,10 @@ final class AppState: ObservableObject {
     @Published var diagnosePresented = false
     @Published var diagnoseStage: RigStage?
     @Published private(set) var lastDiagnose: RigAdvice?
+    
+    /// Current point cloud frame for 3D canvas.
+    @Published var currentFrame: PointCloudFrame?
+    @Published var pointCloudColorMode: PointCloudColorMode = .height
 
     private let service: ConnectivityService
     private let rigIO: RigServiceProtocol
@@ -80,6 +84,34 @@ final class AppState: ObservableObject {
     func start() {
         refresh(manual: true)
         restartTimer()
+        loadSamplePointCloudIfNeeded()
+    }
+    
+    /// Load a sample PCD file for the 3D canvas when Spark is offline.
+    func loadSamplePointCloudIfNeeded() {
+        guard currentFrame == nil else { return }
+        
+        let fm = FileManager.default
+        let searchPaths = [
+            "fixtures/pointclouds/mid360-frame.pcd",
+            "../fixtures/pointclouds/mid360-frame.pcd",
+            "../../fixtures/pointclouds/mid360-frame.pcd",
+        ]
+        
+        let cwd = fm.currentDirectoryPath
+        for relativePath in searchPaths {
+            let url = URL(fileURLWithPath: cwd).appendingPathComponent(relativePath)
+            if fm.fileExists(atPath: url.path) {
+                do {
+                    let frame = try PointCloudDecoder.loadPCD(from: url.path)
+                    currentFrame = frame
+                    appendLog("loaded fixture: mid360-frame.pcd (\(frame.count) pts)", kind: .info)
+                    return
+                } catch {
+                    appendLog("failed to load fixture: \(error)", kind: .error)
+                }
+            }
+        }
     }
 
     func stop() {
