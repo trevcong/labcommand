@@ -39,6 +39,25 @@ public struct PointCloudFrame: Sendable, Equatable {
 
     public var count: Int { positions.count }
     public var isEmpty: Bool { positions.isEmpty }
+    
+    /// Computes the axis-aligned bounding box of all finite points.
+    /// Returns min/max with greatestFiniteMagnitude values if no valid points exist.
+    public var bounds: (min: Point3D, max: Point3D) {
+        var minP = Point3D(x: .greatestFiniteMagnitude, y: .greatestFiniteMagnitude, z: .greatestFiniteMagnitude)
+        var maxP = Point3D(x: -.greatestFiniteMagnitude, y: -.greatestFiniteMagnitude, z: -.greatestFiniteMagnitude)
+        
+        for p in positions {
+            guard p.x.isFinite && p.y.isFinite && p.z.isFinite else { continue }
+            minP.x = min(minP.x, p.x)
+            minP.y = min(minP.y, p.y)
+            minP.z = min(minP.z, p.z)
+            maxP.x = max(maxP.x, p.x)
+            maxP.y = max(maxP.y, p.y)
+            maxP.z = max(maxP.z, p.z)
+        }
+        
+        return (min: minP, max: maxP)
+    }
 }
 
 /// PCD file data format.

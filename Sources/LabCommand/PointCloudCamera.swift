@@ -310,30 +310,48 @@ final class PointCloudCamera: ObservableObject {
         guard !CameraMath.isInvalid(center) else { return }
         
         let size = bounds.max - bounds.min
-        let diagonal = CameraMath.boundsDiagonal(min: bounds.min, max: bounds.max)
-        guard !CameraMath.isInvalid(diagonal) && diagonal > 0 else { return }
+        guard !CameraMath.isInvalid(size) else { return }
         
-        // Calculate distance to fit the cloud based on FOV
+        // Use the largest extent to ensure the whole cloud fits
+        let maxExtent = max(size.x, max(size.y, size.z))
+        guard maxExtent > 0 else { return }
+        
+        // Calculate distance to fit the cloud based on vertical FOV
+        // Account for the view angle - looking from above means we see more horizontal extent
         let fovRad = fieldOfView * .pi / 180.0
-        let fitDistance = (diagonal * 0.5) / tan(fovRad * 0.5) * 1.2  // 1.2x margin
+        let viewElevation: Float = Float.pi / 6  // 30° above horizon
+        
+        // When looking down at an angle, the vertical extent appears compressed
+        // We need to fit both the horizontal extent and the compressed vertical
+        let horizontalExtent = max(size.x, size.y)
+        let verticalExtent = size.z / cos(viewElevation) + horizontalExtent * sin(viewElevation)
+        let effectiveExtent = max(horizontalExtent, verticalExtent)
+        
+        // Distance to fit the effective extent in view with 20% margin
+        let fitDistance = (effectiveExtent * 0.5) / tan(fovRad * 0.5) * 1.4
         
         if mode == .orbit {
+            // Center the orbit target on the cloud center
             target = center
             targetOrbitCenter = center
             distance = CameraMath.clamp(fitDistance, min: minDistance, max: maxDistance)
             targetDistance = distance
-            azimuth = Float.pi / 4  // 45° for nice 3D view
+            // Look from the -Y direction (front) with slight rotation for 3D feel
+            azimuth = -Float.pi / 2 + Float.pi / 8  // Mostly from -Y with slight angle
             targetAzimuth = azimuth
-            elevation = CameraMath.clamp(Float.pi / 6, min: minElevation, max: maxElevation)
+            elevation = CameraMath.clamp(viewElevation, min: minElevation, max: maxElevation)
             targetElevation = elevation
         } else {
-            // Position camera to look at center from a good angle
-            let offset = Float3(-fitDistance * 0.7, -fitDistance * 0.7, fitDistance * 0.5)
-            position = center + offset
+            // Position camera to look at center from front-ish angle
+            let camX = center.x - fitDistance * 0.3
+            let camY = center.y - fitDistance * 0.9
+            let camZ = center.z + fitDistance * 0.4
+            position = Float3(camX, camY, camZ)
             targetPosition = position
-            yaw = Float.pi / 4
+            // Point toward center
+            yaw = Float.pi / 2 - Float.pi / 8
             targetYaw = yaw
-            pitch = CameraMath.clamp(-Float.pi / 8, min: -maxPitch, max: maxPitch)
+            pitch = CameraMath.clamp(-viewElevation * 0.5, min: -maxPitch, max: maxPitch)
             targetPitch = pitch
         }
         

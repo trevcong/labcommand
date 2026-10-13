@@ -1,12 +1,15 @@
 #!/bin/bash
 # Build LabCommand.app (Mac-native command center).
 # Usage: ./build.sh [--no-install]
+#   --no-install  Build only; skip installing to ~/Applications
 set -euo pipefail
 
 NO_INSTALL=false
-if [[ "${1:-}" == "--no-install" ]]; then
-  NO_INSTALL=true
-fi
+for arg in "$@"; do
+  case "$arg" in
+    --no-install) NO_INSTALL=true ;;
+  esac
+done
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="LabCommand"

@@ -137,8 +137,11 @@ final class PointCloudMTKView: MTKView {
         setupEventMonitors()
     }
     
-    deinit {
-        removeEventMonitors()
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            removeEventMonitors()
+        }
     }
     
     private func setupEventMonitors() {

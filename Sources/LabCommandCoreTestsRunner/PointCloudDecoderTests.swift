@@ -1353,6 +1353,11 @@ func testPointCloudFrameStruct() {
     var frame = PointCloudFrame()
     expect(frame.isEmpty, "PointCloudFrame empty init: isEmpty")
     expect(frame.count == 0, "PointCloudFrame empty init: count")
+    
+    // Empty frame bounds should have inverted min/max
+    let emptyBounds = frame.bounds
+    expect(emptyBounds.min.x == .greatestFiniteMagnitude, "Empty bounds min.x")
+    expect(emptyBounds.max.x == -.greatestFiniteMagnitude, "Empty bounds max.x")
 
     frame.positions = [Point3D(x: 1, y: 2, z: 3)]
     frame.intensities = [0.5]
@@ -1363,6 +1368,38 @@ func testPointCloudFrameStruct() {
     expect(frame.count == 1, "PointCloudFrame with data: count")
     expect(frame.sensor == .mid360, "PointCloudFrame: sensor")
     expect(frame.frameId == "test_frame", "PointCloudFrame: frameId")
+    
+    // Single point bounds
+    let singleBounds = frame.bounds
+    expect(singleBounds.min.x == 1 && singleBounds.min.y == 2 && singleBounds.min.z == 3,
+           "Single point bounds min")
+    expect(singleBounds.max.x == 1 && singleBounds.max.y == 2 && singleBounds.max.z == 3,
+           "Single point bounds max")
+    
+    // Multiple points bounds
+    frame.positions = [
+        Point3D(x: -5, y: 0, z: 10),
+        Point3D(x: 5, y: -3, z: 2),
+        Point3D(x: 0, y: 7, z: -1)
+    ]
+    let multiBounds = frame.bounds
+    expect(multiBounds.min.x == -5 && multiBounds.min.y == -3 && multiBounds.min.z == -1,
+           "Multi-point bounds min: (\(multiBounds.min.x), \(multiBounds.min.y), \(multiBounds.min.z))")
+    expect(multiBounds.max.x == 5 && multiBounds.max.y == 7 && multiBounds.max.z == 10,
+           "Multi-point bounds max: (\(multiBounds.max.x), \(multiBounds.max.y), \(multiBounds.max.z))")
+    
+    // Bounds with NaN/Inf points (should be skipped)
+    frame.positions = [
+        Point3D(x: 1, y: 2, z: 3),
+        Point3D(x: .nan, y: 0, z: 0),
+        Point3D(x: 0, y: .infinity, z: 0),
+        Point3D(x: 4, y: 5, z: 6)
+    ]
+    let filteredBounds = frame.bounds
+    expect(filteredBounds.min.x == 1 && filteredBounds.min.y == 2 && filteredBounds.min.z == 3,
+           "Bounds skip NaN/Inf min")
+    expect(filteredBounds.max.x == 4 && filteredBounds.max.y == 5 && filteredBounds.max.z == 6,
+           "Bounds skip NaN/Inf max")
 }
 
 // MARK: - Large Point Cloud Test
@@ -1545,5 +1582,5 @@ func runPointCloudDecoderTests() {
     print("  Fixture: ROS2 PointCloud2 binary from room-scan.mcap (100 points, livox_frame)"); passed()
 
     testPointCloudFrameStruct()
-    print("  PointCloudFrame struct: isEmpty, count, sensor, frameId"); passed()
+    print("  PointCloudFrame struct: isEmpty, count, sensor, frameId, bounds"); passed()
 }
