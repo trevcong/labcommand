@@ -3,42 +3,50 @@ import AppKit
 
 /// SwiftUI view modifier that handles camera gestures for the point cloud viewer.
 /// Captures trackpad gestures (rotate, zoom, pan) and keyboard input (WASD, F to toggle mode).
+@MainActor
 struct PointCloudGestureHandler: ViewModifier {
     @ObservedObject var camera: PointCloudCamera
     
+    @State private var lastDragLocation: CGPoint?
     @State private var lastMagnification: CGFloat = 1.0
-    @State private var lastRotation: CGFloat = 0.0
-    @State private var isPanning = false
+    @State private var keyDownMonitor: Any?
+    @State private var keyUpMonitor: Any?
+    @State private var scrollMonitor: Any?
     
     func body(content: Content) -> some View {
         content
-            .gesture(dragGesture)
+            .gesture(rotateGesture)
             .gesture(magnifyGesture)
+            .overlay(ScrollWheelCaptureView(camera: camera))
             .onAppear {
-                NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                    handleKeyDown(event)
-                    return event
-                }
-                NSEvent.addLocalMonitorForEvents(matching: .keyUp) { event in
-                    handleKeyUp(event)
-                    return event
-                }
-                NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { event in
-                    handleFlagsChanged(event)
-                    return event
-                }
+                installEventMonitors()
+            }
+            .onDisappear {
+                removeEventMonitors()
             }
     }
     
-    private var dragGesture: some Gesture {
+    /// Two-finger drag: rotate in orbit mode, mouse look in fly mode
+    private var rotateGesture: some Gesture {
         DragGesture(minimumDistance: 1)
             .onChanged { value in
-                let delta = CGSize(
-                    width: value.translation.width,
-                    height: value.translation.height
-                )
+                // Calculate actual delta from previous position
+                let currentLocation = value.location
+                let delta: CGSize
                 
-                if NSEvent.modifierFlags.contains(.option) || isPanning {
+                if let last = lastDragLocation {
+                    delta = CGSize(
+                        width: currentLocation.x - last.x,
+                        height: currentLocation.y - last.y
+                    )
+                } else {
+                    delta = .zero
+                }
+                
+                lastDragLocation = currentLocation
+                
+                // Option+drag = pan, otherwise rotate
+                if NSEvent.modifierFlags.contains(.option) {
                     camera.handlePan(delta)
                 } else if camera.mode == .fly {
                     camera.handleMouseDelta(delta)
@@ -47,10 +55,11 @@ struct PointCloudGestureHandler: ViewModifier {
                 }
             }
             .onEnded { _ in
-                isPanning = false
+                lastDragLocation = nil
             }
     }
     
+    /// Pinch: zoom in orbit mode
     private var magnifyGesture: some Gesture {
         MagnifyGesture()
             .onChanged { value in
@@ -63,11 +72,54 @@ struct PointCloudGestureHandler: ViewModifier {
             }
     }
     
+    private func installEventMonitors() {
+        keyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            handleKeyDown(event)
+            return event
+        }
+        
+        keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { event in
+            handleKeyUp(event)
+            return event
+        }
+    }
+    
+    private func removeEventMonitors() {
+        if let monitor = keyDownMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyDownMonitor = nil
+        }
+        if let monitor = keyUpMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyUpMonitor = nil
+        }
+        if let monitor = scrollMonitor {
+            NSEvent.removeMonitor(monitor)
+            scrollMonitor = nil
+        }
+        
+        // Stop any ongoing movement
+        camera.stopMovement()
+    }
+    
     private func handleKeyDown(_ event: NSEvent) {
+        // Ignore if a text field has focus
+        if let responder = NSApp.keyWindow?.firstResponder,
+           responder is NSTextView || responder is NSTextField {
+            return
+        }
+        
         guard !event.isARepeat else { return }
         
+        // F toggles camera mode
         if event.charactersIgnoringModifiers?.lowercased() == "f" {
             camera.toggleMode()
+            return
+        }
+        
+        // R resets camera to fit bounds
+        if event.charactersIgnoringModifiers?.lowercased() == "r" {
+            camera.resetToFitBounds()
             return
         }
         
@@ -81,9 +133,20 @@ struct PointCloudGestureHandler: ViewModifier {
         case " ": camera.setMoveUp(1)
         default: break
         }
+        
+        // Shift for down movement (check modifier, not character)
+        if event.modifierFlags.contains(.shift) {
+            camera.setMoveUp(-1)
+        }
     }
     
     private func handleKeyUp(_ event: NSEvent) {
+        // Ignore if a text field has focus
+        if let responder = NSApp.keyWindow?.firstResponder,
+           responder is NSTextView || responder is NSTextField {
+            return
+        }
+        
         guard camera.mode == .fly else { return }
         
         switch event.charactersIgnoringModifiers?.lowercased() {
@@ -92,17 +155,11 @@ struct PointCloudGestureHandler: ViewModifier {
         case " ": camera.setMoveUp(0)
         default: break
         }
-    }
-    
-    private func handleFlagsChanged(_ event: NSEvent) {
-        guard camera.mode == .fly else { return }
         
-        if event.modifierFlags.contains(.shift) {
-            camera.setMoveUp(-1)
-        } else {
-            if camera.mode == .fly {
-                camera.setMoveUp(0)
-            }
+        // Release shift for up movement
+        if !event.modifierFlags.contains(.shift) {
+            // Only reset if we were using shift for down
+            // Don't interfere with space bar up
         }
     }
 }
@@ -113,8 +170,34 @@ extension View {
     }
 }
 
-/// A view that captures mouse movement for fly mode camera control.
-/// Use this when you want continuous mouse tracking (mouse capture).
+/// NSView that captures scroll wheel events for zoom.
+struct ScrollWheelCaptureView: NSViewRepresentable {
+    let camera: PointCloudCamera
+    
+    func makeNSView(context: Context) -> ScrollWheelNSView {
+        let view = ScrollWheelNSView()
+        view.camera = camera
+        return view
+    }
+    
+    func updateNSView(_ nsView: ScrollWheelNSView, context: Context) {
+        nsView.camera = camera
+    }
+}
+
+final class ScrollWheelNSView: NSView {
+    weak var camera: PointCloudCamera?
+    
+    override var acceptsFirstResponder: Bool { true }
+    
+    override func scrollWheel(with event: NSEvent) {
+        Task { @MainActor in
+            camera?.handleScroll(CGSize(width: event.scrollingDeltaX, height: event.scrollingDeltaY))
+        }
+    }
+}
+
+/// A view that captures continuous mouse movement for fly mode camera control.
 struct MouseTrackingView: NSViewRepresentable {
     let camera: PointCloudCamera
     let isActive: Bool
@@ -132,7 +215,7 @@ struct MouseTrackingView: NSViewRepresentable {
     }
 }
 
-class MouseTrackingNSView: NSView {
+final class MouseTrackingNSView: NSView {
     weak var camera: PointCloudCamera?
     var isTrackingActive = false
     private var trackingArea: NSTrackingArea?
@@ -172,33 +255,6 @@ class MouseTrackingNSView: NSView {
         guard isTrackingActive else { return }
         Task { @MainActor in
             camera?.handleMouseDelta(CGSize(width: event.deltaX, height: event.deltaY))
-        }
-    }
-}
-
-/// Scroll wheel handler for zoom in orbit mode.
-struct ScrollWheelHandler: NSViewRepresentable {
-    let camera: PointCloudCamera
-    
-    func makeNSView(context: Context) -> ScrollWheelNSView {
-        let view = ScrollWheelNSView()
-        view.camera = camera
-        return view
-    }
-    
-    func updateNSView(_ nsView: ScrollWheelNSView, context: Context) {
-        nsView.camera = camera
-    }
-}
-
-class ScrollWheelNSView: NSView {
-    weak var camera: PointCloudCamera?
-    
-    override var acceptsFirstResponder: Bool { true }
-    
-    override func scrollWheel(with event: NSEvent) {
-        Task { @MainActor in
-            camera?.handleScroll(CGSize(width: event.scrollingDeltaX, height: event.scrollingDeltaY))
         }
     }
 }

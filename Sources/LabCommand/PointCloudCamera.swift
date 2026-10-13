@@ -2,13 +2,13 @@ import Foundation
 import simd
 import SwiftUI
 import Combine
+import LabCommandCore
 
 /// Camera controller for point cloud visualization with orbit and fly modes.
-/// Orbit mode: trackpad gestures for rotate/zoom/pan around a target point.
-/// Fly mode: WASD + mouse for first-person flight.
+/// Uses Z-up coordinate convention and integrates with PointCloudRenderer.
 @MainActor
 final class PointCloudCamera: ObservableObject {
-    enum Mode: String, CaseIterable {
+    enum Mode: String, CaseIterable, Sendable {
         case orbit
         case fly
     }
@@ -22,28 +22,22 @@ final class PointCloudCamera: ObservableObject {
     // MARK: - Orbit Mode State
     
     /// Distance from target in orbit mode
-    var distance: Float = 10.0 {
-        didSet { distance = clamp(distance, min: minDistance, max: maxDistance) }
-    }
-    /// Horizontal angle (radians) around target
-    var azimuth: Float = 0.0
-    /// Vertical angle (radians) from horizon
-    var elevation: Float = 0.0 {
-        didSet { elevation = clamp(elevation, min: minElevation, max: maxElevation) }
-    }
+    private(set) var distance: Float = 10.0
+    /// Horizontal angle (radians, rotation around Z axis)
+    private(set) var azimuth: Float = 0.0
+    /// Vertical angle (radians from XY plane)
+    private(set) var elevation: Float = Float.pi / 6
     /// Point the camera orbits around
-    var target: SIMD3<Float> = .zero
+    private(set) var target: Float3 = .zero
     
     // MARK: - Fly Mode State
     
     /// Camera position in fly mode
-    var position: SIMD3<Float> = SIMD3<Float>(0, 0, 10)
-    /// Horizontal rotation (radians)
-    var yaw: Float = 0.0
-    /// Vertical rotation (radians)
-    var pitch: Float = 0.0 {
-        didSet { pitch = clamp(pitch, min: -maxPitch, max: maxPitch) }
-    }
+    private(set) var position: Float3 = Float3(0, -10, 5)
+    /// Horizontal rotation (radians, rotation around Z axis)
+    private(set) var yaw: Float = Float.pi / 2
+    /// Vertical rotation (radians from XY plane)
+    private(set) var pitch: Float = 0.0
     
     // MARK: - Movement State (for smooth interpolation)
     
@@ -69,22 +63,22 @@ final class PointCloudCamera: ObservableObject {
     
     var minDistance: Float = 0.5
     var maxDistance: Float = 500.0
-    var minElevation: Float = -.pi / 2 + 0.01
-    var maxElevation: Float = .pi / 2 - 0.01
-    var maxPitch: Float = .pi / 2 - 0.01
+    var minElevation: Float = -Float.pi / 2 + 0.01
+    var maxElevation: Float = Float.pi / 2 - 0.01
+    var maxPitch: Float = Float.pi / 2 - 0.01
     
-    /// Bounds for the viewable area (prevents losing the point cloud)
-    var boundingBox: (min: SIMD3<Float>, max: SIMD3<Float>)? = nil
+    /// Bounds for orbit target clamping (fly mode is unclamped)
+    var boundingBox: (min: Float3, max: Float3)? = nil
     
     // MARK: - Interpolation Targets
     
     private var targetDistance: Float = 10.0
     private var targetAzimuth: Float = 0.0
-    private var targetElevation: Float = 0.0
-    private var targetOrbitCenter: SIMD3<Float> = .zero
+    private var targetElevation: Float = Float.pi / 6
+    private var targetOrbitCenter: Float3 = .zero
     
-    private var targetPosition: SIMD3<Float> = SIMD3<Float>(0, 0, 10)
-    private var targetYaw: Float = 0.0
+    private var targetPosition: Float3 = Float3(0, -10, 5)
+    private var targetYaw: Float = Float.pi / 2
     private var targetPitch: Float = 0.0
     
     // MARK: - Initialization
@@ -106,21 +100,27 @@ final class PointCloudCamera: ObservableObject {
         guard newMode != mode else { return }
         
         if newMode == .fly {
-            let orbitPosition = computeOrbitPosition()
-            position = orbitPosition
-            targetPosition = orbitPosition
+            let orbitPos = CameraMath.orbitPosition(
+                target: target,
+                distance: distance,
+                azimuth: azimuth,
+                elevation: elevation
+            )
+            position = orbitPos
+            targetPosition = orbitPos
             
-            yaw = azimuth + .pi
+            yaw = CameraMath.wrapAngle(azimuth + Float.pi)
             targetYaw = yaw
-            pitch = -elevation
+            pitch = elevation
             targetPitch = pitch
         } else {
+            let forward = CameraMath.flyForward(yaw: yaw, pitch: pitch)
             target = position + forward * distance
             targetOrbitCenter = target
             
-            azimuth = yaw - .pi
+            azimuth = CameraMath.wrapAngle(yaw - Float.pi)
             targetAzimuth = azimuth
-            elevation = -pitch
+            elevation = CameraMath.clamp(pitch, min: minElevation, max: maxElevation)
             targetElevation = elevation
         }
         
@@ -137,77 +137,56 @@ final class PointCloudCamera: ObservableObject {
     func handleScroll(_ delta: CGSize) {
         guard mode == .orbit else { return }
         let zoomDelta = Float(delta.height) * orbitZoomSensitivity
-        targetDistance = clamp(targetDistance - zoomDelta, min: minDistance, max: maxDistance)
+        targetDistance = CameraMath.clamp(targetDistance - zoomDelta, min: minDistance, max: maxDistance)
     }
     
     func handleRotation(_ delta: CGSize) {
         guard mode == .orbit else { return }
-        targetAzimuth -= Float(delta.width) * orbitRotateSensitivity
+        targetAzimuth = CameraMath.wrapAngle(targetAzimuth - Float(delta.width) * orbitRotateSensitivity)
         targetElevation += Float(delta.height) * orbitRotateSensitivity
-        targetElevation = clamp(targetElevation, min: minElevation, max: maxElevation)
+        targetElevation = CameraMath.clamp(targetElevation, min: minElevation, max: maxElevation)
     }
     
     func handlePan(_ delta: CGSize) {
         guard mode == .orbit else { return }
         
-        let right = computeOrbitRight()
-        let up = computeOrbitUp()
+        let right = CameraMath.orbitRight(azimuth: azimuth)
+        let up = CameraMath.orbitUp(azimuth: azimuth, elevation: elevation)
         
         let panX = Float(delta.width) * orbitPanSensitivity * (distance / 10.0)
         let panY = Float(delta.height) * orbitPanSensitivity * (distance / 10.0)
         
         var newTarget = targetOrbitCenter - right * panX + up * panY
-        newTarget = clampToBounds(newTarget)
-        targetOrbitCenter = newTarget
+        
+        // Clamp orbit target to bounds if set
+        if let bounds = boundingBox {
+            newTarget = CameraMath.clampToBounds(newTarget, min: bounds.min, max: bounds.max)
+        }
+        
+        targetOrbitCenter = CameraMath.sanitize(newTarget, default: targetOrbitCenter)
     }
     
     func handlePinch(_ scale: CGFloat) {
         guard mode == .orbit else { return }
         let newDistance = targetDistance / Float(scale)
-        targetDistance = clamp(newDistance, min: minDistance, max: maxDistance)
+        targetDistance = CameraMath.clamp(newDistance, min: minDistance, max: maxDistance)
     }
     
     // MARK: - Fly Mode Controls
     
-    func handleKeyDown(_ key: KeyEquivalent) {
-        guard mode == .fly else { return }
-        switch key {
-        case "w", "W": moveForward = 1
-        case "s", "S": moveForward = -1
-        case "a", "A": moveRight = -1
-        case "d", "D": moveRight = 1
-        case " ": moveUp = 1
-        case KeyEquivalent(Character(UnicodeScalar(16))): moveUp = -1 // Shift detection via modifier
-        default: break
-        }
-    }
-    
-    func handleKeyUp(_ key: KeyEquivalent) {
-        guard mode == .fly else { return }
-        switch key {
-        case "w", "W": if moveForward > 0 { moveForward = 0 }
-        case "s", "S": if moveForward < 0 { moveForward = 0 }
-        case "a", "A": if moveRight < 0 { moveRight = 0 }
-        case "d", "D": if moveRight > 0 { moveRight = 0 }
-        case " ": if moveUp > 0 { moveUp = 0 }
-        case KeyEquivalent(Character(UnicodeScalar(16))): if moveUp < 0 { moveUp = 0 }
-        default: break
-        }
-    }
-    
     func setMoveForward(_ value: Float) {
         guard mode == .fly else { return }
-        moveForward = clamp(value, min: -1, max: 1)
+        moveForward = CameraMath.clamp(value, min: -1, max: 1)
     }
     
     func setMoveRight(_ value: Float) {
         guard mode == .fly else { return }
-        moveRight = clamp(value, min: -1, max: 1)
+        moveRight = CameraMath.clamp(value, min: -1, max: 1)
     }
     
     func setMoveUp(_ value: Float) {
         guard mode == .fly else { return }
-        moveUp = clamp(value, min: -1, max: 1)
+        moveUp = CameraMath.clamp(value, min: -1, max: 1)
     }
     
     func stopMovement() {
@@ -218,35 +197,47 @@ final class PointCloudCamera: ObservableObject {
     
     func handleMouseDelta(_ delta: CGSize) {
         guard mode == .fly else { return }
-        targetYaw += Float(delta.width) * flyLookSensitivity
+        targetYaw = CameraMath.wrapAngle(targetYaw + Float(delta.width) * flyLookSensitivity)
         targetPitch -= Float(delta.height) * flyLookSensitivity
-        targetPitch = clamp(targetPitch, min: -maxPitch, max: maxPitch)
+        targetPitch = CameraMath.clamp(targetPitch, min: -maxPitch, max: maxPitch)
     }
     
     // MARK: - Update Loop
     
     func update(deltaTime: Float) {
+        guard !CameraMath.isInvalid(deltaTime) && deltaTime > 0 else { return }
+        
         let t = min(1.0, deltaTime * interpolationSpeed)
         
         switch mode {
         case .orbit:
-            distance = lerp(distance, targetDistance, t)
-            azimuth = lerpAngle(azimuth, targetAzimuth, t)
-            elevation = lerp(elevation, targetElevation, t)
-            target = lerp(target, targetOrbitCenter, t)
+            distance = CameraMath.lerp(distance, targetDistance, t)
+            azimuth = CameraMath.lerpAngle(azimuth, targetAzimuth, t)
+            elevation = CameraMath.lerp(elevation, targetElevation, t)
+            target = CameraMath.lerp(target, targetOrbitCenter, t)
             
         case .fly:
-            yaw = lerpAngle(yaw, targetYaw, t)
-            pitch = lerp(pitch, targetPitch, t)
+            yaw = CameraMath.lerpAngle(yaw, targetYaw, t)
+            pitch = CameraMath.lerp(pitch, targetPitch, t)
             
+            // Fly mode: no bounds clamping - let the user explore freely
             if moveForward != 0 || moveRight != 0 || moveUp != 0 {
+                let forward = CameraMath.flyForward(yaw: yaw, pitch: pitch)
+                let right = CameraMath.flyRight(yaw: yaw)
+                let up = CameraMath.flyUp()
+                
                 let velocity = (forward * moveForward + right * moveRight + up * moveUp)
                     * flyMoveSensitivity * deltaTime
-                targetPosition = clampToBounds(targetPosition + velocity)
+                
+                targetPosition = CameraMath.sanitize(targetPosition + velocity, default: targetPosition)
             }
             
-            position = lerp(position, targetPosition, t)
+            position = CameraMath.lerp(position, targetPosition, t)
         }
+        
+        // Sanitize all values
+        distance = CameraMath.sanitize(distance, default: 10.0)
+        azimuth = CameraMath.wrapAngle(azimuth)
         
         updateMatrices()
     }
@@ -254,82 +245,56 @@ final class PointCloudCamera: ObservableObject {
     // MARK: - Matrix Computation
     
     private func updateMatrices() {
+        let coreMat: Float4x4
+        
         switch mode {
         case .orbit:
-            viewMatrix = computeOrbitViewMatrix()
+            coreMat = CameraMath.orbitViewMatrix(
+                target: target,
+                distance: distance,
+                azimuth: azimuth,
+                elevation: elevation
+            )
         case .fly:
-            viewMatrix = computeFlyViewMatrix()
+            coreMat = CameraMath.flyViewMatrix(position: position, yaw: yaw, pitch: pitch)
         }
-        projectionMatrix = computeProjectionMatrix()
+        
+        viewMatrix = toSimd(coreMat)
+        projectionMatrix = toSimd(CameraMath.perspectiveMetal(
+            fovY: fieldOfView * .pi / 180.0,
+            aspect: aspectRatio,
+            near: nearPlane,
+            far: farPlane
+        ))
     }
     
-    private func computeOrbitViewMatrix() -> simd_float4x4 {
-        let eye = computeOrbitPosition()
-        return lookAt(eye: eye, target: target, up: SIMD3<Float>(0, 1, 0))
-    }
-    
-    private func computeFlyViewMatrix() -> simd_float4x4 {
-        let target = position + forward
-        return lookAt(eye: position, target: target, up: SIMD3<Float>(0, 1, 0))
-    }
-    
-    private func computeProjectionMatrix() -> simd_float4x4 {
-        perspective(fovY: fieldOfView * .pi / 180.0, aspect: aspectRatio, near: nearPlane, far: farPlane)
-    }
-    
-    // MARK: - Position & Direction Helpers
-    
-    private func computeOrbitPosition() -> SIMD3<Float> {
-        let x = distance * cos(elevation) * sin(azimuth)
-        let y = distance * sin(elevation)
-        let z = distance * cos(elevation) * cos(azimuth)
-        return target + SIMD3<Float>(x, y, z)
-    }
-    
-    private func computeOrbitRight() -> SIMD3<Float> {
-        let x = cos(azimuth)
-        let z = -sin(azimuth)
-        return SIMD3<Float>(x, 0, z)
-    }
-    
-    private func computeOrbitUp() -> SIMD3<Float> {
-        let x = -sin(elevation) * sin(azimuth)
-        let y = cos(elevation)
-        let z = -sin(elevation) * cos(azimuth)
-        return SIMD3<Float>(x, y, z)
-    }
-    
-    var forward: SIMD3<Float> {
-        let x = cos(pitch) * sin(yaw)
-        let y = sin(pitch)
-        let z = cos(pitch) * cos(yaw)
-        return SIMD3<Float>(x, y, z)
-    }
-    
-    var right: SIMD3<Float> {
-        let x = cos(yaw)
-        let z = -sin(yaw)
-        return SIMD3<Float>(x, 0, z)
-    }
-    
-    var up: SIMD3<Float> {
-        simd_cross(right, forward)
-    }
-    
-    // MARK: - Bounds Clamping
-    
-    private func clampToBounds(_ point: SIMD3<Float>) -> SIMD3<Float> {
-        guard let bounds = boundingBox else { return point }
-        return SIMD3<Float>(
-            clamp(point.x, min: bounds.min.x, max: bounds.max.x),
-            clamp(point.y, min: bounds.min.y, max: bounds.max.y),
-            clamp(point.z, min: bounds.min.z, max: bounds.max.z)
+    /// Convert CameraMath Float4x4 to simd_float4x4 for Metal.
+    private func toSimd(_ m: Float4x4) -> simd_float4x4 {
+        simd_float4x4(
+            SIMD4<Float>(m[0].x, m[0].y, m[0].z, m[0].w),
+            SIMD4<Float>(m[1].x, m[1].y, m[1].z, m[1].w),
+            SIMD4<Float>(m[2].x, m[2].y, m[2].z, m[2].w),
+            SIMD4<Float>(m[3].x, m[3].y, m[3].z, m[3].w)
         )
+    }
+    
+    // MARK: - Computed Properties
+    
+    var forward: Float3 {
+        CameraMath.flyForward(yaw: yaw, pitch: pitch)
+    }
+    
+    var right: Float3 {
+        CameraMath.flyRight(yaw: yaw)
+    }
+    
+    var up: Float3 {
+        CameraMath.flyUp()
     }
     
     // MARK: - Public Configuration
     
-    func setBounds(min: SIMD3<Float>, max: SIMD3<Float>) {
+    func setBounds(min: Float3, max: Float3) {
         boundingBox = (min: min, max: max)
     }
     
@@ -339,7 +304,7 @@ final class PointCloudCamera: ObservableObject {
     
     func resetToFitBounds() {
         guard let bounds = boundingBox else { return }
-        let center = (bounds.min + bounds.max) * 0.5
+        let center = CameraMath.boundsCenter(min: bounds.min, max: bounds.max)
         let size = bounds.max - bounds.min
         let maxExtent = max(size.x, max(size.y, size.z))
         
@@ -347,72 +312,17 @@ final class PointCloudCamera: ObservableObject {
             targetOrbitCenter = center
             targetDistance = maxExtent * 1.5
             targetAzimuth = 0
-            targetElevation = .pi / 6
+            targetElevation = Float.pi / 6
         } else {
-            targetPosition = center + SIMD3<Float>(0, maxExtent * 0.5, maxExtent * 1.5)
-            targetYaw = 0
-            targetPitch = -.pi / 6
+            targetPosition = center + Float3(0, -maxExtent * 1.5, maxExtent * 0.5)
+            targetYaw = Float.pi / 2
+            targetPitch = Float.pi / 6
         }
     }
     
     func setAspectRatio(_ aspect: Float) {
+        guard !CameraMath.isInvalid(aspect) && aspect > 0 else { return }
         aspectRatio = aspect
         updateMatrices()
     }
-}
-
-// MARK: - Math Utilities
-
-private func clamp(_ value: Float, min minVal: Float, max maxVal: Float) -> Float {
-    Swift.min(Swift.max(value, minVal), maxVal)
-}
-
-private func lerp(_ a: Float, _ b: Float, _ t: Float) -> Float {
-    a + (b - a) * t
-}
-
-private func lerp(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ t: Float) -> SIMD3<Float> {
-    a + (b - a) * t
-}
-
-private func lerpAngle(_ a: Float, _ b: Float, _ t: Float) -> Float {
-    var diff = b - a
-    while diff > .pi { diff -= 2 * .pi }
-    while diff < -.pi { diff += 2 * .pi }
-    return a + diff * t
-}
-
-private func lookAt(eye: SIMD3<Float>, target: SIMD3<Float>, up: SIMD3<Float>) -> simd_float4x4 {
-    let f = simd_normalize(target - eye)
-    let s = simd_normalize(simd_cross(f, up))
-    let u = simd_cross(s, f)
-    
-    var result = matrix_identity_float4x4
-    result[0][0] = s.x
-    result[1][0] = s.y
-    result[2][0] = s.z
-    result[0][1] = u.x
-    result[1][1] = u.y
-    result[2][1] = u.z
-    result[0][2] = -f.x
-    result[1][2] = -f.y
-    result[2][2] = -f.z
-    result[3][0] = -simd_dot(s, eye)
-    result[3][1] = -simd_dot(u, eye)
-    result[3][2] = simd_dot(f, eye)
-    return result
-}
-
-private func perspective(fovY: Float, aspect: Float, near: Float, far: Float) -> simd_float4x4 {
-    let yScale = 1.0 / tan(fovY * 0.5)
-    let xScale = yScale / aspect
-    let zRange = far - near
-    
-    var result = simd_float4x4(0)
-    result[0][0] = xScale
-    result[1][1] = yScale
-    result[2][2] = -(far + near) / zRange
-    result[2][3] = -1.0
-    result[3][2] = -2.0 * far * near / zRange
-    return result
 }
