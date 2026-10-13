@@ -3,18 +3,19 @@ import LabCommandCore
 
 /// Tests for RigSpec extrinsics and transformations.
 
-func testMid360ExtrinsicsIsPlaceholder() {
-    // Mid-360 extrinsics are identity placeholders until real calibration is available
+func testMid360ExtrinsicsIsReference() {
+    // Mid-360 IMU is the rig origin — extrinsics should be identity
     let ex = RigSpec.mid360Extrinsics
-    expect(ex.isIdentity, "Mid-360 extrinsics should be identity placeholder")
+    expect(ex.isIdentity, "Mid-360 extrinsics should be identity (reference frame)")
 }
 
-func testJT128ExtrinsicsIsIdentity() {
+func testJT128ExtrinsicsIsPlaceholder() {
+    // JT128 offset is TBD — currently identity placeholder
     let ex = RigSpec.jt128Extrinsics
     
-    expect(ex.isIdentity, "JT128 extrinsics should be identity transform")
+    expect(ex.isIdentity, "JT128 extrinsics should be identity placeholder (offset TBD)")
     expect(ex.translation.x == 0 && ex.translation.y == 0 && ex.translation.z == 0,
-           "JT128 translation should be zero")
+           "JT128 translation should be zero (placeholder)")
 }
 
 func testIdentityExtrinsicsPreservesPoint() {
@@ -90,7 +91,25 @@ func testTransformFramePreservesMetadata() {
            "timestamp should be preserved after transform")
 }
 
+func testMid360FramePassesThrough() {
+    // Mid-360 is the reference frame — should pass through unchanged
+    let frame = PointCloudFrame(
+        positions: [Point3D(x: 5.0, y: 3.0, z: 1.0)],
+        intensities: [0.9],
+        sensor: .mid360,
+        frameId: "mid360_frame"
+    )
+    
+    let transformed = RigSpec.transformToRigFrame(frame)
+    
+    expect(transformed.positions[0].x == 5.0, "Mid-360 point X should be unchanged (reference)")
+    expect(transformed.positions[0].y == 3.0, "Mid-360 point Y should be unchanged (reference)")
+    expect(transformed.positions[0].z == 1.0, "Mid-360 point Z should be unchanged (reference)")
+    expect(transformed.frameId == "mid360_frame", "Mid-360 frameId should be preserved")
+}
+
 func testJT128FramePassesThrough() {
+    // JT128 currently uses identity placeholder — passes through until calibration
     let frame = PointCloudFrame(
         positions: [Point3D(x: 5.0, y: 3.0, z: 1.0)],
         intensities: [0.9],
@@ -100,10 +119,10 @@ func testJT128FramePassesThrough() {
     
     let transformed = RigSpec.transformToRigFrame(frame)
     
-    // JT128 should pass through unchanged (identity transform)
-    expect(transformed.positions[0].x == 5.0, "JT128 point X should be unchanged")
-    expect(transformed.positions[0].y == 3.0, "JT128 point Y should be unchanged")
-    expect(transformed.positions[0].z == 1.0, "JT128 point Z should be unchanged")
+    // With identity placeholder, JT128 passes through unchanged
+    expect(transformed.positions[0].x == 5.0, "JT128 point X should be unchanged (placeholder)")
+    expect(transformed.positions[0].y == 3.0, "JT128 point Y should be unchanged (placeholder)")
+    expect(transformed.positions[0].z == 1.0, "JT128 point Z should be unchanged (placeholder)")
     expect(transformed.frameId == "jt128_frame", "JT128 frameId should be preserved")
 }
 
@@ -128,11 +147,11 @@ func testExtrinsicsLookupBySensor() {
 func runRigSpecTests() {
     print("RigSpec tests:")
     
-    testMid360ExtrinsicsIsPlaceholder()
-    print("  extrinsics: Mid-360 is identity placeholder"); passed()
+    testMid360ExtrinsicsIsReference()
+    print("  extrinsics: Mid-360 is identity (reference frame)"); passed()
     
-    testJT128ExtrinsicsIsIdentity()
-    print("  extrinsics: JT128 is identity transform"); passed()
+    testJT128ExtrinsicsIsPlaceholder()
+    print("  extrinsics: JT128 is identity placeholder (offset TBD)"); passed()
     
     testIdentityExtrinsicsPreservesPoint()
     print("  extrinsics: identity preserves points"); passed()
@@ -146,8 +165,11 @@ func runRigSpecTests() {
     testTransformFramePreservesMetadata()
     print("  frame transform: preserves metadata including frameId"); passed()
     
+    testMid360FramePassesThrough()
+    print("  frame transform: Mid-360 passes through (reference frame)"); passed()
+    
     testJT128FramePassesThrough()
-    print("  frame transform: JT128 passes through unchanged"); passed()
+    print("  frame transform: JT128 passes through (placeholder)"); passed()
     
     testExtrinsicsEquatable()
     print("  Equatable: hand-written == works correctly"); passed()

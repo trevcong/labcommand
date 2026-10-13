@@ -61,26 +61,26 @@ public struct SensorExtrinsics: Sendable, Equatable {
 /// Contains extrinsics, sensor metadata, and frame conventions.
 ///
 /// **Frame Convention:**
-/// - Rig frame origin: JT128 lidar center (reference sensor)
+/// - Rig frame origin: Mid-360 IMU (reference sensor)
 /// - Coordinate system: Right-handed, Z-up
 /// - X: Forward (direction of travel)
 /// - Y: Left
 /// - Z: Up
 ///
 /// **Extrinsics Source:**
-/// - Mid-360: TODO: Real mounting offset TBD — load from rig config file
-/// - JT128: Reference frame (identity transform)
+/// - Mid-360: Reference frame (identity transform)
+/// - JT128: TODO: Real mounting offset TBD — load from rig config file
 public enum RigSpec {
     
     // MARK: - Sensor Extrinsics
     
-    /// Mid-360 extrinsics: transform from sensor frame to rig frame.
-    /// TODO: Real mounting offset TBD — identity placeholder until rig calibration is available.
-    /// Load actual values from a rig config file at runtime.
+    /// Mid-360 extrinsics: identity (reference frame).
+    /// The rig frame is defined at the Mid-360 IMU.
     public static let mid360Extrinsics = SensorExtrinsics.identity
     
-    /// JT128 extrinsics: identity (reference frame).
-    /// The rig frame is defined at the JT128's optical center.
+    /// JT128 extrinsics: transform from sensor frame to rig frame.
+    /// TODO: Real mounting offset TBD — identity placeholder until rig calibration is available.
+    /// Load actual values from a rig config file at runtime.
     public static let jt128Extrinsics = SensorExtrinsics.identity
     
     /// Get extrinsics for a sensor by ID.
