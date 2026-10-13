@@ -546,6 +546,13 @@ public enum PointCloudDecoder {
         let totalPoints = layout.width * layout.height
         let count = pointCount ?? totalPoints
         
+        // Validate pointCount matches width * height when both are provided
+        if let explicit = pointCount, explicit != totalPoints {
+            throw PointCloudError.invalidData(
+                "Point count mismatch: pointCount=\(explicit) but width×height=\(totalPoints)"
+            )
+        }
+        
         if count == 0 {
             return PointCloudFrame()
         }

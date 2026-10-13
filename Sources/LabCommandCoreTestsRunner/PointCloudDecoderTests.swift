@@ -772,6 +772,38 @@ func testPointCloud2InvalidPointStep() {
     }
 }
 
+func testPointCloud2PointCountMismatch() {
+    var data = Data()
+    // Create 3 points of 16 bytes each
+    for _ in 0..<3 {
+        data.append(contentsOf: withUnsafeBytes(of: Float(1.0).bitPattern.littleEndian) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Float(2.0).bitPattern.littleEndian) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Float(3.0).bitPattern.littleEndian) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Float(0.5).bitPattern.littleEndian) { Array($0) })
+    }
+
+    let layout = PointCloud2Layout(
+        pointStep: 16,
+        rowStep: 48,  // 3 points × 16
+        width: 3,
+        height: 1,
+        xOffset: 0,
+        yOffset: 4,
+        zOffset: 8,
+        intensityOffset: 12
+    )
+
+    do {
+        // Pass pointCount=5 but layout says width×height=3
+        _ = try PointCloudDecoder.decodePointCloud2(from: data, layout: layout, pointCount: 5)
+        expect(false, "PC2 pointCount mismatch: should have thrown")
+    } catch PointCloudError.invalidData(let msg) {
+        expect(msg.contains("mismatch") || msg.contains("pointCount"), "PC2 pointCount mismatch: error mentions mismatch")
+    } catch {
+        expect(false, "PC2 pointCount mismatch: unexpected error \(error)")
+    }
+}
+
 func testPointCloud2DataSizeMismatch() {
     var data = Data()
     // Create 2 points of 16 bytes each
@@ -1370,22 +1402,44 @@ func testPCDLargeCloud() {
 
 // MARK: - Real Fixture Regression Test
 
-func testRealROS1MessageFixture() {
-    // This fixture was extracted from room-scan.mcap
-    let path = "fixtures/pointclouds/ros1-pointcloud2.bin"
+func testRealROS2MessageFixture() {
+    // Message 0 extracted from room-scan.mcap (1745 bytes)
+    // This is a ROS2 PointCloud2 message with CDR encapsulation
+    let path = "fixtures/pointclouds/ros2-pointcloud2.bin"
+    
+    // FAIL if fixture is missing — don't skip
     guard FileManager.default.fileExists(atPath: path) else {
-        print("  fixture: ros1-pointcloud2.bin not found — skipped")
-        passed()
+        expect(false, "ROS2 real fixture: ros2-pointcloud2.bin not found at \(path)")
         return
     }
 
     do {
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
-        let frame = try PointCloudDecoder.decodeROS1PointCloud2(from: data)
-        expect(frame.count > 0, "ROS1 real fixture: should have points")
-        expect(frame.frameId != nil && !frame.frameId!.isEmpty, "ROS1 real fixture: should have frame_id")
+        expect(data.count == 1745, "ROS2 real fixture: expected 1745 bytes, got \(data.count)")
+        
+        let frame = try PointCloudDecoder.decodeROS2PointCloud2(from: data)
+        
+        // Assert: 100 points
+        expect(frame.count == 100, "ROS2 real fixture: expected 100 points, got \(frame.count)")
+        
+        // Assert: frame_id is "livox_frame"
+        expect(frame.frameId == "livox_frame", 
+               "ROS2 real fixture: expected frame_id='livox_frame', got '\(frame.frameId ?? "nil")'")
+        
+        // Assert: first point xyz (all zeros in this fixture)
+        expect(frame.positions.count >= 1, "ROS2 real fixture: should have at least 1 position")
+        let first = frame.positions[0]
+        expect(abs(first.x) < 0.001 && abs(first.y) < 0.001 && abs(first.z) < 0.001,
+               "ROS2 real fixture: first point should be (0,0,0), got (\(first.x),\(first.y),\(first.z))")
+        
+        // Second point should be (0.1, 0, 0)
+        if frame.positions.count >= 2 {
+            let second = frame.positions[1]
+            expect(abs(second.x - 0.1) < 0.001 && abs(second.y) < 0.001 && abs(second.z) < 0.001,
+                   "ROS2 real fixture: second point should be (0.1,0,0), got (\(second.x),\(second.y),\(second.z))")
+        }
     } catch {
-        expect(false, "ROS1 real fixture failed: \(error)")
+        expect(false, "ROS2 real fixture failed: \(error)")
     }
 }
 
@@ -1455,6 +1509,8 @@ func runPointCloudDecoderTests() {
     print("  PointCloud2: missing intensity flagged via hasIntensity"); passed()
     testPointCloud2InvalidPointStep()
     print("  PointCloud2: invalid pointStep → error"); passed()
+    testPointCloud2PointCountMismatch()
+    print("  PointCloud2: pointCount != width×height → error"); passed()
     testPointCloud2DataSizeMismatch()
     print("  PointCloud2: data size != row_step × height → error"); passed()
     testPointCloud2RowStepAddressing()
@@ -1485,8 +1541,8 @@ func runPointCloudDecoderTests() {
     testLoadMissingFixture()
     print("  Fixture: missing file → error"); passed()
 
-    testRealROS1MessageFixture()
-    print("  Fixture: ROS1 PointCloud2 binary from room-scan.mcap"); passed()
+    testRealROS2MessageFixture()
+    print("  Fixture: ROS2 PointCloud2 binary from room-scan.mcap (100 points, livox_frame)"); passed()
 
     testPointCloudFrameStruct()
     print("  PointCloudFrame struct: isEmpty, count, sensor, frameId"); passed()
