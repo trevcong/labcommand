@@ -111,7 +111,8 @@ final class PointCloudCamera: ObservableObject {
             
             yaw = CameraMath.wrapAngle(azimuth + Float.pi)
             targetYaw = yaw
-            pitch = elevation
+            // Negate: orbit elevation up = fly pitch down (looking at target)
+            pitch = -elevation
             targetPitch = pitch
         } else {
             let forward = CameraMath.flyForward(yaw: yaw, pitch: pitch)
@@ -120,7 +121,8 @@ final class PointCloudCamera: ObservableObject {
             
             azimuth = CameraMath.wrapAngle(yaw - Float.pi)
             targetAzimuth = azimuth
-            elevation = CameraMath.clamp(pitch, min: minElevation, max: maxElevation)
+            // Negate: fly pitch down = orbit elevation up
+            elevation = CameraMath.clamp(-pitch, min: minElevation, max: maxElevation)
             targetElevation = elevation
         }
         
@@ -308,19 +310,34 @@ final class PointCloudCamera: ObservableObject {
         guard !CameraMath.isInvalid(center) else { return }
         
         let size = bounds.max - bounds.min
-        let maxExtent = max(size.x, max(size.y, size.z))
-        guard !CameraMath.isInvalid(maxExtent) && maxExtent > 0 else { return }
+        let diagonal = CameraMath.boundsDiagonal(min: bounds.min, max: bounds.max)
+        guard !CameraMath.isInvalid(diagonal) && diagonal > 0 else { return }
+        
+        // Calculate distance to fit the cloud based on FOV
+        let fovRad = fieldOfView * .pi / 180.0
+        let fitDistance = (diagonal * 0.5) / tan(fovRad * 0.5) * 1.2  // 1.2x margin
         
         if mode == .orbit {
+            target = center
             targetOrbitCenter = center
-            targetDistance = CameraMath.clamp(maxExtent * 1.5, min: minDistance, max: maxDistance)
-            targetAzimuth = 0
-            targetElevation = CameraMath.clamp(Float.pi / 6, min: minElevation, max: maxElevation)
+            distance = CameraMath.clamp(fitDistance, min: minDistance, max: maxDistance)
+            targetDistance = distance
+            azimuth = Float.pi / 4  // 45° for nice 3D view
+            targetAzimuth = azimuth
+            elevation = CameraMath.clamp(Float.pi / 6, min: minElevation, max: maxElevation)
+            targetElevation = elevation
         } else {
-            targetPosition = center + Float3(0, -maxExtent * 1.5, maxExtent * 0.5)
-            targetYaw = Float.pi / 2
-            targetPitch = CameraMath.clamp(Float.pi / 6, min: -maxPitch, max: maxPitch)
+            // Position camera to look at center from a good angle
+            let offset = Float3(-fitDistance * 0.7, -fitDistance * 0.7, fitDistance * 0.5)
+            position = center + offset
+            targetPosition = position
+            yaw = Float.pi / 4
+            targetYaw = yaw
+            pitch = CameraMath.clamp(-Float.pi / 8, min: -maxPitch, max: maxPitch)
+            targetPitch = pitch
         }
+        
+        updateMatrices()
     }
     
     func setAspectRatio(_ aspect: Float) {
