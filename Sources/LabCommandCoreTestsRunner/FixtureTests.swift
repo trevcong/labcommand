@@ -1,8 +1,8 @@
 import Foundation
 import LabCommandCore
 
-// Fixture loading and decoder round-trip tests for PR 3's decoder.
-// These tests verify the API fixtures parse correctly and produce expected snapshots.
+// Fixture loading and decoder round-trip tests.
+// Tests FAIL (not skip) when fixtures are missing — fixtures must be present for tests to pass.
 
 private func fixturesPath() -> String? {
     let fm = FileManager.default
@@ -28,14 +28,26 @@ private func loadFixture(_ name: String) -> String? {
     return String(data: data, encoding: .utf8)
 }
 
-func testFixtureBothSensorsLive() {
-    guard let json = loadFixture("both-sensors-live") else {
-        print("  fixtures: both-sensors-live.json not found — skipped (run from repo root)")
-        return
+private func requireFixture(_ name: String) -> String {
+    guard let json = loadFixture(name) else {
+        fputs("FAIL: fixtures/api/\(name).json not found — run tests from repo root\n", stderr)
+        exit(1)
     }
+    return json
+}
+
+func testFixturesDirectoryExists() {
+    guard fixturesPath() != nil else {
+        fputs("FAIL: fixtures/api directory not found\n", stderr)
+        exit(1)
+    }
+}
+
+func testFixtureBothSensorsLive() {
+    let json = requireFixture("both-sensors-live")
     guard let snap = RigStatusDecoder.parse(json: json, viewTunnelUp: true) else {
-        expect(false, "both-sensors-live.json must parse")
-        return
+        fputs("FAIL: both-sensors-live.json must parse\n", stderr)
+        exit(1)
     }
     expect(snap.sparkReachable && snap.apiReachable, "live rig is reachable")
     expect(snap.mid360.state == .streaming, "mid360 streaming")
@@ -50,13 +62,10 @@ func testFixtureBothSensorsLive() {
 }
 
 func testFixtureBothSensorsDark() {
-    guard let json = loadFixture("both-sensors-dark") else {
-        print("  fixtures: both-sensors-dark.json not found — skipped")
-        return
-    }
+    let json = requireFixture("both-sensors-dark")
     guard let snap = RigStatusDecoder.parse(json: json, viewTunnelUp: false) else {
-        expect(false, "both-sensors-dark.json must parse")
-        return
+        fputs("FAIL: both-sensors-dark.json must parse\n", stderr)
+        exit(1)
     }
     expect(snap.mid360.state == .dark, "mid360 dark (unpowered)")
     expect(snap.jt128.state == .dark, "jt128 dark (unpowered)")
@@ -66,13 +75,10 @@ func testFixtureBothSensorsDark() {
 }
 
 func testFixtureClockConverging() {
-    guard let json = loadFixture("clock-converging") else {
-        print("  fixtures: clock-converging.json not found — skipped")
-        return
-    }
+    let json = requireFixture("clock-converging")
     guard let snap = RigStatusDecoder.parse(json: json, viewTunnelUp: true) else {
-        expect(false, "clock-converging.json must parse")
-        return
+        fputs("FAIL: clock-converging.json must parse\n", stderr)
+        exit(1)
     }
     expect(snap.mid360.state == .streaming, "mid360 streaming during slew")
     expect(snap.jt128.state == .streaming, "jt128 streaming during slew")
@@ -82,13 +88,10 @@ func testFixtureClockConverging() {
 }
 
 func testFixtureClockLocked() {
-    guard let json = loadFixture("clock-locked") else {
-        print("  fixtures: clock-locked.json not found — skipped")
-        return
-    }
+    let json = requireFixture("clock-locked")
     guard let snap = RigStatusDecoder.parse(json: json, viewTunnelUp: true) else {
-        expect(false, "clock-locked.json must parse")
-        return
+        fputs("FAIL: clock-locked.json must parse\n", stderr)
+        exit(1)
     }
     expect(snap.clock.state == .locked, "clocks locked")
     expect(abs(snap.mid360.clockOffsetMs ?? 1000) < ClockSync.lockedBandMs,
@@ -98,13 +101,10 @@ func testFixtureClockLocked() {
 }
 
 func testFixtureRecordingActive() {
-    guard let json = loadFixture("recording-active") else {
-        print("  fixtures: recording-active.json not found — skipped")
-        return
-    }
+    let json = requireFixture("recording-active")
     guard let snap = RigStatusDecoder.parse(json: json, viewTunnelUp: true) else {
-        expect(false, "recording-active.json must parse")
-        return
+        fputs("FAIL: recording-active.json must parse\n", stderr)
+        exit(1)
     }
     expect(snap.recording.active, "recording active")
     expect(snap.recording.session?.contains("DUAL") == true, "session name contains DUAL")
@@ -126,15 +126,11 @@ func testFixtureSparkOffline() {
 }
 
 func testDecoderRoundTripPreservesFields() {
-    guard let json = loadFixture("both-sensors-live") else {
-        print("  decoder round-trip: fixture not found — skipped")
-        return
-    }
+    let json = requireFixture("both-sensors-live")
     guard let snap = RigStatusDecoder.parse(json: json, viewTunnelUp: true) else {
-        expect(false, "parse must succeed")
-        return
+        fputs("FAIL: parse must succeed\n", stderr)
+        exit(1)
     }
-    // Verify all expected fields are populated, not nil
     expect(snap.mid360.pointRateHz != nil, "mid point rate preserved")
     expect(snap.mid360.imuRateHz != nil, "mid imu rate preserved")
     expect(snap.mid360.clockOffsetMs != nil, "mid clock offset preserved")
@@ -153,8 +149,8 @@ func testDecoderMissingFieldsStayNil() {
     {"ts": 1.0, "containers": {}}
     """
     guard let snap = RigStatusDecoder.parse(json: minimal, viewTunnelUp: false) else {
-        expect(false, "minimal JSON must parse")
-        return
+        fputs("FAIL: minimal JSON must parse\n", stderr)
+        exit(1)
     }
     expect(snap.mid360.state == .unknown, "no ping key → unknown")
     expect(snap.mid360.pointRateHz == nil, "no rate → nil")
@@ -174,15 +170,16 @@ func testAllFixturesParseWithoutCrash() {
         "recording-active",
     ]
     for name in fixtures {
-        if let json = loadFixture(name) {
-            let snap = RigStatusDecoder.parse(json: json, viewTunnelUp: true)
-            expect(snap != nil, "\(name).json parses")
-        }
+        let json = requireFixture(name)
+        let snap = RigStatusDecoder.parse(json: json, viewTunnelUp: true)
+        expect(snap != nil, "\(name).json parses")
     }
 }
 
 func runFixtureTests() {
     print("Running fixture tests…")
+    testFixturesDirectoryExists()
+    print("  fixture: fixtures/api directory exists")
     testFixtureBothSensorsLive()
     print("  fixture: both-sensors-live → streaming duo, locked clocks, pipeline")
     testFixtureBothSensorsDark()

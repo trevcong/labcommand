@@ -34,14 +34,33 @@ public final class MockRigService: @unchecked Sendable {
     }
     
     private static func loadFixtureJSON(named name: String) -> String? {
+        let fm = FileManager.default
+        
+        // Try bundle resources first (for .app bundles)
+        if let resourcePath = Bundle.main.resourcePath {
+            let bundlePath = URL(fileURLWithPath: resourcePath)
+                .appendingPathComponent("fixtures/api/\(name).json")
+            if let data = fm.contents(atPath: bundlePath.path),
+               let json = String(data: data, encoding: .utf8) {
+                return json
+            }
+        }
+        
+        // Try Bundle.main.path for embedded resources
+        if let bundlePath = Bundle.main.path(forResource: name, ofType: "json", inDirectory: "fixtures/api") {
+            if let data = fm.contents(atPath: bundlePath),
+               let json = String(data: data, encoding: .utf8) {
+                return json
+            }
+        }
+        
+        // Fallback to relative paths from cwd (for swift run / development)
+        let cwd = fm.currentDirectoryPath
         let searchPaths = [
             "fixtures/api/\(name).json",
             "../fixtures/api/\(name).json",
             "../../fixtures/api/\(name).json",
         ]
-        
-        let fm = FileManager.default
-        let cwd = fm.currentDirectoryPath
         
         for relativePath in searchPaths {
             let url = URL(fileURLWithPath: cwd).appendingPathComponent(relativePath)
@@ -51,19 +70,25 @@ public final class MockRigService: @unchecked Sendable {
             }
         }
         
-        if let bundlePath = Bundle.main.path(forResource: name, ofType: "json", inDirectory: "fixtures/api") {
-            if let data = fm.contents(atPath: bundlePath),
-               let json = String(data: data, encoding: .utf8) {
-                return json
-            }
-        }
-        
         return nil
     }
     
-    public var isViewTunnelRunning: Bool { fixtureName != "spark-offline" }
+    /// Whether the view tunnel should be up for this fixture.
+    /// Dark sensors typically have no active view tunnel.
+    private var fixtureViewTunnelUp: Bool {
+        switch fixtureName {
+        case "spark-offline":
+            return false
+        case "both-sensors-dark":
+            return false
+        default:
+            return true
+        }
+    }
+    
+    public var isViewTunnelRunning: Bool { fixtureViewTunnelUp }
     public var isAPITunnelRunning: Bool { fixtureName != "spark-offline" }
-    public var viewPathUp: Bool { fixtureName != "spark-offline" }
+    public var viewPathUp: Bool { fixtureViewTunnelUp }
     
     public func ensureTunnels() -> String? {
         if fixtureName == "spark-offline" {
@@ -91,7 +116,7 @@ public final class MockRigService: @unchecked Sendable {
             return RigSnapshot.apiDown(reason: "mock: fixture '\(fixtureName)' not loaded")
         }
         
-        guard let snapshot = RigStatusDecoder.parse(json: json, viewTunnelUp: true) else {
+        guard let snapshot = RigStatusDecoder.parse(json: json, viewTunnelUp: fixtureViewTunnelUp) else {
             return RigSnapshot.apiDown(reason: "mock: could not parse fixture '\(fixtureName)'")
         }
         
@@ -146,6 +171,16 @@ public protocol RigServiceProtocol: Sendable {
     func stopTunnels()
     func fetchStatus(sparkWasReachable: Bool) -> RigSnapshot
     func postAction(_ name: String, arg: String?, extra: [String: Any]) -> (ok: Bool, message: String)
+}
+
+public extension RigServiceProtocol {
+    func postAction(_ name: String) -> (ok: Bool, message: String) {
+        postAction(name, arg: nil, extra: [:])
+    }
+    
+    func postAction(_ name: String, arg: String?) -> (ok: Bool, message: String) {
+        postAction(name, arg: arg, extra: [:])
+    }
 }
 
 extension RigService: RigServiceProtocol {}
