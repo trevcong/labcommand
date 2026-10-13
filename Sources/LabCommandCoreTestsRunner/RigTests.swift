@@ -243,6 +243,16 @@ func testTelemetryFormatUnavailable() {
     expect(TelemetryFormat.flag(nil, yes: "y", no: "n") == "unavailable", "nil flag → unavailable")
 }
 
+func testTelemetryFormatCondense() {
+    expect(TelemetryFormat.condense("ssh: connect to host spark-1f3e.tail8dfdc7.ts.net port 22:\nOperation timed out")
+           == "ssh timed out", "timeout collapses to a fact")
+    expect(TelemetryFormat.condense("Permission denied (publickey).") == "ssh key rejected", "auth failure")
+    expect(TelemetryFormat.condense("ssh spark-ts -> spark-1f3e") == "ssh spark-ts -> spark-1f3e",
+           "a short line passes through unchanged")
+    expect(TelemetryFormat.condense(String(repeating: "x", count: 200)).count <= 64,
+           "long text is truncated")
+}
+
 func testDecoderArmedBlock() {
     let json = """
     {"mid360_ping": true, "jt128_ping": true,

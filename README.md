@@ -12,7 +12,7 @@ an SSH tunnel) — the same collector that serves the web panel and the
 What carried over unchanged: the design system (DESIGN-VISION.md), the
 honest-state contract (missing keys print **unavailable**, a measured 0 Hz
 is a real zero, "a running container is not a running stream"), the mission
-log, session library, trajectory maps, focus mode, and the menu-bar extra.
+log, focus mode, and the menu-bar extra.
 
 What's new:
 
@@ -47,10 +47,8 @@ Menu bar extra: **LAB**. Capture menu: ⌘↩ start/restart rig, ⌘⇧R record,
 
 | Dest | ⌘ | Purpose |
 |---|---|---|
-| **Rig** | 1 | Sensor duo, transport, readout, path rail, take planner |
-| **Hardware** | 2 | Spark / Tailscale / per-sensor cards + containers + watchdog events |
-| **Takes** | 3 | Session library (search, compare, notes) |
-| **Settings** | 4 | Host, probe interval, capture paths |
+| **Rig** | 1 | Sensor duo, transport, recording controls, event log |
+| **Settings** | 2 | Host, probe interval, capture paths |
 
 ## What the buttons do
 
@@ -60,6 +58,8 @@ Menu bar extra: **LAB**. Capture menu: ⌘↩ start/restart rig, ⌘⇧R record,
 | Start recording | API `record` → `ros2 bag` of all four topics inside `lidar-dual` |
 | Stop | Recording? `stop-record` (SIGINT + chown). Else `down` (60 s grace) + close tunnels |
 | Wake / Standby | API `wake`/`standby` → JT128 PTC 0x1C |
+| Arm at lock | API `arm` → collector fires at sustained clock lock |
+| Diagnose | Shows advice for the current rig state |
 
 The Spark side lives in `~/hesai_ws/` (`command_center.py`, `dual_up.sh`,
 `ptp_up.sh`, `watchdog.sh`); the rig write-up is

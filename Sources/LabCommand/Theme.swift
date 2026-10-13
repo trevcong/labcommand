@@ -91,6 +91,19 @@ enum LabTheme {
     }
 }
 
+/// Section header label for settings groups.
+struct SectionLabel: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(LabTheme.t(11, .medium))
+            .foregroundStyle(LabTheme.faint)
+            .textCase(.uppercase)
+            .tracking(0.6)
+    }
+}
+
 struct InstrumentWell<Content: View>: View {
     var minHeight: CGFloat = 0
     var stroke: Color = LabTheme.line
