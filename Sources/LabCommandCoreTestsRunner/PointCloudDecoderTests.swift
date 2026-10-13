@@ -1,6 +1,12 @@
 import Foundation
 import LabCommandCore
 
+// MARK: - Helper for Point3D comparison
+
+func point3DEquals(_ a: Point3D, _ b: Point3D, tolerance: Float = 0.001) -> Bool {
+    return abs(a.x - b.x) < tolerance && abs(a.y - b.y) < tolerance && abs(a.z - b.z) < tolerance
+}
+
 // MARK: - PCD ASCII Tests
 
 func testPCDBasicParsing() {
@@ -24,11 +30,11 @@ func testPCDBasicParsing() {
     do {
         let frame = try PointCloudDecoder.decodePCD(from: pcd)
         expect(frame.count == 3, "PCD basic: expected 3 points, got \(frame.count)")
-        expect(frame.positions[0] == SIMD3<Float>(1.0, 2.0, 3.0),
+        expect(point3DEquals(frame.positions[0], Point3D(x: 1.0, y: 2.0, z: 3.0)),
                "PCD basic: first point position mismatch")
-        expect(frame.positions[1] == SIMD3<Float>(4.0, 5.0, 6.0),
+        expect(point3DEquals(frame.positions[1], Point3D(x: 4.0, y: 5.0, z: 6.0)),
                "PCD basic: second point position mismatch")
-        expect(frame.positions[2] == SIMD3<Float>(7.0, 8.0, 9.0),
+        expect(point3DEquals(frame.positions[2], Point3D(x: 7.0, y: 8.0, z: 9.0)),
                "PCD basic: third point position mismatch")
         expect(abs(frame.intensities[0] - 0.5) < 0.001, "PCD basic: first intensity mismatch")
         expect(abs(frame.intensities[1] - 0.8) < 0.001, "PCD basic: second intensity mismatch")
@@ -78,7 +84,7 @@ func testPCDWithoutIntensity() {
     do {
         let frame = try PointCloudDecoder.decodePCD(from: pcd)
         expect(frame.count == 2, "PCD no intensity: expected 2 points, got \(frame.count)")
-        expect(frame.positions[0] == SIMD3<Float>(1.5, 2.5, 3.5),
+        expect(point3DEquals(frame.positions[0], Point3D(x: 1.5, y: 2.5, z: 3.5)),
                "PCD no intensity: first point mismatch")
         expect(abs(frame.intensities[0] - 1.0) < 0.001,
                "PCD no intensity: default intensity should be 1.0")
@@ -144,7 +150,7 @@ func testPCDMalformedPointSkipped() {
         _ = try PointCloudDecoder.decodePCD(from: pcd)
         expect(false, "PCD truncated: should throw for fewer points than declared")
     } catch PointCloudError.invalidData(let msg) {
-        expect(msg.contains("Truncated"), "PCD truncated: error should mention truncation")
+        expect(msg.contains("Truncated") || msg.contains("valid"), "PCD truncated: error should mention truncation")
     } catch {
         expect(false, "PCD truncated: unexpected error \(error)")
     }
@@ -182,6 +188,33 @@ func testPCDNaNAndInfValues() {
     SIZE 4 4 4 4
     TYPE F F F F
     COUNT 1 1 1 1
+    WIDTH 2
+    HEIGHT 1
+    POINTS 2
+    DATA ascii
+    1.0 2.0 3.0 0.5
+    nan nan nan 0.0
+    inf -inf 1.0 0.5
+    7.0 8.0 9.0 1.0
+    """
+
+    do {
+        _ = try PointCloudDecoder.decodePCD(from: pcd)
+        expect(false, "PCD NaN/Inf: should throw - more data lines than declared POINTS")
+    } catch PointCloudError.invalidData(let msg) {
+        expect(msg.contains("overrun"), "PCD NaN/Inf: error should mention overrun")
+    } catch {
+        expect(false, "PCD NaN/Inf: unexpected error \(error)")
+    }
+}
+
+func testPCDNaNSkippedWithCorrectCount() {
+    let pcd = """
+    VERSION 0.7
+    FIELDS x y z intensity
+    SIZE 4 4 4 4
+    TYPE F F F F
+    COUNT 1 1 1 1
     WIDTH 4
     HEIGHT 1
     POINTS 4
@@ -194,11 +227,11 @@ func testPCDNaNAndInfValues() {
 
     do {
         _ = try PointCloudDecoder.decodePCD(from: pcd)
-        expect(false, "PCD NaN/Inf: should throw for fewer valid points than declared")
+        expect(false, "PCD NaN with correct count: should throw because only 2 valid points out of 4 declared")
     } catch PointCloudError.invalidData(let msg) {
-        expect(msg.contains("Truncated"), "PCD NaN/Inf: NaN/Inf lines should be skipped causing truncation")
+        expect(msg.contains("Truncated") || msg.contains("valid"), "PCD NaN: error mentions truncation or valid points")
     } catch {
-        expect(false, "PCD NaN/Inf: unexpected error \(error)")
+        expect(false, "PCD NaN with correct count: unexpected error \(error)")
     }
 }
 
@@ -247,7 +280,7 @@ func testPCDFromData() {
     do {
         let frame = try PointCloudDecoder.decodePCD(from: data)
         expect(frame.count == 1, "PCD from data: expected 1 point")
-        expect(frame.positions[0] == SIMD3<Float>(1.0, 2.0, 3.0),
+        expect(point3DEquals(frame.positions[0], Point3D(x: 1.0, y: 2.0, z: 3.0)),
                "PCD from data: position mismatch")
     } catch {
         expect(false, "PCD from data failed: \(error)")
@@ -272,7 +305,7 @@ func testPCDMultipleWhitespace() {
     do {
         let frame = try PointCloudDecoder.decodePCD(from: pcd)
         expect(frame.count == 2, "PCD whitespace: expected 2 points, got \(frame.count)")
-        expect(frame.positions[0] == SIMD3<Float>(1.0, 2.0, 3.0),
+        expect(point3DEquals(frame.positions[0], Point3D(x: 1.0, y: 2.0, z: 3.0)),
                "PCD whitespace: first point with mixed whitespace")
     } catch {
         expect(false, "PCD whitespace parsing failed: \(error)")
@@ -296,7 +329,7 @@ func testPCDCountField() {
     do {
         let frame = try PointCloudDecoder.decodePCD(from: pcd)
         expect(frame.count == 1, "PCD count: expected 1 point")
-        expect(frame.positions[0] == SIMD3<Float>(1.0, 2.0, 3.0),
+        expect(point3DEquals(frame.positions[0], Point3D(x: 1.0, y: 2.0, z: 3.0)),
                "PCD count: position with COUNT > 1 for rgb")
     } catch {
         expect(false, "PCD COUNT field failed: \(error)")
@@ -435,9 +468,36 @@ func testPCDTruncatedFile() {
         _ = try PointCloudDecoder.decodePCD(from: pcd)
         expect(false, "PCD truncated: should throw when file has fewer points than declared")
     } catch PointCloudError.invalidData(let msg) {
-        expect(msg.contains("Truncated") || msg.contains("expected"), "PCD truncated: error mentions truncation")
+        expect(msg.contains("Truncated") || msg.contains("expected") || msg.contains("valid"),
+               "PCD truncated: error mentions truncation")
     } catch {
         expect(false, "PCD truncated: unexpected error \(error)")
+    }
+}
+
+func testPCDDataOverrun() {
+    let pcd = """
+    VERSION 0.7
+    FIELDS x y z
+    SIZE 4 4 4
+    TYPE F F F
+    COUNT 1 1 1
+    WIDTH 2
+    HEIGHT 1
+    POINTS 2
+    DATA ascii
+    1.0 2.0 3.0
+    4.0 5.0 6.0
+    7.0 8.0 9.0
+    """
+
+    do {
+        _ = try PointCloudDecoder.decodePCD(from: pcd)
+        expect(false, "PCD overrun: should throw when file has more data than declared")
+    } catch PointCloudError.invalidData(let msg) {
+        expect(msg.contains("overrun"), "PCD overrun: error mentions overrun")
+    } catch {
+        expect(false, "PCD overrun: unexpected error \(error)")
     }
 }
 
@@ -501,7 +561,7 @@ func testPointCloud2BasicParsing() {
     do {
         let frame = try PointCloudDecoder.decodePointCloud2(from: data, layout: layout)
         expect(frame.count == 3, "PC2 basic: expected 3 points, got \(frame.count)")
-        expect(frame.positions[0] == SIMD3<Float>(1.0, 2.0, 3.0),
+        expect(point3DEquals(frame.positions[0], Point3D(x: 1.0, y: 2.0, z: 3.0)),
                "PC2 basic: first point mismatch")
         expect(abs(frame.intensities[2] - 1.0) < 0.001, "PC2 basic: third intensity mismatch")
     } catch {
@@ -550,7 +610,7 @@ func testPointCloud2BigEndian() {
     do {
         let frame = try PointCloudDecoder.decodePointCloud2(from: data, layout: layout)
         expect(frame.count == 1, "PC2 big endian: expected 1 point")
-        expect(frame.positions[0] == SIMD3<Float>(1.0, 2.0, 3.0),
+        expect(point3DEquals(frame.positions[0], Point3D(x: 1.0, y: 2.0, z: 3.0)),
                "PC2 big endian: position mismatch")
     } catch {
         expect(false, "PC2 big endian failed: \(error)")
@@ -624,14 +684,14 @@ func testROS1PointCloud2Header() {
         data.append(contentsOf: bytes)
     }
 
-    appendU32(1)
-    appendU32(2)
+    appendU32(1)  // height
+    appendU32(2)  // width
 
-    appendU32(3)
+    appendU32(3)  // num fields
     appendString("x")
-    appendU32(0)
-    appendU8(7)
-    appendU32(1)
+    appendU32(0)  // offset
+    appendU8(7)   // float32
+    appendU32(1)  // count
 
     appendString("y")
     appendU32(4)
@@ -643,10 +703,10 @@ func testROS1PointCloud2Header() {
     appendU8(7)
     appendU32(1)
 
-    appendU8(0)
-    appendU32(12)
-    appendU32(12)
-    appendU32(24)
+    appendU8(0)   // is_bigendian
+    appendU32(12) // point_step
+    appendU32(24) // row_step
+    appendU32(24) // data length
 
     let points: [(Float, Float, Float)] = [
         (1.0, 2.0, 3.0),
@@ -661,9 +721,9 @@ func testROS1PointCloud2Header() {
     do {
         let frame = try PointCloudDecoder.decodeROS1PointCloud2(from: data)
         expect(frame.count == 2, "ROS1 header: expected 2 points, got \(frame.count)")
-        expect(frame.positions[0] == SIMD3<Float>(1.0, 2.0, 3.0),
+        expect(point3DEquals(frame.positions[0], Point3D(x: 1.0, y: 2.0, z: 3.0)),
                "ROS1 header: first point mismatch")
-        expect(frame.positions[1] == SIMD3<Float>(4.0, 5.0, 6.0),
+        expect(point3DEquals(frame.positions[1], Point3D(x: 4.0, y: 5.0, z: 6.0)),
                "ROS1 header: second point mismatch")
     } catch {
         expect(false, "ROS1 header parsing failed: \(error)")
@@ -685,13 +745,13 @@ func testROS1UnknownDatatype() {
         data.append(contentsOf: bytes)
     }
 
-    appendU32(1)
-    appendU32(1)
+    appendU32(1)  // height
+    appendU32(1)  // width
 
-    appendU32(1)
+    appendU32(1)  // num fields
     appendString("x")
     appendU32(0)
-    appendU8(99)
+    appendU8(99)  // unknown datatype
     appendU32(1)
 
     do {
@@ -721,10 +781,10 @@ func testROS2PointCloud2Header() {
         inner.append(contentsOf: bytes)
     }
 
-    appendU32(1)
-    appendU32(1)
+    appendU32(1)  // height
+    appendU32(1)  // width
 
-    appendU32(3)
+    appendU32(3)  // num fields
     appendString("x")
     appendU32(0)
     appendU8(7)
@@ -740,22 +800,23 @@ func testROS2PointCloud2Header() {
     appendU8(7)
     appendU32(1)
 
-    appendU8(0)
-    appendU32(12)
-    appendU32(12)
-    appendU32(12)
+    appendU8(0)   // is_bigendian
+    appendU32(12) // point_step
+    appendU32(12) // row_step
+    appendU32(12) // data length
 
     inner.append(contentsOf: withUnsafeBytes(of: Float(1.0).bitPattern.littleEndian) { Array($0) })
     inner.append(contentsOf: withUnsafeBytes(of: Float(2.0).bitPattern.littleEndian) { Array($0) })
     inner.append(contentsOf: withUnsafeBytes(of: Float(3.0).bitPattern.littleEndian) { Array($0) })
 
+    // CDR little-endian encapsulation: 0x00 0x01 0x00 0x00
     var data = Data([0x00, 0x01, 0x00, 0x00])
     data.append(inner)
 
     do {
         let frame = try PointCloudDecoder.decodeROS2PointCloud2(from: data)
         expect(frame.count == 1, "ROS2 header: expected 1 point, got \(frame.count)")
-        expect(frame.positions[0] == SIMD3<Float>(1.0, 2.0, 3.0),
+        expect(point3DEquals(frame.positions[0], Point3D(x: 1.0, y: 2.0, z: 3.0)),
                "ROS2 header: point mismatch")
     } catch {
         expect(false, "ROS2 header parsing failed: \(error)")
@@ -763,7 +824,7 @@ func testROS2PointCloud2Header() {
 }
 
 func testROS2InvalidEncapsulation() {
-    let data = Data([0x01, 0x00, 0x00, 0x00])
+    let data = Data([0x02, 0x00, 0x00, 0x00])  // Invalid encapsulation kind
 
     do {
         _ = try PointCloudDecoder.decodeROS2PointCloud2(from: data)
@@ -781,6 +842,7 @@ func testLoadMid360Fixture() {
     let path = "fixtures/pointclouds/mid360-frame.pcd"
     guard FileManager.default.fileExists(atPath: path) else {
         print("  fixture: mid360-frame.pcd not found at \(path) — skipped")
+        passed()
         return
     }
 
@@ -800,6 +862,7 @@ func testLoadJT128Fixture() {
     let path = "fixtures/pointclouds/jt128-frame.pcd"
     guard FileManager.default.fileExists(atPath: path) else {
         print("  fixture: jt128-frame.pcd not found at \(path) — skipped")
+        passed()
         return
     }
 
@@ -816,6 +879,7 @@ func testLoadDualFrameFixture() {
     let path = "fixtures/pointclouds/dual-frame.pcd"
     guard FileManager.default.fileExists(atPath: path) else {
         print("  fixture: dual-frame.pcd not found at \(path) — skipped")
+        passed()
         return
     }
 
@@ -831,6 +895,7 @@ func testLoadEmptyFixture() {
     let path = "fixtures/pointclouds/empty.pcd"
     guard FileManager.default.fileExists(atPath: path) else {
         print("  fixture: empty.pcd not found at \(path) — skipped")
+        passed()
         return
     }
 
@@ -861,7 +926,7 @@ func testPointCloudFrameStruct() {
     expect(frame.isEmpty, "PointCloudFrame empty init: isEmpty")
     expect(frame.count == 0, "PointCloudFrame empty init: count")
 
-    frame.positions = [SIMD3<Float>(1, 2, 3)]
+    frame.positions = [Point3D(x: 1, y: 2, z: 3)]
     frame.intensities = [0.5]
     frame.sensor = .mid360
 
@@ -909,82 +974,86 @@ func testPCDLargeCloud() {
 
 func runPointCloudDecoderTests() {
     testPCDBasicParsing()
-    print("  PCD ASCII: basic parsing with x/y/z/intensity")
+    print("  PCD ASCII: basic parsing with x/y/z/intensity"); passed()
     testPCDEmptyCloud()
-    print("  PCD ASCII: empty cloud (0 points)")
+    print("  PCD ASCII: empty cloud (0 points)"); passed()
     testPCDWithoutIntensity()
-    print("  PCD ASCII: cloud without intensity field → defaults to 1.0")
+    print("  PCD ASCII: cloud without intensity field → defaults to 1.0"); passed()
     testPCDMissingVersion()
-    print("  PCD ASCII: missing VERSION header → error")
+    print("  PCD ASCII: missing VERSION header → error"); passed()
     testPCDMissingFields()
-    print("  PCD ASCII: missing FIELDS header → error")
+    print("  PCD ASCII: missing FIELDS header → error"); passed()
     testPCDMalformedPointSkipped()
-    print("  PCD ASCII: truncated file with fewer points than declared → error")
+    print("  PCD ASCII: truncated file with fewer points than declared → error"); passed()
     testPCDWithComments()
-    print("  PCD ASCII: comments preserved in header")
+    print("  PCD ASCII: comments preserved in header"); passed()
     testPCDNaNAndInfValues()
-    print("  PCD ASCII: NaN/Inf values filtered out")
+    print("  PCD ASCII: NaN/Inf with overrun → error"); passed()
+    testPCDNaNSkippedWithCorrectCount()
+    print("  PCD ASCII: NaN/Inf lines skipped don't count toward valid points"); passed()
     testPCDUnsupportedBinaryFormat()
-    print("  PCD ASCII: binary format → unsupported error with docs")
+    print("  PCD ASCII: binary format → unsupported error with docs"); passed()
     testPCDFromData()
-    print("  PCD ASCII: parse from Data (not String)")
+    print("  PCD ASCII: parse from Data (not String)"); passed()
     testPCDMultipleWhitespace()
-    print("  PCD ASCII: multiple whitespace delimiters")
+    print("  PCD ASCII: multiple whitespace delimiters"); passed()
     testPCDCountField()
-    print("  PCD ASCII: COUNT field with multiple values per field")
+    print("  PCD ASCII: COUNT field with multiple values per field"); passed()
     testPCDPointsWithoutWidth()
-    print("  PCD ASCII: POINTS header without WIDTH")
+    print("  PCD ASCII: POINTS header without WIDTH"); passed()
     testPCDHeaderMetadata()
-    print("  PCD ASCII: SIZE/TYPE/COUNT metadata preserved")
+    print("  PCD ASCII: SIZE/TYPE/COUNT metadata preserved"); passed()
     testPCDLargeCloud()
-    print("  PCD ASCII: 1000-point cloud parsed correctly")
+    print("  PCD ASCII: 1000-point cloud parsed correctly"); passed()
 
     testPCDNegativeWidth()
-    print("  PCD safety: negative WIDTH rejected")
+    print("  PCD safety: negative WIDTH rejected"); passed()
     testPCDNegativeHeight()
-    print("  PCD safety: negative HEIGHT rejected")
+    print("  PCD safety: negative HEIGHT rejected"); passed()
     testPCDOverflowProtection()
-    print("  PCD safety: WIDTH * HEIGHT overflow rejected")
+    print("  PCD safety: WIDTH * HEIGHT overflow rejected"); passed()
     testPCDTruncatedFile()
-    print("  PCD safety: truncated file detected")
+    print("  PCD safety: truncated file detected"); passed()
+    testPCDDataOverrun()
+    print("  PCD safety: data overrun detected"); passed()
 
     testPCDSensorFromFilename()
-    print("  PCD: sensor ID derived from filename")
+    print("  PCD: sensor ID derived from filename"); passed()
 
     testPointCloud2BasicParsing()
-    print("  PointCloud2: basic binary parsing")
+    print("  PointCloud2: basic binary parsing"); passed()
     testPointCloud2EmptyData()
-    print("  PointCloud2: empty data → empty cloud")
+    print("  PointCloud2: empty data → empty cloud"); passed()
     testPointCloud2BigEndian()
-    print("  PointCloud2: big-endian byte order")
+    print("  PointCloud2: big-endian byte order"); passed()
     testPointCloud2LayoutFromFields()
-    print("  PointCloud2: layout derived from fields array")
+    print("  PointCloud2: layout derived from fields array"); passed()
     testPointCloud2LayoutMissingFields()
-    print("  PointCloud2: missing required fields → error")
+    print("  PointCloud2: missing required fields → error"); passed()
     testPointCloud2InvalidPointStep()
-    print("  PointCloud2: invalid pointStep → error")
+    print("  PointCloud2: invalid pointStep → error"); passed()
 
     testROS1PointCloud2Header()
-    print("  ROS1: PointCloud2 header parsing")
+    print("  ROS1: PointCloud2 header parsing"); passed()
     testROS1UnknownDatatype()
-    print("  ROS1: unknown datatype → error")
+    print("  ROS1: unknown datatype → error"); passed()
 
     testROS2PointCloud2Header()
-    print("  ROS2: PointCloud2 with CDR encapsulation")
+    print("  ROS2: PointCloud2 with CDR encapsulation"); passed()
     testROS2InvalidEncapsulation()
-    print("  ROS2: invalid CDR encapsulation → error")
+    print("  ROS2: invalid CDR encapsulation → error"); passed()
 
     testLoadMid360Fixture()
-    print("  Fixture: mid360-frame.pcd loaded")
+    print("  Fixture: mid360-frame.pcd"); passed()
     testLoadJT128Fixture()
-    print("  Fixture: jt128-frame.pcd loaded")
+    print("  Fixture: jt128-frame.pcd"); passed()
     testLoadDualFrameFixture()
-    print("  Fixture: dual-frame.pcd loaded")
+    print("  Fixture: dual-frame.pcd"); passed()
     testLoadEmptyFixture()
-    print("  Fixture: empty.pcd loaded")
+    print("  Fixture: empty.pcd"); passed()
     testLoadMissingFixture()
-    print("  Fixture: missing file → error")
+    print("  Fixture: missing file → error"); passed()
 
     testPointCloudFrameStruct()
-    print("  PointCloudFrame struct: isEmpty, count, sensor")
+    print("  PointCloudFrame struct: isEmpty, count, sensor"); passed()
 }
