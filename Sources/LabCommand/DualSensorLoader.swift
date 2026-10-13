@@ -4,9 +4,17 @@ import LabCommandCore
 /// Loads and prepares dual-sensor point clouds for rendering.
 /// Uses PointCloudDecoder from LabCommandCore and applies RigSpec extrinsics.
 ///
-/// Search order for fixtures:
-/// 1. Bundle resources (for .app bundles)
-/// 2. Relative paths from current working directory
+/// **Transform Convention (R·p−t):**
+/// Each sensor's extrinsics define `t` = the sensor's optical center position relative to the rig origin (Mid-360 IMU).
+/// To bring points into the IMU frame: `p_imu = R * p_sensor - t`
+///
+/// **Resource Loading:**
+/// For .app bundles, `build.sh` copies fixtures to `Contents/Resources/fixtures/pointclouds/`.
+/// For development (`swift run`), relative paths from cwd are searched.
+///
+/// Search order:
+/// 1. Bundle.main.resourcePath/fixtures/pointclouds/
+/// 2. fixtures/pointclouds/, ../fixtures/pointclouds/, ../../fixtures/pointclouds/
 public enum DualSensorLoader {
     
     /// Standard fixture filenames.

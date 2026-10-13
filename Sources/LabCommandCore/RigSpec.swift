@@ -62,27 +62,39 @@ public struct SensorExtrinsics: Sendable, Equatable {
 /// Contains extrinsics, sensor metadata, and frame conventions.
 ///
 /// **Frame Convention:**
-/// - Rig frame origin: Mid-360 IMU (reference sensor)
+/// - Rig frame origin: Mid-360 IMU
 /// - Coordinate system: Right-handed, Z-up
 /// - X: Forward (direction of travel)
 /// - Y: Left
 /// - Z: Up
 ///
+/// **Transform Convention (R·p−t):**
+/// To bring sensor points into the IMU frame: `p_imu = R * p_sensor - t`
+/// where `t` is the sensor's optical center position relative to the IMU.
+///
 /// **Extrinsics Source:**
-/// - Mid-360: Reference frame (identity transform)
-/// - JT128: TODO: Real mounting offset TBD — load from rig config file
+/// - Mid-360: Livox SDK calibration — optical center offset from IMU
+/// - JT128: Placeholder (not yet calibrated)
 public enum RigSpec {
     
     // MARK: - Sensor Extrinsics
     
-    /// Mid-360 extrinsics: identity (reference frame).
-    /// The rig frame is defined at the Mid-360 IMU.
-    public static let mid360Extrinsics = SensorExtrinsics.identity
+    /// Mid-360 extrinsics: optical center offset from IMU.
+    /// Source: Livox SDK extrinsic calibration.
+    /// The Mid-360's optical center is at (11.0, 23.29, −44.12) mm from its IMU.
+    /// Transform: p_imu = p_lidar - (0.011, 0.02329, -0.04412)
+    public static let mid360Extrinsics = SensorExtrinsics(
+        rotation: nil,
+        translation: (x: 0.011, y: 0.02329, z: -0.04412)
+    )
     
-    /// JT128 extrinsics: transform from sensor frame to rig frame.
-    /// TODO: Real mounting offset TBD — identity placeholder until rig calibration is available.
-    /// Load actual values from a rig config file at runtime.
+    /// JT128 extrinsics: placeholder (not yet calibrated).
+    /// Set `isCalibrated` to false to indicate this is a placeholder.
     public static let jt128Extrinsics = SensorExtrinsics.identity
+    
+    /// Whether the JT128 extrinsics have been calibrated.
+    /// When false, the overlay may not be spatially accurate.
+    public static let jt128IsCalibrated = false
     
     /// Get extrinsics for a sensor by ID.
     public static func extrinsics(for sensor: SensorID) -> SensorExtrinsics {

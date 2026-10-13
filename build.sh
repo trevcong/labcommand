@@ -44,12 +44,14 @@ if [[ -d "${ROOT}/fixtures/api" ]]; then
   cp -R "${ROOT}/fixtures/api" "${APP}/Contents/Resources/fixtures/api"
 fi
 
-# Copy sample PCD for 3D canvas (just the small one for testing)
-if [[ -f "${ROOT}/fixtures/pointclouds/mid360-frame.pcd" ]]; then
-  echo "==> Copying sample PCD to app bundle"
-  mkdir -p "${APP}/Contents/Resources/fixtures/pointclouds"
-  cp -f "${ROOT}/fixtures/pointclouds/mid360-frame.pcd" "${APP}/Contents/Resources/fixtures/pointclouds/"
-fi
+# Copy dual-sensor PCD fixtures for 3D canvas overlay
+echo "==> Copying PCD fixtures to app bundle"
+mkdir -p "${APP}/Contents/Resources/fixtures/pointclouds"
+for pcd in mid360-frame.pcd jt128-frame.pcd; do
+  if [[ -f "${ROOT}/fixtures/pointclouds/${pcd}" ]]; then
+    cp -f "${ROOT}/fixtures/pointclouds/${pcd}" "${APP}/Contents/Resources/fixtures/pointclouds/"
+  fi
+done
 
 codesign -s - --force --deep "${APP}" 2>/dev/null || true
 

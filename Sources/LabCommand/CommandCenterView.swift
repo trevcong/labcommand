@@ -180,8 +180,9 @@ struct CommandCenterView: View {
                 .frame(width: 200)
             }
             
-            PointCloudView(
-                frame: $state.currentFrame,
+            DualPointCloudView(
+                midFrame: $state.mid360Frame,
+                jtFrame: $state.jt128Frame,
                 colorMode: state.pointCloudColorMode,
                 pointSize: 3.0
             )

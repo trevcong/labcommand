@@ -51,9 +51,16 @@ final class AppState: ObservableObject {
     @Published var diagnoseStage: RigStage?
     @Published private(set) var lastDiagnose: RigAdvice?
     
-    /// Current point cloud frame for 3D canvas.
-    @Published var currentFrame: PointCloudFrame?
-    @Published var pointCloudColorMode: PointCloudColorMode = .height
+    /// Current point cloud frames for 3D canvas (dual-sensor overlay).
+    @Published var mid360Frame: PointCloudFrame?
+    @Published var jt128Frame: PointCloudFrame?
+    @Published var pointCloudColorMode: PointCloudColorMode = .sensor
+    
+    /// Legacy single-frame accessor for compatibility.
+    var currentFrame: PointCloudFrame? {
+        get { mid360Frame }
+        set { mid360Frame = newValue }
+    }
 
     private let service: ConnectivityService
     private let rigIO: RigServiceProtocol
@@ -87,50 +94,32 @@ final class AppState: ObservableObject {
         loadSamplePointCloudIfNeeded()
     }
     
-    /// Load a sample PCD file for the 3D canvas when Spark is offline.
+    /// Load sample PCD files for the 3D canvas when Spark is offline.
+    /// Uses DualSensorLoader to find and load both sensor fixtures with extrinsics applied.
     func loadSamplePointCloudIfNeeded() {
-        guard currentFrame == nil else { return }
+        guard mid360Frame == nil && jt128Frame == nil else { return }
         
-        let fm = FileManager.default
-        let filename = "mid360-frame.pcd"
+        let frames = DualSensorLoader.loadDualSensorFixtures()
         
-        // Try app bundle first
-        if let resourceURL = Bundle.main.resourceURL {
-            let bundlePath = resourceURL
-                .appendingPathComponent("fixtures/pointclouds")
-                .appendingPathComponent(filename)
-            if fm.fileExists(atPath: bundlePath.path) {
-                if loadPCDFile(at: bundlePath.path, name: filename) { return }
+        for frame in frames {
+            switch frame.sensor {
+            case .mid360:
+                mid360Frame = frame
+                appendLog("loaded mid360-frame.pcd (\(frame.count) pts)", kind: .info)
+            case .jt128:
+                jt128Frame = frame
+                appendLog("loaded jt128-frame.pcd (\(frame.count) pts)", kind: .info)
+            case nil:
+                break
             }
         }
         
-        // Fallback to relative paths from cwd (for swift run / development)
-        let cwd = fm.currentDirectoryPath
-        let searchPaths = [
-            "fixtures/pointclouds/\(filename)",
-            "../fixtures/pointclouds/\(filename)",
-            "../../fixtures/pointclouds/\(filename)",
-        ]
-        
-        for relativePath in searchPaths {
-            let url = URL(fileURLWithPath: cwd).appendingPathComponent(relativePath)
-            if fm.fileExists(atPath: url.path) {
-                if loadPCDFile(at: url.path, name: filename) { return }
-            }
+        if mid360Frame == nil && jt128Frame == nil {
+            appendLog("no fixtures found (3D canvas will be empty)", kind: .info)
         }
         
-        appendLog("fixture not found: \(filename) (3D canvas will be empty)", kind: .info)
-    }
-    
-    private func loadPCDFile(at path: String, name: String) -> Bool {
-        do {
-            let frame = try PointCloudDecoder.loadPCD(from: path)
-            currentFrame = frame
-            appendLog("loaded fixture: \(name) (\(frame.count) pts)", kind: .info)
-            return true
-        } catch {
-            appendLog("failed to load fixture: \(error)", kind: .error)
-            return false
+        if !RigSpec.jt128IsCalibrated && jt128Frame != nil {
+            appendLog("JT128 extrinsics not calibrated — overlay may be inaccurate", kind: .info)
         }
     }
 
