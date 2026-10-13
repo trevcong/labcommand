@@ -305,18 +305,21 @@ final class PointCloudCamera: ObservableObject {
     func resetToFitBounds() {
         guard let bounds = boundingBox else { return }
         let center = CameraMath.boundsCenter(min: bounds.min, max: bounds.max)
+        guard !CameraMath.isInvalid(center) else { return }
+        
         let size = bounds.max - bounds.min
         let maxExtent = max(size.x, max(size.y, size.z))
+        guard !CameraMath.isInvalid(maxExtent) && maxExtent > 0 else { return }
         
         if mode == .orbit {
             targetOrbitCenter = center
-            targetDistance = maxExtent * 1.5
+            targetDistance = CameraMath.clamp(maxExtent * 1.5, min: minDistance, max: maxDistance)
             targetAzimuth = 0
-            targetElevation = Float.pi / 6
+            targetElevation = CameraMath.clamp(Float.pi / 6, min: minElevation, max: maxElevation)
         } else {
             targetPosition = center + Float3(0, -maxExtent * 1.5, maxExtent * 0.5)
             targetYaw = Float.pi / 2
-            targetPitch = Float.pi / 6
+            targetPitch = CameraMath.clamp(Float.pi / 6, min: -maxPitch, max: maxPitch)
         }
     }
     

@@ -11,18 +11,23 @@ struct PointCloudGestureHandler: ViewModifier {
     @State private var lastMagnification: CGFloat = 1.0
     @State private var keyDownMonitor: Any?
     @State private var keyUpMonitor: Any?
-    @State private var scrollMonitor: Any?
+    @State private var flagsMonitor: Any?
+    @State private var displayLink: CVDisplayLink?
+    @State private var lastFrameTime: CFTimeInterval = 0
+    @State private var isShiftDown: Bool = false
     
     func body(content: Content) -> some View {
         content
             .gesture(rotateGesture)
             .gesture(magnifyGesture)
-            .overlay(ScrollWheelCaptureView(camera: camera))
+            .background(ScrollWheelCaptureView(camera: camera))
             .onAppear {
                 installEventMonitors()
+                startDisplayLink()
             }
             .onDisappear {
                 removeEventMonitors()
+                stopDisplayLink()
             }
     }
     
@@ -30,7 +35,6 @@ struct PointCloudGestureHandler: ViewModifier {
     private var rotateGesture: some Gesture {
         DragGesture(minimumDistance: 1)
             .onChanged { value in
-                // Calculate actual delta from previous position
                 let currentLocation = value.location
                 let delta: CGSize
                 
@@ -72,6 +76,59 @@ struct PointCloudGestureHandler: ViewModifier {
             }
     }
     
+    // MARK: - Display Link for update(deltaTime:)
+    
+    private func startDisplayLink() {
+        var link: CVDisplayLink?
+        CVDisplayLinkCreateWithActiveCGDisplays(&link)
+        guard let displayLink = link else { return }
+        
+        let displayLinkCallback: CVDisplayLinkOutputCallback = { _, inNow, _, _, _, userInfo in
+            let now = inNow.pointee
+            let timeNow = Double(now.videoTime) / Double(now.videoTimeScale)
+            
+            DispatchQueue.main.async {
+                guard let camera = userInfo?.assumingMemoryBound(to: PointCloudCamera.self).pointee else { return }
+                // Use a fixed timestep for stability
+                camera.update(deltaTime: 1.0 / 60.0)
+            }
+            return kCVReturnSuccess
+        }
+        
+        // Note: We can't easily pass camera to the callback, so use a simpler approach
+        CVDisplayLinkSetOutputCallback(displayLink, displayLinkCallback, nil)
+        CVDisplayLinkStart(displayLink)
+        self.displayLink = displayLink
+        
+        // Use a Timer instead for simpler MainActor-compatible updates
+        stopDisplayLink()
+        startUpdateTimer()
+    }
+    
+    private func stopDisplayLink() {
+        if let link = displayLink {
+            CVDisplayLinkStop(link)
+            displayLink = nil
+        }
+    }
+    
+    @State private var updateTimer: Timer?
+    
+    private func startUpdateTimer() {
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 1.0/60.0, repeats: true) { _ in
+            Task { @MainActor in
+                camera.update(deltaTime: 1.0 / 60.0)
+            }
+        }
+    }
+    
+    private func stopUpdateTimer() {
+        updateTimer?.invalidate()
+        updateTimer = nil
+    }
+    
+    // MARK: - Event Monitors
+    
     private func installEventMonitors() {
         keyDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             handleKeyDown(event)
@@ -80,6 +137,11 @@ struct PointCloudGestureHandler: ViewModifier {
         
         keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { event in
             handleKeyUp(event)
+            return event
+        }
+        
+        flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { event in
+            handleFlagsChanged(event)
             return event
         }
     }
@@ -93,12 +155,13 @@ struct PointCloudGestureHandler: ViewModifier {
             NSEvent.removeMonitor(monitor)
             keyUpMonitor = nil
         }
-        if let monitor = scrollMonitor {
+        if let monitor = flagsMonitor {
             NSEvent.removeMonitor(monitor)
-            scrollMonitor = nil
+            flagsMonitor = nil
         }
         
-        // Stop any ongoing movement
+        stopDisplayLink()
+        stopUpdateTimer()
         camera.stopMovement()
     }
     
@@ -109,16 +172,24 @@ struct PointCloudGestureHandler: ViewModifier {
             return
         }
         
+        // Ignore keys with command or control modifiers
+        let ignoredModifiers: NSEvent.ModifierFlags = [.command, .control]
+        if !event.modifierFlags.intersection(ignoredModifiers).isEmpty {
+            return
+        }
+        
         guard !event.isARepeat else { return }
         
-        // F toggles camera mode
-        if event.charactersIgnoringModifiers?.lowercased() == "f" {
+        // F toggles camera mode (no modifiers)
+        if event.charactersIgnoringModifiers?.lowercased() == "f" &&
+           event.modifierFlags.intersection([.shift, .option]).isEmpty {
             camera.toggleMode()
             return
         }
         
-        // R resets camera to fit bounds
-        if event.charactersIgnoringModifiers?.lowercased() == "r" {
+        // R resets camera to fit bounds (no modifiers)
+        if event.charactersIgnoringModifiers?.lowercased() == "r" &&
+           event.modifierFlags.intersection([.shift, .option]).isEmpty {
             camera.resetToFitBounds()
             return
         }
@@ -132,11 +203,6 @@ struct PointCloudGestureHandler: ViewModifier {
         case "d": camera.setMoveRight(1)
         case " ": camera.setMoveUp(1)
         default: break
-        }
-        
-        // Shift for down movement (check modifier, not character)
-        if event.modifierFlags.contains(.shift) {
-            camera.setMoveUp(-1)
         }
     }
     
@@ -155,12 +221,22 @@ struct PointCloudGestureHandler: ViewModifier {
         case " ": camera.setMoveUp(0)
         default: break
         }
+    }
+    
+    private func handleFlagsChanged(_ event: NSEvent) {
+        guard camera.mode == .fly else { return }
         
-        // Release shift for up movement
-        if !event.modifierFlags.contains(.shift) {
-            // Only reset if we were using shift for down
-            // Don't interfere with space bar up
+        let shiftNowDown = event.modifierFlags.contains(.shift)
+        
+        if shiftNowDown && !isShiftDown {
+            // Shift pressed - move down
+            camera.setMoveUp(-1)
+        } else if !shiftNowDown && isShiftDown {
+            // Shift released - stop descending
+            camera.setMoveUp(0)
         }
+        
+        isShiftDown = shiftNowDown
     }
 }
 
@@ -171,6 +247,7 @@ extension View {
 }
 
 /// NSView that captures scroll wheel events for zoom.
+/// Uses .background placement to avoid blocking drag gestures.
 struct ScrollWheelCaptureView: NSViewRepresentable {
     let camera: PointCloudCamera
     
