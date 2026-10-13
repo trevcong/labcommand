@@ -1,35 +1,13 @@
 import Foundation
 import MetalKit
 import simd
-
-/// A point cloud loaded from PCD or PointCloud2 data.
-/// Expected to be provided by PointCloudDecoder from LabCommandCore.
-public struct PointCloud: Equatable, Identifiable {
-    public let id: UUID
-    public var positions: [SIMD3<Float>]
-    public var intensities: [Float]
-    public var sensorID: UInt32?
-    
-    public init(positions: [SIMD3<Float>], intensities: [Float], sensorID: UInt32? = nil) {
-        self.id = UUID()
-        self.positions = positions
-        self.intensities = intensities
-        self.sensorID = sensorID
-    }
-    
-    public var pointCount: Int { positions.count }
-    public var isEmpty: Bool { positions.isEmpty }
-    
-    public static func == (lhs: PointCloud, rhs: PointCloud) -> Bool {
-        lhs.id == rhs.id
-    }
-}
+import LabCommandCore
 
 /// Color modes for point cloud visualization.
 public enum PointCloudColorMode: Int, CaseIterable, Sendable {
-    case intensity = 0  // Grayscale based on intensity
-    case height = 1     // Rainbow gradient based on Z
-    case sensor = 2     // Mid-360 = cyan, JT128 = magenta
+    case intensity = 0
+    case height = 1
+    case sensor = 2
     
     public var label: String {
         switch self {
@@ -41,21 +19,27 @@ public enum PointCloudColorMode: Int, CaseIterable, Sendable {
 }
 
 /// Metal renderer for point cloud visualization.
-/// Renders up to millions of points at 60fps using instanced geometry.
+/// Renders millions of points at 60fps using instanced geometry.
+/// Z-up coordinate system. Metal depth range [0, 1].
 @MainActor
 public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     
     // MARK: - Metal State
     
-    private let device: MTLDevice
-    private let commandQueue: MTLCommandQueue
+    public let device: MTLDevice?
+    private let commandQueue: MTLCommandQueue?
     private var pipelineState: MTLRenderPipelineState?
     private var depthState: MTLDepthStencilState?
+    
+    /// True when Metal initialized successfully.
+    public var isReady: Bool { pipelineState != nil }
     
     // MARK: - Buffers
     
     private var vertexBuffer: MTLBuffer?
-    private var uniformBuffer: MTLBuffer?
+    private var uniformBuffers: [MTLBuffer] = []
+    private var uniformBufferIndex: Int = 0
+    private static let uniformBufferCount = 3
     private var pointCount: Int = 0
     
     // MARK: - Uniforms
@@ -92,23 +76,16 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         var position: SIMD3<Float>
         var intensity: Float
         var sensorID: UInt32
-        var _padding: UInt32 = 0  // Align to 32 bytes
+        var _padding: UInt32 = 0
     }
     
     // MARK: - Init
     
     public override init() {
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            fatalError("Metal is not supported on this device")
-        }
-        self.device = device
+        self.device = MTLCreateSystemDefaultDevice()
+        self.commandQueue = device?.makeCommandQueue()
         
-        guard let queue = device.makeCommandQueue() else {
-            fatalError("Failed to create Metal command queue")
-        }
-        self.commandQueue = queue
-        
-        // Default camera: look at origin from a reasonable distance
+        // Default camera: Z-up, look at origin from Y-negative
         let eye = SIMD3<Float>(0, -5, 3)
         let center = SIMD3<Float>(0, 0, 0)
         let up = SIMD3<Float>(0, 0, 1)
@@ -116,38 +93,43 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         
         super.init()
         
+        guard device != nil else { return }
+        
         buildPipeline()
         buildDepthState()
-        buildUniformBuffer()
+        buildUniformBuffers()
     }
     
     // MARK: - Pipeline Setup
     
     private func buildPipeline() {
-        guard let library = device.makeDefaultLibrary() else {
-            print("PointCloudRenderer: Failed to create default Metal library")
+        guard let device = device else { return }
+        
+        let library: MTLLibrary?
+        do {
+            library = try device.makeLibrary(source: Self.shaderSource, options: nil)
+        } catch {
+            print("PointCloudRenderer: Shader compile error: \(error)")
             return
         }
         
-        guard let vertexFunction = library.makeFunction(name: "pointVertex"),
-              let fragmentFunction = library.makeFunction(name: "pointFragment") else {
+        guard let lib = library,
+              let vertexFunction = lib.makeFunction(name: "pointVertex"),
+              let fragmentFunction = lib.makeFunction(name: "pointFragment") else {
             print("PointCloudRenderer: Failed to find shader functions")
             return
         }
         
         let vertexDescriptor = MTLVertexDescriptor()
         
-        // Position (float3)
         vertexDescriptor.attributes[0].format = .float3
         vertexDescriptor.attributes[0].offset = 0
         vertexDescriptor.attributes[0].bufferIndex = 0
         
-        // Intensity (float)
         vertexDescriptor.attributes[1].format = .float
         vertexDescriptor.attributes[1].offset = MemoryLayout<SIMD3<Float>>.stride
         vertexDescriptor.attributes[1].bufferIndex = 0
         
-        // SensorID (uint)
         vertexDescriptor.attributes[2].format = .uint
         vertexDescriptor.attributes[2].offset = MemoryLayout<SIMD3<Float>>.stride + MemoryLayout<Float>.stride
         vertexDescriptor.attributes[2].bufferIndex = 0
@@ -161,11 +143,7 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         pipelineDescriptor.fragmentFunction = fragmentFunction
         pipelineDescriptor.vertexDescriptor = vertexDescriptor
         pipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-        pipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
-        pipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        pipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        pipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
-        pipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        pipelineDescriptor.colorAttachments[0].isBlendingEnabled = false
         pipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
         
         do {
@@ -176,83 +154,101 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     }
     
     private func buildDepthState() {
+        guard let device = device else { return }
         let depthDescriptor = MTLDepthStencilDescriptor()
         depthDescriptor.depthCompareFunction = .less
         depthDescriptor.isDepthWriteEnabled = true
         depthState = device.makeDepthStencilState(descriptor: depthDescriptor)
     }
     
-    private func buildUniformBuffer() {
-        uniformBuffer = device.makeBuffer(
-            length: MemoryLayout<Uniforms>.stride,
-            options: .storageModeShared
-        )
+    private func buildUniformBuffers() {
+        guard let device = device else { return }
+        uniformBuffers = (0..<Self.uniformBufferCount).compactMap { _ in
+            device.makeBuffer(length: MemoryLayout<Uniforms>.stride, options: .storageModeShared)
+        }
     }
     
     // MARK: - Data Loading
     
-    /// Load point cloud data into GPU buffers.
-    public func load(points: [SIMD3<Float>], intensities: [Float], sensorID: UInt32?) {
-        guard !points.isEmpty else {
+    /// Load a PointCloudFrame from LabCommandCore.
+    public func load(_ frame: PointCloudFrame) {
+        guard let device = device, !frame.isEmpty else {
             vertexBuffer = nil
             pointCount = 0
             return
         }
         
-        let sid = sensorID ?? 0
+        let sensorIndex: UInt32 = {
+            switch frame.sensor {
+            case .mid360: return 0
+            case .jt128: return 1
+            case nil: return 0
+            }
+        }()
         
-        // Calculate height bounds for rainbow coloring
         var minZ: Float = .greatestFiniteMagnitude
         var maxZ: Float = -.greatestFiniteMagnitude
-        for p in points {
+        
+        var vertices: [PointVertex] = []
+        vertices.reserveCapacity(frame.count)
+        
+        for i in 0..<frame.count {
+            let p = frame.positions[i]
+            let intensity = i < frame.intensities.count ? frame.intensities[i] : 0.5
+            
+            vertices.append(PointVertex(
+                position: SIMD3<Float>(p.x, p.y, p.z),
+                intensity: intensity,
+                sensorID: sensorIndex
+            ))
+            
             minZ = min(minZ, p.z)
             maxZ = max(maxZ, p.z)
         }
+        
         heightMin = minZ
-        heightMax = maxZ
-        
-        // Build vertex data
-        var vertices: [PointVertex] = []
-        vertices.reserveCapacity(points.count)
-        
-        for i in 0..<points.count {
-            let intensity = i < intensities.count ? intensities[i] : 0.5
-            vertices.append(PointVertex(
-                position: points[i],
-                intensity: intensity,
-                sensorID: sid
-            ))
-        }
+        heightMax = max(maxZ, minZ + 0.001)
         
         vertexBuffer = device.makeBuffer(
             bytes: vertices,
             length: vertices.count * MemoryLayout<PointVertex>.stride,
             options: .storageModeShared
         )
-        pointCount = points.count
+        pointCount = frame.count
         needsUniformUpdate = true
     }
     
-    /// Load a PointCloud struct directly.
-    public func load(_ cloud: PointCloud) {
-        load(points: cloud.positions, intensities: cloud.intensities, sensorID: cloud.sensorID)
-    }
-    
-    /// Load multiple point clouds with different sensor IDs.
-    public func load(clouds: [(cloud: PointCloud, sensorID: UInt32)]) {
+    /// Load multiple frames with sensor coloring.
+    public func load(frames: [PointCloudFrame]) {
+        guard let device = device else {
+            vertexBuffer = nil
+            pointCount = 0
+            return
+        }
+        
         var allVertices: [PointVertex] = []
         var minZ: Float = .greatestFiniteMagnitude
         var maxZ: Float = -.greatestFiniteMagnitude
         
-        for (cloud, sid) in clouds {
-            for i in 0..<cloud.positions.count {
-                let p = cloud.positions[i]
-                let intensity = i < cloud.intensities.count ? cloud.intensities[i] : 0.5
+        for frame in frames {
+            let sensorIndex: UInt32 = {
+                switch frame.sensor {
+                case .mid360: return 0
+                case .jt128: return 1
+                case nil: return 0
+                }
+            }()
+            
+            for i in 0..<frame.count {
+                let p = frame.positions[i]
+                let intensity = i < frame.intensities.count ? frame.intensities[i] : 0.5
+                
                 allVertices.append(PointVertex(
-                    position: p,
+                    position: SIMD3<Float>(p.x, p.y, p.z),
                     intensity: intensity,
-                    sensorID: sid
+                    sensorID: sensorIndex
                 ))
+                
                 minZ = min(minZ, p.z)
                 maxZ = max(maxZ, p.z)
             }
@@ -265,7 +261,7 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         }
         
         heightMin = minZ
-        heightMax = maxZ
+        heightMax = max(maxZ, minZ + 0.001)
         
         vertexBuffer = device.makeBuffer(
             bytes: allVertices,
@@ -278,13 +274,11 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     
     // MARK: - Camera Control
     
-    /// Set the view matrix for camera positioning.
     public func setViewMatrix(_ matrix: simd_float4x4) {
         viewMatrix = matrix
         needsUniformUpdate = true
     }
     
-    /// Reset camera to default position.
     public func resetCamera() {
         let eye = SIMD3<Float>(0, -5, 3)
         let center = SIMD3<Float>(0, 0, 0)
@@ -303,17 +297,21 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     
     public func draw(in view: MTKView) {
         guard let pipelineState = pipelineState,
+              let commandQueue = commandQueue,
               let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor,
               let commandBuffer = commandQueue.makeCommandBuffer(),
               let vertexBuffer = vertexBuffer,
-              pointCount > 0 else {
+              pointCount > 0,
+              !uniformBuffers.isEmpty else {
             return
         }
         
-        // Update uniforms if needed
+        uniformBufferIndex = (uniformBufferIndex + 1) % Self.uniformBufferCount
+        let uniformBuffer = uniformBuffers[uniformBufferIndex]
+        
         if needsUniformUpdate {
-            updateUniforms()
+            updateUniforms(to: uniformBuffer)
             needsUniformUpdate = false
         }
         
@@ -338,9 +336,7 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         commandBuffer.commit()
     }
     
-    private func updateUniforms() {
-        guard let uniformBuffer = uniformBuffer else { return }
-        
+    private func updateUniforms(to buffer: MTLBuffer) {
         let mvp = projectionMatrix * viewMatrix
         var uniforms = Uniforms(
             modelViewProjection: mvp,
@@ -349,11 +345,10 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             heightMin: heightMin,
             heightMax: heightMax
         )
-        
-        memcpy(uniformBuffer.contents(), &uniforms, MemoryLayout<Uniforms>.stride)
+        memcpy(buffer.contents(), &uniforms, MemoryLayout<Uniforms>.stride)
     }
     
-    // MARK: - Matrix Helpers
+    // MARK: - Matrix Helpers (Z-up, Metal depth [0,1])
     
     private static func lookAt(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> simd_float4x4 {
         let z = normalize(eye - center)
@@ -370,12 +365,15 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         )
     }
     
+    /// Perspective projection with Metal depth range [0, 1].
     private static func perspective(fovY: Float, aspect: Float, near: Float, far: Float) -> simd_float4x4 {
         let yScale = 1 / tan(fovY * 0.5)
         let xScale = yScale / aspect
         let zRange = far - near
-        let zScale = -(far + near) / zRange
-        let wzScale = -2 * far * near / zRange
+        
+        // Metal NDC: depth in [0, 1]
+        let zScale = -far / zRange
+        let wzScale = -far * near / zRange
         
         return simd_float4x4(
             SIMD4<Float>(xScale, 0, 0, 0),
@@ -384,4 +382,99 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             SIMD4<Float>(0, 0, wzScale, 0)
         )
     }
+    
+    // MARK: - Inline Shader Source
+    
+    private static let shaderSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    
+    struct PointVertex {
+        float3 position [[attribute(0)]];
+        float intensity [[attribute(1)]];
+        uint sensorID [[attribute(2)]];
+    };
+    
+    struct VertexOut {
+        float4 position [[position]];
+        float pointSize [[point_size]];
+        float4 color;
+    };
+    
+    struct Uniforms {
+        float4x4 modelViewProjection;
+        float pointSize;
+        uint colorMode;
+        float heightMin;
+        float heightMax;
+    };
+    
+    float3 rainbowGradient(float t) {
+        t = saturate(t);
+        float3 c;
+        if (t < 0.25) {
+            c = mix(float3(0.0, 0.0, 1.0), float3(0.0, 1.0, 1.0), t * 4.0);
+        } else if (t < 0.5) {
+            c = mix(float3(0.0, 1.0, 1.0), float3(0.0, 1.0, 0.0), (t - 0.25) * 4.0);
+        } else if (t < 0.75) {
+            c = mix(float3(0.0, 1.0, 0.0), float3(1.0, 1.0, 0.0), (t - 0.5) * 4.0);
+        } else {
+            c = mix(float3(1.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), (t - 0.75) * 4.0);
+        }
+        return c;
+    }
+    
+    vertex VertexOut pointVertex(
+        PointVertex in [[stage_in]],
+        constant Uniforms& uniforms [[buffer(1)]]
+    ) {
+        VertexOut out;
+        out.position = uniforms.modelViewProjection * float4(in.position, 1.0);
+        out.pointSize = uniforms.pointSize;
+        
+        float3 color;
+        switch (uniforms.colorMode) {
+            case 0: {
+                float i = saturate(in.intensity);
+                color = float3(i, i, i);
+                break;
+            }
+            case 1: {
+                float heightRange = uniforms.heightMax - uniforms.heightMin;
+                float normalizedHeight = (heightRange > 0.001)
+                    ? (in.position.z - uniforms.heightMin) / heightRange
+                    : 0.5;
+                color = rainbowGradient(normalizedHeight);
+                break;
+            }
+            case 2: {
+                if (in.sensorID == 0) {
+                    color = float3(0.0, 0.85, 0.95);
+                } else {
+                    color = float3(0.9, 0.25, 0.8);
+                }
+                break;
+            }
+            default:
+                color = float3(1.0, 1.0, 1.0);
+        }
+        
+        out.color = float4(color, 1.0);
+        return out;
+    }
+    
+    fragment float4 pointFragment(
+        VertexOut in [[stage_in]],
+        float2 pointCoord [[point_coord]]
+    ) {
+        float2 centered = pointCoord - 0.5;
+        float dist = length(centered);
+        
+        if (dist > 0.5) {
+            discard_fragment();
+        }
+        
+        return in.color;
+    }
+    """
 }
