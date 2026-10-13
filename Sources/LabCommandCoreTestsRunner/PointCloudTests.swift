@@ -114,7 +114,7 @@ func testPCDMid360FrameValid() {
     
     // Verify we have actual data lines
     let lines = content.components(separatedBy: .newlines)
-    let dataLines = lines.dropFirst(while: { !$0.hasPrefix("DATA") }).dropFirst()
+    let dataLines = lines.drop(while: { !$0.hasPrefix("DATA") }).dropFirst()
     let nonEmptyDataLines = dataLines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
     expect(nonEmptyDataLines.count == 50000, "mid360 PCD has 50000 data lines, got \(nonEmptyDataLines.count)")
 }
@@ -210,15 +210,15 @@ func testPCDDataLinesParseable() {
 func runPointCloudTests() {
     print("Running point cloud fixture tests…")
     testPCDFixturesExist()
-    print("  point cloud: all PCD fixture files exist")
+    print("  point cloud: all PCD fixture files exist"); passed()
     testPCDMid360FrameValid()
-    print("  point cloud: mid360-frame.pcd has valid header, 50k points, ascii format")
+    print("  point cloud: mid360-frame.pcd has valid header, 50k points, ascii format"); passed()
     testPCDJT128FrameValid()
-    print("  point cloud: jt128-frame.pcd has valid header, 50k points")
+    print("  point cloud: jt128-frame.pcd has valid header, 50k points"); passed()
     testPCDDualFrameValid()
-    print("  point cloud: dual-frame.pcd has 100k points (both sensors)")
+    print("  point cloud: dual-frame.pcd has 100k points (both sensors)"); passed()
     testPCDEmptyFrameValid()
-    print("  point cloud: empty.pcd has 0 points")
+    print("  point cloud: empty.pcd has 0 points"); passed()
     testPCDDataLinesParseable()
-    print("  point cloud: PCD data lines are valid x y z intensity floats")
+    print("  point cloud: PCD data lines are valid x y z intensity floats"); passed()
 }

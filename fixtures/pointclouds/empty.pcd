@@ -1,3 +1,11 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:bc957d1b4054ea12a96d51c0047544be7a6ca0bbd085a5d6d175724402ca7965
-size 167
+# .PCD v0.7 - Point Cloud Data
+VERSION 0.7
+FIELDS x y z intensity
+SIZE 4 4 4 4
+TYPE F F F F
+COUNT 1 1 1 1
+WIDTH 0
+HEIGHT 1
+VIEWPOINT 0 0 0 1 0 0 0
+POINTS 0
+DATA ascii

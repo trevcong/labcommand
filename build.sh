@@ -28,6 +28,12 @@ cp -f "${ROOT}/Info.plist" "${APP}/Contents/Info.plist"
 cp -f "${ROOT}/scripts/spark-capture.sh" "${APP}/Contents/Resources/spark-capture.sh"
 chmod +x "${APP}/Contents/Resources/spark-capture.sh"
 
+# Copy fixtures for mock mode
+if [[ -d "${ROOT}/fixtures" ]]; then
+  echo "==> Copying fixtures to app bundle"
+  cp -R "${ROOT}/fixtures" "${APP}/Contents/Resources/fixtures"
+fi
+
 codesign -s - --force --deep "${APP}" 2>/dev/null || true
 
 mkdir -p "${INSTALL_DIR}"

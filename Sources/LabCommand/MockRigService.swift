@@ -19,7 +19,6 @@ public final class MockRigService: @unchecked Sendable {
     
     private let fixtureName: String
     private let fixtureJSON: String?
-    private var cachedSnapshot: RigSnapshot?
     
     public init(fixture: String) {
         self.fixtureName = fixture
