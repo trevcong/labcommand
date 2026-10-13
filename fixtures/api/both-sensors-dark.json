@@ -1,0 +1,53 @@
+{
+  "ts": 1787961000.0,
+  "mid360_ping": false,
+  "jt128_ping": false,
+  "jt128_ptc": false,
+  "containers": {
+    "lidar-dual": "running",
+    "ptp-master": "running",
+    "lidar-watchdog": "running",
+    "lidar-center": "running"
+  },
+  "pipeline": {
+    "nic": {
+      "speed_mbps": 1000,
+      "mtu": 1500,
+      "carrier": true,
+      "duplex": "full",
+      "rmem_max": 67108864
+    },
+    "counters": {
+      "udp_in_errors": 0,
+      "udp_rcvbuf_errors": 0,
+      "rx_mac_missed": 1034144,
+      "udp_in_errors_delta": 0,
+      "udp_rcvbuf_errors_delta": 0,
+      "rx_mac_missed_delta": 0
+    },
+    "sockets": {
+      "udp_bound": {"2368": true, "56401": true, "56301": true},
+      "established": {"8765": 0, "8766": 1}
+    },
+    "ptp_role": "grandmaster"
+  },
+  "rates": {
+    "livox_pts": 0.0,
+    "jt_pts": 0.0,
+    "livox_imu": 0.0,
+    "jt_imu": 0.0
+  },
+  "offsets": {
+    "livox_ms": null,
+    "jt_ms": null
+  },
+  "recording": {
+    "active": false,
+    "session": null,
+    "size_gb": 0
+  },
+  "disk_free_gb": 2400,
+  "load1": 0.09,
+  "mem_pct": 2.5,
+  "events": []
+}

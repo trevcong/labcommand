@@ -143,6 +143,8 @@ func testMetricsLoaderMissingFilesStayEmpty() {
 }
 
 print("Running LabCommandCore tests…")
+runFixtureTests()
+runPointCloudTests()
 testSingleCheckMapping()
 testCombineWorstWins()
 testSnapshotConnected()
@@ -226,4 +228,4 @@ testAuditDegradationsGoAmberOrRed()
 print("  pipeline audit: parked is pending not failing; loss/link/ptp degradations surface")
 testSpecDossiersCarryTheResearch()
 print("  spec dossiers: manual figures + cautions pinned")
-print("PASS LabCommandCoreTestsRunner (61 groups)")
+print("PASS LabCommandCoreTestsRunner (76 groups)")
