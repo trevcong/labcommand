@@ -28,11 +28,18 @@ cp -f "${ROOT}/Info.plist" "${APP}/Contents/Info.plist"
 cp -f "${ROOT}/scripts/spark-capture.sh" "${APP}/Contents/Resources/spark-capture.sh"
 chmod +x "${APP}/Contents/Resources/spark-capture.sh"
 
-# Copy API fixtures for mock mode (pointclouds are too large for bundle)
+# Copy API fixtures for mock mode
 if [[ -d "${ROOT}/fixtures/api" ]]; then
   echo "==> Copying API fixtures to app bundle"
   mkdir -p "${APP}/Contents/Resources/fixtures"
   cp -R "${ROOT}/fixtures/api" "${APP}/Contents/Resources/fixtures/api"
+fi
+
+# Copy sample PCD for 3D canvas (just the small one for testing)
+if [[ -f "${ROOT}/fixtures/pointclouds/mid360-frame.pcd" ]]; then
+  echo "==> Copying sample PCD to app bundle"
+  mkdir -p "${APP}/Contents/Resources/fixtures/pointclouds"
+  cp -f "${ROOT}/fixtures/pointclouds/mid360-frame.pcd" "${APP}/Contents/Resources/fixtures/pointclouds/"
 fi
 
 codesign -s - --force --deep "${APP}" 2>/dev/null || true

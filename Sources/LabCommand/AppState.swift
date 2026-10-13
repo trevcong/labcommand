@@ -92,25 +92,45 @@ final class AppState: ObservableObject {
         guard currentFrame == nil else { return }
         
         let fm = FileManager.default
+        let filename = "mid360-frame.pcd"
+        
+        // Try app bundle first
+        if let resourceURL = Bundle.main.resourceURL {
+            let bundlePath = resourceURL
+                .appendingPathComponent("fixtures/pointclouds")
+                .appendingPathComponent(filename)
+            if fm.fileExists(atPath: bundlePath.path) {
+                if loadPCDFile(at: bundlePath.path, name: filename) { return }
+            }
+        }
+        
+        // Fallback to relative paths from cwd (for swift run / development)
+        let cwd = fm.currentDirectoryPath
         let searchPaths = [
-            "fixtures/pointclouds/mid360-frame.pcd",
-            "../fixtures/pointclouds/mid360-frame.pcd",
-            "../../fixtures/pointclouds/mid360-frame.pcd",
+            "fixtures/pointclouds/\(filename)",
+            "../fixtures/pointclouds/\(filename)",
+            "../../fixtures/pointclouds/\(filename)",
         ]
         
-        let cwd = fm.currentDirectoryPath
         for relativePath in searchPaths {
             let url = URL(fileURLWithPath: cwd).appendingPathComponent(relativePath)
             if fm.fileExists(atPath: url.path) {
-                do {
-                    let frame = try PointCloudDecoder.loadPCD(from: url.path)
-                    currentFrame = frame
-                    appendLog("loaded fixture: mid360-frame.pcd (\(frame.count) pts)", kind: .info)
-                    return
-                } catch {
-                    appendLog("failed to load fixture: \(error)", kind: .error)
-                }
+                if loadPCDFile(at: url.path, name: filename) { return }
             }
+        }
+        
+        appendLog("fixture not found: \(filename) (3D canvas will be empty)", kind: .info)
+    }
+    
+    private func loadPCDFile(at path: String, name: String) -> Bool {
+        do {
+            let frame = try PointCloudDecoder.loadPCD(from: path)
+            currentFrame = frame
+            appendLog("loaded fixture: \(name) (\(frame.count) pts)", kind: .info)
+            return true
+        } catch {
+            appendLog("failed to load fixture: \(error)", kind: .error)
+            return false
         }
     }
 
