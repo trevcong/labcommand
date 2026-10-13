@@ -134,6 +134,27 @@ func testGatesJTControls() {
     expect(!RigGate.canStandbyJT(parked).0, "standby refused when unpowered")
 }
 
+func testGatesArmAtLock() {
+    guard let live = RigStatusDecoder.parse(json: liveJSON, viewTunnelUp: true) else {
+        expect(false, "parses")
+        return
+    }
+    let off = RigSnapshot.offline(reason: "Spark unreachable")
+    expect(!RigGate.canArmAtLock(off).0, "arm blocked offline")
+    expect(RigGate.canArmAtLock(off).1?.contains("Spark") == true, "reason names Spark")
+    expect(RigGate.canArmAtLock(live).0, "arm allowed when live and idle")
+    
+    let recordingJSON = liveJSON.replacingOccurrences(
+        of: "\"recording\": {\"active\": false, \"session\": null, \"size_gb\": 0}",
+        with: "\"recording\": {\"active\": true, \"session\": \"take1\", \"size_gb\": 1.0}"
+    )
+    guard let recording = RigStatusDecoder.parse(json: recordingJSON, viewTunnelUp: true) else {
+        expect(false, "recording JSON parses")
+        return
+    }
+    expect(!RigGate.canArmAtLock(recording).0, "arm blocked while recording")
+}
+
 func testRecordingHealthAndStop() {
     let json = liveJSON.replacingOccurrences(
         of: "\"recording\": {\"active\": false, \"session\": null, \"size_gb\": 0}",
@@ -358,4 +379,55 @@ func testSpecDossiersCarryTheResearch() {
     let jtIP = SensorID.jt128.ip
     expect(midIP == "192.168.1.135", "mid ip")
     expect(jtIP == "192.168.118.201", "jt ip")
+}
+
+// MARK: - StatusAggregation tests
+
+func testStatusAggregationSparkPreferSuccess() {
+    let sshOk = CheckOutcome(id: "spark_ssh", kind: .success, detail: "ssh connected")
+    let pingFail = CheckOutcome(id: "spark_ping", kind: .failure, detail: "timeout")
+    let checks = [sshOk, pingFail]
+    let status = StatusAggregation.statusPreferSuccess(from: checks, matching: StatusAggregation.sparkCheckIDs)
+    expect(status == .connected, "SSH success wins over ping failure for Spark")
+}
+
+func testStatusAggregationTailscaleCombine() {
+    let tailOk = CheckOutcome(id: "tailscale", kind: .success, detail: "up")
+    let tailDown = CheckOutcome(id: "tailscale", kind: .failure, detail: "down")
+    
+    let statusOk = StatusAggregation.statusFrom(checks: [tailOk], matching: StatusAggregation.tailscaleCheckIDs)
+    expect(statusOk == .connected, "single tailscale success → connected")
+    
+    let statusDown = StatusAggregation.statusFrom(checks: [tailDown], matching: StatusAggregation.tailscaleCheckIDs)
+    expect(statusDown == .disconnected, "single tailscale failure → disconnected")
+}
+
+func testStatusAggregationEmptyReturnsUnknown() {
+    let status = StatusAggregation.statusFrom(checks: [], matching: StatusAggregation.sparkCheckIDs)
+    expect(status == .unknown, "empty checks → unknown")
+    
+    let unrelated = CheckOutcome(id: "other_check", kind: .success, detail: "ok")
+    let noMatch = StatusAggregation.statusFrom(checks: [unrelated], matching: StatusAggregation.sparkCheckIDs)
+    expect(noMatch == .unknown, "no matching IDs → unknown")
+}
+
+func testStatusAggregationBuildSnapshotSummary() {
+    let sparkOk = CheckOutcome(id: "spark_ssh", kind: .success, detail: "reachable")
+    let tailOk = CheckOutcome(id: "tailscale", kind: .success, detail: "up")
+    let snapshot = StatusAggregation.buildSnapshot(from: [sparkOk, tailOk])
+    expect(snapshot.overall == .connected, "connected summary when spark reachable")
+    expect(snapshot.summaryLine.contains("healthy"), "summary says healthy: \(snapshot.summaryLine)")
+    
+    let sparkDown = CheckOutcome(id: "spark_ssh", kind: .failure, detail: "timeout")
+    let downSnap = StatusAggregation.buildSnapshot(from: [sparkDown, tailOk])
+    expect(downSnap.overall == .disconnected, "disconnected when spark down")
+    expect(downSnap.summaryLine.contains("down"), "summary says down: \(downSnap.summaryLine)")
+}
+
+func testStatusAggregationCombineWorstWins() {
+    expect(StatusAggregation.combine([.connected, .connected]) == .connected, "all connected → connected")
+    expect(StatusAggregation.combine([.connected, .unknown]) == .unknown, "unknown degrades connected")
+    expect(StatusAggregation.combine([.connected, .disconnected]) == .disconnected, "disconnected beats connected")
+    expect(StatusAggregation.combine([.disconnected, .error]) == .error, "error beats disconnected")
+    expect(StatusAggregation.combine([]) == .unknown, "empty → unknown")
 }
