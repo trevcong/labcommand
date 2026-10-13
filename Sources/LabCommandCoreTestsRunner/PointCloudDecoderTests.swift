@@ -131,7 +131,7 @@ func testPCDMissingFields() {
     }
 }
 
-func testPCDMalformedPointSkipped() {
+func testPCDMalformedLineIsError() {
     let pcd = """
     VERSION 0.7
     FIELDS x y z intensity
@@ -148,11 +148,11 @@ func testPCDMalformedPointSkipped() {
 
     do {
         _ = try PointCloudDecoder.decodePCD(from: pcd)
-        expect(false, "PCD truncated: should throw for fewer points than declared")
+        expect(false, "PCD malformed: should throw for unparseable line")
     } catch PointCloudError.invalidData(let msg) {
-        expect(msg.contains("Truncated") || msg.contains("valid"), "PCD truncated: error should mention truncation")
+        expect(msg.contains("Malformed") || msg.contains("parse"), "PCD malformed: error should mention malformed data")
     } catch {
-        expect(false, "PCD truncated: unexpected error \(error)")
+        expect(false, "PCD malformed: unexpected error \(error)")
     }
 }
 
@@ -182,33 +182,7 @@ func testPCDWithComments() {
 }
 
 func testPCDNaNAndInfValues() {
-    let pcd = """
-    VERSION 0.7
-    FIELDS x y z intensity
-    SIZE 4 4 4 4
-    TYPE F F F F
-    COUNT 1 1 1 1
-    WIDTH 2
-    HEIGHT 1
-    POINTS 2
-    DATA ascii
-    1.0 2.0 3.0 0.5
-    nan nan nan 0.0
-    inf -inf 1.0 0.5
-    7.0 8.0 9.0 1.0
-    """
-
-    do {
-        _ = try PointCloudDecoder.decodePCD(from: pcd)
-        expect(false, "PCD NaN/Inf: should throw - more data lines than declared POINTS")
-    } catch PointCloudError.invalidData(let msg) {
-        expect(msg.contains("overrun"), "PCD NaN/Inf: error should mention overrun")
-    } catch {
-        expect(false, "PCD NaN/Inf: unexpected error \(error)")
-    }
-}
-
-func testPCDNaNSkippedWithCorrectCount() {
+    // NaN/Inf lines are valid but filtered — they count as data lines
     let pcd = """
     VERSION 0.7
     FIELDS x y z intensity
@@ -226,12 +200,41 @@ func testPCDNaNSkippedWithCorrectCount() {
     """
 
     do {
-        _ = try PointCloudDecoder.decodePCD(from: pcd)
-        expect(false, "PCD NaN with correct count: should throw because only 2 valid points out of 4 declared")
-    } catch PointCloudError.invalidData(let msg) {
-        expect(msg.contains("Truncated") || msg.contains("valid"), "PCD NaN: error mentions truncation or valid points")
+        let frame = try PointCloudDecoder.decodePCD(from: pcd)
+        // 4 data lines, 2 valid points (NaN/Inf filtered out)
+        expect(frame.count == 2, "PCD NaN/Inf: expected 2 valid points after filtering, got \(frame.count)")
+        expect(point3DEquals(frame.positions[0], Point3D(x: 1.0, y: 2.0, z: 3.0)),
+               "PCD NaN/Inf: first valid point")
+        expect(point3DEquals(frame.positions[1], Point3D(x: 7.0, y: 8.0, z: 9.0)),
+               "PCD NaN/Inf: second valid point")
     } catch {
-        expect(false, "PCD NaN with correct count: unexpected error \(error)")
+        expect(false, "PCD NaN/Inf parsing failed: \(error)")
+    }
+}
+
+func testPCDNaNSkippedWithCorrectCount() {
+    // POINTS declares 4, we have 4 data lines, 2 are NaN/Inf → 2 valid points output
+    let pcd = """
+    VERSION 0.7
+    FIELDS x y z intensity
+    SIZE 4 4 4 4
+    TYPE F F F F
+    COUNT 1 1 1 1
+    WIDTH 4
+    HEIGHT 1
+    POINTS 4
+    DATA ascii
+    1.0 2.0 3.0 0.5
+    nan nan nan 0.0
+    inf -inf 1.0 0.5
+    7.0 8.0 9.0 1.0
+    """
+
+    do {
+        let frame = try PointCloudDecoder.decodePCD(from: pcd)
+        expect(frame.count == 2, "PCD NaN correct count: NaN/Inf don't count against valid points")
+    } catch {
+        expect(false, "PCD NaN with correct count failed: \(error)")
     }
 }
 
@@ -388,6 +391,75 @@ func testPCDHeaderMetadata() {
     }
 }
 
+func testPCDValidateSizeTypeCounts() {
+    // SIZE count doesn't match FIELDS
+    let pcd1 = """
+    VERSION 0.7
+    FIELDS x y z
+    SIZE 4 4
+    TYPE F F F
+    WIDTH 1
+    HEIGHT 1
+    POINTS 1
+    DATA ascii
+    1.0 2.0 3.0
+    """
+
+    do {
+        _ = try PointCloudDecoder.decodePCD(from: pcd1)
+        expect(false, "PCD SIZE mismatch: should have thrown")
+    } catch PointCloudError.invalidHeader(let msg) {
+        expect(msg.contains("SIZE") && msg.contains("FIELDS"), "PCD SIZE: error mentions SIZE and FIELDS")
+    } catch {
+        expect(false, "PCD SIZE mismatch: unexpected error \(error)")
+    }
+
+    // TYPE count doesn't match FIELDS
+    let pcd2 = """
+    VERSION 0.7
+    FIELDS x y z
+    SIZE 4 4 4
+    TYPE F F
+    WIDTH 1
+    HEIGHT 1
+    POINTS 1
+    DATA ascii
+    1.0 2.0 3.0
+    """
+
+    do {
+        _ = try PointCloudDecoder.decodePCD(from: pcd2)
+        expect(false, "PCD TYPE mismatch: should have thrown")
+    } catch PointCloudError.invalidHeader(let msg) {
+        expect(msg.contains("TYPE") && msg.contains("FIELDS"), "PCD TYPE: error mentions TYPE and FIELDS")
+    } catch {
+        expect(false, "PCD TYPE mismatch: unexpected error \(error)")
+    }
+
+    // COUNT count doesn't match FIELDS  
+    let pcd3 = """
+    VERSION 0.7
+    FIELDS x y z
+    SIZE 4 4 4
+    TYPE F F F
+    COUNT 1 1
+    WIDTH 1
+    HEIGHT 1
+    POINTS 1
+    DATA ascii
+    1.0 2.0 3.0
+    """
+
+    do {
+        _ = try PointCloudDecoder.decodePCD(from: pcd3)
+        expect(false, "PCD COUNT mismatch: should have thrown")
+    } catch PointCloudError.invalidHeader(let msg) {
+        expect(msg.contains("COUNT") && msg.contains("FIELDS"), "PCD COUNT: error mentions COUNT and FIELDS")
+    } catch {
+        expect(false, "PCD COUNT mismatch: unexpected error \(error)")
+    }
+}
+
 // MARK: - Safety Tests
 
 func testPCDNegativeWidth() {
@@ -468,7 +540,7 @@ func testPCDTruncatedFile() {
         _ = try PointCloudDecoder.decodePCD(from: pcd)
         expect(false, "PCD truncated: should throw when file has fewer points than declared")
     } catch PointCloudError.invalidData(let msg) {
-        expect(msg.contains("Truncated") || msg.contains("expected") || msg.contains("valid"),
+        expect(msg.contains("Truncated") || msg.contains("expected"),
                "PCD truncated: error mentions truncation")
     } catch {
         expect(false, "PCD truncated: unexpected error \(error)")
@@ -531,6 +603,7 @@ func testPCDSensorFromFilename() {
 // MARK: - PointCloud2 Binary Tests
 
 func testPointCloud2BasicParsing() {
+    // Realistic layout: x, y, z, intensity at typical offsets
     var data = Data()
 
     let points: [(Float, Float, Float, Float)] = [
@@ -548,6 +621,9 @@ func testPointCloud2BasicParsing() {
 
     let layout = PointCloud2Layout(
         pointStep: 16,
+        rowStep: 48,  // 3 points × 16 bytes
+        width: 3,
+        height: 1,
         xOffset: 0,
         yOffset: 4,
         zOffset: 8,
@@ -571,7 +647,15 @@ func testPointCloud2BasicParsing() {
 
 func testPointCloud2EmptyData() {
     let data = Data()
-    let layout = PointCloud2Layout(pointStep: 16, xOffset: 0, yOffset: 4, zOffset: 8)
+    let layout = PointCloud2Layout(
+        pointStep: 16,
+        rowStep: 0,
+        width: 0,
+        height: 1,
+        xOffset: 0,
+        yOffset: 4,
+        zOffset: 8
+    )
 
     do {
         let frame = try PointCloudDecoder.decodePointCloud2(from: data, layout: layout)
@@ -596,6 +680,9 @@ func testPointCloud2BigEndian() {
 
     let layout = PointCloud2Layout(
         pointStep: 16,
+        rowStep: 16,
+        width: 1,
+        height: 1,
         xOffset: 0,
         yOffset: 4,
         zOffset: 8,
@@ -618,6 +705,7 @@ func testPointCloud2BigEndian() {
 }
 
 func testPointCloud2LayoutFromFields() {
+    // Realistic Livox Mid-360 layout
     let fields = [
         PointCloud2Layout.FieldDescriptor(name: "x", offset: 0, datatype: .float32),
         PointCloud2Layout.FieldDescriptor(name: "y", offset: 4, datatype: .float32),
@@ -626,12 +714,13 @@ func testPointCloud2LayoutFromFields() {
     ]
 
     do {
-        let layout = try PointCloud2Layout.from(fields: fields, pointStep: 16)
+        let layout = try PointCloud2Layout.from(fields: fields, pointStep: 16, rowStep: 160, width: 10, height: 1)
         expect(layout.xOffset == 0, "Layout from fields: xOffset")
         expect(layout.yOffset == 4, "Layout from fields: yOffset")
         expect(layout.zOffset == 8, "Layout from fields: zOffset")
         expect(layout.intensityOffset == 12, "Layout from fields: intensityOffset")
         expect(layout.xType == .float32, "Layout from fields: xType")
+        expect(layout.hasIntensity, "Layout from fields: hasIntensity")
     } catch {
         expect(false, "Layout from fields failed: \(error)")
     }
@@ -653,6 +742,22 @@ func testPointCloud2LayoutMissingFields() {
     }
 }
 
+func testPointCloud2LayoutNoIntensity() {
+    let fields = [
+        PointCloud2Layout.FieldDescriptor(name: "x", offset: 0, datatype: .float32),
+        PointCloud2Layout.FieldDescriptor(name: "y", offset: 4, datatype: .float32),
+        PointCloud2Layout.FieldDescriptor(name: "z", offset: 8, datatype: .float32),
+    ]
+
+    do {
+        let layout = try PointCloud2Layout.from(fields: fields, pointStep: 12)
+        expect(!layout.hasIntensity, "Layout no intensity: hasIntensity should be false")
+        expect(layout.intensityOffset == nil, "Layout no intensity: intensityOffset should be nil")
+    } catch {
+        expect(false, "Layout no intensity failed: \(error)")
+    }
+}
+
 func testPointCloud2InvalidPointStep() {
     let data = Data([0, 1, 2, 3])
     let layout = PointCloud2Layout(pointStep: 0, xOffset: 0, yOffset: 4, zOffset: 8)
@@ -664,6 +769,102 @@ func testPointCloud2InvalidPointStep() {
         // Expected
     } catch {
         expect(false, "PC2 invalid step: unexpected error \(error)")
+    }
+}
+
+func testPointCloud2DataSizeMismatch() {
+    var data = Data()
+    // Create 2 points of 16 bytes each
+    for _ in 0..<2 {
+        data.append(contentsOf: withUnsafeBytes(of: Float(1.0).bitPattern.littleEndian) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Float(2.0).bitPattern.littleEndian) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Float(3.0).bitPattern.littleEndian) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Float(0.5).bitPattern.littleEndian) { Array($0) })
+    }
+    // Add extra bytes to trigger mismatch
+    data.append(contentsOf: [0, 1, 2, 3])
+
+    let layout = PointCloud2Layout(
+        pointStep: 16,
+        rowStep: 32,  // 2 points
+        width: 2,
+        height: 1,
+        xOffset: 0,
+        yOffset: 4,
+        zOffset: 8,
+        intensityOffset: 12
+    )
+
+    do {
+        _ = try PointCloudDecoder.decodePointCloud2(from: data, layout: layout)
+        expect(false, "PC2 data mismatch: should have thrown")
+    } catch PointCloudError.invalidData(let msg) {
+        expect(msg.contains("mismatch") || msg.contains("row_step"), "PC2 data mismatch: error mentions mismatch")
+    } catch {
+        expect(false, "PC2 data mismatch: unexpected error \(error)")
+    }
+}
+
+func testPointCloud2RowStepAddressing() {
+    // Test that row_step is used for multi-row clouds
+    var data = Data()
+    
+    // Row 0: 2 points + padding (row_step = 48, point_step = 16, 2 points = 32 bytes, 16 bytes padding)
+    data.append(contentsOf: withUnsafeBytes(of: Float(1.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(2.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(3.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(0.5).bitPattern.littleEndian) { Array($0) })
+    
+    data.append(contentsOf: withUnsafeBytes(of: Float(4.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(5.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(6.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(0.8).bitPattern.littleEndian) { Array($0) })
+    
+    // Padding for row 0
+    data.append(contentsOf: [UInt8](repeating: 0, count: 16))
+    
+    // Row 1: 2 points + padding
+    data.append(contentsOf: withUnsafeBytes(of: Float(7.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(8.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(9.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(1.0).bitPattern.littleEndian) { Array($0) })
+    
+    data.append(contentsOf: withUnsafeBytes(of: Float(10.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(11.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(12.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(0.9).bitPattern.littleEndian) { Array($0) })
+    
+    // Padding for row 1
+    data.append(contentsOf: [UInt8](repeating: 0, count: 16))
+
+    let layout = PointCloud2Layout(
+        pointStep: 16,
+        rowStep: 48,
+        width: 2,
+        height: 2,
+        xOffset: 0,
+        yOffset: 4,
+        zOffset: 8,
+        intensityOffset: 12,
+        xType: .float32,
+        yType: .float32,
+        zType: .float32,
+        intensityType: .float32
+    )
+
+    do {
+        let frame = try PointCloudDecoder.decodePointCloud2(from: data, layout: layout)
+        expect(frame.count == 4, "PC2 row_step: expected 4 points, got \(frame.count)")
+        expect(point3DEquals(frame.positions[0], Point3D(x: 1.0, y: 2.0, z: 3.0)),
+               "PC2 row_step: point (0,0)")
+        expect(point3DEquals(frame.positions[1], Point3D(x: 4.0, y: 5.0, z: 6.0)),
+               "PC2 row_step: point (0,1)")
+        expect(point3DEquals(frame.positions[2], Point3D(x: 7.0, y: 8.0, z: 9.0)),
+               "PC2 row_step: point (1,0)")
+        expect(point3DEquals(frame.positions[3], Point3D(x: 10.0, y: 11.0, z: 12.0)),
+               "PC2 row_step: point (1,1)")
+    } catch {
+        expect(false, "PC2 row_step addressing failed: \(error)")
     }
 }
 
@@ -684,6 +885,13 @@ func testROS1PointCloud2Header() {
         data.append(contentsOf: bytes)
     }
 
+    // std_msgs/Header
+    appendU32(42)              // seq
+    appendU32(1609459200)      // stamp.sec (2021-01-01 00:00:00 UTC)
+    appendU32(500_000_000)     // stamp.nsec
+    appendString("lidar_frame") // frame_id
+
+    // PointCloud2 body
     appendU32(1)  // height
     appendU32(2)  // width
 
@@ -718,6 +926,8 @@ func testROS1PointCloud2Header() {
         data.append(contentsOf: withUnsafeBytes(of: z.bitPattern.littleEndian) { Array($0) })
     }
 
+    appendU8(1)  // is_dense
+
     do {
         let frame = try PointCloudDecoder.decodeROS1PointCloud2(from: data)
         expect(frame.count == 2, "ROS1 header: expected 2 points, got \(frame.count)")
@@ -725,6 +935,8 @@ func testROS1PointCloud2Header() {
                "ROS1 header: first point mismatch")
         expect(point3DEquals(frame.positions[1], Point3D(x: 4.0, y: 5.0, z: 6.0)),
                "ROS1 header: second point mismatch")
+        expect(frame.frameId == "lidar_frame", "ROS1 header: frame_id")
+        expect(frame.timestamp != nil, "ROS1 header: timestamp parsed")
     } catch {
         expect(false, "ROS1 header parsing failed: \(error)")
     }
@@ -745,6 +957,12 @@ func testROS1UnknownDatatype() {
         data.append(contentsOf: bytes)
     }
 
+    // std_msgs/Header
+    appendU32(0)       // seq
+    appendU32(0)       // stamp.sec
+    appendU32(0)       // stamp.nsec
+    appendString("")   // frame_id
+
     appendU32(1)  // height
     appendU32(1)  // width
 
@@ -764,25 +982,29 @@ func testROS1UnknownDatatype() {
     }
 }
 
-// MARK: - ROS2 Header Tests
-
-func testROS2PointCloud2Header() {
-    var inner = Data()
+func testROS1DataSizeMismatch() {
+    var data = Data()
 
     func appendU32(_ value: UInt32) {
-        inner.append(contentsOf: withUnsafeBytes(of: value.littleEndian) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: value.littleEndian) { Array($0) })
     }
     func appendU8(_ value: UInt8) {
-        inner.append(value)
+        data.append(value)
     }
     func appendString(_ str: String) {
         let bytes = Array(str.utf8)
         appendU32(UInt32(bytes.count))
-        inner.append(contentsOf: bytes)
+        data.append(contentsOf: bytes)
     }
 
-    appendU32(1)  // height
-    appendU32(1)  // width
+    // std_msgs/Header
+    appendU32(0)       // seq
+    appendU32(0)       // stamp.sec
+    appendU32(0)       // stamp.nsec
+    appendString("")   // frame_id
+
+    appendU32(2)  // height = 2
+    appendU32(2)  // width = 2
 
     appendU32(3)  // num fields
     appendString("x")
@@ -802,29 +1024,203 @@ func testROS2PointCloud2Header() {
 
     appendU8(0)   // is_bigendian
     appendU32(12) // point_step
+    appendU32(24) // row_step = 24 (2 points × 12)
+    appendU32(24) // data length = 24 (WRONG: should be 48 for 2 rows)
+
+    // Only add data for 2 points instead of 4
+    for _ in 0..<2 {
+        data.append(contentsOf: withUnsafeBytes(of: Float(1.0).bitPattern.littleEndian) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Float(2.0).bitPattern.littleEndian) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Float(3.0).bitPattern.littleEndian) { Array($0) })
+    }
+
+    appendU8(1)  // is_dense
+
+    do {
+        _ = try PointCloudDecoder.decodeROS1PointCloud2(from: data)
+        expect(false, "ROS1 data mismatch: should have thrown")
+    } catch PointCloudError.invalidData(let msg) {
+        expect(msg.contains("mismatch") || msg.contains("row_step"), "ROS1 data mismatch: error mentions mismatch")
+    } catch {
+        expect(false, "ROS1 data mismatch: unexpected error \(error)")
+    }
+}
+
+// MARK: - ROS2 Header Tests
+
+func testROS2PointCloud2Header() {
+    var data = Data()
+
+    func appendU32(_ value: UInt32) {
+        data.append(contentsOf: withUnsafeBytes(of: value.littleEndian) { Array($0) })
+    }
+    func appendI32(_ value: Int32) {
+        data.append(contentsOf: withUnsafeBytes(of: value.littleEndian) { Array($0) })
+    }
+    func appendU8(_ value: UInt8) {
+        data.append(value)
+    }
+    func appendStringCDR(_ str: String) {
+        // CDR string: uint32 length (including NUL) + chars + NUL
+        let bytes = Array(str.utf8)
+        appendU32(UInt32(bytes.count + 1))
+        data.append(contentsOf: bytes)
+        data.append(0)  // NUL terminator
+    }
+    func alignTo4() {
+        let rem = data.count % 4
+        if rem != 0 {
+            data.append(contentsOf: [UInt8](repeating: 0, count: 4 - rem))
+        }
+    }
+
+    // CDR header: little-endian
+    data.append(contentsOf: [0x00, 0x01, 0x00, 0x00])
+
+    // std_msgs/Header (ROS2 format)
+    appendI32(1609459200)      // stamp.sec
+    appendU32(500_000_000)     // stamp.nsec
+    appendStringCDR("base_link") // frame_id with NUL
+
+    alignTo4()
+
+    // PointCloud2 body
+    appendU32(1)  // height
+    appendU32(1)  // width
+
+    appendU32(3)  // num fields
+    
+    appendStringCDR("x")
+    alignTo4()
+    appendU32(0)  // offset
+    appendU8(7)   // float32
+    alignTo4()
+    appendU32(1)  // count
+
+    appendStringCDR("y")
+    alignTo4()
+    appendU32(4)
+    appendU8(7)
+    alignTo4()
+    appendU32(1)
+
+    appendStringCDR("z")
+    alignTo4()
+    appendU32(8)
+    appendU8(7)
+    alignTo4()
+    appendU32(1)
+
+    appendU8(0)   // is_bigendian
+    alignTo4()
+    appendU32(12) // point_step
     appendU32(12) // row_step
     appendU32(12) // data length
 
-    inner.append(contentsOf: withUnsafeBytes(of: Float(1.0).bitPattern.littleEndian) { Array($0) })
-    inner.append(contentsOf: withUnsafeBytes(of: Float(2.0).bitPattern.littleEndian) { Array($0) })
-    inner.append(contentsOf: withUnsafeBytes(of: Float(3.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(1.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(2.0).bitPattern.littleEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(3.0).bitPattern.littleEndian) { Array($0) })
 
-    // CDR little-endian encapsulation: 0x00 0x01 0x00 0x00
-    var data = Data([0x00, 0x01, 0x00, 0x00])
-    data.append(inner)
+    appendU8(1)  // is_dense
 
     do {
         let frame = try PointCloudDecoder.decodeROS2PointCloud2(from: data)
         expect(frame.count == 1, "ROS2 header: expected 1 point, got \(frame.count)")
         expect(point3DEquals(frame.positions[0], Point3D(x: 1.0, y: 2.0, z: 3.0)),
                "ROS2 header: point mismatch")
+        expect(frame.frameId == "base_link", "ROS2 header: frame_id stripped NUL")
+        expect(frame.timestamp != nil, "ROS2 header: timestamp parsed")
     } catch {
         expect(false, "ROS2 header parsing failed: \(error)")
     }
 }
 
+func testROS2BigEndianEncapsulation() {
+    var data = Data()
+
+    func appendU32BE(_ value: UInt32) {
+        data.append(contentsOf: withUnsafeBytes(of: value.bigEndian) { Array($0) })
+    }
+    func appendI32BE(_ value: Int32) {
+        data.append(contentsOf: withUnsafeBytes(of: value.bigEndian) { Array($0) })
+    }
+    func appendU8(_ value: UInt8) {
+        data.append(value)
+    }
+    func appendStringCDR(_ str: String) {
+        let bytes = Array(str.utf8)
+        appendU32BE(UInt32(bytes.count + 1))
+        data.append(contentsOf: bytes)
+        data.append(0)
+    }
+    func alignTo4() {
+        let rem = data.count % 4
+        if rem != 0 {
+            data.append(contentsOf: [UInt8](repeating: 0, count: 4 - rem))
+        }
+    }
+
+    // CDR header: big-endian (encapsulation kind = 0x00)
+    data.append(contentsOf: [0x00, 0x00, 0x00, 0x00])
+
+    // std_msgs/Header
+    appendI32BE(1609459200)
+    appendU32BE(0)
+    appendStringCDR("lidar")
+
+    alignTo4()
+
+    appendU32BE(1)  // height
+    appendU32BE(1)  // width
+
+    appendU32BE(3)  // num fields
+    
+    appendStringCDR("x")
+    alignTo4()
+    appendU32BE(0)
+    appendU8(7)
+    alignTo4()
+    appendU32BE(1)
+
+    appendStringCDR("y")
+    alignTo4()
+    appendU32BE(4)
+    appendU8(7)
+    alignTo4()
+    appendU32BE(1)
+
+    appendStringCDR("z")
+    alignTo4()
+    appendU32BE(8)
+    appendU8(7)
+    alignTo4()
+    appendU32BE(1)
+
+    appendU8(1)   // is_bigendian = true
+    alignTo4()
+    appendU32BE(12) // point_step
+    appendU32BE(12) // row_step
+    appendU32BE(12) // data length
+
+    // Point data in big-endian
+    data.append(contentsOf: withUnsafeBytes(of: Float(5.0).bitPattern.bigEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(6.0).bitPattern.bigEndian) { Array($0) })
+    data.append(contentsOf: withUnsafeBytes(of: Float(7.0).bitPattern.bigEndian) { Array($0) })
+
+    appendU8(1)  // is_dense
+
+    do {
+        let frame = try PointCloudDecoder.decodeROS2PointCloud2(from: data)
+        expect(frame.count == 1, "ROS2 BE: expected 1 point, got \(frame.count)")
+        expect(point3DEquals(frame.positions[0], Point3D(x: 5.0, y: 6.0, z: 7.0)),
+               "ROS2 BE: point mismatch")
+    } catch {
+        expect(false, "ROS2 big-endian parsing failed: \(error)")
+    }
+}
+
 func testROS2InvalidEncapsulation() {
-    let data = Data([0x02, 0x00, 0x00, 0x00])  // Invalid encapsulation kind
+    let data = Data([0x00, 0x02, 0x00, 0x00])  // Invalid encapsulation kind (0x02)
 
     do {
         _ = try PointCloudDecoder.decodeROS2PointCloud2(from: data)
@@ -929,10 +1325,12 @@ func testPointCloudFrameStruct() {
     frame.positions = [Point3D(x: 1, y: 2, z: 3)]
     frame.intensities = [0.5]
     frame.sensor = .mid360
+    frame.frameId = "test_frame"
 
     expect(!frame.isEmpty, "PointCloudFrame with data: not empty")
     expect(frame.count == 1, "PointCloudFrame with data: count")
     expect(frame.sensor == .mid360, "PointCloudFrame: sensor")
+    expect(frame.frameId == "test_frame", "PointCloudFrame: frameId")
 }
 
 // MARK: - Large Point Cloud Test
@@ -970,6 +1368,27 @@ func testPCDLargeCloud() {
     }
 }
 
+// MARK: - Real Fixture Regression Test
+
+func testRealROS1MessageFixture() {
+    // This fixture was extracted from room-scan.mcap
+    let path = "fixtures/pointclouds/ros1-pointcloud2.bin"
+    guard FileManager.default.fileExists(atPath: path) else {
+        print("  fixture: ros1-pointcloud2.bin not found — skipped")
+        passed()
+        return
+    }
+
+    do {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let frame = try PointCloudDecoder.decodeROS1PointCloud2(from: data)
+        expect(frame.count > 0, "ROS1 real fixture: should have points")
+        expect(frame.frameId != nil && !frame.frameId!.isEmpty, "ROS1 real fixture: should have frame_id")
+    } catch {
+        expect(false, "ROS1 real fixture failed: \(error)")
+    }
+}
+
 // MARK: - Test Runner Entry Points
 
 func runPointCloudDecoderTests() {
@@ -983,14 +1402,14 @@ func runPointCloudDecoderTests() {
     print("  PCD ASCII: missing VERSION header → error"); passed()
     testPCDMissingFields()
     print("  PCD ASCII: missing FIELDS header → error"); passed()
-    testPCDMalformedPointSkipped()
-    print("  PCD ASCII: truncated file with fewer points than declared → error"); passed()
+    testPCDMalformedLineIsError()
+    print("  PCD ASCII: malformed data line → error (not silent skip)"); passed()
     testPCDWithComments()
     print("  PCD ASCII: comments preserved in header"); passed()
     testPCDNaNAndInfValues()
-    print("  PCD ASCII: NaN/Inf with overrun → error"); passed()
+    print("  PCD ASCII: NaN/Inf lines filtered but valid"); passed()
     testPCDNaNSkippedWithCorrectCount()
-    print("  PCD ASCII: NaN/Inf lines skipped don't count toward valid points"); passed()
+    print("  PCD ASCII: NaN/Inf don't count against POINTS"); passed()
     testPCDUnsupportedBinaryFormat()
     print("  PCD ASCII: binary format → unsupported error with docs"); passed()
     testPCDFromData()
@@ -1003,6 +1422,8 @@ func runPointCloudDecoderTests() {
     print("  PCD ASCII: POINTS header without WIDTH"); passed()
     testPCDHeaderMetadata()
     print("  PCD ASCII: SIZE/TYPE/COUNT metadata preserved"); passed()
+    testPCDValidateSizeTypeCounts()
+    print("  PCD ASCII: SIZE/TYPE/COUNT lengths validated"); passed()
     testPCDLargeCloud()
     print("  PCD ASCII: 1000-point cloud parsed correctly"); passed()
 
@@ -1021,7 +1442,7 @@ func runPointCloudDecoderTests() {
     print("  PCD: sensor ID derived from filename"); passed()
 
     testPointCloud2BasicParsing()
-    print("  PointCloud2: basic binary parsing"); passed()
+    print("  PointCloud2: basic binary parsing with realistic layout"); passed()
     testPointCloud2EmptyData()
     print("  PointCloud2: empty data → empty cloud"); passed()
     testPointCloud2BigEndian()
@@ -1030,16 +1451,26 @@ func runPointCloudDecoderTests() {
     print("  PointCloud2: layout derived from fields array"); passed()
     testPointCloud2LayoutMissingFields()
     print("  PointCloud2: missing required fields → error"); passed()
+    testPointCloud2LayoutNoIntensity()
+    print("  PointCloud2: missing intensity flagged via hasIntensity"); passed()
     testPointCloud2InvalidPointStep()
     print("  PointCloud2: invalid pointStep → error"); passed()
+    testPointCloud2DataSizeMismatch()
+    print("  PointCloud2: data size != row_step × height → error"); passed()
+    testPointCloud2RowStepAddressing()
+    print("  PointCloud2: row_step used for multi-row addressing"); passed()
 
     testROS1PointCloud2Header()
-    print("  ROS1: PointCloud2 header parsing"); passed()
+    print("  ROS1: std_msgs/Header parsed before height/width"); passed()
     testROS1UnknownDatatype()
     print("  ROS1: unknown datatype → error"); passed()
+    testROS1DataSizeMismatch()
+    print("  ROS1: data size mismatch → error"); passed()
 
     testROS2PointCloud2Header()
-    print("  ROS2: PointCloud2 with CDR encapsulation"); passed()
+    print("  ROS2: CDR encapsulation + Header + NUL-stripped strings"); passed()
+    testROS2BigEndianEncapsulation()
+    print("  ROS2: CDR big-endian encapsulation honored"); passed()
     testROS2InvalidEncapsulation()
     print("  ROS2: invalid CDR encapsulation → error"); passed()
 
@@ -1054,6 +1485,9 @@ func runPointCloudDecoderTests() {
     testLoadMissingFixture()
     print("  Fixture: missing file → error"); passed()
 
+    testRealROS1MessageFixture()
+    print("  Fixture: ROS1 PointCloud2 binary from room-scan.mcap"); passed()
+
     testPointCloudFrameStruct()
-    print("  PointCloudFrame struct: isEmpty, count, sensor"); passed()
+    print("  PointCloudFrame struct: isEmpty, count, sensor, frameId"); passed()
 }

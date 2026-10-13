@@ -21,17 +21,20 @@ public struct PointCloudFrame: Sendable, Equatable {
     public var intensities: [Float]
     public var sensor: SensorID?
     public var timestamp: Date?
+    public var frameId: String?
 
     public init(
         positions: [Point3D] = [],
         intensities: [Float] = [],
         sensor: SensorID? = nil,
-        timestamp: Date? = nil
+        timestamp: Date? = nil,
+        frameId: String? = nil
     ) {
         self.positions = positions
         self.intensities = intensities
         self.sensor = sensor
         self.timestamp = timestamp
+        self.frameId = frameId
     }
 
     public var count: Int { positions.count }
@@ -70,6 +73,7 @@ public struct PointCloud2Layout: Sendable, Equatable {
     public var yType: FieldType
     public var zType: FieldType
     public var intensityType: FieldType?
+    public var hasIntensity: Bool { intensityOffset != nil }
 
     public enum FieldType: UInt8, Sendable, Equatable {
         case int8 = 1
@@ -115,7 +119,7 @@ public struct PointCloud2Layout: Sendable, Equatable {
         intensityType: FieldType? = nil
     ) {
         self.pointStep = pointStep
-        self.rowStep = rowStep > 0 ? rowStep : pointStep
+        self.rowStep = rowStep > 0 ? rowStep : (pointStep * width)
         self.width = width
         self.height = height
         self.xOffset = xOffset
@@ -234,13 +238,16 @@ public struct PCDHeaderExtended: Sendable, Equatable {
         return counts.reduce(0, +)
     }
 
-    /// Validate that SIZE and TYPE arrays match FIELDS.
+    /// Validate that SIZE, TYPE, and COUNT arrays match FIELDS.
     public func validate() throws {
         if !sizes.isEmpty && sizes.count != fields.count {
             throw PointCloudError.invalidHeader("SIZE count (\(sizes.count)) doesn't match FIELDS count (\(fields.count))")
         }
         if !types.isEmpty && types.count != fields.count {
             throw PointCloudError.invalidHeader("TYPE count (\(types.count)) doesn't match FIELDS count (\(fields.count))")
+        }
+        if !counts.isEmpty && counts.count != fields.count {
+            throw PointCloudError.invalidHeader("COUNT count (\(counts.count)) doesn't match FIELDS count (\(fields.count))")
         }
     }
 }
@@ -251,7 +258,7 @@ public struct PCDHeaderExtended: Sendable, Equatable {
 ///
 /// **Supported formats:**
 /// - PCD ASCII format (VERSION 0.7)
-/// - ROS1 PointCloud2 binary messages
+/// - ROS1 PointCloud2 binary messages (with std_msgs/Header)
 /// - ROS2 PointCloud2 binary messages (with CDR encapsulation)
 ///
 /// **Not yet supported:**
@@ -460,14 +467,22 @@ public enum PointCloudDecoder {
 
             let values = trimmed.split(whereSeparator: { $0.isWhitespace })
             let minRequired = max(xIndex, yIndex, zIndex) + 1
-            guard values.count >= minRequired else { continue }
+            
+            guard values.count >= minRequired else {
+                throw PointCloudError.invalidData(
+                    "Malformed data line \(totalDataLines): expected at least \(minRequired) values, got \(values.count)"
+                )
+            }
 
             guard let x = Float(values[xIndex]),
                   let y = Float(values[yIndex]),
                   let z = Float(values[zIndex]) else {
-                continue
+                throw PointCloudError.invalidData(
+                    "Malformed data line \(totalDataLines): cannot parse x/y/z as float"
+                )
             }
 
+            // NaN/Inf lines don't count against POINTS — they're filtered but valid lines
             if !x.isFinite || !y.isFinite || !z.isFinite {
                 continue
             }
@@ -484,15 +499,17 @@ public enum PointCloudDecoder {
             validPoints += 1
         }
 
-        if validPoints < header.points {
-            throw PointCloudError.invalidData(
-                "Truncated file: expected \(header.points) points but found \(validPoints) valid points"
-            )
-        }
-
+        // Check for data overrun: more data lines than declared (excluding NaN/Inf filtering)
         if totalDataLines > header.points {
             throw PointCloudError.invalidData(
                 "Data overrun: declared \(header.points) points but found \(totalDataLines) data lines"
+            )
+        }
+
+        // Check for truncated file: fewer data lines than declared
+        if totalDataLines < header.points {
+            throw PointCloudError.invalidData(
+                "Truncated file: expected \(header.points) data lines but found \(totalDataLines)"
             )
         }
 
@@ -526,7 +543,9 @@ public enum PointCloudDecoder {
             throw PointCloudError.invalidData("pointStep must be positive")
         }
 
-        let count = pointCount ?? (data.count / layout.pointStep)
+        let totalPoints = layout.width * layout.height
+        let count = pointCount ?? totalPoints
+        
         if count == 0 {
             return PointCloudFrame()
         }
@@ -537,6 +556,24 @@ public enum PointCloudDecoder {
             )
         }
 
+        // Validate data size matches row_step * height
+        let expectedSize = layout.rowStep * layout.height
+        if expectedSize > 0 && data.count != expectedSize {
+            throw PointCloudError.invalidData(
+                "Data size mismatch: expected \(expectedSize) bytes (row_step=\(layout.rowStep) × height=\(layout.height)), got \(data.count)"
+            )
+        }
+
+        // Check for leftover partial bytes
+        if layout.rowStep > 0 && layout.height > 0 {
+            let bytesPerRow = layout.pointStep * layout.width
+            if bytesPerRow > layout.rowStep {
+                throw PointCloudError.invalidData(
+                    "Invalid layout: point_step × width (\(bytesPerRow)) exceeds row_step (\(layout.rowStep))"
+                )
+            }
+        }
+
         var positions: [Point3D] = []
         var intensities: [Float] = []
         positions.reserveCapacity(count)
@@ -544,52 +581,58 @@ public enum PointCloudDecoder {
 
         try data.withUnsafeBytes { buffer in
             guard let baseAddress = buffer.baseAddress else {
+                if count > 0 {
+                    throw PointCloudError.invalidData("Empty buffer with pointCount > 0")
+                }
                 return
             }
 
-            for i in 0..<count {
-                let baseOffset = i * layout.pointStep
+            for row in 0..<layout.height {
+                for col in 0..<layout.width {
+                    // Use rowStep for row addressing
+                    let baseOffset = row * layout.rowStep + col * layout.pointStep
 
-                guard baseOffset + layout.xOffset + layout.xType.size <= buffer.count,
-                      baseOffset + layout.yOffset + layout.yType.size <= buffer.count,
-                      baseOffset + layout.zOffset + layout.zType.size <= buffer.count else {
-                    throw PointCloudError.invalidData("Point \(i) extends beyond data bounds")
-                }
+                    guard baseOffset + layout.xOffset + layout.xType.size <= buffer.count,
+                          baseOffset + layout.yOffset + layout.yType.size <= buffer.count,
+                          baseOffset + layout.zOffset + layout.zType.size <= buffer.count else {
+                        throw PointCloudError.invalidData("Point at row=\(row) col=\(col) extends beyond data bounds")
+                    }
 
-                let x = readFloatUnsafe(
-                    from: baseAddress,
-                    at: baseOffset + layout.xOffset,
-                    type: layout.xType,
-                    bigEndian: layout.isBigEndian
-                )
-                let y = readFloatUnsafe(
-                    from: baseAddress,
-                    at: baseOffset + layout.yOffset,
-                    type: layout.yType,
-                    bigEndian: layout.isBigEndian
-                )
-                let z = readFloatUnsafe(
-                    from: baseAddress,
-                    at: baseOffset + layout.zOffset,
-                    type: layout.zType,
-                    bigEndian: layout.isBigEndian
-                )
-
-                if !x.isFinite || !y.isFinite || !z.isFinite { continue }
-
-                positions.append(Point3D(x: x, y: y, z: z))
-
-                if let intOffset = layout.intensityOffset, let intType = layout.intensityType,
-                   baseOffset + intOffset + intType.size <= buffer.count {
-                    let intensity = readFloatUnsafe(
+                    let x = readFloatUnsafe(
                         from: baseAddress,
-                        at: baseOffset + intOffset,
-                        type: intType,
+                        at: baseOffset + layout.xOffset,
+                        type: layout.xType,
                         bigEndian: layout.isBigEndian
                     )
-                    intensities.append(intensity.isFinite ? intensity : 1.0)
-                } else {
-                    intensities.append(1.0)
+                    let y = readFloatUnsafe(
+                        from: baseAddress,
+                        at: baseOffset + layout.yOffset,
+                        type: layout.yType,
+                        bigEndian: layout.isBigEndian
+                    )
+                    let z = readFloatUnsafe(
+                        from: baseAddress,
+                        at: baseOffset + layout.zOffset,
+                        type: layout.zType,
+                        bigEndian: layout.isBigEndian
+                    )
+
+                    if !x.isFinite || !y.isFinite || !z.isFinite { continue }
+
+                    positions.append(Point3D(x: x, y: y, z: z))
+
+                    if let intOffset = layout.intensityOffset, let intType = layout.intensityType,
+                       baseOffset + intOffset + intType.size <= buffer.count {
+                        let intensity = readFloatUnsafe(
+                            from: baseAddress,
+                            at: baseOffset + intOffset,
+                            type: intType,
+                            bigEndian: layout.isBigEndian
+                        )
+                        intensities.append(intensity.isFinite ? intensity : 1.0)
+                    } else {
+                        intensities.append(1.0)
+                    }
                 }
             }
         }
@@ -599,7 +642,7 @@ public enum PointCloudDecoder {
 
     /// Decode a ROS1 PointCloud2 message (fields array embedded in message).
     /// ROS1 PointCloud2 format:
-    /// - Header (seq, stamp, frame_id) - skipped
+    /// - std_msgs/Header: seq (uint32), stamp (uint32 sec + uint32 nsec), frame_id (string)
     /// - uint32 height
     /// - uint32 width
     /// - PointField[] fields
@@ -609,15 +652,48 @@ public enum PointCloudDecoder {
     /// - uint8[] data
     /// - bool is_dense
     public static func decodeROS1PointCloud2(from data: Data) throws -> PointCloudFrame {
-        guard data.count >= 12 else {
+        guard data.count >= 20 else {
             throw PointCloudError.invalidData("Data too short for ROS1 PointCloud2 header")
         }
 
         var offset = 0
+        let isBigEndian = false  // ROS1 default is little-endian
 
-        let height = Int(try readUInt32Safe(from: data, at: offset))
+        // Parse std_msgs/Header
+        let seq = try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian)
         offset += 4
-        let width = Int(try readUInt32Safe(from: data, at: offset))
+        _ = seq  // unused but parsed
+
+        let stampSec = try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian)
+        offset += 4
+        let stampNsec = try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian)
+        offset += 4
+        let timestamp = Date(timeIntervalSince1970: Double(stampSec) + Double(stampNsec) / 1_000_000_000)
+
+        // Parse frame_id string
+        let frameIdLen = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+        offset += 4
+        guard offset + frameIdLen <= data.count else {
+            throw PointCloudError.invalidData("Truncated frame_id string")
+        }
+        let frameId: String
+        if frameIdLen > 0 {
+            let start = data.startIndex.advanced(by: offset)
+            let end = data.startIndex.advanced(by: offset + frameIdLen)
+            frameId = String(data: data[start..<end], encoding: .utf8) ?? ""
+        } else {
+            frameId = ""
+        }
+        offset += frameIdLen
+
+        // Now parse the PointCloud2 message body
+        guard offset + 8 <= data.count else {
+            throw PointCloudError.invalidData("Truncated PointCloud2 header")
+        }
+
+        let height = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+        offset += 4
+        let width = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
         offset += 4
 
         let (totalPoints, overflow) = width.multipliedReportingOverflow(by: height)
@@ -625,45 +701,46 @@ public enum PointCloudDecoder {
             throw PointCloudError.invalidHeader("width * height overflows")
         }
 
-        let numFields = Int(try readUInt32Safe(from: data, at: offset))
+        // Parse fields array
+        guard offset + 4 <= data.count else {
+            throw PointCloudError.invalidData("Truncated fields array length")
+        }
+        let numFields = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
         offset += 4
 
         var fields: [PointCloud2Layout.FieldDescriptor] = []
 
-        for _ in 0..<numFields {
+        for fieldIdx in 0..<numFields {
             guard offset + 4 <= data.count else {
-                throw PointCloudError.invalidData("Truncated field header")
+                throw PointCloudError.invalidData("Truncated field \(fieldIdx) name length")
             }
 
-            let nameLen = Int(try readUInt32Safe(from: data, at: offset))
+            let nameLen = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
             offset += 4
 
             guard offset + nameLen + 9 <= data.count else {
-                throw PointCloudError.invalidData("Truncated field data")
+                throw PointCloudError.invalidData("Truncated field \(fieldIdx) data")
             }
 
-            let name: String
+            var name: String = ""
             if nameLen > 0 {
                 let start = data.startIndex.advanced(by: offset)
                 let end = data.startIndex.advanced(by: offset + nameLen)
-                let nameData = data[start..<end]
-                name = String(data: nameData, encoding: .utf8)?.lowercased() ?? ""
-            } else {
-                name = ""
+                name = String(data: data[start..<end], encoding: .utf8)?.lowercased() ?? ""
             }
             offset += nameLen
 
-            let fieldOffset = Int(try readUInt32Safe(from: data, at: offset))
+            let fieldOffset = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
             offset += 4
 
             let datatype = data[data.startIndex.advanced(by: offset)]
             offset += 1
 
-            let count = Int(try readUInt32Safe(from: data, at: offset))
+            let count = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
             offset += 4
 
             guard let fieldType = PointCloud2Layout.FieldType(rawValue: datatype) else {
-                throw PointCloudError.invalidData("Unknown field datatype: \(datatype)")
+                throw PointCloudError.invalidData("Unknown field datatype: \(datatype) for field '\(name)'")
             }
 
             fields.append(PointCloud2Layout.FieldDescriptor(
@@ -678,21 +755,40 @@ public enum PointCloudDecoder {
             throw PointCloudError.invalidData("Truncated PointCloud2 metadata")
         }
 
-        let isBigEndian = data[data.startIndex.advanced(by: offset)] != 0
+        let msgIsBigEndian = data[data.startIndex.advanced(by: offset)] != 0
         offset += 1
 
-        let pointStep = Int(try readUInt32Safe(from: data, at: offset))
+        let pointStep = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
         offset += 4
 
-        let rowStep = Int(try readUInt32Safe(from: data, at: offset))
+        let rowStep = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
         offset += 4
 
-        let dataLen = Int(try readUInt32Safe(from: data, at: offset))
+        let dataLen = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
         offset += 4
 
+        // Validate data section
         guard offset + dataLen <= data.count else {
             throw PointCloudError.invalidData(
-                "Data section truncated: expected \(dataLen) bytes at offset \(offset), have \(data.count)"
+                "Data section truncated: expected \(dataLen) bytes at offset \(offset), have \(data.count - offset)"
+            )
+        }
+
+        // Check for leftover partial bytes after data section
+        let expectedEnd = offset + dataLen
+        let actualRemaining = data.count - expectedEnd
+        // Note: is_dense byte follows data, so 1 byte is expected
+        if actualRemaining > 1 {
+            throw PointCloudError.invalidData(
+                "Leftover bytes after data section: expected 1 (is_dense), got \(actualRemaining)"
+            )
+        }
+
+        // Validate data size matches row_step * height
+        let expectedDataSize = rowStep * height
+        if expectedDataSize > 0 && dataLen != expectedDataSize {
+            throw PointCloudError.invalidData(
+                "Data size mismatch: expected \(expectedDataSize) bytes (row_step=\(rowStep) × height=\(height)), got \(dataLen)"
             )
         }
 
@@ -706,37 +802,228 @@ public enum PointCloudDecoder {
             rowStep: rowStep,
             width: width,
             height: height,
-            isBigEndian: isBigEndian
+            isBigEndian: msgIsBigEndian
         )
 
-        return try decodePointCloud2(from: pointData, layout: layout, pointCount: totalPoints)
+        var frame = try decodePointCloud2(from: pointData, layout: layout, pointCount: totalPoints)
+        frame.timestamp = timestamp
+        frame.frameId = frameId
+        return frame
     }
 
     /// Decode a ROS2 PointCloud2 message (with CDR encapsulation header).
     /// ROS2 uses CDR (Common Data Representation) serialization.
-    /// CDR header: 4 bytes (encapsulation kind + options)
-    /// - Byte 0: encapsulation kind (0x00 = CDR_BE, 0x01 = CDR_LE)
-    /// - Byte 1: options (usually 0x00 or 0x01)
-    /// - Bytes 2-3: reserved (0x00)
+    /// CDR header: 4 bytes
+    /// - Byte 0: 0x00 (unused in plain CDR)
+    /// - Byte 1: encapsulation kind (0x00 = CDR_BE, 0x01 = CDR_LE)
+    /// - Bytes 2-3: options (usually 0x00)
     public static func decodeROS2PointCloud2(from data: Data) throws -> PointCloudFrame {
         guard data.count >= 4 else {
             throw PointCloudError.invalidData("Data too short for ROS2 CDR header")
         }
 
-        let encapsulationKind = data[data.startIndex]
+        // Byte 1 contains the encapsulation kind
+        let encapsulationKind = data[data.startIndex.advanced(by: 1)]
 
+        // 0x00 = CDR_BE (big endian), 0x01 = CDR_LE (little endian)
         guard encapsulationKind == 0x00 || encapsulationKind == 0x01 else {
-            throw PointCloudError.invalidData("Invalid CDR encapsulation kind: \(encapsulationKind)")
+            throw PointCloudError.invalidData("Invalid CDR encapsulation kind: 0x\(String(format: "%02x", encapsulationKind))")
         }
 
-        let start = data.startIndex.advanced(by: 4)
-        let innerData = Data(data[start...])
-        return try decodeROS1PointCloud2(from: innerData)
+        let isBigEndian = encapsulationKind == 0x00
+
+        // Skip CDR header (4 bytes)
+        var offset = 4
+
+        // Parse std_msgs/Header (ROS2 format: stamp + frame_id)
+        // stamp: builtin_interfaces/Time (int32 sec + uint32 nanosec)
+        guard offset + 8 <= data.count else {
+            throw PointCloudError.invalidData("Truncated ROS2 header timestamp")
+        }
+
+        let stampSec = try readInt32Safe(from: data, at: offset, bigEndian: isBigEndian)
+        offset += 4
+        let stampNsec = try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian)
+        offset += 4
+        let timestamp = Date(timeIntervalSince1970: Double(stampSec) + Double(stampNsec) / 1_000_000_000)
+
+        // Parse frame_id string (CDR format: uint32 length + chars + NUL)
+        guard offset + 4 <= data.count else {
+            throw PointCloudError.invalidData("Truncated ROS2 frame_id length")
+        }
+        let frameIdLen = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+        offset += 4
+
+        guard offset + frameIdLen <= data.count else {
+            throw PointCloudError.invalidData("Truncated ROS2 frame_id string")
+        }
+        var frameId: String = ""
+        if frameIdLen > 0 {
+            let start = data.startIndex.advanced(by: offset)
+            // CDR strings include NUL terminator - strip it
+            let effectiveLen = frameIdLen > 0 && data[data.startIndex.advanced(by: offset + frameIdLen - 1)] == 0 
+                ? frameIdLen - 1 
+                : frameIdLen
+            let end = data.startIndex.advanced(by: offset + effectiveLen)
+            frameId = String(data: data[start..<end], encoding: .utf8) ?? ""
+        }
+        offset += frameIdLen
+
+        // Apply 4-byte alignment relative to payload start (after CDR header at byte 4)
+        let payloadStart = 4
+        let relativeOffset = offset - payloadStart
+        let padding = (4 - (relativeOffset % 4)) % 4
+        offset += padding
+
+        // Now parse PointCloud2 message body
+        guard offset + 8 <= data.count else {
+            throw PointCloudError.invalidData("Truncated ROS2 PointCloud2 header")
+        }
+
+        let height = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+        offset += 4
+        let width = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+        offset += 4
+
+        let (totalPoints, overflow) = width.multipliedReportingOverflow(by: height)
+        if overflow {
+            throw PointCloudError.invalidHeader("width * height overflows")
+        }
+
+        // Parse fields array
+        guard offset + 4 <= data.count else {
+            throw PointCloudError.invalidData("Truncated ROS2 fields array length")
+        }
+        let numFields = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+        offset += 4
+
+        var fields: [PointCloud2Layout.FieldDescriptor] = []
+
+        for fieldIdx in 0..<numFields {
+            guard offset + 4 <= data.count else {
+                throw PointCloudError.invalidData("Truncated ROS2 field \(fieldIdx) name length")
+            }
+
+            let nameLen = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+            offset += 4
+
+            guard offset + nameLen <= data.count else {
+                throw PointCloudError.invalidData("Truncated ROS2 field \(fieldIdx) name")
+            }
+
+            var name: String = ""
+            if nameLen > 0 {
+                let start = data.startIndex.advanced(by: offset)
+                // CDR strings include NUL terminator - strip it
+                let effectiveLen = nameLen > 0 && data[data.startIndex.advanced(by: offset + nameLen - 1)] == 0 
+                    ? nameLen - 1 
+                    : nameLen
+                let end = data.startIndex.advanced(by: offset + effectiveLen)
+                name = String(data: data[start..<end], encoding: .utf8)?.lowercased() ?? ""
+            }
+            offset += nameLen
+
+            // Align to 4 bytes for the offset field
+            let relOff = offset - payloadStart
+            let fieldPad = (4 - (relOff % 4)) % 4
+            offset += fieldPad
+
+            guard offset + 9 <= data.count else {
+                throw PointCloudError.invalidData("Truncated ROS2 field \(fieldIdx) data")
+            }
+
+            let fieldOffset = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+            offset += 4
+
+            let datatype = data[data.startIndex.advanced(by: offset)]
+            offset += 1
+
+            // Align to 4 bytes for count
+            let relOff2 = offset - payloadStart
+            let countPad = (4 - (relOff2 % 4)) % 4
+            offset += countPad
+
+            guard offset + 4 <= data.count else {
+                throw PointCloudError.invalidData("Truncated ROS2 field \(fieldIdx) count")
+            }
+
+            let count = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+            offset += 4
+
+            guard let fieldType = PointCloud2Layout.FieldType(rawValue: datatype) else {
+                throw PointCloudError.invalidData("Unknown field datatype: \(datatype) for field '\(name)'")
+            }
+
+            fields.append(PointCloud2Layout.FieldDescriptor(
+                name: name,
+                offset: fieldOffset,
+                datatype: fieldType,
+                count: count
+            ))
+        }
+
+        guard offset + 1 <= data.count else {
+            throw PointCloudError.invalidData("Truncated ROS2 is_bigendian")
+        }
+
+        let msgIsBigEndian = data[data.startIndex.advanced(by: offset)] != 0
+        offset += 1
+
+        // Align to 4 bytes for point_step
+        let relOff3 = offset - payloadStart
+        let stepPad = (4 - (relOff3 % 4)) % 4
+        offset += stepPad
+
+        guard offset + 12 <= data.count else {
+            throw PointCloudError.invalidData("Truncated ROS2 PointCloud2 metadata")
+        }
+
+        let pointStep = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+        offset += 4
+
+        let rowStep = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+        offset += 4
+
+        let dataLen = Int(try readUInt32Safe(from: data, at: offset, bigEndian: isBigEndian))
+        offset += 4
+
+        // Validate data section
+        guard offset + dataLen <= data.count else {
+            throw PointCloudError.invalidData(
+                "ROS2 data section truncated: expected \(dataLen) bytes at offset \(offset), have \(data.count - offset)"
+            )
+        }
+
+        // Validate data size matches row_step * height
+        let expectedDataSize = rowStep * height
+        if expectedDataSize > 0 && dataLen != expectedDataSize {
+            throw PointCloudError.invalidData(
+                "ROS2 data size mismatch: expected \(expectedDataSize) bytes (row_step=\(rowStep) × height=\(height)), got \(dataLen)"
+            )
+        }
+
+        let start = data.startIndex.advanced(by: offset)
+        let end = data.startIndex.advanced(by: offset + dataLen)
+        let pointData = Data(data[start..<end])
+
+        let layout = try PointCloud2Layout.from(
+            fields: fields,
+            pointStep: pointStep,
+            rowStep: rowStep,
+            width: width,
+            height: height,
+            isBigEndian: msgIsBigEndian
+        )
+
+        var frame = try decodePointCloud2(from: pointData, layout: layout, pointCount: totalPoints)
+        frame.timestamp = timestamp
+        frame.frameId = frameId
+        return frame
     }
 
     // MARK: - Safe Read Helpers
 
-    private static func readUInt32Safe(from data: Data, at offset: Int) throws -> UInt32 {
+    private static func readUInt32Safe(from data: Data, at offset: Int, bigEndian: Bool = false) throws -> UInt32 {
         guard offset >= 0 else {
             throw PointCloudError.invalidData("Negative offset: \(offset)")
         }
@@ -748,7 +1035,15 @@ public enum PointCloudDecoder {
         let b1 = UInt32(data[data.index(after: start)])
         let b2 = UInt32(data[data.index(start, offsetBy: 2)])
         let b3 = UInt32(data[data.index(start, offsetBy: 3)])
+        if bigEndian {
+            return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+        }
         return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+
+    private static func readInt32Safe(from data: Data, at offset: Int, bigEndian: Bool = false) throws -> Int32 {
+        let unsigned = try readUInt32Safe(from: data, at: offset, bigEndian: bigEndian)
+        return Int32(bitPattern: unsigned)
     }
 
     private static func readFloatUnsafe(
