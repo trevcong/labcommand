@@ -40,6 +40,7 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     private var uniformBuffers: [MTLBuffer] = []
     private var uniformBufferIndex: Int = 0
     private static let uniformBufferCount = 3
+    private let bufferSemaphore = DispatchSemaphore(value: uniformBufferCount)
     private var pointCount: Int = 0
     
     // MARK: - Uniforms
@@ -54,21 +55,15 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     
     // MARK: - Configuration
     
-    public var colorMode: PointCloudColorMode = .intensity {
-        didSet { needsUniformUpdate = true }
-    }
-    
-    public var pointSize: Float = 4.0 {
-        didSet { needsUniformUpdate = true }
-    }
+    public var colorMode: PointCloudColorMode = .intensity
+    public var pointSize: Float = 4.0
     
     // MARK: - Camera (static for this PR)
     
     private var viewMatrix: simd_float4x4
-    private var projectionMatrix: simd_float4x4 = matrix_identity_float4x4
+    private var projectionMatrix: simd_float4x4
     private var heightMin: Float = 0
     private var heightMax: Float = 1
-    private var needsUniformUpdate = true
     
     // MARK: - Vertex Layout
     
@@ -90,6 +85,9 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         let center = SIMD3<Float>(0, 0, 0)
         let up = SIMD3<Float>(0, 0, 1)
         self.viewMatrix = Self.lookAt(eye: eye, center: center, up: up)
+        
+        // Initialize projection with default 16:9 aspect
+        self.projectionMatrix = Self.perspective(fovY: Float.pi / 4, aspect: 16.0 / 9.0, near: 0.01, far: 1000)
         
         super.init()
         
@@ -178,11 +176,12 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             return
         }
         
+        // Sensor index: 0=Mid-360, 1=JT128, 2=unknown/nil (neutral color)
         let sensorIndex: UInt32 = {
             switch frame.sensor {
             case .mid360: return 0
             case .jt128: return 1
-            case nil: return 0
+            case nil: return 2
             }
         }()
         
@@ -194,7 +193,14 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         
         for i in 0..<frame.count {
             let p = frame.positions[i]
-            let intensity = i < frame.intensities.count ? frame.intensities[i] : 0.5
+            var intensity: Float = 1.0
+            if i < frame.intensities.count {
+                intensity = frame.intensities[i]
+                // Normalize 0-255 range to 0-1
+                if intensity > 1.0 {
+                    intensity = intensity / 255.0
+                }
+            }
             
             vertices.append(PointVertex(
                 position: SIMD3<Float>(p.x, p.y, p.z),
@@ -215,7 +221,6 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             options: .storageModeShared
         )
         pointCount = frame.count
-        needsUniformUpdate = true
     }
     
     /// Load multiple frames with sensor coloring.
@@ -235,13 +240,19 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
                 switch frame.sensor {
                 case .mid360: return 0
                 case .jt128: return 1
-                case nil: return 0
+                case nil: return 2
                 }
             }()
             
             for i in 0..<frame.count {
                 let p = frame.positions[i]
-                let intensity = i < frame.intensities.count ? frame.intensities[i] : 0.5
+                var intensity: Float = 1.0
+                if i < frame.intensities.count {
+                    intensity = frame.intensities[i]
+                    if intensity > 1.0 {
+                        intensity = intensity / 255.0
+                    }
+                }
                 
                 allVertices.append(PointVertex(
                     position: SIMD3<Float>(p.x, p.y, p.z),
@@ -269,14 +280,12 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             options: .storageModeShared
         )
         pointCount = allVertices.count
-        needsUniformUpdate = true
     }
     
     // MARK: - Camera Control
     
     public func setViewMatrix(_ matrix: simd_float4x4) {
         viewMatrix = matrix
-        needsUniformUpdate = true
     }
     
     public func resetCamera() {
@@ -284,15 +293,14 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         let center = SIMD3<Float>(0, 0, 0)
         let up = SIMD3<Float>(0, 0, 1)
         viewMatrix = Self.lookAt(eye: eye, center: center, up: up)
-        needsUniformUpdate = true
     }
     
     // MARK: - MTKViewDelegate
     
     public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
         let aspect = Float(size.width / size.height)
         projectionMatrix = Self.perspective(fovY: Float.pi / 4, aspect: aspect, near: 0.01, far: 1000)
-        needsUniformUpdate = true
     }
     
     public func draw(in view: MTKView) {
@@ -300,19 +308,29 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
               let commandQueue = commandQueue,
               let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor,
-              let commandBuffer = commandQueue.makeCommandBuffer(),
               let vertexBuffer = vertexBuffer,
               pointCount > 0,
               !uniformBuffers.isEmpty else {
             return
         }
         
+        // Wait for an available buffer slot
+        _ = bufferSemaphore.wait(timeout: .distantFuture)
+        
         uniformBufferIndex = (uniformBufferIndex + 1) % Self.uniformBufferCount
         let uniformBuffer = uniformBuffers[uniformBufferIndex]
         
-        if needsUniformUpdate {
-            updateUniforms(to: uniformBuffer)
-            needsUniformUpdate = false
+        // Write uniforms every frame to the current buffer
+        updateUniforms(to: uniformBuffer)
+        
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            bufferSemaphore.signal()
+            return
+        }
+        
+        // Signal semaphore when GPU is done with this buffer
+        commandBuffer.addCompletedHandler { [weak self] _ in
+            self?.bufferSemaphore.signal()
         }
         
         renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(
@@ -449,9 +467,11 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             }
             case 2: {
                 if (in.sensorID == 0) {
-                    color = float3(0.0, 0.85, 0.95);
+                    color = float3(0.0, 0.85, 0.95);  // Mid-360: cyan
+                } else if (in.sensorID == 1) {
+                    color = float3(0.9, 0.25, 0.8);   // JT128: magenta
                 } else {
-                    color = float3(0.9, 0.25, 0.8);
+                    color = float3(0.7, 0.7, 0.7);   // Unknown: gray
                 }
                 break;
             }
