@@ -46,4 +46,12 @@ public enum RigGate {
         if s.recording.active { return (false, "Recording — stop the take first") }
         return (true, nil)
     }
+
+    public static func canArmAtLock(_ s: RigSnapshot) -> (Bool, String?) {
+        if !s.sparkReachable { return (false, "Spark not reachable") }
+        if !s.apiReachable { return (false, s.blockReason ?? "Command center not answering") }
+        if s.recording.active { return (false, "Already recording") }
+        if !s.stackRunning { return (false, "Drivers are not running — Start rig first") }
+        return (true, nil)
+    }
 }

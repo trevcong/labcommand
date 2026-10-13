@@ -308,7 +308,7 @@ struct CommandCenterView: View {
                 .textCase(.uppercase)
 
             VStack(alignment: .leading, spacing: 4) {
-                ForEach(state.missionEvents.suffix(5).reversed()) { event in
+                ForEach(Array(state.missionEvents.suffix(5).reversed())) { event in
                     HStack(alignment: .top, spacing: 6) {
                         Text(event.time)
                             .font(LabTheme.mono(10))
