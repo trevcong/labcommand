@@ -31,18 +31,19 @@ public struct SensorExtrinsics: Sendable, Equatable {
     /// Identity transform (no rotation or translation).
     public static let identity = SensorExtrinsics(translation: (0, 0, 0))
     
-    /// Transform a point from sensor frame to rig frame.
+    /// Transform a point from sensor frame to rig (IMU) frame.
+    /// p_imu = R * p_sensor - t
     public func transform(_ point: Point3D) -> Point3D {
         // Apply rotation: R * p
         let rx = rotation[0] * point.x + rotation[3] * point.y + rotation[6] * point.z
         let ry = rotation[1] * point.x + rotation[4] * point.y + rotation[7] * point.z
         let rz = rotation[2] * point.x + rotation[5] * point.y + rotation[8] * point.z
         
-        // Apply translation: R * p + t
+        // Subtract translation: p_imu = R * p - t
         return Point3D(
-            x: rx + translation.x,
-            y: ry + translation.y,
-            z: rz + translation.z
+            x: rx - translation.x,
+            y: ry - translation.y,
+            z: rz - translation.z
         )
     }
     

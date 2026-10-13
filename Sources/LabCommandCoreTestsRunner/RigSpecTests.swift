@@ -41,28 +41,30 @@ func testExtrinsicsWithRotation() {
     
     let ex = SensorExtrinsics(rotation: rotation90Z, translation: (0.1, 0.2, 0.3))
     
-    // Point (1, 0, 0) rotated 90° CCW around Z becomes (0, 1, 0), then add translation
+    // Point (1, 0, 0) rotated 90° CCW around Z becomes (0, 1, 0), then SUBTRACT translation
+    // p_imu = R * p - t = (0, 1, 0) - (0.1, 0.2, 0.3) = (-0.1, 0.8, -0.3)
     let point = Point3D(x: 1, y: 0, z: 0)
     let transformed = ex.transform(point)
     
     let tolerance: Float = 0.0001
-    expect(abs(transformed.x - 0.1) < tolerance,
-           "Rotated point X should be ~0.1 (translation only), got \(transformed.x)")
-    expect(abs(transformed.y - 1.2) < tolerance,
-           "Rotated point Y should be ~1.2 (1 from rotation + 0.2 translation), got \(transformed.y)")
-    expect(abs(transformed.z - 0.3) < tolerance,
-           "Rotated point Z should be ~0.3 (translation only), got \(transformed.z)")
+    expect(abs(transformed.x - (-0.1)) < tolerance,
+           "Rotated point X should be ~-0.1, got \(transformed.x)")
+    expect(abs(transformed.y - 0.8) < tolerance,
+           "Rotated point Y should be ~0.8 (1 from rotation - 0.2 translation), got \(transformed.y)")
+    expect(abs(transformed.z - (-0.3)) < tolerance,
+           "Rotated point Z should be ~-0.3, got \(transformed.z)")
 }
 
 func testExtrinsicsWithTranslationOnly() {
+    // p_imu = p_sensor - t
     let ex = SensorExtrinsics(rotation: nil, translation: (1.0, 2.0, 3.0))
     
     let point = Point3D(x: 10, y: 20, z: 30)
     let transformed = ex.transform(point)
     
-    expect(transformed.x == 11.0, "X should be offset by translation")
-    expect(transformed.y == 22.0, "Y should be offset by translation")
-    expect(transformed.z == 33.0, "Z should be offset by translation")
+    expect(transformed.x == 9.0, "X should be 10 - 1 = 9")
+    expect(transformed.y == 18.0, "Y should be 20 - 2 = 18")
+    expect(transformed.z == 27.0, "Z should be 30 - 3 = 27")
 }
 
 func testTransformFramePreservesMetadata() {
