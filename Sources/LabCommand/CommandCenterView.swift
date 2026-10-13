@@ -259,7 +259,7 @@ struct CommandCenterView: View {
                         performAction(btn.action)
                     }
                     .font(LabTheme.t(12, btn.isPrimary ? .semibold : .medium))
-                    .buttonStyle(btn.isPrimary ? PrimaryButton(emphasized: true) : QuietButton())
+                    .buttonStyle(PrimaryButton(emphasized: btn.isPrimary))
                     .disabled(!btn.enabled || state.isActing)
                 }
             }
