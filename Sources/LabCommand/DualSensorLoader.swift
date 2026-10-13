@@ -3,31 +3,38 @@ import LabCommandCore
 
 /// Loads and prepares dual-sensor point clouds for rendering.
 /// Uses PointCloudDecoder from LabCommandCore and applies RigSpec extrinsics.
+///
+/// Search order for fixtures:
+/// 1. Bundle resources (for .app bundles)
+/// 2. Relative paths from current working directory
 public enum DualSensorLoader {
     
-    /// Standard fixture paths.
-    public static let mid360FixturePath = "fixtures/pointclouds/mid360-frame.pcd"
-    public static let jt128FixturePath = "fixtures/pointclouds/jt128-frame.pcd"
-    public static let dualFixturePath = "fixtures/pointclouds/dual-frame.pcd"
+    /// Standard fixture filenames.
+    public static let mid360FixtureName = "mid360-frame.pcd"
+    public static let jt128FixtureName = "jt128-frame.pcd"
+    
+    /// Relative search paths for fixture files.
+    private static let fixtureSearchPaths = [
+        "fixtures/pointclouds",
+        "../fixtures/pointclouds",
+        "../../fixtures/pointclouds",
+    ]
     
     // MARK: - Loading
     
     /// Load both sensor fixtures with extrinsics applied.
     /// Returns frames ready for rendering.
-    public static func loadDualSensorFixtures(
-        mid360Path: String = mid360FixturePath,
-        jt128Path: String = jt128FixturePath
-    ) -> [PointCloudFrame] {
+    public static func loadDualSensorFixtures() -> [PointCloudFrame] {
         var result: [PointCloudFrame] = []
         
         // Load Mid-360
-        if let mid360Frame = loadFrame(from: mid360Path, sensor: .mid360) {
+        if let mid360Frame = loadFixture(named: mid360FixtureName, sensor: .mid360) {
             let transformed = RigSpec.transformToRigFrame(mid360Frame)
             result.append(transformed)
         }
         
         // Load JT128
-        if let jt128Frame = loadFrame(from: jt128Path, sensor: .jt128) {
+        if let jt128Frame = loadFixture(named: jt128FixtureName, sensor: .jt128) {
             let transformed = RigSpec.transformToRigFrame(jt128Frame)
             result.append(transformed)
         }
@@ -37,19 +44,60 @@ public enum DualSensorLoader {
     
     /// Load a single sensor fixture with extrinsics applied.
     public static func loadSensorFixture(
-        path: String,
+        named filename: String,
         sensor: SensorID
     ) -> PointCloudFrame? {
-        guard let frame = loadFrame(from: path, sensor: sensor) else {
+        guard let frame = loadFixture(named: filename, sensor: sensor) else {
             return nil
         }
         
         return RigSpec.transformToRigFrame(frame)
     }
     
+    // MARK: - Fixture Resolution
+    
+    /// Resolve a fixture filename to an absolute path using bundle + filesystem search.
+    public static func resolveFixturePath(named filename: String) -> String? {
+        let fm = FileManager.default
+        
+        // Try bundle resources first (for .app bundles)
+        if let resourcePath = Bundle.main.resourcePath {
+            let bundlePath = URL(fileURLWithPath: resourcePath)
+                .appendingPathComponent("fixtures/pointclouds/\(filename)")
+            if fm.fileExists(atPath: bundlePath.path) {
+                return bundlePath.path
+            }
+        }
+        
+        // Try Bundle.main.path for embedded resources
+        if let bundlePath = Bundle.main.path(forResource: filename.replacingOccurrences(of: ".pcd", with: ""),
+                                              ofType: "pcd",
+                                              inDirectory: "fixtures/pointclouds") {
+            return bundlePath
+        }
+        
+        // Try relative paths from current working directory
+        let cwd = fm.currentDirectoryPath
+        for searchDir in fixtureSearchPaths {
+            let url = URL(fileURLWithPath: cwd)
+                .appendingPathComponent(searchDir)
+                .appendingPathComponent(filename)
+            if fm.fileExists(atPath: url.path) {
+                return url.path
+            }
+        }
+        
+        return nil
+    }
+    
     // MARK: - Frame Loading
     
-    private static func loadFrame(from path: String, sensor: SensorID) -> PointCloudFrame? {
+    private static func loadFixture(named filename: String, sensor: SensorID) -> PointCloudFrame? {
+        guard let path = resolveFixturePath(named: filename) else {
+            print("DualSensorLoader: Could not resolve fixture: \(filename)")
+            return nil
+        }
+        
         do {
             var frame = try PointCloudDecoder.loadPCD(from: path)
             frame.sensor = sensor
@@ -62,8 +110,8 @@ public enum DualSensorLoader {
     
     // MARK: - Combined Operations
     
-    /// Load frames and apply extrinsics.
-    public static func loadAndTransform(_ frames: [PointCloudFrame]) -> [PointCloudFrame] {
+    /// Transform existing frames to rig frame.
+    public static func transformToRigFrame(_ frames: [PointCloudFrame]) -> [PointCloudFrame] {
         RigSpec.transformToRigFrame(frames)
     }
 }

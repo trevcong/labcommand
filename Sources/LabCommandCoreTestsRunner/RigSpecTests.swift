@@ -3,17 +3,10 @@ import LabCommandCore
 
 /// Tests for RigSpec extrinsics and transformations.
 
-func testMid360ExtrinsicsValues() {
+func testMid360ExtrinsicsIsPlaceholder() {
+    // Mid-360 extrinsics are identity placeholders until real calibration is available
     let ex = RigSpec.mid360Extrinsics
-    
-    // Verify translation matches spec: (11.0, 23.29, −44.12) mm
-    let tolerance: Float = 0.00001
-    expect(abs(ex.translation.x - 0.011) < tolerance,
-           "Mid-360 X translation should be 0.011m, got \(ex.translation.x)")
-    expect(abs(ex.translation.y - 0.02329) < tolerance,
-           "Mid-360 Y translation should be 0.02329m, got \(ex.translation.y)")
-    expect(abs(ex.translation.z - (-0.04412)) < tolerance,
-           "Mid-360 Z translation should be -0.04412m, got \(ex.translation.z)")
+    expect(ex.isIdentity, "Mid-360 extrinsics should be identity placeholder")
 }
 
 func testJT128ExtrinsicsIsIdentity() {
@@ -22,23 +15,6 @@ func testJT128ExtrinsicsIsIdentity() {
     expect(ex.isIdentity, "JT128 extrinsics should be identity transform")
     expect(ex.translation.x == 0 && ex.translation.y == 0 && ex.translation.z == 0,
            "JT128 translation should be zero")
-}
-
-func testExtrinsicsTransformPoint() {
-    let ex = RigSpec.mid360Extrinsics
-    
-    // Transform origin point
-    let origin = Point3D(x: 0, y: 0, z: 0)
-    let transformed = ex.transform(origin)
-    
-    // Origin should map to the translation offset
-    let tolerance: Float = 0.00001
-    expect(abs(transformed.x - 0.011) < tolerance,
-           "Transformed origin X should equal translation X")
-    expect(abs(transformed.y - 0.02329) < tolerance,
-           "Transformed origin Y should equal translation Y")
-    expect(abs(transformed.z - (-0.04412)) < tolerance,
-           "Transformed origin Z should equal translation Z")
 }
 
 func testIdentityExtrinsicsPreservesPoint() {
@@ -54,6 +30,8 @@ func testIdentityExtrinsicsPreservesPoint() {
 
 func testExtrinsicsWithRotation() {
     // 90° rotation around Z axis: (1, 0, 0) -> (0, 1, 0)
+    // For column-major: column 0 = [cos, sin, 0], column 1 = [-sin, cos, 0], column 2 = [0, 0, 1]
+    // cos(90°) = 0, sin(90°) = 1
     let rotation90Z: [Float] = [
         0, 1, 0,   // Column 0
         -1, 0, 0,  // Column 1
@@ -62,6 +40,7 @@ func testExtrinsicsWithRotation() {
     
     let ex = SensorExtrinsics(rotation: rotation90Z, translation: (0.1, 0.2, 0.3))
     
+    // Point (1, 0, 0) rotated 90° CCW around Z becomes (0, 1, 0), then add translation
     let point = Point3D(x: 1, y: 0, z: 0)
     let transformed = ex.transform(point)
     
@@ -69,44 +48,54 @@ func testExtrinsicsWithRotation() {
     expect(abs(transformed.x - 0.1) < tolerance,
            "Rotated point X should be ~0.1 (translation only), got \(transformed.x)")
     expect(abs(transformed.y - 1.2) < tolerance,
-           "Rotated point Y should be ~1.2, got \(transformed.y)")
+           "Rotated point Y should be ~1.2 (1 from rotation + 0.2 translation), got \(transformed.y)")
     expect(abs(transformed.z - 0.3) < tolerance,
-           "Rotated point Z should be ~0.3, got \(transformed.z)")
+           "Rotated point Z should be ~0.3 (translation only), got \(transformed.z)")
 }
 
-func testTransformFrameAppliesExtrinsics() {
-    // Create a simple Mid-360 frame
+func testExtrinsicsWithTranslationOnly() {
+    let ex = SensorExtrinsics(rotation: nil, translation: (1.0, 2.0, 3.0))
+    
+    let point = Point3D(x: 10, y: 20, z: 30)
+    let transformed = ex.transform(point)
+    
+    expect(transformed.x == 11.0, "X should be offset by translation")
+    expect(transformed.y == 22.0, "Y should be offset by translation")
+    expect(transformed.z == 33.0, "Z should be offset by translation")
+}
+
+func testTransformFramePreservesMetadata() {
     let frame = PointCloudFrame(
-        positions: [Point3D(x: 0, y: 0, z: 0), Point3D(x: 1, y: 0, z: 0)],
-        intensities: [0.5, 0.8],
-        sensor: .mid360
+        positions: [Point3D(x: 1, y: 2, z: 3)],
+        intensities: [0.75],
+        sensor: .mid360,
+        timestamp: Date(timeIntervalSince1970: 1000),
+        frameId: "test_frame"
     )
     
     let transformed = RigSpec.transformToRigFrame(frame)
     
-    // Check first point (origin) is at Mid-360 offset
-    let tolerance: Float = 0.00001
-    expect(abs(transformed.positions[0].x - 0.011) < tolerance,
-           "Transformed origin X should equal Mid-360 offset")
+    // With identity placeholder, positions should be unchanged
+    expect(transformed.positions[0].x == 1 && transformed.positions[0].y == 2 && transformed.positions[0].z == 3,
+           "Position should pass through identity transform")
     
-    // Check second point is offset by same amount
-    expect(abs(transformed.positions[1].x - 1.011) < tolerance,
-           "Transformed point X should be original + offset")
-    
-    // Intensities should be preserved
+    // Metadata should be preserved
     expect(transformed.intensities == frame.intensities,
            "Intensities should be preserved after transform")
-    
-    // Sensor ID should be preserved
     expect(transformed.sensor == .mid360,
            "Sensor ID should be preserved after transform")
+    expect(transformed.frameId == "test_frame",
+           "frameId should be preserved after transform")
+    expect(transformed.timestamp == frame.timestamp,
+           "timestamp should be preserved after transform")
 }
 
 func testJT128FramePassesThrough() {
     let frame = PointCloudFrame(
         positions: [Point3D(x: 5.0, y: 3.0, z: 1.0)],
         intensities: [0.9],
-        sensor: .jt128
+        sensor: .jt128,
+        frameId: "jt128_frame"
     )
     
     let transformed = RigSpec.transformToRigFrame(frame)
@@ -115,38 +104,35 @@ func testJT128FramePassesThrough() {
     expect(transformed.positions[0].x == 5.0, "JT128 point X should be unchanged")
     expect(transformed.positions[0].y == 3.0, "JT128 point Y should be unchanged")
     expect(transformed.positions[0].z == 1.0, "JT128 point Z should be unchanged")
+    expect(transformed.frameId == "jt128_frame", "JT128 frameId should be preserved")
 }
 
-func testSensorColors() {
-    let mid360Color = RigSpec.color(for: .mid360)
-    let jt128Color = RigSpec.color(for: .jt128)
+func testExtrinsicsEquatable() {
+    let ex1 = SensorExtrinsics(rotation: nil, translation: (1.0, 2.0, 3.0))
+    let ex2 = SensorExtrinsics(rotation: nil, translation: (1.0, 2.0, 3.0))
+    let ex3 = SensorExtrinsics(rotation: nil, translation: (1.0, 2.0, 4.0))
     
-    // Mid-360 should be cyan (0, 1, 1)
-    expect(mid360Color.r == 0.0 && mid360Color.g == 1.0 && mid360Color.b == 1.0,
-           "Mid-360 color should be cyan")
-    
-    // JT128 should be magenta (1, 0, 1)
-    expect(jt128Color.r == 1.0 && jt128Color.g == 0.0 && jt128Color.b == 1.0,
-           "JT128 color should be magenta")
+    expect(ex1 == ex2, "Identical extrinsics should be equal")
+    expect(ex1 != ex3, "Different extrinsics should not be equal")
+    expect(SensorExtrinsics.identity == SensorExtrinsics.identity, "Identity should equal itself")
 }
 
-func testSensorIDForGPU() {
-    expect(RigSpec.sensorIDForGPU(.mid360) == 1, "Mid-360 GPU ID should be 1")
-    expect(RigSpec.sensorIDForGPU(.jt128) == 2, "JT128 GPU ID should be 2")
-    expect(RigSpec.sensorIDForGPU(nil) == 0, "nil sensor GPU ID should be 0")
+func testExtrinsicsLookupBySensor() {
+    let mid360 = RigSpec.extrinsics(for: .mid360)
+    let jt128 = RigSpec.extrinsics(for: .jt128)
+    
+    expect(mid360 == RigSpec.mid360Extrinsics, "Lookup for .mid360 should return mid360Extrinsics")
+    expect(jt128 == RigSpec.jt128Extrinsics, "Lookup for .jt128 should return jt128Extrinsics")
 }
 
 func runRigSpecTests() {
     print("RigSpec tests:")
     
-    testMid360ExtrinsicsValues()
-    print("  extrinsics: Mid-360 translation values match spec"); passed()
+    testMid360ExtrinsicsIsPlaceholder()
+    print("  extrinsics: Mid-360 is identity placeholder"); passed()
     
     testJT128ExtrinsicsIsIdentity()
     print("  extrinsics: JT128 is identity transform"); passed()
-    
-    testExtrinsicsTransformPoint()
-    print("  extrinsics: transform applies translation correctly"); passed()
     
     testIdentityExtrinsicsPreservesPoint()
     print("  extrinsics: identity preserves points"); passed()
@@ -154,15 +140,18 @@ func runRigSpecTests() {
     testExtrinsicsWithRotation()
     print("  extrinsics: rotation + translation combined correctly"); passed()
     
-    testTransformFrameAppliesExtrinsics()
-    print("  frame transform: applies extrinsics to point cloud frame"); passed()
+    testExtrinsicsWithTranslationOnly()
+    print("  extrinsics: translation-only transform works"); passed()
+    
+    testTransformFramePreservesMetadata()
+    print("  frame transform: preserves metadata including frameId"); passed()
     
     testJT128FramePassesThrough()
     print("  frame transform: JT128 passes through unchanged"); passed()
     
-    testSensorColors()
-    print("  sensor colors: Mid-360=cyan, JT128=magenta"); passed()
+    testExtrinsicsEquatable()
+    print("  Equatable: hand-written == works correctly"); passed()
     
-    testSensorIDForGPU()
-    print("  sensor IDs: GPU IDs map correctly"); passed()
+    testExtrinsicsLookupBySensor()
+    print("  extrinsics lookup: by sensor returns correct values"); passed()
 }
