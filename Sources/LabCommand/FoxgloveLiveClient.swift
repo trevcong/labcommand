@@ -461,7 +461,7 @@ private enum LiveStream {
                 announcedDown = true
             }
 
-            let delay = rotation.record(opened: end.opened, candidateCount: candidates.count)
+            let delay = rotation.record(opened: end.opened, in: candidates)
             if delay > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }

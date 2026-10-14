@@ -318,7 +318,8 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         guard let feed = liveFeed else { return false }
         let clouds = SensorID.allCases.compactMap { feed.latest($0)?.cloud.frame.positions }
         guard let bounds = Self.fitBounds(clouds) else { return false }
-        if let raw = RobustBounds.percentile(clouds, lower: 0, upper: 1, maxSamples: 0) {
+        // Extremes of the same bounded sample, for the log: cheap on the main thread.
+        if let raw = RobustBounds.percentile(clouds, lower: 0, upper: 1) {
             func box(_ lo: Point3D, _ hi: Point3D) -> String {
                 String(format: "x %.1f…%.1f y %.1f…%.1f z %.1f…%.1f m", lo.x, hi.x, lo.y, hi.y, lo.z, hi.z)
             }
@@ -332,10 +333,11 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         return true
     }
     
-    /// The box the camera frames: 2nd–98th percentile per axis, so a few stray
-    /// returns far outside the room don't shrink the room to a corner of the view.
+    /// The box the camera frames: 2nd–98th percentile per axis of the points within
+    /// `RobustBounds.maxFitRange` of the rig, so the far field and a few stray
+    /// returns don't shrink the room to a corner of the view.
     private static func fitBounds(_ clouds: [[Point3D]]) -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
-        guard let bounds = RobustBounds.percentile(clouds) else { return nil }
+        guard let bounds = RobustBounds.percentile(clouds, maxHorizontalRange: RobustBounds.maxFitRange) else { return nil }
         return (
             SIMD3(bounds.min.x, bounds.min.y, bounds.min.z),
             SIMD3(bounds.max.x, bounds.max.y, bounds.max.z)

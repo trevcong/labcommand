@@ -10,6 +10,9 @@ public enum RobustBounds {
     public static let defaultMaxSamples = 4096
     /// Below this many finite points a percentile says little; use plain min/max.
     public static let minSamplesForPercentiles = 32
+    /// Horizontal range (m, √(x² + y²) from the rig origin) past which returns are
+    /// left out of the camera fit: the room is inside it, the far field isn't.
+    public static let maxFitRange: Float = 15
 
     /// Per-axis `lower`…`upper` percentiles over every cloud together.
     ///
@@ -20,24 +23,23 @@ public enum RobustBounds {
     ///   - upper: Fraction in [0, 1] for the high edge, e.g. 0.98.
     ///   - maxSamples: Cap on points examined; sampling is a fixed stride, so the
     ///     same cloud always gives the same bounds.
+    ///   - maxHorizontalRange: Sampled points farther than this from the origin in
+    ///     x/y are dropped first, e.g. `maxFitRange`; if that drops every point the
+    ///     whole sample is used. Height doesn't count toward the range.
     /// - Returns: nil when no point is finite.
     public static func percentile(
         _ clouds: [[Point3D]],
         lower: Float = defaultLower,
         upper: Float = defaultUpper,
-        maxSamples: Int = defaultMaxSamples
+        maxSamples: Int = defaultMaxSamples,
+        maxHorizontalRange: Float = .infinity
     ) -> (min: Point3D, max: Point3D)? {
         let total = clouds.reduce(0) { $0 + $1.count }
         guard total > 0 else { return nil }
         let stride = maxSamples > 0 && total > maxSamples ? (total - 1) / maxSamples + 1 : 1
 
-        var xs: [Float] = []
-        var ys: [Float] = []
-        var zs: [Float] = []
-        let capacity = (total - 1) / stride + 1
-        xs.reserveCapacity(capacity)
-        ys.reserveCapacity(capacity)
-        zs.reserveCapacity(capacity)
+        var sample: [Point3D] = []
+        sample.reserveCapacity((total - 1) / stride + 1)
 
         // One running index across clouds so the stride doesn't restart per cloud.
         var next = 0
@@ -47,34 +49,71 @@ public enum RobustBounds {
                 let p = cloud[next - base]
                 next += stride
                 guard p.x.isFinite, p.y.isFinite, p.z.isFinite else { continue }
-                xs.append(p.x)
-                ys.append(p.y)
-                zs.append(p.z)
+                sample.append(p)
             }
             base += cloud.count
         }
-        guard !xs.isEmpty else { return nil }
+        guard !sample.isEmpty else { return nil }
+
+        if maxHorizontalRange < .infinity {
+            let limit = maxHorizontalRange * maxHorizontalRange
+            let inRange = sample.filter { $0.x * $0.x + $0.y * $0.y <= limit }
+            if !inRange.isEmpty { sample = inRange }
+        }
 
         let lo = Swift.min(Swift.max(Swift.min(lower, upper), 0), 1)
         let hi = Swift.min(Swift.max(Swift.max(lower, upper), 0), 1)
-        let usePercentiles = xs.count >= minSamplesForPercentiles
-        func range(_ values: inout [Float]) -> (Float, Float) {
-            values.sort()
-            guard usePercentiles else { return (values[0], values[values.count - 1]) }
-            return (quantile(values, lo), quantile(values, hi))
+        let usePercentiles = sample.count >= minSamplesForPercentiles
+        func range(_ axis: KeyPath<Point3D, Float>) -> (Float, Float) {
+            var values = sample.map { $0[keyPath: axis] }
+            guard usePercentiles else { return (values.min()!, values.max()!) }
+            return (quantile(&values, lo), quantile(&values, hi))
         }
-        let (x0, x1) = range(&xs)
-        let (y0, y1) = range(&ys)
-        let (z0, z1) = range(&zs)
+        let (x0, x1) = range(\.x)
+        let (y0, y1) = range(\.y)
+        let (z0, z1) = range(\.z)
         return (Point3D(x: x0, y: y0, z: z0), Point3D(x: x1, y: y1, z: z1))
     }
 
-    /// Linear interpolation between closest ranks of an ascending array.
-    static func quantile(_ sorted: [Float], _ q: Float) -> Float {
-        let position = q * Float(sorted.count - 1)
+    /// The `q` quantile, linearly interpolated between closest ranks, found by
+    /// selection instead of a full sort. Reorders `values`.
+    static func quantile(_ values: inout [Float], _ q: Float) -> Float {
+        let position = q * Float(values.count - 1)
         let below = Int(position.rounded(.down))
-        let above = Swift.min(below + 1, sorted.count - 1)
         let t = position - Float(below)
-        return sorted[below] + (sorted[above] - sorted[below]) * t
+        let low = select(&values, below)
+        guard t > 0, below + 1 < values.count else { return low }
+        // Everything past `below` is ≥ `low`; the smallest of it is the next rank.
+        let high = values[(below + 1)...].min()!
+        return low + (high - low) * t
+    }
+
+    /// Hoare quickselect: puts the `k`th smallest value at `values[k]`, smaller or
+    /// equal values before it and larger or equal after. O(n) on average.
+    static func select(_ values: inout [Float], _ k: Int) -> Float {
+        var lo = 0
+        var hi = values.count - 1
+        while lo < hi {
+            let pivot = values[(lo + hi) / 2]
+            var i = lo
+            var j = hi
+            while i <= j {
+                while values[i] < pivot { i += 1 }
+                while values[j] > pivot { j -= 1 }
+                if i <= j {
+                    values.swapAt(i, j)
+                    i += 1
+                    j -= 1
+                }
+            }
+            if k <= j {
+                hi = j
+            } else if k >= i {
+                lo = i
+            } else {
+                break
+            }
+        }
+        return values[k]
     }
 }

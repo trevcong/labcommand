@@ -149,10 +149,13 @@ public enum FoxgloveProtocol {
 
     // MARK: Endpoint
 
-    /// Hosts to try for `ws://<host>:8765`, in `SparkSSH.hopList` order (tailnet IP
-    /// first, then the last LAN hop that answered SSH). Only IPv4 literals: the ssh
-    /// aliases don't resolve outside ssh, and App Transport Security refuses
-    /// cleartext to DNS names under the app's `NSAllowsLocalNetworking`.
+    /// Hosts to try for `ws://<host>:8765`: the IPv4 literals of `SparkSSH.hopList`,
+    /// i.e. the tailnet IP, then the cached LAN hop when it is an IPv4 address. The
+    /// ssh aliases and the MagicDNS name are left out; the aliases only resolve
+    /// inside ssh. Cleartext ws:// here is allowed by Info.plist's ATS block:
+    /// `NSAllowsLocalNetworking` covers LAN addresses but not the 100.x CGNAT
+    /// tailnet IP, which needs its own `NSExceptionDomains` entry (macOS honours it
+    /// for an IP literal, though Apple documents exceptions for domain names).
     public static func streamHosts(lastLAN: String? = nil) -> [String] {
         SparkSSH.hopList(lastLAN: lastLAN).filter(isIPv4Literal)
     }
@@ -172,32 +175,48 @@ public enum FoxgloveProtocol {
     }
 }
 
-/// Which `streamHosts` entry to dial next. Every round starts at the first host
-/// (the tailnet IP); a later host — the cached LAN hop, which DHCP may have moved
-/// — is tried only straight after the ones before it failed, so a working tailnet
-/// never waits out a dead lease's handshake timeout.
+/// Which `streamHosts` entry to dial next. Every round starts at the host whose
+/// last connection opened (the tailnet IP until one has), then tries the rest in
+/// list order, each straight after the one before it failed. A drop redials the
+/// host that was working rather than one that may never answer — e.g. a dead DHCP
+/// lease's handshake timeout ahead of a working tailnet, or the reverse.
 public struct StreamHostRotation: Sendable, Equatable {
     /// Position in the current round.
     public private(set) var index = 0
     /// Rounds in a row where every host failed; drives the backoff.
     public private(set) var failedRounds = 0
+    /// The host whose last connection opened; rounds start from it while it is
+    /// still a candidate.
+    public private(set) var lastWorking: String?
 
     public init() {}
 
-    public func host(in candidates: [String]) -> String? {
-        candidates.isEmpty ? nil : candidates[min(index, candidates.count - 1)]
+    /// `candidates` with `lastWorking` moved to the front.
+    public func order(_ candidates: [String]) -> [String] {
+        guard let lastWorking, let i = candidates.firstIndex(of: lastWorking), i > 0 else { return candidates }
+        var ordered = candidates
+        ordered.remove(at: i)
+        ordered.insert(lastWorking, at: 0)
+        return ordered
     }
 
-    /// Record how the attempt on `host(in:)` ended; returns the wait before the next one.
-    public mutating func record(opened: Bool, candidateCount: Int) -> TimeInterval {
+    public func host(in candidates: [String]) -> String? {
+        let ordered = order(candidates)
+        return ordered.isEmpty ? nil : ordered[min(index, ordered.count - 1)]
+    }
+
+    /// Record how the attempt on `host(in: candidates)` ended; returns the wait
+    /// before the next one. Pass the same `candidates` the host was picked from.
+    public mutating func record(opened: Bool, in candidates: [String]) -> TimeInterval {
         if opened {
-            // A link that worked and dropped: the same first-choice round again.
+            // A link that worked and dropped: start the next round from it.
+            lastWorking = host(in: candidates)
             index = 0
             failedRounds = 0
             return FoxgloveProtocol.reconnectDelay(afterFailures: 0)
         }
         index += 1
-        if index < candidateCount {
+        if index < candidates.count {
             return 0
         }
         index = 0

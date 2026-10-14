@@ -182,28 +182,50 @@ func testStreamHostRotation() {
 
     // Tailscale works: every reconnect goes back to it, never to the LAN hop.
     for _ in 0..<3 {
-        let delay = rotation.record(opened: true, candidateCount: hosts.count)
+        let delay = rotation.record(opened: true, in: hosts)
         expect(delay == 1 && rotation.host(in: hosts) == "100.118.187.99", "a dropped tailnet link redials the tailnet")
     }
 
     // Tailscale fails: the LAN hop right away, then back to Tailscale after a backoff.
-    var delay = rotation.record(opened: false, candidateCount: hosts.count)
+    var delay = rotation.record(opened: false, in: hosts)
     expect(delay == 0 && rotation.host(in: hosts) == "192.168.68.65", "LAN only after the tailnet fails, without waiting")
-    delay = rotation.record(opened: false, candidateCount: hosts.count)
-    expect(delay == 1 && rotation.host(in: hosts) == "100.118.187.99", "a failed round restarts at the tailnet")
-    _ = rotation.record(opened: false, candidateCount: hosts.count)
-    delay = rotation.record(opened: false, candidateCount: hosts.count)
+    delay = rotation.record(opened: false, in: hosts)
+    expect(delay == 1 && rotation.host(in: hosts) == "100.118.187.99", "a failed round restarts at the last working host")
+    _ = rotation.record(opened: false, in: hosts)
+    delay = rotation.record(opened: false, in: hosts)
     expect(delay == 2 && rotation.failedRounds == 2, "backoff grows per failed round, not per host: \(delay)")
 
-    // The LAN hop answering resets the round, so the next attempt is Tailscale again.
-    _ = rotation.record(opened: false, candidateCount: hosts.count)
-    _ = rotation.record(opened: true, candidateCount: hosts.count)
-    expect(rotation.host(in: hosts) == "100.118.187.99" && rotation.failedRounds == 0, "a success restarts at the tailnet")
+    // The LAN hop answers: it becomes the first choice, so a drop redials it.
+    _ = rotation.record(opened: false, in: hosts)
+    expect(rotation.host(in: hosts) == "192.168.68.65", "the LAN hop is next")
+    delay = rotation.record(opened: true, in: hosts)
+    expect(delay == 1 && rotation.lastWorking == "192.168.68.65" && rotation.failedRounds == 0, "a success remembers its host")
+    expect(rotation.host(in: hosts) == "192.168.68.65", "a dropped LAN link redials the LAN hop, not the tailnet")
+    expect(rotation.order(hosts) == ["192.168.68.65", "100.118.187.99"], "the working host leads the round")
+    for _ in 0..<2 {
+        _ = rotation.record(opened: true, in: hosts)
+        expect(rotation.host(in: hosts) == "192.168.68.65", "repeated drops stay on the LAN hop")
+    }
+
+    // The remembered host stops answering: the tailnet straight away, and its success takes over.
+    delay = rotation.record(opened: false, in: hosts)
+    expect(delay == 0 && rotation.host(in: hosts) == "100.118.187.99", "after the remembered host fails, the tailnet without waiting")
+    _ = rotation.record(opened: true, in: hosts)
+    expect(rotation.lastWorking == "100.118.187.99" && rotation.host(in: hosts) == "100.118.187.99", "the tailnet is remembered again")
+
+    // The remembered host leaves the candidate list (the LAN cache moved): list order.
+    var moved = StreamHostRotation()
+    _ = moved.record(opened: false, in: hosts)
+    _ = moved.record(opened: true, in: hosts)
+    expect(moved.lastWorking == "192.168.68.65", "LAN hop remembered")
+    let newLease = FoxgloveProtocol.streamHosts(lastLAN: "192.168.68.70")
+    expect(moved.order(newLease) == newLease && moved.host(in: newLease) == "100.118.187.99",
+           "a remembered host that is no longer listed falls back to tailnet first")
 
     // Only the tailnet IP known: retries stay on it.
     var single = StreamHostRotation()
     let only = FoxgloveProtocol.streamHosts(lastLAN: "100.118.187.99")
-    delay = single.record(opened: false, candidateCount: only.count)
+    delay = single.record(opened: false, in: only)
     expect(delay == 1 && single.host(in: only) == "100.118.187.99", "one host: back off and redial it")
     expect(StreamHostRotation().host(in: []) == nil, "no hosts, nothing to dial")
 }
@@ -271,7 +293,7 @@ func runFoxgloveProtocolTests() {
     testFoxgloveReconnectBackoff()
     print("  Foxglove: reconnect backoff 1 s → 30 s"); passed()
     testStreamHostRotation()
-    print("  Foxglove: tailnet first every round; LAN hop only right after it fails"); passed()
+    print("  Foxglove: rounds start at the last working host (tailnet until one works); the rest only right after it fails"); passed()
     testLiveViewBadge()
     print("  live view: LIVE badge counts + Hz, SAMPLE badge wording"); passed()
     testArrivalRate()
