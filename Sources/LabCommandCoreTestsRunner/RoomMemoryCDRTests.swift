@@ -50,7 +50,8 @@ private let goldenStatus = Room.MemoryStatus(
     windowS: 1.0,
     mid360Hz: 10,
     jt128Hz: nil,
-    droppedWindows: 3
+    droppedWindows: 3,
+    eventsSeq: 12
 )
 
 private let goldenEpoch = Room.Epoch(
@@ -652,7 +653,8 @@ private struct MessageFactory {
             windowS: coin() ? 0.5 + fraction() : nil,
             mid360Hz: coin() ? UInt16(below(0xFFFF)) : nil,
             jt128Hz: coin() ? UInt16(below(0xFFFF)) : nil,
-            droppedWindows: UInt32(truncatingIfNeeded: random.next())
+            droppedWindows: UInt32(truncatingIfNeeded: random.next()),
+            eventsSeq: coin() ? random.next() % Room.MemoryStatus.eventsSeqNone : nil
         )
     }
 

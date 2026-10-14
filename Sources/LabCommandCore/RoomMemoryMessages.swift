@@ -322,6 +322,9 @@ public enum RoomMemory {
 
     /// `labcommand_msgs/MemoryStatus`: room-memory health at 1 Hz.
     public struct MemoryStatus: Sendable, Equatable {
+        /// `MemoryStatus.EVENTS_SEQ_NONE`: the wire value of `events_seq` before the first event is published.
+        public static let eventsSeqNone = UInt64.max
+
         /// The common fields.
         public var header: Header
         /// Memory state.
@@ -342,6 +345,8 @@ public enum RoomMemory {
         public var jt128Hz: UInt16?
         /// Windows dropped since the node started.
         public var droppedWindows: UInt32
+        /// `seq` of the newest live `events` message, the events high-water mark. Nil before the first event.
+        public var eventsSeq: UInt64?
 
         /// Creates a status message.
         public init(
@@ -354,7 +359,8 @@ public enum RoomMemory {
             windowS: Float?,
             mid360Hz: UInt16?,
             jt128Hz: UInt16?,
-            droppedWindows: UInt32
+            droppedWindows: UInt32,
+            eventsSeq: UInt64?
         ) {
             self.header = header
             self.state = state
@@ -366,6 +372,7 @@ public enum RoomMemory {
             self.mid360Hz = mid360Hz
             self.jt128Hz = jt128Hz
             self.droppedWindows = droppedWindows
+            self.eventsSeq = eventsSeq
         }
     }
 
