@@ -277,6 +277,9 @@ public enum CameraMath {
     /// Default elevation angle for camera (30 degrees above horizontal).
     public static let defaultElevation: Float = Float.pi / 6
     
+    /// World up vector (Z-up convention).
+    public static let worldUp: Float3 = Float3(0, 0, 1)
+    
     /// Normalize a Point3D vector.
     public static func normalize(_ v: Point3D) -> Point3D {
         let len = sqrt(v.x * v.x + v.y * v.y + v.z * v.z)

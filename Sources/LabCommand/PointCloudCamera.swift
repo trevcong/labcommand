@@ -317,49 +317,45 @@ final class PointCloudCamera: ObservableObject {
         let center = CameraMath.boundsCenter(min: bounds.min, max: bounds.max)
         guard !CameraMath.isInvalid(center) else { return }
         
-        let halfX = (bounds.max.x - bounds.min.x) / 2
-        let halfY = (bounds.max.y - bounds.min.y) / 2
-        let halfZ = (bounds.max.z - bounds.min.z) / 2
-        
-        guard halfX > 0 || halfY > 0 || halfZ > 0 else { return }
-        
-        // FOV for each axis
+        // Use CameraMath.fitDistance - single source of truth for fit algorithm
         let fovY = fieldOfView * .pi / 180.0
-        let fovX = 2 * atan(tan(fovY / 2) * aspectRatio)
+        let viewElevation = CameraMath.defaultElevation
         
-        // Corners closer to camera (at Y = min) project larger due to perspective.
-        // Account for this by scaling halfWidth by a perspective factor.
-        let perspectiveFactor: Float = 1.0 + (halfX > 0 ? halfY * tan(fovX / 2) / halfX : 0)
-        let halfWidth = halfX * perspectiveFactor
+        // Convert Float3 bounds to Point3D for CameraMath
+        let minPt = Point3D(x: bounds.min.x, y: bounds.min.y, z: bounds.min.z)
+        let maxPt = Point3D(x: bounds.max.x, y: bounds.max.y, z: bounds.max.z)
+        let corners = CameraMath.bboxCorners(min: minPt, max: maxPt)
+        let targetPt = Point3D(x: center.x, y: center.y, z: center.z)
         
-        // Camera looks at an angle (elevation). Z and Y contribute to screen vertical.
-        let halfHeight = halfZ + halfY * 0.3
+        let (forward, right, up) = CameraMath.cameraOrientation(elevation: viewElevation)
         
-        // Distance needed for each axis to fit in view
-        let distForWidth = halfWidth / tan(fovX / 2)
-        let distForHeight = halfHeight / tan(fovY / 2)
-        
-        // Take max (limiting axis) and apply 1.1 margin for 80-90% fill
-        let fitDistance = max(distForWidth, distForHeight) * 1.1
-        
-        let viewElevation: Float = Float.pi / 6  // 30° above horizon
+        let fitDist = CameraMath.fitDistance(
+            corners: corners,
+            target: targetPt,
+            forward: forward,
+            right: right,
+            up: up,
+            fovY: fovY,
+            aspect: aspectRatio,
+            margin: 0.9
+        )
         
         if mode == .orbit {
             // Center the orbit target on the cloud center
             target = center
             targetOrbitCenter = center
-            distance = CameraMath.clamp(fitDistance, min: minDistance, max: maxDistance)
+            distance = CameraMath.clamp(fitDist, min: minDistance, max: maxDistance)
             targetDistance = distance
             // Look from the -Y direction (front) with slight rotation for 3D feel
-            azimuth = -Float.pi / 2 + Float.pi / 8  // Mostly from -Y with slight angle
+            azimuth = -Float.pi / 2 + Float.pi / 8
             targetAzimuth = azimuth
             elevation = CameraMath.clamp(viewElevation, min: minElevation, max: maxElevation)
             targetElevation = elevation
         } else {
             // Position camera to look at center from front-ish angle
-            let camX = center.x - fitDistance * 0.3
-            let camY = center.y - fitDistance * 0.9
-            let camZ = center.z + fitDistance * 0.4
+            let camX = center.x - fitDist * 0.3
+            let camY = center.y - fitDist * 0.9
+            let camZ = center.z + fitDist * 0.4
             position = Float3(camX, camY, camZ)
             targetPosition = position
             // Point toward center
@@ -369,7 +365,7 @@ final class PointCloudCamera: ObservableObject {
             targetPitch = pitch
         }
         
-        print("[fitToBounds] center=\(center), distance=\(fitDistance), aspect=\(aspectRatio)")
+        print("[fitToBounds] center=\(center), distance=\(fitDist), aspect=\(aspectRatio)")
         updateMatrices()
     }
     
