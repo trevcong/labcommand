@@ -1,4 +1,4 @@
-# Command
+# LabCommand
 
 macOS instrument console for the **dual-lidar rig** (Livox Mid-360 + Hesai
 JT128) on the DGX Spark.
@@ -32,12 +32,12 @@ What's new:
 - **5 s polling** — an HTTP GET over the tunnel, not an SSH round-trip, so
   the panel tracks reality at web-page speed.
 
-## Open
+## Build and run
 
 ```bash
-cd ~/Desktop/hdc-spatial-memory/LabCommand
-./build.sh
-open ~/Applications/LabCommand.app
+cd ~/Developer/labcommand-grunt
+./build.sh --no-install
+open ./build/LabCommand.app
 ```
 
 Menu bar extra: **LAB**. Capture menu: ⌘↩ start/restart rig, ⌘⇧R record,
@@ -84,4 +84,5 @@ Pins the decoder's honest rules, the gates (record needs points, not
 containers), the Parked band, dual session naming, and the v0.4 design
 contract (type cap, spacing tokens, no placeholder chrome).
 `change-detect` diffs two clouds of the same sensor (`.pcd` or CDR `.bin`).
-`--json` writes the v2 parity record, and `--evidence` carves free space from the after cloud.
+`--json` writes the v2 parity record, and `--evidence` carves free space from
+the after cloud.
