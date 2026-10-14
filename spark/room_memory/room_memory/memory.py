@@ -6,6 +6,7 @@ spec DDA from the sensor origin. Each sensor keeps its own reference and recent 
 its own frame, until the JT128↔Mid-360 extrinsic exists (brief §5 R1).
 """
 
+import math
 import os
 import pathlib
 import re
@@ -15,7 +16,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from .core import Config, OccupancyMap, PointCloudError, cast_rays, decode_pointcloud2, diff, occupancy_map
+from .core import Config, OccupancyMap, cast_rays, decode_pointcloud2, diff, occupancy_map
 from .core.change_detection import contains, pack, unpack, validate
 from .messages import (
     BRICK_DIM,
@@ -289,8 +290,8 @@ class RoomMemory:
             raise ValueError(f"sensors must be a non-empty subset of {sorted(SENSORS)}, got {list(config.sensors)}")
         if config.reference_windows < 1 or config.recent_windows < 1:
             raise ValueError("reference_windows and recent_windows must be >= 1")
-        if not config.window_s > 0:
-            raise ValueError("window_s must be > 0 s")
+        if not (math.isfinite(config.window_s) and config.window_s > 0):
+            raise ValueError("window_s must be a finite number > 0 s")
         self.config = config
         self.change = config.change_config()
         validate(self.change)
@@ -351,7 +352,7 @@ class RoomMemory:
         """Decodes one CDR PointCloud2 and queues it. Returns False when the frame is rejected."""
         try:
             positions = decode_pointcloud2(data).positions
-        except PointCloudError:
+        except Exception:  # any decode failure is a rejected frame, never a crash (PointCloudError and beyond)
             channel = self.channels[sensor]
             channel.received += 1
             channel.failed += 1

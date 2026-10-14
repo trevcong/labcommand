@@ -274,3 +274,22 @@ def test_config_rejections():
         RoomMemory(MemoryConfig(sensors=()), START)
     with pytest.raises(ValueError):
         RoomMemory(MemoryConfig(window_s=0, state_dir=None), START)
+
+
+def test_window_s_must_be_finite_and_positive():
+    for bad in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="window_s"):
+            RoomMemory(MemoryConfig(window_s=bad, state_dir=None), Time(0, 0))
+
+
+def test_any_decode_failure_is_a_rejected_frame(monkeypatch):
+    import room_memory.memory as memory_module
+
+    def explode(data):
+        raise MemoryError("decoder ran out of memory")
+
+    monkeypatch.setattr(memory_module, "decode_pointcloud2", explode)
+    memory = RoomMemory(MemoryConfig(state_dir=None), Time(0, 0))
+    assert memory.add_cdr("mid360", b"\x00\x01\x00\x00") is False
+    channel = memory.channels["mid360"]
+    assert (channel.received, channel.failed) == (1, 1)
