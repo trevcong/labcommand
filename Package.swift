@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "LabCommand", targets: ["LabCommand"]),
+        .executable(name: "change-detect", targets: ["ChangeDetect"]),
         .library(name: "LabCommandCore", targets: ["LabCommandCore"]),
     ],
     targets: [
@@ -17,6 +18,11 @@ let package = Package(
             name: "LabCommand",
             dependencies: ["LabCommandCore"],
             path: "Sources/LabCommand"
+        ),
+        .executableTarget(
+            name: "ChangeDetect",
+            dependencies: ["LabCommandCore"],
+            path: "Sources/ChangeDetect"
         ),
         // XCTest may be unavailable under CLT-only installs; assert-based runner.
         .executableTarget(

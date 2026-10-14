@@ -76,8 +76,12 @@ The Spark side lives in `~/hesai_ws/` (`command_center.py`, `dual_up.sh`,
 
 ```bash
 swift run LabCommandCoreTestsRunner
+swift run change-detect -- before.pcd after.pcd
+swift run change-detect -- --evidence --json before.bin after.bin
 ```
 
 Pins the decoder's honest rules, the gates (record needs points, not
 containers), the Parked band, dual session naming, and the v0.4 design
 contract (type cap, spacing tokens, no placeholder chrome).
+`change-detect` diffs two clouds of the same sensor (`.pcd` or CDR `.bin`).
+`--json` writes the v2 parity record, and `--evidence` carves free space from the after cloud.
