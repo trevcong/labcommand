@@ -17,13 +17,14 @@ COPY ros/labcommand_msgs src/labcommand_msgs
 COPY spark/room_memory src/room_memory
 COPY Tests/Fixtures/change-detection fixtures/change-detection
 COPY Tests/Fixtures/room/snapshots fixtures/room/snapshots
+COPY Tests/Fixtures/room/synthetic fixtures/room/synthetic
 
 RUN . /opt/ros/jazzy/setup.sh \
     && colcon build --packages-select labcommand_msgs room_memory
 
 RUN . /opt/ros/jazzy/setup.sh && . install/setup.sh \
     && cd src/room_memory \
-    && ROOM_MEMORY_CD_FIXTURES=/ws/fixtures/change-detection ROOM_MEMORY_SNAPSHOTS=/ws/fixtures/room/snapshots python3 -m pytest -q tests
+    && ROOM_MEMORY_CD_FIXTURES=/ws/fixtures/change-detection ROOM_MEMORY_SNAPSHOTS=/ws/fixtures/room/snapshots ROOM_MEMORY_PHASE0_FIXTURES=/ws/fixtures/room/synthetic python3 -m pytest -q tests
 
 ENTRYPOINT ["/ws/src/room_memory/docker-entrypoint.sh"]
 CMD ["ros2", "launch", "room_memory", "room_memory.launch.py"]

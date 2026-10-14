@@ -17,7 +17,7 @@ import scenes
 HERE = pathlib.Path(__file__).resolve().parent
 SWIFT_DIR = HERE / "fixtures" / "swift"
 PHASE0_DIR = pathlib.Path(
-    os.environ.get("ROOM_MEMORY_PHASE0_FIXTURES", "~/Developer/labcommand-memory/Tests/Fixtures/room/synthetic")
+    os.environ.get("ROOM_MEMORY_PHASE0_FIXTURES", HERE.parents[2] / "Tests" / "Fixtures" / "room" / "synthetic")
 ).expanduser()
 
 EVIDENCE = ["--evidence", "--json"]
