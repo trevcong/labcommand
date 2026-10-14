@@ -2,7 +2,7 @@
 
 Status: draft for PR 0.1. Codex has not signed it off. Trevor decided D5, D9 and D19 on 2026-10-14 (§8); he has not answered Q1–Q4 (end of this doc). Sources: `RESEARCH_BRIEF.md` §2.2–§2.5 (2026-10-14). The `.msg` files are in `ros/labcommand_msgs/msg/`. The Swift codecs are `Sources/LabCommandCore/RoomMemoryMessages.swift` and `RoomMemoryCDR.swift`.
 
-The Spark does all perception and keeps the memory. The Mac mirrors the reference map, the event list and the timeline, and renders them. It never infers a change itself. Four Spark → Mac topics carry the state, two sync topics carry answers to the Mac's resync requests, and one Mac → Spark topic carries those requests. All of them go through the existing foxglove_bridge on :8765.
+The Spark does all perception and keeps the memory. The Mac mirrors the reference map, the event list and the timeline, and renders them. It never infers a change itself. Four Spark → Mac topics carry the state, two sync topics carry answers to the Mac's resync requests, and one Mac → Spark topic carries those requests. They reach the Mac through a dedicated foxglove_bridge in the room-memory container on :8767, which relays only `/room_memory/*` (§2, D23). The lidar containers' bridge on :8765 is not touched.
 
 ## 1. Conventions
 
@@ -71,7 +71,7 @@ Topic names are a proposal for PR 2.4 (D18):
 
 | topic | direction | message | rate | QoS (proposal) |
 |---|---|---|---|---|
-| `/room_memory/map_bricks` | Spark → Mac | `MapBricks` | snapshot when the node starts and on (re)connect; deltas ≤ 0.2 Hz, only when the reference changes | reliable, keep-last 10 |
+| `/room_memory/map_bricks` | Spark → Mac | `MapBricks` | snapshot when TRACKING starts and then every `keyframe_period_s` (60 s); deltas at least `delta_period_s` (5 s) apart, only when the reference changed (D24) | reliable, keep-last 10 |
 | `/room_memory/events` | Spark → Mac | `ChangeEvent` | one per lifecycle transition, typically < 1/min | reliable, keep-last 100 |
 | `/room_memory/status` | Spark → Mac | `MemoryStatus` | 1 Hz | reliable, keep-last 1 |
 | `/room_memory/epoch` | Spark → Mac | `Epoch` | 0.2 Hz | reliable, keep-last 1 |
@@ -79,7 +79,9 @@ Topic names are a proposal for PR 2.4 (D18):
 | `/room_memory/sync/map_bricks` | Spark → Mac | `MapBricks` | answers to `TOPIC_MAP_BRICKS` requests | reliable, keep-last 10 |
 | `/room_memory/sync/events` | Spark → Mac | `ChangeEvent` | answers to `TOPIC_EVENTS` requests | reliable, keep-last 200 |
 
-The Mac publishes `RequestSync` through foxglove_bridge's client-publish path. That path has not been checked against the deployed bridge (D19).
+**Transport (D23).** The room-memory container starts its own foxglove_bridge on :8767 (launch argument `foxglove_bridge`, default on), with `topic_whitelist` `^/room_memory/.*`, so the raw clouds never leave through it, and `labcommand_msgs` in its environment, so Foxglove and the Mac get the full message definitions. It is read-only by default (capabilities `connectionGraph` only). foxglove_bridge 3.4.1 parses `client_topic_whitelist` but does not enforce it, so turning on client publishing (`foxglove_client_publish:=true`) lets any client that reaches the port publish on any topic. The node answers whatever arrives on `/room_memory/request_sync`, so a relay that publishes the Mac's bytes there works the same way.
+
+**Keyframes are the (re)connect snapshot (D24).** The bridge shares one ROS subscription across its clients, so the node cannot see a Mac (re)connect. The periodic keyframe on the live topic plays that role: a Mac that (re)connects holds a current map within `keyframe_period_s` without sending anything, and `RequestSync` makes it immediate where it can be sent.
 
 ## 3. Messages
 
@@ -247,13 +249,17 @@ uint32 dropped_windows
 | field | type | unit | valid | missing on the wire | rendering when missing / invalid |
 |---|---|---|---|---|---|
 | `state` | `uint8` | enum | `STATE_*` (§4.1) | cannot be missing | other value: message rejected; status stale after 3 s |
-| `n_bricks` | `uint32` | bricks | bricks in the reference map | cannot be missing | stale: "—" |
+| `n_bricks` | `uint32` | bricks | bricks in the published reference map, the one `map_bricks` carries (D25) | cannot be missing | stale: "—" |
 | `n_open_events` | `uint32` | events | events in CANDIDATE or CONFIRMED | cannot be missing | stale: "—" |
-| `coverage_known_frac` | `float32` | fraction 0–1 | observed share of the room volume | NaN = room volume not yet known | "coverage —", never 0 % |
-| `pose_residual_m` | `float32` | m | finite, ≥ 0 | NaN = guard has not run | "guard not run", never "0 m" |
+| `coverage_known_frac` | `float32` | fraction 0–1 | observed share of the room volume, defined below | NaN = room volume not yet known | "coverage —", never 0 % |
+| `pose_residual_m` | `float32` | m | finite, ≥ 0; the rig-pose estimate defined below | NaN = guard has not run | "guard not run", never "0 m" |
 | `window_s` | `float32` | s | finite, > 0 (0.5–1.0 expected) | NaN = not reported | "window —" |
 | `per_sensor_hz` | `uint16[2]` | Hz, frames received per second, rounded | `[0]` Mid-360, `[1]` JT128 (same order as `sensors`) | `65535` = not measured | "—". `0` renders "0 Hz", a measured zero |
 | `dropped_windows` | `uint32` | windows since node start | any | cannot be missing | stale: "—" |
+
+**Definitions (v1, as the Spark computes them).**
+- **`coverage_known_frac`.** Of the published reference map (D25): the number of known voxels (occupied or free) inside the axis-aligned voxel-index box of its occupied voxels, divided by the number of voxels in that box. The box stands in for the room volume until one is configured; voxels inside walls and furniture are in it and can never be observed, so the value stays well below 1 (0.17–0.18 on the JT128 recording). NaN while the reference has no occupied voxel. It is computed during BUILDING too, from the reference built so far.
+- **`pose_residual_m`.** The size of the translation that best registers the latest window onto the reference, per sensor, then the largest over sensors. For each axis separately, the window's occupied voxels are shifted by −4 … +4 voxels and counted where they land on reference-occupied voxels. The best shift is refined by the parabola through that count and its two neighbours, unless it is ±4. The value is the length of the three per-axis shifts, in meters. Walls normal to an axis register that axis, and floors and ceilings do not mask a horizontal move. On the static recording it is 2.8 mm median (3.4 mm max). A real (2, 2, 0) cm move of the JT128 reads 26 mm, (5, 5, 0) cm reads 74 mm and 3 cm vertical reads 35 mm. It saturates near 0.35 m. NaN while BUILDING and when no shift overlaps at all. The memory stops learning from a window whose estimate exceeds `learn_max_offset_m` (0.02 m). Acting on it (RIG_MOVED, §4.1) is not implemented yet.
 
 **Wire size.** `4 + C + 32` bytes: 68 B for "lab", 76 B for "lab-a".
 
@@ -344,9 +350,9 @@ The Spark owns both machines. The Mac renders them, and it flags a transition th
 
 | from | to | trigger | Mac rendering of the new state |
 |---|---|---|---|
-| — | CANDIDATE | disagreement between the reference and recent layers where both have evidence | dashed outline, "candidate"; not counted as a change |
+| — | CANDIDATE | disagreement between the reference and recent layers where both have evidence, persisting `candidate_windows` (3) consecutive windows; a shorter one sends nothing (D26) | dashed outline, "candidate"; not counted as a change |
 | CANDIDATE | CONFIRMED | persists ≥ T_commit (start at 5 s; tuned in PR 2.3) | solid overlay; counted; arrow for MOVED |
-| CANDIDATE | EXPIRED | gone before T_commit (walk-through), superseded by a MOVED pairing, or memory left TRACKING for RIG_MOVED | removed from the overlay; history only |
+| CANDIDATE | EXPIRED | gone before T_commit (walk-through): no matching region for `expire_windows` (3) consecutive windows; superseded by a MOVED pairing; or memory left TRACKING for RIG_MOVED | removed from the overlay; history only |
 | CONFIRMED | ACCEPTED | operator accept; the reference absorbs it and `map_epoch` bumps | overlay removed; the map now shows the new state; history entry |
 | CONFIRMED | REVERTED | the region returned to the reference state, or operator revert | removed; history only |
 
@@ -386,6 +392,9 @@ The Spark keeps its last 10 `map_bricks` messages. It answers a `TOPIC_MAP_BRICK
 
    It republishes every message after `since_seq` unchanged (same `seq`, same bytes), in `seq` order.
 2. **Snapshot** otherwise. That covers no `since`, a `since_seq` older than the kept messages, a `since_seq` newer than the latest (the node restarted), an epoch that does not match, and nothing missed. The Spark publishes a new snapshot of the current map. Its `seq` is the latest `seq` published on the live topic, so the next live delta chains from it.
+3. **No answer** before the first live map message (BUILDING): there is no map yet, and the live snapshot that starts TRACKING ends the Mac's STALE state.
+
+A request whose `room_id` is not the node's room gets no answer, and one that does not decode is dropped and logged.
 
 **`events`.** A message with `seq` ≤ the last applied, for an `event_id` the Mac already holds in that `state`, is a duplicate: ignored and counted. Any other `seq` ≠ previous + 1 is a gap, including a reset after a node restart. A gap marks the event list "incomplete since \<stamp of the last good message\>". Open events show "may be outdated". Missed transitions are never invented. The Mac sends `RequestSync{TOPIC_EVENTS, since = (map_epoch, seq) of the last event message applied}`, or `SINCE_NONE` when it holds none. It does the same on every (re)connect, and it repeats the request after 5 s like the map request.
 
@@ -432,6 +441,15 @@ These extend the app's existing contract (missing ≠ zero, a running container 
 | MapBricks snapshot | node start, (re)connect, and the answer to a request that cannot be replayed | 52,863–59,024 B (measured, see below) | — |
 | RequestSync (Mac → Spark) | on (re)connect and on a gap | 53 B (exact) | — |
 
+**Measured on the real 5-minute static recording** (`spark/room_memory_cpp/PLAN.md`), both lidars, node defaults, the JT128's reference as the map: 1.28 KB/s mean over all room-memory topics.
+
+| stream | messages | bytes | mean |
+|---|---|---|---|
+| MapBricks snapshot (keyframe, 43 KB) | 6 | 259,350 | 0.87 KB/s |
+| MapBricks delta (new coverage, median 1.2 KB) | 48 | 91,619 | 0.31 KB/s |
+| MemoryStatus | 299 | 20,332 | 0.07 KB/s |
+| ChangeEvent (a real object next to the rig) | 49 | 12,034 | 0.04 KB/s |
+
 **Measured** by the size test in `RoomMemoryCDRTests.swift`.
 - The input is a full-sphere synthetic accumulation of the furnished 8 × 8 × 3 m room: 720 × 360 rays, ±1 cm range noise, seed 1, 5 cm voxels.
 - Every brick with any evidence is sent, all-free ones included (D5).
@@ -458,7 +476,7 @@ These extend the app's existing contract (missing ≠ zero, a running container 
 
 ## 8. Decisions for review
 
-Each item is a place where §2.4 was not legal ROS 2, was underspecified, or conflicted with the honest-state rules. Each states what this doc does and why. All need Codex review. Trevor decided D5, D9 and D19 on 2026-10-14; the parts of D19 marked below go beyond his decision and need his confirmation.
+Each item is a place where §2.4 was not legal ROS 2, was underspecified, or conflicted with the honest-state rules. Each states what this doc does and why. All need Codex review. Trevor decided D5, D9 and D19 on 2026-10-14; the parts of D19 marked below go beyond his decision and need his confirmation. D23–D26 come from the Spark implementation (Phase 2b) and the static recording.
 
 - **D1. ROS 2 syntax.** §2.4's text was made legal ROS 2. Names, types and order are unchanged except in `MapBricks`, where D9 moved `compression` ahead of the brick arrays and packed those into `payload`. The syntax changes:
   - Constants go one per line (`KIND_SNAPSHOT=0, KIND_DELTA=1` became two lines).
@@ -538,6 +556,10 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
   - A missed trailing delta is caught by `MemoryStatus.map_epoch` disagreeing with the mirror twice in a row.
 - **D21. `package.xml` license** says `Proprietary` because the repo has no LICENSE file. Trevor should confirm.
 - **D22. Payload limit.** The uncompressed `MapBricks` payload, `134 × n_bricks + 4 × n_removed`, is at most 16 MiB (16,777,216 bytes), about 125,000 bricks or 8,000 m³ fully covered. Without a limit, a 2 MB zlib payload could declare and inflate to over 2 GB. The decoder rejects a larger declared size before inflating, and the encoder refuses to write one (D16). The measured room needs 547 KB.
+- **D23. A dedicated, read-only bridge on :8767** (§2). The memory topics need `labcommand_msgs` in the bridge's environment, which the lidar bridge on :8765 does not have, and a separate bridge leaves LIVE untouched. Read-only by default because foxglove_bridge 3.4.1 does not enforce `client_topic_whitelist`. `RequestSync` then needs `foxglove_client_publish:=true` or a relay.
+- **D24. Periodic keyframes.** §2.4's "snapshot on (re)connect" cannot be detected through the bridge, so the live topic carries a snapshot every `keyframe_period_s` (60 s). Changed bricks between keyframes go out as deltas at most every `delta_period_s` (5 s, the ≤ 0.2 Hz of §2). A snapshot replaces the next delta once the deltas since the last snapshot would exceed `keyframe_delta_ratio` (0.5) of its size. A keyframe of an unchanged map does not bump `map_epoch`; every delta does.
+- **D25. One published map.** There is no JT128↔Mid-360 extrinsic yet (brief R1), so the references stay per sensor and `map_bricks` carries one of them, `map_sensor` (default: the JT128 when configured; its repeating pattern gives the denser map). `n_bricks` and `coverage_known_frac` describe that map. Events of the other sensor are in that sensor's own frame.
+- **D26. A persistence gate before CANDIDATE.** On the static recording the node sent ~120 CANDIDATE/EXPIRED messages per minute. Most of them came from a reference built as the union of 5 windows of the Mid-360's sparse non-repetitive pattern; per-voxel window counts fix that (`spark/room_memory_cpp/PLAN.md`). As a second line, a region now has to persist `candidate_windows` windows before its CANDIDATE is sent. An open candidate expires only after `expire_windows` unmatched windows, so an intermittently seen change does not flicker. T_commit (CANDIDATE → CONFIRMED) is unchanged and still PR 2.3.
 
 ## 9. Verification status
 
@@ -556,7 +578,7 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **No independent CDR cross-check yet.** No offline ROS 2 CDR library (`rosbags`, `mcap_ros2`) is installed on this Mac, and none was installed for this PR. So the hand goldens have only been checked against the Swift codec, which follows the same rules.
 - **Spark goldens: not produced.** `scripts/spark/make_room_memory_goldens.py` serializes the 9 little-endian values with `rclpy` after a `colcon build` of `labcommand_msgs` in the Jazzy container. Running it is a Spark task. The follow-up test then requires each Spark file to decode to the same value as its hand golden, which confirms D4.
 - **`colcon build` of `labcommand_msgs`: not run.** There is no ROS 2 on the Mac.
-- **The resync rules of §5 are a contract only.** They are not implemented yet: `RoomMemoryStore` is PR 1.1 and the Spark side is PR 2.4.
+- **The Spark side of §5 is implemented** in `spark/room_memory_cpp` (the node) and in the Python oracle `spark/room_memory`. The differential tests check the two byte for byte: the map log and replay, sync snapshots, event replay and the bounded fallback, the 100-message log and the room and decode checks. `RoomMemoryStore` (the Mac side) is PR 1.1. The bridge's client-publish path has not been tried against a live bridge.
 
 ## 10. Open questions for Trevor (brief §5, Q1–Q4)
 

@@ -6,15 +6,17 @@ import pathlib
 import numpy as np
 
 from room_memory.memory import MemoryConfig, RoomMemory
-from room_memory.messages import Time
+from room_memory.messages import CDRError, RequestSync, Time
 
-_FLOATS = {"voxel_size", "window_s"}
-_INTS = {"tolerance", "min_voxels", "min_extent", "reference_windows", "recent_windows"}
+_FLOATS = {"voxel_size", "window_s", "occupied_min_ratio", "free_max_ratio", "learn_max_offset_m", "delta_period_s",
+           "keyframe_period_s", "keyframe_delta_ratio"}
+_INTS = {"tolerance", "min_voxels", "min_extent", "reference_windows", "recent_windows", "occupied_min_hits",
+         "free_min_seen", "candidate_windows", "expire_windows"}
 
 
 def _config(fields, pair):
     key, value = pair.split("=", 1)
-    if key == "room_id":
+    if key in ("room_id", "map_sensor"):
         fields[key] = value
     elif key == "sensors":
         fields[key] = tuple(name for name in value.split(",") if name)
@@ -61,6 +63,17 @@ def run(script):
         elif command == "status":
             status = memory.status(Time(int(args[0]), int(args[1])), float(args[2]))
             out.append(f"status {status.to_cdr().hex()}")
+        elif command == "map":
+            message = memory.map_update(Time(int(args[0]), int(args[1])))
+            out.append(f"map {'none' if message is None else message.hex()}")
+        elif command == "sync":
+            try:
+                answer = memory.sync(RequestSync.from_cdr(bytes.fromhex(args[2])), Time(int(args[0]), int(args[1])))
+            except CDRError:
+                out.append("sync invalid")
+            else:
+                out.append(f"sync {len(answer)}")
+                out += [f"data {message.hex()}" for message in answer]
         else:
             raise ValueError(f"unknown command {command}")
     return "".join(line + "\n" for line in out)

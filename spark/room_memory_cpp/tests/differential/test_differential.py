@@ -11,6 +11,7 @@ import io
 import os
 import pathlib
 import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -19,6 +20,7 @@ import goldens
 import replay
 import scenes
 from room_memory import offline
+from room_memory.messages import ChangeEvent, Header, MapBricks, MapKind, RequestSync, SyncTopic, Time
 
 OFFLINE = os.environ.get("ROOM_MEMORY_OFFLINE")
 REPLAY = os.environ.get("ROOM_MEMORY_REPLAY")
@@ -34,7 +36,12 @@ OVERFLOWING_CLOUD = (
     "01"
 )
 
-pytestmark =pytest.mark.skipif(not (OFFLINE and REPLAY), reason="ROOM_MEMORY_OFFLINE / ROOM_MEMORY_REPLAY not set")
+# The memory tests' single-window mechanics (every voxel a window sees settles, every region is
+# sent and expired at once); scenarios written for them prepend it to their config line.
+SINGLE_WINDOW = ("recent_windows=1 occupied_min_hits=1 occupied_min_ratio=0 free_min_seen=1 candidate_windows=1 "
+                 "expire_windows=1")
+
+pytestmark = pytest.mark.skipif(not (OFFLINE and REPLAY), reason="ROOM_MEMORY_OFFLINE / ROOM_MEMORY_REPLAY not set")
 
 
 def python_offline(args):
@@ -198,7 +205,7 @@ def test_board_reference_and_lifecycle(tmp_path):
     before, after, _, _ = scenes.board_scene()
     b, a = floats(tmp_path, "before", before), floats(tmp_path, "after", after)
     out = run_both(tmp_path, f"""
-config sensors=mid360 max_range=none reference_windows=3 min_extent=1 state_dir={{state}}
+config {SINGLE_WINDOW} sensors=mid360 max_range=none reference_windows=3 min_extent=1 state_dir={{state}}
 start 1760400000 0
 status 1760400000 0 1.0
 points mid360 {b}
@@ -298,7 +305,8 @@ def test_codex_reference_needs_usable_data(tmp_path):
              floats(tmp_path, "nan", np.full((50, 3), np.nan, dtype=np.float32)),
              floats(tmp_path, "far", room + 50), floats(tmp_path, "room", room),
              floats(tmp_path, "added", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))]))]
-    lines = ["config sensors=mid360 max_range=15 reference_windows=3 state_dir={state}", "start 1760400000 0"]
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360 max_range=15 reference_windows=3 state_dir={{state}}",
+             "start 1760400000 0"]
     for second, path in enumerate(paths[:3] + [paths[3]] * 3 + [paths[4]]):
         lines += [f"points mid360 {path}", f"close {1760400000 + second} 0", f"status {1760400000 + second} 0 1.0"]
     out = run_both(tmp_path, "\n".join(lines))
@@ -310,7 +318,7 @@ def test_codex_per_sensor_freeze(tmp_path):
     r = floats(tmp_path, "room", room)
     boxed = floats(tmp_path, "boxed", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))]))
     out = run_both(tmp_path, f"""
-config state_dir=none max_range=none reference_windows=1
+config {SINGLE_WINDOW} state_dir=none max_range=none reference_windows=1
 start 1760400000 0
 points mid360 {r}
 close 1760400000 0
@@ -331,7 +339,7 @@ def test_codex_recent_windows_age_through_gaps(tmp_path):
     room = scenes.room_shell()
     r = floats(tmp_path, "room", room)
     boxed = floats(tmp_path, "boxed", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))]))
-    lines = ["config sensors=mid360 max_range=none reference_windows=3 recent_windows=3 state_dir=none",
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360 max_range=none reference_windows=3 recent_windows=3 state_dir=none",
              "start 1760400000 0"]
     for second in range(3):
         lines += [f"points mid360 {r}", f"close {1760400000 + second} 0"]
@@ -377,7 +385,7 @@ def test_bench_scale_window(tmp_path):
     """One sensor pair at the benchmark's scale: 4 x 80,000-point frames per window."""
     rng = np.random.default_rng(7)
     still, moved = scenes.indoor(False), scenes.indoor(True)
-    lines = ["config state_dir=none reference_windows=1", "start 0 0"]
+    lines = [f"config {SINGLE_WINDOW} state_dir=none reference_windows=1", "start 0 0"]
     for window, cloud in enumerate([still, still, moved, moved]):
         for frame in range(4):
             pick = cloud[rng.choice(len(cloud), 80_000, replace=False)]
@@ -386,3 +394,92 @@ def test_bench_scale_window(tmp_path):
         lines.append(f"close {window + 1} 0")
     out = run_both(tmp_path, "\n".join(lines))
     assert out.count("event ") == 2
+
+
+def request(room, since, topic, seq=0):
+    epoch = (1 << 64) - 1 if since is None else since[0]
+    return RequestSync(Header(room, epoch, seq, Time(1760400000, 0)), since, topic).to_cdr().hex()
+
+
+@pytest.mark.parametrize("variant", [
+    "keyframe_period_s=7 keyframe_delta_ratio=0.5 candidate_windows=2 expire_windows=2",
+    "keyframe_period_s=100 keyframe_delta_ratio=0.02 candidate_windows=3 expire_windows=1",
+    "keyframe_period_s=3 keyframe_delta_ratio=5 candidate_windows=1 expire_windows=3 map_sensor=mid360",
+])
+def test_settled_reference_map_stream_and_sync(tmp_path, variant):
+    """Count-thresholded references, new coverage joining them as deltas, keyframes, the
+    candidate gate, and every RequestSync answer path."""
+    rng = np.random.default_rng(5)
+    room = scenes.room_shell()
+    box = scenes.box_shell((0.3, 1.2, 0.3))
+    clouds = {"partial": room[room[:, 0] < 1.5], "room": room, "box": np.concatenate([room, box])}
+    lines = [f"config sensors=mid360,jt128 max_range=none reference_windows=4 occupied_min_hits=2 "
+             f"occupied_min_ratio=0.3 free_min_seen=2 free_max_ratio=0.2 map_sensor=jt128 delta_period_s=2 "
+             f"room_id=lab state_dir={{state}} {variant}", "start 1760400000 0"]
+    sequence = ["partial"] * 4 + ["room"] * 5 + ["box"] * 4 + ["room"] * 4 + ["box", "room", "box"] + ["room"] * 3
+    syncs = {6: [(None, SyncTopic.MAP_BRICKS)], 12: [("map", SyncTopic.MAP_BRICKS), (None, SyncTopic.EVENTS)],
+             18: [("event", SyncTopic.EVENTS), ("last event", SyncTopic.EVENTS), ((1, 99), SyncTopic.MAP_BRICKS)]}
+    for second, name in enumerate(sequence):
+        for sensor, sigma in (("mid360", 0.004), ("jt128", 0.008)):
+            cloud = clouds[name]
+            pick = cloud[rng.random(len(cloud)) < 0.7]
+            noisy = (pick + rng.normal(0, sigma, pick.shape)).astype(np.float32)
+            lines.append(f"points {sensor} {floats(tmp_path, f'{second}-{sensor}', noisy)}")
+        stamp = f"{1760400000 + second} 0"
+        lines += [f"close {stamp}", f"map {stamp}", f"status {stamp} 1.0"]
+        for n, (since, topic) in enumerate(syncs.get(second, [])):
+            if isinstance(since, str):
+                # (map_epoch, seq) of the first map message, or of the first or last event so far.
+                prefix = replay.run("\n".join(lines).replace("{state}", str(tmp_path / f"probe-{second}-{n}")))
+                kind = "map" if since == "map" else "event"
+                found = [line.split()[1] for line in prefix.splitlines() if line.startswith(kind + " ") and line != "map none"]
+                cls = MapBricks if kind == "map" else ChangeEvent
+                header = cls.from_cdr(bytes.fromhex(found[-1 if since == "last event" else 0])).header
+                since = (header.map_epoch, header.seq)
+            lines.append(f"sync {stamp} {request('lab', since, topic, n)}")
+        if second == 18:
+            lines += [f"sync {stamp} {request('other', None, SyncTopic.MAP_BRICKS, 6)}", f"sync {stamp} 0001000001"]
+    lines += ["config state_dir={state}", "start 1760400100 0", "status 1760400100 0 1.0", "map 1760400100 0"]
+    out = run_both(tmp_path, "\n".join(lines))
+    maps = [MapBricks.from_cdr(bytes.fromhex(line.split()[1])) for line in out.splitlines()
+            if line.startswith("map ") and line != "map none"]
+    kinds = {message.kind for message in maps}
+    assert MapKind.SNAPSHOT in kinds and (MapKind.DELTA in kinds or "ratio=0.02" in variant)
+    assert [m.header.seq for m in maps[:-1]] == list(range(len(maps) - 1))
+    answers = [line for line in out.splitlines() if line.startswith("sync ")]
+    # Replays: the map since the first message, the events since the first one and since the latest (nothing missed).
+    assert answers[4] == "sync 0" and answers[-2:] == ["sync 0", "sync invalid"] and answers[0] == "sync 1"
+
+
+EXCERPT = goldens.HERE.parents[1] / "room_memory_cpp" / "tests" / "fixtures" / "static5m-mid360-excerpt.mcap"
+
+
+def test_real_mid360_frames(tmp_path):
+    """Eight real Mid-360 frames (tools/bag_excerpt.py from the static recording, 0.8 s, about
+    a fifth of the points zero-range non-returns) through both engines in 0.2 s windows: the
+    count rule, learning, the map stream and both sync answers on real data."""
+    pytest.importorskip("mcap", reason="the mcap package reads the excerpt (pip install mcap)")
+    sys.path.insert(0, str(goldens.HERE.parents[1] / "room_memory_cpp" / "tools"))
+    import bag_stream
+
+    frames = [data for topic, _, data in bag_stream.messages([EXCERPT]) if topic == "/livox/lidar"]
+    assert len(frames) == 8
+    lines = ["config sensors=mid360 window_s=0.2 reference_windows=2 recent_windows=2 occupied_min_hits=2 "
+             "occupied_min_ratio=0.5 free_min_seen=2 candidate_windows=1 expire_windows=2 delta_period_s=0.2 "
+             "keyframe_period_s=0.6 keyframe_delta_ratio=5 state_dir={state}", "start 1792014385 0"]
+    for n, data in enumerate(frames):
+        path = tmp_path / f"frame-{n}.cdr"
+        path.write_bytes(data)
+        lines.append(f"cdr mid360 {path}")
+        if n % 2:
+            stamp = f"1792014385 {(n + 1) * 100_000_000}"
+            lines += [f"close {stamp}", f"map {stamp}", f"status {stamp} 0.2"]
+    stamp = "1792014386 0"
+    lines += [f"sync {stamp} {request('lab', None, SyncTopic.MAP_BRICKS)}",
+              f"sync {stamp} {request('lab', None, SyncTopic.EVENTS, 1)}"]
+    out = run_both(tmp_path, "\n".join(lines))
+    maps = [MapBricks.from_cdr(bytes.fromhex(line.split()[1])) for line in out.splitlines()
+            if line.startswith("map ") and line != "map none"]
+    # The reference settles after two windows and keeps learning: a snapshot, then deltas.
+    assert [(m.kind, m.header.map_epoch) for m in maps] == [(MapKind.SNAPSHOT, 1), (MapKind.DELTA, 2), (MapKind.DELTA, 3)]
+    assert out.splitlines()[-3] == "sync 1" and out.endswith("sync 0\n")

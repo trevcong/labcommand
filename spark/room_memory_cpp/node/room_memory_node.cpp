@@ -1,5 +1,7 @@
 // Thin rclcpp node around RoomMemory: raw CDR in, codec bytes out. The C++ twin of
-// spark/room_memory/room_memory/node.py, with the same topics, QoS and parameters.
+// spark/room_memory/room_memory/node.py, with the same topics, QoS and parameters: status at
+// 1 Hz, events per transition, map_bricks after each window when RoomMemory::map_update has
+// one, and RequestSync answers on the two sync topics (protocol sections 2 and 5).
 //
 // Subscriptions and publishers are generic (serialized), so frames go through the tested
 // decode_pointcloud2 and outputs are the codec's CDR bytes; sensor_msgs and labcommand_msgs
@@ -10,6 +12,8 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -26,6 +30,12 @@ namespace msg = room_memory::msg;
 
 constexpr const char* kStatusTopic = "/room_memory/status";
 constexpr const char* kEventsTopic = "/room_memory/events";
+constexpr const char* kMapTopic = "/room_memory/map_bricks";
+constexpr const char* kRequestTopic = "/room_memory/request_sync";
+constexpr const char* kSyncMapTopic = "/room_memory/sync/map_bricks";
+constexpr const char* kSyncEventsTopic = "/room_memory/sync/events";
+constexpr const char* kMapType = "labcommand_msgs/msg/MapBricks";
+constexpr const char* kEventType = "labcommand_msgs/msg/ChangeEvent";
 
 double cpu_ms() {
     timespec t{};
@@ -65,10 +75,27 @@ public:
         config.recent_windows = declare_parameter<std::int64_t>("recent_windows", defaults.recent_windows);
         const std::string state_dir = declare_parameter<std::string>("state_dir", *defaults.state_dir);
         config.state_dir = state_dir.empty() ? std::nullopt : std::optional<std::string>(state_dir);
+        config.occupied_min_hits = declare_parameter<std::int64_t>("occupied_min_hits", defaults.occupied_min_hits);
+        config.occupied_min_ratio = declare_parameter<double>("occupied_min_ratio", defaults.occupied_min_ratio);
+        config.free_min_seen = declare_parameter<std::int64_t>("free_min_seen", defaults.free_min_seen);
+        config.free_max_ratio = declare_parameter<double>("free_max_ratio", defaults.free_max_ratio);
+        config.candidate_windows = declare_parameter<std::int64_t>("candidate_windows", defaults.candidate_windows);
+        config.expire_windows = declare_parameter<std::int64_t>("expire_windows", defaults.expire_windows);
+        config.learn_max_offset_m = declare_parameter<double>("learn_max_offset_m", defaults.learn_max_offset_m);
+        config.map_sensor = declare_parameter<std::string>("map_sensor", defaults.map_sensor);
+        config.delta_period_s = declare_parameter<double>("delta_period_s", defaults.delta_period_s);
+        config.keyframe_period_s = declare_parameter<double>("keyframe_period_s", defaults.keyframe_period_s);
+        config.keyframe_delta_ratio = declare_parameter<double>("keyframe_delta_ratio", defaults.keyframe_delta_ratio);
         memory_ = std::make_unique<RoomMemory>(config, stamp());
 
-        events_ = create_generic_publisher(kEventsTopic, "labcommand_msgs/msg/ChangeEvent", rclcpp::QoS(100).reliable());
+        events_ = create_generic_publisher(kEventsTopic, kEventType, rclcpp::QoS(100).reliable());
         status_ = create_generic_publisher(kStatusTopic, "labcommand_msgs/msg/MemoryStatus", rclcpp::QoS(1).reliable());
+        map_ = create_generic_publisher(kMapTopic, kMapType, rclcpp::QoS(10).reliable());
+        sync_map_ = create_generic_publisher(kSyncMapTopic, kMapType, rclcpp::QoS(10).reliable());
+        sync_events_ = create_generic_publisher(kSyncEventsTopic, kEventType, rclcpp::QoS(200).reliable());
+        requests_ = create_generic_subscription(
+            kRequestTopic, "labcommand_msgs/msg/RequestSync", rclcpp::QoS(10).reliable(),
+            [this](std::shared_ptr<const rclcpp::SerializedMessage> message) { answer(*message); });
         for (const std::string& name : memory_->config().sensors) {
             const room_memory::Sensor& sensor = memory_->channel(name).sensor;
             subscriptions_.push_back(create_generic_subscription(
@@ -98,11 +125,14 @@ private:
     void close_window() {
         const auto start = std::chrono::steady_clock::now();
         const double cpu = cpu_ms();
-        const std::vector<msg::ChangeEvent> events = memory_->close_window(stamp());
+        const msg::Time now_stamp = stamp();
+        const std::vector<msg::ChangeEvent> events = memory_->close_window(now_stamp);
         for (const msg::ChangeEvent& event : events) events_->publish(serialized(event.to_cdr()));
+        const std::optional<msg::Bytes> map = memory_->map_update(now_stamp);
+        if (map) map_->publish(serialized(*map));
         const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        RCLCPP_INFO(get_logger(), "window %.1f ms wall, %.1f ms cpu, %zu event messages, state %s", elapsed,
-                    cpu_ms() - cpu, events.size(), msg::name(memory_->state()));
+        RCLCPP_INFO(get_logger(), "window %.1f ms wall, %.1f ms cpu, %zu event messages, map %zu B, state %s", elapsed,
+                    cpu_ms() - cpu, events.size(), map ? map->size() : std::size_t{0}, msg::name(memory_->state()));
         if (elapsed > memory_->config().window_s * 1000) {
             RCLCPP_WARN(get_logger(), "window took %.0f ms, longer than window_s", elapsed);
         }
@@ -115,9 +145,30 @@ private:
         status_->publish(serialized(memory_->status(stamp(), period).to_cdr()));
     }
 
+    void answer(const rclcpp::SerializedMessage& message) {
+        const rcl_serialized_message_t& raw = message.get_rcl_serialized_message();
+        msg::RequestSync request;
+        try {
+            request = msg::RequestSync::from_cdr(std::span<const std::uint8_t>(raw.buffer, raw.buffer_length));
+        } catch (const msg::CDRError& error) {
+            RCLCPP_WARN(get_logger(), "RequestSync dropped: %s", error.what());
+            return;
+        }
+        const std::vector<msg::Bytes> reply = memory_->sync(request, stamp());
+        const auto& publisher = request.topic == msg::SyncTopic::map_bricks ? sync_map_ : sync_events_;
+        for (const msg::Bytes& bytes : reply) publisher->publish(serialized(bytes));
+        RCLCPP_INFO(get_logger(), "RequestSync %s from room '%s': %zu messages",
+                    request.topic == msg::SyncTopic::map_bricks ? "map_bricks" : "events", request.header.room_id.c_str(),
+                    reply.size());
+    }
+
     std::unique_ptr<RoomMemory> memory_;
     std::shared_ptr<rclcpp::GenericPublisher> events_;
     std::shared_ptr<rclcpp::GenericPublisher> status_;
+    std::shared_ptr<rclcpp::GenericPublisher> map_;
+    std::shared_ptr<rclcpp::GenericPublisher> sync_map_;
+    std::shared_ptr<rclcpp::GenericPublisher> sync_events_;
+    std::shared_ptr<rclcpp::GenericSubscription> requests_;
     std::vector<std::shared_ptr<rclcpp::GenericSubscription>> subscriptions_;
     rclcpp::TimerBase::SharedPtr window_timer_;
     rclcpp::TimerBase::SharedPtr status_timer_;

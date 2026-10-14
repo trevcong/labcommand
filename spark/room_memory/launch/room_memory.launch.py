@@ -2,7 +2,9 @@
 
     ros2 launch room_memory room_memory.launch.py room_id:=lab sensors:="['mid360']"
 
-``max_range`` <= 0 disables the range clip; an empty ``state_dir`` disables saving and loading.
+``max_range`` <= 0 disables the range clip; an empty ``state_dir`` disables saving and loading;
+an empty ``map_sensor`` publishes the JT128's reference when it is configured, else the first
+sensor's. The defaults are ``MemoryConfig``'s, measured on the static recording.
 """
 
 from launch import LaunchDescription
@@ -20,9 +22,20 @@ ARGUMENTS = {
     "min_voxels": ("6", int),
     "min_extent": ("2", int),
     "window_s": ("1.0", float),
-    "reference_windows": ("5", int),
-    "recent_windows": ("1", int),
+    "reference_windows": ("30", int),
+    "recent_windows": ("3", int),
     "state_dir": ("~/room-memory", str),
+    "occupied_min_hits": ("2", int),
+    "occupied_min_ratio": ("0.3", float),
+    "free_min_seen": ("2", int),
+    "free_max_ratio": ("0.0", float),
+    "candidate_windows": ("3", int),
+    "expire_windows": ("3", int),
+    "learn_max_offset_m": ("0.02", float),
+    "map_sensor": ("", str),
+    "delta_period_s": ("5.0", float),
+    "keyframe_period_s": ("60.0", float),
+    "keyframe_delta_ratio": ("0.5", float),
 }
 
 

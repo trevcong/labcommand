@@ -77,7 +77,15 @@ int main(int argc, char** argv) {
     }
 
     MemoryConfig config;
+    // One reference window settles everything it saw, and every region is sent at once, so
+    // tracking starts at window 1 with the benchmark's two events; the recent layer and the
+    // per-window learning are the node's.
     config.reference_windows = 1;
+    config.occupied_min_hits = 1;
+    config.occupied_min_ratio = 0.0;
+    config.free_min_seen = 1;
+    config.candidate_windows = 1;
+    config.expire_windows = 1;
     config.state_dir = std::nullopt;
     RoomMemory memory(config, msg::Time{0, 0}, nullptr, full ? DiffScope::full : DiffScope::regions);
     std::vector<double> add_ms, close_ms;

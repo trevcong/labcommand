@@ -105,6 +105,9 @@ target_link_libraries(room_memory_offline PRIVATE room_memory_offline_cli)
 add_executable(room_memory_replay tools/replay.cpp)
 target_link_libraries(room_memory_replay PRIVATE room_memory_core)
 
+add_executable(room_memory_bag tools/bag.cpp)
+target_link_libraries(room_memory_bag PRIVATE room_memory_core)
+
 add_executable(bench_memory bench/bench_memory.cpp)
 target_link_libraries(bench_memory PRIVATE room_memory_core)
 
@@ -116,7 +119,7 @@ endif()
 if(ROOM_MEMORY_BUILD_NODE)
   add_executable(room_memory_node node/room_memory_node.cpp)
   target_link_libraries(room_memory_node PRIVATE room_memory_core rclcpp::rclcpp)
-  install(TARGETS room_memory_node room_memory_offline room_memory_replay DESTINATION lib/${PROJECT_NAME})
+  install(TARGETS room_memory_node room_memory_offline room_memory_replay room_memory_bag DESTINATION lib/${PROJECT_NAME})
   install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
   ament_package()
 endif()

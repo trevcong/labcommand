@@ -6,7 +6,9 @@
 #   docker build -f spark/room_memory_cpp/Dockerfile -t labcommand/room-memory-cpp:jazzy .
 #   docker run --rm --net=host --ipc=host -v ~/room-memory:/root/room-memory labcommand/room-memory-cpp:jazzy
 #
-# --net=host and --ipc=host let DDS discovery and shared memory reach the lidar drivers.
+# --net=host and --ipc=host let DDS discovery and shared memory reach the lidar drivers. The
+# launch file also starts a read-only foxglove_bridge on :8767 that relays only /room_memory/*
+# (launch argument foxglove_bridge:=false turns it off).
 # CPU_FLAGS defaults to the build machine's CPU; set it (e.g. -march=armv9-a) when the image
 # is built on a different host than the one it runs on.
 FROM ros:jazzy-ros-base
@@ -14,7 +16,7 @@ FROM ros:jazzy-ros-base
 ARG CPU_FLAGS=-mcpu=native
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends zlib1g-dev ros-jazzy-sensor-msgs python3-numpy python3-pytest \
+    && apt-get install -y --no-install-recommends zlib1g-dev ros-jazzy-sensor-msgs ros-jazzy-foxglove-bridge python3-numpy python3-pytest \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /ws

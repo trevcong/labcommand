@@ -3,7 +3,9 @@
 A ``VoxelLayer`` holds two sorted key arrays, ``occupied ⊆ known``: free is known minus
 occupied, and every other voxel is UNKNOWN. A window's free space comes from the core's
 spec DDA from the sensor origin. Each sensor keeps its own reference and recent layers, in
-its own frame, until the JT128↔Mid-360 extrinsic exists (brief §5 R1).
+its own frame, until the JT128↔Mid-360 extrinsic exists (brief §5 R1). The reference is the
+settled part of per-voxel window counts (``VoxelStats``); one sensor's reference is the map the
+node publishes as ``MapBricks`` snapshots and deltas.
 """
 
 import math
@@ -11,13 +13,13 @@ import os
 import pathlib
 import re
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple
 
 import numpy as np
 
 from .core import Config, OccupancyMap, cast_rays, decode_pointcloud2, diff, occupancy_map
-from .core.change_detection import contains, pack, unpack, validate
+from .core.change_detection import contains, in_range, pack, unpack, validate
 from .messages import (
     BRICK_DIM,
     Brick,
@@ -26,6 +28,7 @@ from .messages import (
     EventKind,
     EventState,
     HZ_UNAVAILABLE,
+    SINCE_NONE,
     Header,
     MapBricks,
     MapKind,
@@ -33,6 +36,7 @@ from .messages import (
     MemoryStatus,
     SENSOR_JT128,
     SENSOR_MID360,
+    SyncTopic,
     Time,
 )
 
@@ -40,6 +44,14 @@ _INT16 = (-(1 << 15), (1 << 15) - 1)
 _NO_POINTS = np.zeros((0, 3), dtype=np.float32)
 _KINDS = {"appeared": EventKind.APPEARED, "disappeared": EventKind.DISAPPEARED, "moved": EventKind.MOVED}
 _ROOM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_EMPTY_KEYS = np.zeros(0, dtype=np.int64)
+_EMPTY_COUNTS = np.zeros(0, dtype=np.uint32)
+
+# The protocol's replay depths (§5).
+MAP_LOG_DEPTH = 10
+EVENT_LOG_DEPTH = 100
+# pose_residual_m: the registration search reaches this many voxels along each axis.
+POSE_SEARCH_VOXELS = 4
 
 
 @dataclass(frozen=True)
@@ -146,6 +158,113 @@ class VoxelLayer:
         return cls(keys([brick.occupied for brick in bricks]), keys([brick.known for brick in bricks]))
 
 
+def _nanoseconds(time):
+    return time.sec * 1_000_000_000 + time.nanosec
+
+
+# MARK: Window counts
+
+
+@dataclass(frozen=True)
+class SettleRule:
+    """Thresholds that turn per-voxel window counts into reference evidence."""
+
+    occupied_min_hits: int = 1
+    occupied_min_ratio: float = 0.0
+    free_min_seen: int = 1
+    free_max_ratio: float = 0.0
+
+
+class VoxelStats:
+    """Per-voxel window counts: ``seen`` counts the windows that observed the voxel (occupied or
+    ray-free), ``hits`` the windows in which it was occupied. Sorted unique keys, parallel counts."""
+
+    def __init__(self):
+        self.keys, self.hits, self.seen = _EMPTY_KEYS, _EMPTY_COUNTS, _EMPTY_COUNTS
+
+    def add(self, occupied, known):
+        """Counts one window: every voxel of ``known`` once in seen, those of ``occupied`` also in hits."""
+        keys = np.union1d(self.keys, known)
+        hits = np.zeros(len(keys), dtype=np.uint32)
+        seen = np.zeros(len(keys), dtype=np.uint32)
+        old = np.searchsorted(keys, self.keys)
+        hits[old], seen[old] = self.hits, self.seen
+        new = np.searchsorted(keys, known)
+        hits[new] += contains(occupied, known).astype(np.uint32)
+        seen[new] += np.uint32(1)
+        self.keys, self.hits, self.seen = keys, hits, seen
+
+    def settled(self, rule):
+        """The voxels the rule settles, as a layer: occupied when ``hits >= occupied_min_hits`` and
+        ``hits >= occupied_min_ratio * seen``; else free when ``seen >= free_min_seen`` and
+        ``hits <= free_max_ratio * seen``. Every other counted voxel stays UNKNOWN."""
+        h, n = self.hits.astype(np.float64), self.seen.astype(np.float64)
+        occupied = (self.hits.astype(np.int64) >= rule.occupied_min_hits) & (h >= rule.occupied_min_ratio * n)
+        free = ~occupied & (self.seen.astype(np.int64) >= rule.free_min_seen) & (h <= rule.free_max_ratio * n)
+        return VoxelLayer(self.keys[occupied], self.keys[occupied | free])
+
+    def erase(self, drop):
+        """Drops the counts of the sorted keys ``drop``."""
+        keep = ~contains(drop, self.keys)
+        self.keys, self.hits, self.seen = self.keys[keep], self.hits[keep], self.seen[keep]
+
+
+def map_delta(before, after):
+    """What turns the canonical brick tuple ``before`` into ``after``: ``(bricks, removed)``, the new
+    or changed bricks and the indices into ``before`` of the bricks absent from ``after``."""
+    old = {brick.coordinate: brick for brick in before}
+    new = {brick.coordinate for brick in after}
+    bricks = tuple(brick for brick in after if old.get(brick.coordinate) != brick)
+    removed = tuple(index for index, brick in enumerate(before) if brick.coordinate not in new)
+    return bricks, removed
+
+
+def _coverage(reference):
+    """Share of the voxels in the index box of ``reference.occupied`` that the reference observed."""
+    if not len(reference.occupied):
+        return None
+    lo = [axis.min() for axis in unpack(reference.occupied)]
+    hi = [axis.max() for axis in unpack(reference.occupied)]
+    i, j, k = unpack(reference.known)
+    inside = (i >= lo[0]) & (i <= hi[0]) & (j >= lo[1]) & (j <= hi[1]) & (k >= lo[2]) & (k <= hi[2])
+    cells = int(hi[0] - lo[0] + 1) * int(hi[1] - lo[1] + 1) * int(hi[2] - lo[2] + 1)
+    return int(np.count_nonzero(inside)) / cells
+
+
+def pose_offset(recent, reference_occupied, voxel_size):
+    """The translation (meters) that best registers ``recent`` (occupied keys) onto the reference
+    occupancy, as one number: per axis, the shift of -POSE_SEARCH_VOXELS .. POSE_SEARCH_VOXELS
+    voxels that maximizes the count of recent voxels landing on reference-occupied ones, refined
+    by the parabola through that count and its two neighbours (not at the ends of the range);
+    the norm of the three per-axis shifts. None when no shift overlaps at all."""
+    r = POSE_SEARCH_VOXELS
+    lanes = unpack(recent)
+    squared = 0.0
+    for axis in range(3):
+        counts = []
+        for shift in range(-r, r + 1):
+            moved = [lane + shift if n == axis else lane for n, lane in enumerate(lanes)]
+            ok = in_range(*moved)
+            counts.append(int(contains(reference_occupied, pack(*(lane[ok] for lane in moved))).sum()))
+        # The peak; on ties the shift nearest zero, the negative one first.
+        best = 0
+        for step in range(1, r + 1):
+            for shift in (-step, step):
+                if counts[shift + r] > counts[best + r]:
+                    best = shift
+        if counts[best + r] == 0:
+            return None
+        shift = float(best)
+        if -r < best < r:
+            low, mid, high = (float(counts[best + r + d]) for d in (-1, 0, 1))
+            curvature = low - 2.0 * mid + high
+            if curvature < 0.0:
+                shift += (low - high) / (2.0 * curvature)
+        meters = shift * voxel_size
+        squared += meters * meters
+    return math.sqrt(squared)
+
+
 # MARK: Persistence
 
 
@@ -181,14 +300,17 @@ def load_reference(path):
 
 @dataclass
 class Candidate:
-    """One open change: CANDIDATE sent, no terminal transition yet."""
+    """One change region followed across windows: pending until it has persisted, then an open
+    candidate (CANDIDATE sent, no terminal transition yet)."""
 
-    event_id: int
+    event_id: int  # 0 while pending
     kind: EventKind
     keys: np.ndarray
     region: object
     first_seen: Time
     last_seen: Time
+    windows: int = 1  # consecutive windows with a matching region
+    missed: int = 0  # consecutive windows without one
 
 
 def region_keys(region):
@@ -201,39 +323,70 @@ def region_keys(region):
 class CandidateTracker:
     """Transition-only bookkeeping for one sensor's change regions (PR 2.3 adds CONFIRMED).
 
-    A region without an open candidate of the same kind sharing a voxel starts a CANDIDATE.
-    A candidate that no region of the next window matches goes EXPIRED. A matched
-    candidate sends nothing: the protocol has one message per lifecycle transition.
+    A region matches the first open, else the first pending, region of the same kind sharing a
+    voxel that no other region of this window matched; otherwise it starts a pending one. A
+    pending region becomes a CANDIDATE (and gets its event id) once it has matched in
+    ``candidate_windows`` consecutive windows, and is dropped silently the first window it is not
+    matched. An open candidate goes EXPIRED after ``expire_windows`` consecutive windows without
+    a match. A matched candidate sends nothing: the protocol has one message per transition.
     """
 
-    def __init__(self):
+    def __init__(self, candidate_windows=1, expire_windows=1):
+        self.candidate_windows = candidate_windows
+        self.expire_windows = expire_windows
         self.open = []
+        self.pending = []
 
     def update(self, regions, stamp, next_id):
-        """Returns ``[(state, candidate)]`` in a fixed order: new candidates, then expiries."""
+        """Returns ``[(state, candidate)]``: new candidates in region order, then expiries by id."""
         transitions = []
-        matched = set()
+        open_matched, pending_matched = set(), set()
+        promoted, started = [], []
+
+        def first(entries, matched, kind, keys):
+            for index, entry in enumerate(entries):
+                if index not in matched and entry.kind == kind and len(np.intersect1d(entry.keys, keys, assume_unique=True)):
+                    matched.add(index)
+                    return entry
+            return None
+
+        def promote(candidate):
+            candidate = replace(candidate, event_id=next_id())
+            transitions.append((EventState.CANDIDATE, candidate))
+            promoted.append(candidate)
+
+        promoted_pending = set()
         for region in regions:
             kind = _KINDS.get(region.kind)
             if kind is None:
                 continue
             keys = region_keys(region)
-            match = next(
-                (c for c in self.open if c.event_id not in matched and c.kind == kind
-                 and len(np.intersect1d(c.keys, keys, assume_unique=True))),
-                None,
-            )
-            if match is None:
-                match = Candidate(next_id(), kind, keys, region, stamp, stamp)
-                self.open.append(match)
-                transitions.append((EventState.CANDIDATE, match))
+            match = first(self.open, open_matched, kind, keys)
+            if match is not None:
+                match.keys, match.region, match.last_seen, match.missed = keys, region, stamp, 0
+                continue
+            waiting = first(self.pending, pending_matched, kind, keys)
+            if waiting is not None:
+                waiting.keys, waiting.region, waiting.last_seen = keys, region, stamp
+                waiting.windows += 1
+                if waiting.windows >= self.candidate_windows:
+                    promoted_pending.add(id(waiting))
+                    promote(waiting)
+            elif self.candidate_windows <= 1:
+                promote(Candidate(0, kind, keys, region, stamp, stamp))
             else:
-                match.keys, match.region, match.last_seen = keys, region, stamp
-            matched.add(match.event_id)
-        for candidate in sorted(self.open, key=lambda c: c.event_id):
-            if candidate.event_id not in matched:
-                transitions.append((EventState.EXPIRED, candidate))
-        self.open = [c for c in self.open if c.event_id in matched]
+                started.append(Candidate(0, kind, keys, region, stamp, stamp))
+        expired = set()
+        for index in sorted(range(len(self.open)), key=lambda n: self.open[n].event_id):
+            if index in open_matched:
+                continue
+            self.open[index].missed += 1
+            if self.open[index].missed >= self.expire_windows:
+                expired.add(index)
+                transitions.append((EventState.EXPIRED, self.open[index]))
+        self.open = [c for n, c in enumerate(self.open) if n not in expired] + promoted
+        self.pending = [c for n, c in enumerate(self.pending)
+                        if n in pending_matched and id(c) not in promoted_pending] + started
         return transitions
 
 
@@ -252,9 +405,30 @@ class MemoryConfig:
     min_voxels: int = 6
     min_extent: int = 2
     window_s: float = 1.0
-    reference_windows: int = 5
-    recent_windows: int = 1
+    # Defaults measured on the static recording (room_memory_cpp/PLAN.md, "False change events").
+    reference_windows: int = 30
+    recent_windows: int = 3
     state_dir: Optional[str] = "~/room-memory"
+    # Reference evidence from per-voxel window counts (``VoxelStats.settled``).
+    occupied_min_hits: int = 2
+    occupied_min_ratio: float = 0.3
+    free_min_seen: int = 2
+    free_max_ratio: float = 0.0
+    # Change gate: windows a region must persist before its CANDIDATE, and windows an open
+    # candidate may go unmatched before it EXPIRES.
+    candidate_windows: int = 3
+    expire_windows: int = 3
+    # A tracking window adds to the counts of unsettled voxels only while its pose offset is at
+    # most this (meters), so a moved rig never teaches the reference its new view.
+    learn_max_offset_m: float = 0.02
+    # Map stream: the sensor whose reference is published ("" = jt128 when configured, else the
+    # first configured), the
+    # minimum time between map messages, the maximum time between snapshots, and the share of
+    # the last snapshot's size the deltas since it may reach before a snapshot replaces the next delta.
+    map_sensor: str = ""
+    delta_period_s: float = 5.0
+    keyframe_period_s: float = 60.0
+    keyframe_delta_ratio: float = 0.5
 
     def change_config(self):
         """The core config: evidence on, sensor origin (0, 0, 0) in each sensor's frame."""
@@ -263,19 +437,33 @@ class MemoryConfig:
             min_voxels=self.min_voxels, min_extent=self.min_extent, evidence_of_absence=True,
         )
 
+    def settle_rule(self):
+        return SettleRule(self.occupied_min_hits, self.occupied_min_ratio, self.free_min_seen, self.free_max_ratio)
+
+
+@dataclass
+class Logged:
+    """One published message kept for ``RequestSync`` replays."""
+
+    seq: int
+    map_epoch: int
+    data: bytes
+
 
 class _Channel:
-    def __init__(self, sensor, recent_windows):
+    def __init__(self, sensor, config):
         self.sensor = sensor
         self.frames = []
         self.received = 0
         self.failed = 0
         self.last_error = None  # None, or (type name, message). Never the exception or the frame.
         self.reference = VoxelLayer.empty()
-        self.reference_windows = 0  # windows with usable points merged into the reference
-        self.recent = deque(maxlen=recent_windows)  # one entry per closed window, empty when it had none
-        self.tracker = CandidateTracker()
+        self.stats = VoxelStats()  # every voxel while BUILDING; the not yet settled ones while TRACKING
+        self.reference_windows = 0  # windows with usable points counted into the reference
+        self.recent = deque(maxlen=config.recent_windows)  # one entry per closed window, empty when it had none
+        self.tracker = CandidateTracker(config.candidate_windows, config.expire_windows)
         self.hz = None
+        self.residual = None  # pose_offset of the last tracking window with points
 
 
 class RoomMemory:
@@ -293,10 +481,24 @@ class RoomMemory:
             raise ValueError("reference_windows and recent_windows must be >= 1")
         if not (math.isfinite(config.window_s) and config.window_s > 0):
             raise ValueError("window_s must be a finite number > 0 s")
+        if (config.occupied_min_hits < 1 or config.free_min_seen < 1 or not 0 <= config.occupied_min_ratio <= 1
+                or not 0 <= config.free_max_ratio <= 1):
+            raise ValueError("occupied_min_hits and free_min_seen must be >= 1, the ratios in [0, 1]")
+        if config.candidate_windows < 1 or config.expire_windows < 1:
+            raise ValueError("candidate_windows and expire_windows must be >= 1")
+        if not 0 <= config.learn_max_offset_m < 1e9:
+            raise ValueError("learn_max_offset_m must be in [0, 1e9) m")
+        if not (0 < config.delta_period_s < 1e9 and 0 < config.keyframe_period_s < 1e9
+                and 0 <= config.keyframe_delta_ratio < 1e9):
+            raise ValueError("delta_period_s and keyframe_period_s must be in (0, 1e9) s, keyframe_delta_ratio in [0, 1e9)")
+        names = list(dict.fromkeys(config.sensors))
+        if config.map_sensor and config.map_sensor not in names:
+            raise ValueError(f"map_sensor '{config.map_sensor}' is not one of the sensors {list(config.sensors)}")
         self.config = config
         self.change = config.change_config()
         validate(self.change)
-        self.channels = {name: _Channel(SENSORS[name], config.recent_windows) for name in config.sensors}
+        self.channels = {name: _Channel(SENSORS[name], config) for name in names}
+        self.map_sensor = config.map_sensor or ("jt128" if "jt128" in names else names[0])
         self.state = MemoryState.BUILDING
         self.map_epoch = 0
         self.event_seq = 0
@@ -304,6 +506,20 @@ class RoomMemory:
         self.dropped_windows = 0
         self.last_window_dropped = False
         self._next_event_id = ((start.sec * 1000 + start.nanosec // 1_000_000) << 20) & ((1 << 64) - 1)
+        self._coverage = None
+        # Map stream: the bricks and epoch of the last live map message, its seq counter and
+        # timing, and the bytes sent since the last snapshot.
+        self._map_started = False
+        self._map_bricks = ()
+        self._map_epoch_sent = 0
+        self._map_seq = 0
+        self._last_map_ns = 0
+        self._last_keyframe_ns = 0
+        self._keyframe_bytes = 0
+        self._delta_bytes = 0
+        self._map_log = deque(maxlen=MAP_LOG_DEPTH)
+        self._event_log = deque(maxlen=EVENT_LOG_DEPTH)
+        self._open_latest = {}  # event_id -> latest Logged message, open events only
         self._load()
 
     def _paths(self):
@@ -328,7 +544,7 @@ class RoomMemory:
                 raise ValueError(f"{path} uses voxel_size {message.voxel_size} m, not {self.config.voxel_size} m")
             epochs.add(message.header.map_epoch)
             channel = self.channels[name]
-            channel.reference = layer
+            self._set_reference(channel, layer)
             channel.reference_windows = self.config.reference_windows
         if len(epochs) != 1:
             raise ValueError(f"saved references disagree on map_epoch: {sorted(epochs)}")
@@ -375,6 +591,11 @@ class RoomMemory:
         self._next_event_id = (value + 1) & ((1 << 64) - 1)
         return value
 
+    def _set_reference(self, channel, reference):
+        channel.reference = reference
+        if channel.sensor.name == self.map_sensor:
+            self._coverage = _coverage(reference)
+
     def close_window(self, stamp):
         """Integrates the queued frames. Returns the ``ChangeEvent`` messages to publish, in order."""
         events = []
@@ -390,8 +611,10 @@ class RoomMemory:
                 if frames and channel.reference_windows < self.config.reference_windows:
                     window = occupancy_map(np.concatenate(frames), self.change)
                     if len(window.occupied):
-                        channel.reference = channel.reference.merge(VoxelLayer.observe(window, self.change))
+                        observed = VoxelLayer.observe(window, self.change)
+                        channel.stats.add(observed.occupied, observed.known)
                         channel.reference_windows += 1
+                        self._set_reference(channel, channel.stats.settled(self.config.settle_rule()))
                 continue
             points = np.concatenate(frames) if frames else _NO_POINTS
             window = occupancy_map(points, self.change) if frames else None
@@ -400,11 +623,20 @@ class RoomMemory:
                 channel.recent.append(_NO_POINTS)
                 continue
             channel.recent.append(points)
-            recent = window if len(channel.recent) == 1 else occupancy_map(np.concatenate(channel.recent), self.change)
             reference = channel.reference
+            recent = window if len(channel.recent) == 1 else occupancy_map(np.concatenate(channel.recent), self.change)
+            # The rig-pose estimate uses this window alone, so a move shows in full at once.
+            channel.residual = pose_offset(window.occupied, reference.occupied, self.config.voxel_size)
+            # Voxels the reference has not settled keep counting, so new coverage joins it, unless
+            # the rig may have moved.
+            if channel.residual is not None and channel.residual <= self.config.learn_max_offset_m:
+                observed = VoxelLayer.observe(window, self.change)
+                channel.stats.add(np.setdiff1d(observed.occupied, reference.known, assume_unique=True),
+                                  np.setdiff1d(observed.known, reference.known, assume_unique=True))
             report = diff(reference.as_occupancy(self.config.voxel_size), recent, self.change, reference.known)
             for state, candidate in channel.tracker.update(report.regions, stamp, self._next_id):
                 events.append(self._event(channel, state, candidate, stamp))
+                self._log_event(events[-1])
         if dropped:
             self.dropped_windows += 1
         self.last_window_dropped = dropped
@@ -412,9 +644,110 @@ class RoomMemory:
             channel.reference_windows >= self.config.reference_windows for channel in self.channels.values()
         ):
             self.state = MemoryState.TRACKING
+            # From here on only the voxels the reference has not settled keep their counts.
+            for channel in self.channels.values():
+                channel.stats.erase(channel.reference.known)
             self.map_epoch += 1
             self.save(stamp)
         return events
+
+    def _log_event(self, event):
+        entry = Logged(event.header.seq, event.header.map_epoch, event.to_cdr())
+        if event.state in (EventState.CANDIDATE, EventState.CONFIRMED):
+            self._open_latest[event.event_id] = entry
+        else:
+            self._open_latest.pop(event.event_id, None)
+        self._event_log.append(entry)
+
+    def _map_message(self, kind, stamp, bricks, base_epoch=0, removed=()):
+        header = Header(self.config.room_id, self.map_epoch, self._map_seq, stamp)
+        return MapBricks(header, Compression.ZLIB, kind, base_epoch, self.config.voxel_size, bricks, removed)
+
+    def _publish_map(self, message):
+        data = message.to_cdr()
+        ns = _nanoseconds(message.header.stamp)
+        if message.kind == MapKind.SNAPSHOT:
+            self._last_keyframe_ns, self._keyframe_bytes, self._delta_bytes = ns, len(data), 0
+        else:
+            self._delta_bytes += len(data)
+        self._last_map_ns = ns
+        self._map_epoch_sent = message.header.map_epoch
+        self._map_log.append(Logged(self._map_seq, message.header.map_epoch, data))
+        self._map_seq += 1
+        return data
+
+    def map_update(self, stamp):
+        """The live ``MapBricks`` CDR due at ``stamp``, or None (call once per window, after
+        ``close_window``). Nothing while BUILDING; the first message is a snapshot. Afterwards,
+        once ``delta_period_s`` has passed since the last message, voxels that settled since join
+        the references (``map_epoch`` + 1, references saved) and go out as a delta of the changed
+        bricks; a snapshot instead when ``keyframe_period_s`` has passed since the last one, or
+        when the deltas since it would exceed ``keyframe_delta_ratio`` of its size."""
+        if self.state == MemoryState.BUILDING:
+            return None
+        ns = _nanoseconds(stamp)
+        if not self._map_started:
+            self._map_started = True
+            self._map_bricks = self.channels[self.map_sensor].reference.to_bricks()
+            return self._publish_map(self._map_message(MapKind.SNAPSHOT, stamp, self._map_bricks))
+        keyframe_due = ns - self._last_keyframe_ns >= int(self.config.keyframe_period_s * 1e9)
+        if not keyframe_due and ns - self._last_map_ns < int(self.config.delta_period_s * 1e9):
+            return None
+        changed = False
+        for channel in self.channels.values():
+            fresh = channel.stats.settled(self.config.settle_rule())
+            if not len(fresh.known):
+                continue
+            channel.stats.erase(fresh.known)
+            self._set_reference(channel, channel.reference.merge(fresh))
+            changed = True
+        if not changed and not keyframe_due:
+            return None
+        if changed:
+            self.map_epoch += 1
+            self.save(stamp)
+        bricks = self.channels[self.map_sensor].reference.to_bricks() if changed else self._map_bricks
+        if not keyframe_due:
+            upserts, removed = map_delta(self._map_bricks, bricks)
+            delta = self._map_message(MapKind.DELTA, stamp, upserts, self._map_epoch_sent, removed)
+            if self._delta_bytes + len(delta.to_cdr()) <= self.config.keyframe_delta_ratio * self._keyframe_bytes:
+                self._map_bricks = bricks
+                return self._publish_map(delta)
+        self._map_bricks = bricks
+        return self._publish_map(self._map_message(MapKind.SNAPSHOT, stamp, bricks))
+
+    def sync(self, request, stamp):
+        """The answer to one ``RequestSync`` (protocol §5): CDR messages to publish in order on the
+        sync topic of ``request.topic``. Empty for another ``room_id``, and for a map request
+        before the first live map message."""
+        if request.header.room_id != self.config.room_id:
+            return []
+
+        def since_index(log):
+            if request.since is None:
+                return None
+            return next((n for n, entry in enumerate(log) if (entry.map_epoch, entry.seq) == request.since), None)
+
+        if request.topic == SyncTopic.MAP_BRICKS:
+            if not self._map_started:
+                return []
+            log = list(self._map_log)
+            at = since_index(log)
+            if at is not None and at + 1 < len(log):
+                return [entry.data for entry in log[at + 1:]]
+            # A fresh snapshot of the last live state, under the latest live seq.
+            header = Header(self.config.room_id, self.map_epoch, self._map_seq - 1, stamp)
+            return [MapBricks(header, Compression.ZLIB, MapKind.SNAPSHOT, 0, self.config.voxel_size,
+                              self._map_bricks).to_cdr()]
+        log = list(self._event_log)
+        at = since_index(log)
+        if at is not None:
+            return [entry.data for entry in log[at + 1:]]
+        # Bounded fallback: open events whose latest message is older than the kept ones, then
+        # every kept message.
+        oldest = log[0].seq if log else SINCE_NONE
+        older = sorted((entry for entry in self._open_latest.values() if entry.seq < oldest), key=lambda e: e.seq)
+        return [entry.data for entry in older] + [entry.data for entry in log]
 
     def _event(self, channel, state, candidate, stamp):
         region = candidate.region
@@ -449,8 +782,8 @@ class RoomMemory:
         """``MemoryStatus`` for the last ``period_s`` seconds; resets the per-sensor frame counts.
 
         DEGRADED while a configured sensor measured 0 Hz or the last window was dropped.
-        ``pose_residual_m`` and ``coverage_known_frac`` are NaN: no rig-pose guard and no
-        configured room volume yet.
+        ``n_bricks`` and ``coverage_known_frac`` describe the map sensor's reference;
+        ``pose_residual_m`` is the largest per-sensor residual of the last tracking windows.
         """
         hz = [None, None]
         for channel in self.channels.values():
@@ -458,15 +791,17 @@ class RoomMemory:
             channel.received = 0
             hz[channel.sensor.hz_index] = channel.hz
         state = self.state
+        residuals = [c.residual for c in self.channels.values() if c.residual is not None]
+        residual = max(residuals) if residuals and self.state != MemoryState.BUILDING else None
         if self.last_window_dropped or any(channel.hz == 0 for channel in self.channels.values()):
             state = MemoryState.DEGRADED
         message = MemoryStatus(
             header=Header(self.config.room_id, self.map_epoch, self.status_seq, stamp),
             state=state,
-            n_bricks=sum(channel.reference.brick_count for channel in self.channels.values()),
+            n_bricks=self.channels[self.map_sensor].reference.brick_count,
             n_open_events=sum(len(channel.tracker.open) for channel in self.channels.values()),
-            coverage_known_frac=None,
-            pose_residual_m=None,
+            coverage_known_frac=self._coverage,
+            pose_residual_m=residual,
             window_s=self.config.window_s,
             mid360_hz=hz[0],
             jt128_hz=hz[1],

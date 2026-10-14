@@ -5,3 +5,9 @@ build/
 spark/.venv-local/
 __pycache__/
 .pytest_cache/
+# Lidar recordings stay out of git (spark/room_memory_cpp/tests/recording reads them from
+# ROOM_MEMORY_RECORDING, default ~/Developer/lc-tasks/recordings/static5m); only the small
+# committed excerpt is tracked.
+/recordings/
+*.mcap
+!spark/room_memory_cpp/tests/fixtures/static5m-mid360-excerpt.mcap

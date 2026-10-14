@@ -66,4 +66,10 @@ if(ROOM_MEMORY_PYTHON)
       ENVIRONMENT "OMP_NUM_THREADS=${threads};ROOM_MEMORY_PYTHON_PACKAGE=${ROOM_MEMORY_PYTHON_PACKAGE};ROOM_MEMORY_OFFLINE=$<TARGET_FILE:room_memory_offline>;ROOM_MEMORY_REPLAY=$<TARGET_FILE:room_memory_replay>;ROOM_MEMORY_SNAPSHOTS=${ROOM_MEMORY_SNAPSHOTS};ROOM_MEMORY_PHASE0_FIXTURES=${ROOM_MEMORY_PHASE0_FIXTURES}"
       TIMEOUT 1800)
   endforeach()
+  # The real static recording (not in git; skipped with the reason printed when absent).
+  add_test(NAME static_recording
+           COMMAND ${ROOM_MEMORY_PYTHON} -m pytest -q -rs -p no:cacheprovider ${CMAKE_CURRENT_SOURCE_DIR}/recording)
+  set_tests_properties(static_recording PROPERTIES
+    ENVIRONMENT "ROOM_MEMORY_BAG=$<TARGET_FILE:room_memory_bag>"
+    TIMEOUT 3600)
 endif()

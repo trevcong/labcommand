@@ -9,6 +9,8 @@
 //   hex <sensor> <hex>          add_cdr with inline bytes
 //   close <sec> <nanosec>       close_window
 //   status <sec> <nanosec> <period_s>
+//   map <sec> <nanosec>         map_update
+//   sync <sec> <nanosec> <hex>  sync with a CDR RequestSync
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -19,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "config_keys.hpp"
 #include "room_memory/memory.hpp"
 
 namespace {
@@ -63,38 +66,6 @@ std::vector<float> read_floats(const std::string& path) {
     return out;
 }
 
-void configure(MemoryConfig& config, const std::string& key, const std::string& value) {
-    if (key == "room_id") {
-        config.room_id = value;
-    } else if (key == "sensors") {
-        config.sensors.clear();
-        std::stringstream parts(value);
-        for (std::string name; std::getline(parts, name, ',');) {
-            if (!name.empty()) config.sensors.push_back(name);
-        }
-    } else if (key == "voxel_size") {
-        config.voxel_size = std::strtod(value.c_str(), nullptr);
-    } else if (key == "max_range") {
-        config.max_range = value == "none" ? std::nullopt : std::optional<double>(std::strtod(value.c_str(), nullptr));
-    } else if (key == "tolerance") {
-        config.tolerance = std::stoll(value);
-    } else if (key == "min_voxels") {
-        config.min_voxels = std::stoll(value);
-    } else if (key == "min_extent") {
-        config.min_extent = std::stoll(value);
-    } else if (key == "window_s") {
-        config.window_s = std::strtod(value.c_str(), nullptr);
-    } else if (key == "reference_windows") {
-        config.reference_windows = std::stoll(value);
-    } else if (key == "recent_windows") {
-        config.recent_windows = std::stoll(value);
-    } else if (key == "state_dir") {
-        config.state_dir = value == "none" ? std::nullopt : std::optional<std::string>(value);
-    } else {
-        throw std::runtime_error("unknown config key " + key);
-    }
-}
-
 msg::Time time_of(std::istringstream& words) {
     msg::Time t;
     words >> t.sec >> t.nanosec;
@@ -122,7 +93,7 @@ int main(int argc, char** argv) {
         if (command == "config") {
             for (std::string pair; words >> pair;) {
                 const std::size_t eq = pair.find('=');
-                configure(config, pair.substr(0, eq), pair.substr(eq + 1));
+                room_memory::tools::configure(config, pair.substr(0, eq), pair.substr(eq + 1));
             }
         } else if (command == "start") {
             const msg::Time start = time_of(words);
@@ -152,6 +123,20 @@ int main(int argc, char** argv) {
             double period = 0;
             words >> period;
             std::cout << "status " << hex(memory->status(stamp, period).to_cdr()) << "\n";
+        } else if (command == "map") {
+            const std::optional<msg::Bytes> message = memory->map_update(time_of(words));
+            std::cout << "map " << (message ? hex(*message) : "none") << "\n";
+        } else if (command == "sync") {
+            const msg::Time stamp = time_of(words);
+            std::string value;
+            words >> value;
+            try {
+                const std::vector<msg::Bytes> answer = memory->sync(msg::RequestSync::from_cdr(unhex(value)), stamp);
+                std::cout << "sync " << answer.size() << "\n";
+                for (const msg::Bytes& message : answer) std::cout << "data " << hex(message) << "\n";
+            } catch (const msg::CDRError&) {
+                std::cout << "sync invalid\n";
+            }
         } else {
             std::cerr << "room_memory_replay: unknown command " << command << "\n";
             return 2;

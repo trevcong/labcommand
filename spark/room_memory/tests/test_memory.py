@@ -6,15 +6,32 @@ import pytest
 import scenes
 from room_memory.core import Config, occupancy_map
 from room_memory.core.change_detection import contains, pack
-from room_memory.memory import MemoryConfig, RoomMemory, VoxelLayer, load_reference, reference_path, save_reference
+from room_memory.memory import (
+    EVENT_LOG_DEPTH,
+    CandidateTracker,
+    MemoryConfig,
+    RoomMemory,
+    SettleRule,
+    VoxelLayer,
+    VoxelStats,
+    load_reference,
+    map_delta,
+    reference_path,
+    save_reference,
+)
 from room_memory.messages import (
+    Brick,
     ChangeEvent,
     EventKind,
     EventState,
     Header,
+    MapBricks,
+    MapKind,
     MemoryState,
     MemoryStatus,
+    RequestSync,
     SENSOR_MID360,
+    SyncTopic,
     Time,
 )
 from test_messages import DELTA_BRICKS
@@ -80,8 +97,15 @@ def test_save_and_load_reference(tmp_path):
         reference_path(tmp_path, "../etc", "mid360")
 
 
+# Single-window mechanics: every voxel a window sees settles, the recent layer is the last window,
+# and every region is sent and expired at once. The node's defaults are measured on the static
+# recording (room_memory_cpp/tests/recording).
+SINGLE_WINDOW = dict(recent_windows=1, occupied_min_hits=1, occupied_min_ratio=0.0, free_min_seen=1,
+                     candidate_windows=1, expire_windows=1)
+
+
 def mid360_memory(tmp_path, **changes):
-    values = dict(sensors=("mid360",), max_range=None, reference_windows=3, state_dir=str(tmp_path))
+    values = dict(sensors=("mid360",), max_range=None, reference_windows=3, state_dir=str(tmp_path), **SINGLE_WINDOW)
     values.update(changes)
     return RoomMemory(MemoryConfig(**values), START)
 
@@ -233,7 +257,7 @@ def test_windows_without_usable_points_do_not_build_the_reference(tmp_path):
 def test_each_sensor_reference_freezes_at_its_own_window_count():
     room = scenes.room_shell()
     box = scenes.box_shell((0.3, 1.2, 0.3))
-    memory = RoomMemory(MemoryConfig(state_dir=None, max_range=None, reference_windows=1), START)
+    memory = RoomMemory(MemoryConfig(state_dir=None, max_range=None, reference_windows=1, **SINGLE_WINDOW), START)
     memory.add_points("mid360", room)
     memory.close_window(stamp(0))
     assert memory.state == MemoryState.BUILDING
@@ -293,3 +317,170 @@ def test_any_decode_failure_is_a_rejected_frame(monkeypatch):
     assert memory.add_cdr("mid360", b"\x00\x01\x00\x00") is False
     channel = memory.channels["mid360"]
     assert (channel.received, channel.failed) == (1, 1)
+
+
+def keys_of(cells):
+    return np.unique(pack(*np.array(cells, dtype=np.int64).reshape(-1, 3).T))
+
+
+def test_voxel_stats_count_windows_and_settle_by_rule():
+    stats = VoxelStats()
+    stats.add(keys_of([0, 0, 0]), keys_of([[0, 0, 0], [1, 0, 0], [2, 0, 0]]))
+    stats.add(keys_of([[0, 0, 0], [2, 0, 0]]), keys_of([[0, 0, 0], [2, 0, 0], [3, 0, 0]]))
+    stats.add(keys_of([]), keys_of([[0, 0, 0], [1, 0, 0]]))
+    assert stats.hits.tolist() == [2, 0, 1, 0] and stats.seen.tolist() == [3, 2, 2, 1]
+    union = stats.settled(SettleRule())
+    assert union.occupied.tolist() == keys_of([[0, 0, 0], [2, 0, 0]]).tolist() and len(union.known) == 4
+    strict = stats.settled(SettleRule(2, 0.6, 2, 0.0))
+    assert strict.occupied.tolist() == keys_of([0, 0, 0]).tolist()
+    assert strict.known.tolist() == keys_of([[0, 0, 0], [1, 0, 0]]).tolist()
+    assert len(stats.settled(SettleRule(2, 0.6, 2, 0.5)).known) == 3
+    stats.erase(strict.known)
+    assert stats.keys.tolist() == keys_of([[2, 0, 0], [3, 0, 0]]).tolist() and stats.hits.tolist() == [1, 0]
+
+
+def test_map_delta_sends_changed_bricks_and_removes_absent_ones():
+    def brick(i, bits):
+        return Brick((i, 0, 0), bytes(64), bytes([bits]) + bytes(63))
+    before = (brick(0, 1), brick(1, 1), brick(2, 1), brick(4, 1))
+    after = (brick(0, 1), brick(2, 3), brick(3, 1), brick(4, 1))
+    assert map_delta(before, after) == ((after[1], after[2]), (1,))
+    assert map_delta(after, after) == ((), ())
+
+
+def test_candidate_gate_waits_and_expiry_has_hysteresis():
+    tracker = CandidateTracker(3, 2)
+    ids = iter(range(100, 200))
+    box = type("Region", (), {"kind": "appeared", "keys": keys_of([[0, 0, 0], [1, 0, 0]]), "from_keys": None})()
+    speck = type("Region", (), {"kind": "appeared", "keys": keys_of([9, 9, 9]), "from_keys": None})()
+    next_id = lambda: next(ids)
+    assert tracker.update([box, speck], stamp(0), next_id) == []
+    assert tracker.update([box], stamp(1), next_id) == [] and len(tracker.pending) == 1
+    started = tracker.update([box, speck], stamp(2), next_id)
+    assert [(s, c.event_id, c.first_seen) for s, c in started] == [(EventState.CANDIDATE, 100, stamp(0))]
+    assert tracker.update([], stamp(3), next_id) == [] and tracker.update([box], stamp(4), next_id) == []
+    assert tracker.update([], stamp(5), next_id) == []
+    gone = tracker.update([], stamp(6), next_id)
+    assert [(s, c.last_seen) for s, c in gone] == [(EventState.EXPIRED, stamp(4))] and tracker.open == []
+
+
+def partial_room():
+    room = scenes.room_shell()
+    return room, room[room[:, 0] < 1.5]
+
+
+def test_map_stream_snapshot_then_deltas_and_keyframes():
+    room, partial = partial_room()
+    memory = mid360_memory(None, state_dir=None, delta_period_s=2.0, keyframe_period_s=6.0, keyframe_delta_ratio=100.0)
+    assert memory.map_update(stamp(0)) is None
+    second = build_reference(memory, partial)
+    sent = []
+    for s in range(second, second + 9):
+        memory.add_points("mid360", room)
+        memory.close_window(stamp(s))
+        data = memory.map_update(stamp(s))
+        if data is not None:
+            sent.append((s - second, MapBricks.from_cdr(data)))
+    assert [(at, m.kind, m.header.map_epoch, m.base_epoch, m.header.seq) for at, m in sent] == [
+        (0, MapKind.SNAPSHOT, 1, 0, 0), (2, MapKind.DELTA, 2, 1, 1), (6, MapKind.SNAPSHOT, 2, 0, 2)]
+    mirror = {b.coordinate: b for b in sent[0][1].bricks}
+    mirror.update({b.coordinate: b for b in sent[1][1].bricks})
+    assert tuple(mirror[c] for c in sorted(mirror)) == sent[2][1].bricks == memory.channels["mid360"].reference.to_bricks()
+
+
+def test_sync_replays_or_snapshots_maps_and_replays_events():
+    room = scenes.room_shell()
+    boxed = np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))])
+    memory = mid360_memory(None, state_dir=None, delta_period_s=1.0, keyframe_period_s=1.0)
+
+    def request(since, topic, room_id="lab"):
+        epoch = (1 << 64) - 1 if since is None else since[0]
+        return RequestSync(Header(room_id, epoch, 0, START), since, topic)
+
+    assert memory.sync(request(None, SyncTopic.MAP_BRICKS), stamp(0)) == []
+    second = build_reference(memory, room)
+    live = []
+    for n in range(3):
+        memory.add_points("mid360", boxed if n == 1 else room)
+        memory.close_window(stamp(second + n))
+        live.append(memory.map_update(stamp(second + n)))
+    now = stamp(second + 3)
+    epoch = MapBricks.from_cdr(live[0]).header.map_epoch
+    assert memory.sync(request((epoch, 0), SyncTopic.MAP_BRICKS), now) == live[1:]
+    for since in (None, (epoch, 2), (epoch + 7, 0), (epoch, 40)):
+        (answer,) = memory.sync(request(since, SyncTopic.MAP_BRICKS), now)
+        snapshot = MapBricks.from_cdr(answer)
+        assert snapshot.kind == MapKind.SNAPSHOT and snapshot.header.seq == 2
+        assert snapshot.bricks == MapBricks.from_cdr(live[2]).bricks
+    assert memory.sync(request(None, SyncTopic.MAP_BRICKS, "other"), now) == []
+    opened, closed = memory.sync(request(None, SyncTopic.EVENTS), now)
+    first = ChangeEvent.from_cdr(opened)
+    assert first.state == EventState.CANDIDATE and ChangeEvent.from_cdr(closed).state == EventState.EXPIRED
+    assert memory.sync(request((first.header.map_epoch, first.header.seq), SyncTopic.EVENTS), now) == [closed]
+    assert memory.sync(request((first.header.map_epoch, 1), SyncTopic.EVENTS), now) == []
+
+
+def test_event_fallback_resends_open_events_older_than_the_log():
+    room = scenes.room_shell()
+    box, speck = scenes.box_shell((0.3, 1.2, 0.3)), scenes.box_shell((-0.8, -0.8, 0.3))
+    memory = mid360_memory(None, state_dir=None)
+    second = build_reference(memory, room)
+    memory.add_points("mid360", np.concatenate([room, box]))
+    (opened,) = memory.close_window(stamp(second))
+    transitions = 0
+    while transitions < EVENT_LOG_DEPTH:
+        second += 1
+        memory.add_points("mid360", np.concatenate([room, box] if transitions % 2 else [room, box, speck]))
+        transitions += len(memory.close_window(stamp(second)))
+    answer = memory.sync(RequestSync(Header("lab", (1 << 64) - 1, 0, START), None, SyncTopic.EVENTS), stamp(second))
+    assert len(answer) == EVENT_LOG_DEPTH + 1 and answer[0] == opened.to_cdr()
+
+
+def test_coverage_and_pose_residual():
+    room = scenes.room_shell()
+    memory = mid360_memory(None, state_dir=None)
+    second = build_reference(memory, room)
+    building = memory.status(stamp(second), 1.0)
+    assert 0.2 < building.coverage_known_frac <= 1 and building.pose_residual_m is None
+    memory.add_points("mid360", room)
+    memory.close_window(stamp(second))
+    assert memory.status(stamp(second), 1.0).pose_residual_m == 0.0
+    # The rig shifted by (0.1, 0.05, 0.1) m: each wall registers on its own axis.
+    memory.add_points("mid360", (room + np.float32([0.1, 0.05, 0.1])).astype(np.float32))
+    memory.close_window(stamp(second + 1))
+    assert abs(memory.status(stamp(second + 1), 1.0).pose_residual_m - 0.15) <= 0.01
+    assert len(memory.channels["mid360"].stats.keys) == 0  # a shifted window teaches the reference nothing
+
+
+@pytest.mark.parametrize("changes", [
+    dict(occupied_min_hits=0), dict(free_min_seen=0), dict(occupied_min_ratio=1.5), dict(free_max_ratio=-0.1),
+    dict(candidate_windows=0), dict(expire_windows=0), dict(delta_period_s=0), dict(keyframe_period_s=float("nan")),
+    dict(keyframe_delta_ratio=-1), dict(map_sensor="jt128"), dict(learn_max_offset_m=-0.1),
+])
+def test_stream_config_rejections(changes):
+    with pytest.raises(ValueError):
+        mid360_memory(None, state_dir=None, **changes)
+
+
+@pytest.mark.parametrize("launch", ["room_memory/launch/room_memory.launch.py",
+                                    "room_memory_cpp/launch/room_memory_cpp.launch.py"])
+def test_launch_files_carry_the_memory_config_defaults(launch):
+    import ast
+    import dataclasses
+    import pathlib
+
+    tree = ast.parse((pathlib.Path(__file__).resolve().parents[2] / launch).read_text())
+    table = next(node.value for node in tree.body if isinstance(node, ast.Assign) and node.targets[0].id == "ARGUMENTS")
+    # name -> default text, the first element of each (default, type) tuple
+    arguments = {ast.literal_eval(k): ast.literal_eval(v.elts[0]) for k, v in zip(table.keys, table.values)}
+    assert set(arguments) == {field.name for field in dataclasses.fields(MemoryConfig)}
+    defaults = MemoryConfig()
+    for field in dataclasses.fields(MemoryConfig):
+        text = arguments[field.name]
+        value = getattr(defaults, field.name)
+        if field.name == "sensors":
+            assert ast.literal_eval(text) == list(value)
+        elif isinstance(value, str):
+            assert text == value, field.name
+        else:
+            assert type(value)(text) == value, field.name
