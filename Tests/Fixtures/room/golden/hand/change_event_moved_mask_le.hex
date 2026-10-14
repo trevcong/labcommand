@@ -1,7 +1,8 @@
 # labcommand_msgs/ChangeEvent KIND_MOVED with a mask, CDR little endian. Derived by hand; see
 # memory_status_le.hex. Covers: uint8 pair -> float32[3] pad; fixed arrays with no length prefix;
 # NaN alpha (uncalibrated); uint8 -> Time pad; MapBricks[<=1] count 1 with the nested MapBricks
-# aligned against the outer stream (4 pad bytes before its map_epoch at pos 144).
+# aligned against the outer stream (4 pad bytes before its map_epoch at pos 144). The mask uses
+# COMPRESSION_NONE so every payload byte is visible.
 00 01 00 00                 # encapsulation CDR_LE, options 0
 04 00 00 00                 # pos 0   room_id length 4
 6c 61 62 00                 # pos 4   "lab\0"
@@ -43,24 +44,22 @@
 00 00 00 00 00 00 00 00     # pos 152 mask.seq 0
 8a 92 ed 68                 # pos 160 mask.stamp.sec 1760400010
 80 b2 e6 0e                 # pos 164 mask.stamp.nanosec 250000000
-00                          # pos 168 mask.kind KIND_SNAPSHOT
-00 00 00 00 00 00 00        # pos 169 pad to 8
+00                          # pos 168 mask.compression COMPRESSION_NONE
+00                          # pos 169 mask.kind KIND_SNAPSHOT
+00 00 00 00 00 00           # pos 170 pad to 8
 00 00 00 00 00 00 00 00     # pos 176 mask.base_epoch 0
 cd cc 4c 3d                 # pos 184 mask.voxel_size 0.05
 08                          # pos 188 mask.brick_dim 8
 00 00 00                    # pos 189 pad to 4
-03 00 00 00                 # pos 192 mask.brick_ijk length 3
-03 00 ff ff 00 00           # pos 196 mask.brick_ijk (3, -1, 0)
-00 00                       # pos 202 pad to 4
-40 00 00 00                 # pos 204 mask.occ_bits length 64
-01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 208 voxel (0,0,0) is in the region
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 224
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 240
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 256
-40 00 00 00                 # pos 272 mask.known_bits length 64
-01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 276 voxel (0,0,0) has evidence
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 292
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 308
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 324
-00 00 00 00                 # pos 340 mask.removed_bricks_idx length 0
-00                          # pos 344 mask.compression COMPRESSION_NONE
+01 00 00 00                 # pos 192 mask.n_bricks 1
+00 00 00 00                 # pos 196 mask.n_removed 0
+86 00 00 00                 # pos 200 mask.payload length 134
+03 00 ff ff 00 00           # pos 204 mask.payload brick_ijk (3, -1, 0)
+01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 210 occ: voxel (0,0,0) is in the region
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 226
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 242
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 258
+01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 274 known: voxel (0,0,0) has evidence
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 290
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 306
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 322

@@ -34,7 +34,7 @@ public enum RoomMemory {
         public var roomId: String
         /// Reference-map epoch the message describes. Bumped on every reference-map change.
         public var mapEpoch: UInt64
-        /// Per-topic counter, +1 per message. `0` for a `ChangeEvent.mask`.
+        /// Per-topic counter, +1 per message. `0` for a `ChangeEvent.mask`; this client's request count in a `RequestSync`.
         public var seq: UInt64
         /// When the Spark produced the message.
         public var stamp: Time
@@ -167,11 +167,23 @@ public enum RoomMemory {
             case delta = 1
         }
 
+        /// `MapBricks.COMPRESSION_*`: how the brick payload travels on the wire.
+        public enum Compression: UInt8, Sendable, CaseIterable {
+            /// The packed payload as is.
+            case none = 0
+            /// Raw DEFLATE (RFC 1951, no zlib header or checksum): Foundation `.zlib`, Python `zlib.decompress(payload, -15)`.
+            case zlib = 1
+            /// Apple LZFSE: Foundation `.lzfse`.
+            case lzfse = 2
+        }
+
         /// The common fields.
         public var header: Header
+        /// How the encoder compresses the brick payload. A decoded message reports what the sender used.
+        public var compression: Compression
         /// Snapshot or delta.
         public var kind: Kind
-        /// For a delta, the epoch it applies to. `0` in a snapshot.
+        /// For a delta, the epoch it applies to; below `header.mapEpoch`. `0` in a snapshot.
         public var baseEpoch: UInt64
         /// Voxel edge length in meters. Fixed per room; 0.05 by default.
         public var voxelSize: Float
@@ -181,9 +193,10 @@ public enum RoomMemory {
         /// Strictly increasing.
         public var removedBrickIndices: [UInt32]
 
-        /// Creates a map message.
+        /// Creates a map message. The payload is zlib-compressed unless `compression` says otherwise.
         public init(
             header: Header,
+            compression: Compression = .zlib,
             kind: Kind,
             baseEpoch: UInt64,
             voxelSize: Float,
@@ -191,6 +204,7 @@ public enum RoomMemory {
             removedBrickIndices: [UInt32] = []
         ) {
             self.header = header
+            self.compression = compression
             self.kind = kind
             self.baseEpoch = baseEpoch
             self.voxelSize = voxelSize
@@ -385,6 +399,52 @@ public enum RoomMemory {
             self.movedCount = movedCount
             self.coverageKnownFraction = coverageKnownFraction
             self.state = state
+        }
+    }
+
+    /// `labcommand_msgs/RequestSync`: the Mac asks the Spark to resend what it missed on one topic.
+    ///
+    /// `header.mapEpoch` repeats `since.epoch` (`RequestSync.SINCE_NONE` when `since` is nil), and
+    /// `header.seq` counts this client's requests. The Spark answers on the topic's sync topic with
+    /// the missed messages or a snapshot (`docs/ROOM-MEMORY-PROTOCOL.md` §5).
+    public struct RequestSync: Sendable, Equatable {
+        /// `RequestSync.TOPIC_*`: which topic the request is about.
+        public enum Topic: UInt8, Sendable, CaseIterable {
+            /// `/room_memory/map_bricks`.
+            case mapBricks = 0
+            /// `/room_memory/events`.
+            case events = 1
+        }
+
+        /// The last message the Mac applied on the topic.
+        public struct Position: Sendable, Equatable {
+            /// That message's `map_epoch`. For `mapBricks` this is the epoch the mirror holds.
+            public var epoch: UInt64
+            /// That message's `seq`.
+            public var seq: UInt64
+
+            /// Creates a position. Neither value may be `RequestSync.sinceNone`.
+            public init(epoch: UInt64, seq: UInt64) {
+                self.epoch = epoch
+                self.seq = seq
+            }
+        }
+
+        /// `RequestSync.SINCE_NONE`: the wire value of `since_epoch` and `since_seq` when the Mac holds nothing.
+        public static let sinceNone = UInt64.max
+
+        /// The common fields.
+        public var header: Header
+        /// The last message applied on `topic`. Nil when the Mac holds nothing for it, which asks for everything.
+        public var since: Position?
+        /// The topic to resynchronize.
+        public var topic: Topic
+
+        /// Creates a request.
+        public init(header: Header, since: Position?, topic: Topic) {
+            self.header = header
+            self.since = since
+            self.topic = topic
         }
     }
 }

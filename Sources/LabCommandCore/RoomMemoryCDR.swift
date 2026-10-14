@@ -1,3 +1,4 @@
+import Compression
 import Foundation
 
 // MARK: - Room Memory CDR Codecs
@@ -8,17 +9,19 @@ public enum RoomMemoryCDRError: Error, Sendable, Equatable {
     case truncated(String)
     /// A value breaks the contract in `docs/ROOM-MEMORY-PROTOCOL.md`.
     case invalid(String)
-    /// Well-formed input that v1 does not handle: encapsulation, `brick_dim`, or `compression`.
+    /// Well-formed input that v1 does not handle: the encapsulation or `brick_dim`.
     case unsupported(String)
 }
 
-// Wire format, shared by all four messages (classic CDR, as rmw_fastrtps writes it on Jazzy):
+// Wire format, shared by all five messages (classic CDR, as rmw_fastrtps writes it on Jazzy):
 // - 4-byte encapsulation header: `0x00 0x01` CDR little endian, `0x00 0x00` CDR big endian, 2 option bytes.
 // - Every primitive is aligned to its own size (1, 2, 4 or 8), measured from the byte after the header.
 // - string: uint32 length including the NUL, then the bytes and the NUL.
 // - T[]: uint32 element count, then the elements. T[N]: N elements, no count.
 // - Nested messages add no alignment of their own; `MapBricks[<=1]` is a count of 0 or 1, then the message.
 // - Up to 3 trailing bytes are padding the rmw layer may add.
+// - MapBricks carries its bricks as one `uint8[] payload`, packed little endian in either byte order
+//   and compressed as its `compression` field says (`RoomPayload`).
 // Encoders always write little endian with option bytes 0.
 
 extension RoomMemory.MapBricks {
@@ -47,32 +50,45 @@ extension RoomMemory.MapBricks {
 
     func write(to writer: inout RoomCDRWriter) throws {
         writer.header(header)
+        writer.u8(compression.rawValue)
         writer.u8(kind.rawValue)
         writer.u64(baseEpoch)
         writer.f32(voxelSize)
         writer.u8(UInt8(RoomMemory.Brick.dim))
-
-        writer.u32(UInt32(bricks.count * 3))
-        writer.align(2)
-        for brick in bricks {
-            writer.u16(UInt16(bitPattern: brick.coordinate.i))
-            writer.u16(UInt16(bitPattern: brick.coordinate.j))
-            writer.u16(UInt16(bitPattern: brick.coordinate.k))
-        }
-        writer.u32(UInt32(bricks.count * RoomMemory.Brick.maskBytes))
-        for brick in bricks { writer.raw(brick.occupied) }
-        writer.u32(UInt32(bricks.count * RoomMemory.Brick.maskBytes))
-        for brick in bricks { writer.raw(brick.known) }
-
+        writer.u32(UInt32(bricks.count))
         writer.u32(UInt32(removedBrickIndices.count))
-        for index in removedBrickIndices { writer.u32(index) }
-        writer.u8(RoomCDR.compressionNone)
+        let payload = try RoomPayload.compress(packedPayload(), compression)
+        writer.u32(UInt32(payload.count))
+        writer.raw(payload)
+    }
+
+    /// The payload before compression, packed little endian whatever the CDR byte order:
+    /// `brick_ijk` (int16 × 3 per brick), `occ_bits` (64 B per brick), `known_bits` (64 B per brick),
+    /// then `removed_bricks_idx` (uint32 each).
+    func packedPayload() -> [UInt8] {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(RoomPayload.size(bricks: bricks.count, removed: removedBrickIndices.count))
+        for brick in bricks {
+            for value in [brick.coordinate.i, brick.coordinate.j, brick.coordinate.k] {
+                withUnsafeBytes(of: value.littleEndian) { bytes.append(contentsOf: $0) }
+            }
+        }
+        for brick in bricks { bytes.append(contentsOf: brick.occupied) }
+        for brick in bricks { bytes.append(contentsOf: brick.known) }
+        for index in removedBrickIndices {
+            withUnsafeBytes(of: index.littleEndian) { bytes.append(contentsOf: $0) }
+        }
+        return bytes
     }
 
     /// Reads one MapBricks, top level (`path` empty) or nested (`path` such as `"mask[0]."`).
     /// The caller validates the result.
     static func read(from reader: inout RoomCDRReader, path: String) throws -> RoomMemory.MapBricks {
         let header = try reader.header(path)
+        let compressionValue = try reader.u8(path + "compression")
+        guard let compression = Compression(rawValue: compressionValue) else {
+            throw RoomMemoryCDRError.invalid("MapBricks: \(path)compression \(compressionValue) is not a COMPRESSION_* value")
+        }
         let kindValue = try reader.u8(path + "kind")
         guard let kind = Kind(rawValue: kindValue) else {
             throw RoomMemoryCDRError.invalid("MapBricks: \(path)kind \(kindValue) is not a KIND_* value")
@@ -84,54 +100,24 @@ extension RoomMemory.MapBricks {
             throw RoomMemoryCDRError.unsupported("MapBricks: \(path)brick_dim \(brickDim); v1 handles only \(RoomMemory.Brick.dim)")
         }
 
-        let coordinateCount = try reader.count(elementSize: 2, path + "brick_ijk")
-        guard coordinateCount % 3 == 0 else {
-            throw RoomMemoryCDRError.invalid("MapBricks: \(path)brick_ijk holds \(coordinateCount) values, not 3 per brick")
+        let brickCount = Int(try reader.u32(path + "n_bricks"))
+        let removedCount = Int(try reader.u32(path + "n_removed"))
+        let rawSize = RoomPayload.size(bricks: brickCount, removed: removedCount)
+        guard rawSize <= RoomPayload.maxBytes else {
+            throw RoomMemoryCDRError.invalid(
+                "MapBricks: \(path)n_bricks \(brickCount) and n_removed \(removedCount) need a \(rawSize)-byte payload; the limit is \(RoomPayload.maxBytes)"
+            )
         }
-        let brickCount = coordinateCount / 3
-        var coordinates: [RoomMemory.BrickCoordinate] = []
-        coordinates.reserveCapacity(brickCount)
-        for index in 0..<brickCount {
-            let what = "\(path)brick_ijk[\(index)]"
-            coordinates.append(RoomMemory.BrickCoordinate(
-                i: Int16(bitPattern: try reader.u16(what)),
-                j: Int16(bitPattern: try reader.u16(what)),
-                k: Int16(bitPattern: try reader.u16(what))
-            ))
-        }
-
-        let maskLength = brickCount * RoomMemory.Brick.maskBytes
-        let occupiedStart = try reader.byteSequence(expectedCount: maskLength, path + "occ_bits")
-        let knownStart = try reader.byteSequence(expectedCount: maskLength, path + "known_bits")
-        var bricks: [RoomMemory.Brick] = []
-        bricks.reserveCapacity(brickCount)
-        for (index, coordinate) in coordinates.enumerated() {
-            let offset = index * RoomMemory.Brick.maskBytes
-            bricks.append(RoomMemory.Brick(
-                coordinate: coordinate,
-                occupied: reader.slice(occupiedStart + offset, RoomMemory.Brick.maskBytes),
-                known: reader.slice(knownStart + offset, RoomMemory.Brick.maskBytes)
-            ))
-        }
-
-        let removedCount = try reader.count(elementSize: 4, path + "removed_bricks_idx")
-        var removed: [UInt32] = []
-        removed.reserveCapacity(removedCount)
-        for index in 0..<removedCount {
-            removed.append(try reader.u32("\(path)removed_bricks_idx[\(index)]"))
-        }
-
-        let compression = try reader.u8(path + "compression")
-        switch compression {
-        case RoomCDR.compressionNone: break
-        case RoomCDR.compressionZstd:
-            throw RoomMemoryCDRError.unsupported("MapBricks: \(path)compression 1 (zstd) is reserved; v1 decodes only 0 (none)")
-        default:
-            throw RoomMemoryCDRError.invalid("MapBricks: \(path)compression \(compression) is not a COMPRESSION_* value")
-        }
+        let payloadLength = try reader.count(elementSize: 1, path + "payload")
+        let payloadStart = try reader.take(payloadLength, path + "payload")
+        let raw = try RoomPayload.decompress(
+            reader.slice(payloadStart, payloadLength), compression, expectedCount: rawSize, "MapBricks: \(path)payload"
+        )
+        let (bricks, removed) = RoomPayload.unpack(raw, brickCount: brickCount, removedCount: removedCount)
 
         return RoomMemory.MapBricks(
             header: header,
+            compression: compression,
             kind: kind,
             baseEpoch: baseEpoch,
             voxelSize: voxelSize,
@@ -146,14 +132,18 @@ extension RoomMemory.MapBricks {
         guard voxelSize.isFinite, voxelSize > 0 else {
             throw RoomMemoryCDRError.invalid("\(context): voxel_size \(voxelSize) must be finite and > 0 m")
         }
+        if kind == .delta, header.mapEpoch <= baseEpoch {
+            throw RoomMemoryCDRError.invalid("\(context): delta map_epoch \(header.mapEpoch) is not after base_epoch \(baseEpoch)")
+        }
         if kind == .snapshot, !removedBrickIndices.isEmpty {
             throw RoomMemoryCDRError.invalid("\(context): a snapshot carries \(removedBrickIndices.count) removed_bricks_idx")
         }
         for index in removedBrickIndices.indices.dropFirst() where removedBrickIndices[index - 1] >= removedBrickIndices[index] {
             throw RoomMemoryCDRError.invalid("\(context): removed_bricks_idx not strictly increasing at \(index)")
         }
-        guard bricks.count * 3 <= Int(UInt32.max) else {
-            throw RoomMemoryCDRError.invalid("\(context): \(bricks.count) bricks overflow a CDR sequence")
+        let rawSize = RoomPayload.size(bricks: bricks.count, removed: removedBrickIndices.count)
+        guard rawSize <= RoomPayload.maxBytes else {
+            throw RoomMemoryCDRError.invalid("\(context): \(bricks.count) bricks need a \(rawSize)-byte payload; the limit is \(RoomPayload.maxBytes)")
         }
         for (index, brick) in bricks.enumerated() {
             guard brick.occupied.count == RoomMemory.Brick.maskBytes, brick.known.count == RoomMemory.Brick.maskBytes else {
@@ -445,6 +435,60 @@ extension RoomMemory.Epoch {
     }
 }
 
+extension RoomMemory.RequestSync {
+    /// Encodes the message as CDR little endian, including the encapsulation header.
+    ///
+    /// - Throws: `RoomMemoryCDRError.invalid` when the message breaks the protocol contract.
+    public func encodedCDR() throws -> Data {
+        try validate()
+        var writer = RoomCDRWriter()
+        writer.header(header)
+        writer.u64(since?.epoch ?? Self.sinceNone)
+        writer.u64(since?.seq ?? Self.sinceNone)
+        writer.u8(topic.rawValue)
+        return writer.data
+    }
+
+    /// Decodes a CDR `labcommand_msgs/RequestSync`, including the encapsulation header.
+    ///
+    /// Accepts either byte order. The input may be a slice.
+    ///
+    /// - Throws: `RoomMemoryCDRError` on truncated or invalid input.
+    public static func decode(cdr data: Data) throws -> RoomMemory.RequestSync {
+        try RoomCDR.decode(data, message: "RequestSync") { reader in
+            let header = try reader.header("")
+            let sinceEpoch = try reader.u64("since_epoch")
+            let sinceSeq = try reader.u64("since_seq")
+            let topicValue = try reader.u8("topic")
+            guard let topic = Topic(rawValue: topicValue) else {
+                throw RoomMemoryCDRError.invalid("RequestSync: topic \(topicValue) is not a TOPIC_* value")
+            }
+            let since: Position?
+            switch (sinceEpoch == sinceNone, sinceSeq == sinceNone) {
+            case (true, true): since = nil
+            case (false, false): since = Position(epoch: sinceEpoch, seq: sinceSeq)
+            default:
+                throw RoomMemoryCDRError.invalid("RequestSync: since_epoch and since_seq must both be SINCE_NONE or neither")
+            }
+            let request = RoomMemory.RequestSync(header: header, since: since, topic: topic)
+            try request.validate()
+            return request
+        }
+    }
+
+    func validate() throws {
+        let context = "RequestSync"
+        try header.validate(context)
+        if let since, since.epoch == Self.sinceNone || since.seq == Self.sinceNone {
+            throw RoomMemoryCDRError.invalid("\(context): \(Self.sinceNone) is the SINCE_NONE sentinel; use a nil since")
+        }
+        let sinceEpoch = since?.epoch ?? Self.sinceNone
+        guard header.mapEpoch == sinceEpoch else {
+            throw RoomMemoryCDRError.invalid("\(context): map_epoch \(header.mapEpoch) must repeat since_epoch \(sinceEpoch)")
+        }
+    }
+}
+
 extension RoomMemory.Header {
     func validate(_ context: String) throws {
         guard !roomId.isEmpty else {
@@ -460,8 +504,6 @@ extension RoomMemory.Header {
 // MARK: - Shared Rules
 
 enum RoomCDR {
-    static let compressionNone: UInt8 = 0
-    static let compressionZstd: UInt8 = 1
     static let hzUnavailable: UInt16 = 0xFFFF
     static let encapsulationSize = 4
     static let maxTrailingPadding = 3
@@ -492,6 +534,124 @@ enum RoomCDR {
     static func requireValid(_ time: RoomMemory.Time, _ what: String) throws {
         guard time.nanosec < 1_000_000_000 else {
             throw RoomMemoryCDRError.invalid("\(what).nanosec \(time.nanosec) is not below 1e9")
+        }
+    }
+}
+
+// MARK: - MapBricks Payload
+
+/// Size, compression and unpacking of the MapBricks brick payload.
+enum RoomPayload {
+    /// `brick_ijk` bytes per brick: three int16.
+    static let coordinateBytes = 6
+    /// Uncompressed payload bytes per brick: coordinates plus both masks.
+    static let bytesPerBrick = coordinateBytes + 2 * RoomMemory.Brick.maskBytes
+    /// Largest uncompressed payload either side accepts: 16 MiB, about 125,000 bricks.
+    /// Bounds what a small compressed payload can make the decoder allocate.
+    static let maxBytes = 16 << 20
+
+    /// Uncompressed payload bytes for `bricks` bricks and `removed` removed indices.
+    static func size(bricks: Int, removed: Int) -> Int {
+        bricks * bytesPerBrick + removed * MemoryLayout<UInt32>.size
+    }
+
+    static func compress(_ raw: [UInt8], _ compression: RoomMemory.MapBricks.Compression) throws -> [UInt8] {
+        let algorithm: NSData.CompressionAlgorithm
+        switch compression {
+        case .none: return raw
+        case .zlib: algorithm = .zlib
+        case .lzfse: algorithm = .lzfse
+        }
+        do {
+            return [UInt8](try (Data(raw) as NSData).compressed(using: algorithm) as Data)
+        } catch {
+            throw RoomMemoryCDRError.invalid("MapBricks: \(compression) compression of \(raw.count) payload bytes failed: \(error)")
+        }
+    }
+
+    /// Returns the uncompressed payload, which must be exactly `expectedCount` bytes. A compressed
+    /// payload must be one complete stream. Bytes after the stream's end are not detected.
+    static func decompress(
+        _ payload: [UInt8],
+        _ compression: RoomMemory.MapBricks.Compression,
+        expectedCount: Int,
+        _ what: String
+    ) throws -> [UInt8] {
+        let algorithm: compression_algorithm
+        switch compression {
+        case .none:
+            guard payload.count == expectedCount else {
+                throw RoomMemoryCDRError.invalid("\(what) holds \(payload.count) bytes, expected \(expectedCount)")
+            }
+            return payload
+        case .zlib: algorithm = COMPRESSION_ZLIB
+        case .lzfse: algorithm = COMPRESSION_LZFSE
+        }
+        guard !payload.isEmpty, let raw = inflate(payload, algorithm, expectedCount: expectedCount) else {
+            throw RoomMemoryCDRError.invalid(
+                "\(what): \(payload.count) \(compression) bytes are not one complete stream of \(expectedCount) bytes"
+            )
+        }
+        return raw
+    }
+
+    /// Decodes into a buffer one byte larger than expected, so a longer stream is caught without
+    /// decoding more than `expectedCount + 1` bytes. Nil unless the stream ends at exactly `expectedCount`.
+    private static func inflate(_ payload: [UInt8], _ algorithm: compression_algorithm, expectedCount: Int) -> [UInt8]? {
+        let stream = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
+        defer { stream.deallocate() }
+        guard compression_stream_init(stream, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else {
+            return nil
+        }
+        defer { compression_stream_destroy(stream) }
+
+        var output = [UInt8](repeating: 0, count: expectedCount + 1)
+        let status = payload.withUnsafeBufferPointer { source in
+            output.withUnsafeMutableBufferPointer { destination in
+                stream.pointee.src_ptr = source.baseAddress!
+                stream.pointee.src_size = source.count
+                stream.pointee.dst_ptr = destination.baseAddress!
+                stream.pointee.dst_size = destination.count
+                var status: compression_status
+                var progressed: Bool
+                repeat {
+                    let before = (stream.pointee.src_size, stream.pointee.dst_size)
+                    status = compression_stream_process(stream, Int32(bitPattern: COMPRESSION_STREAM_FINALIZE.rawValue))
+                    progressed = before != (stream.pointee.src_size, stream.pointee.dst_size)
+                } while status == COMPRESSION_STATUS_OK && stream.pointee.dst_size > 0 && progressed
+                return status
+            }
+        }
+        guard status == COMPRESSION_STATUS_END, output.count - stream.pointee.dst_size == expectedCount else {
+            return nil
+        }
+        output.removeLast()
+        return output
+    }
+
+    /// Splits an uncompressed payload of exactly `size(bricks:removed:)` bytes into bricks and removed indices.
+    static func unpack(_ raw: [UInt8], brickCount: Int, removedCount: Int) -> ([RoomMemory.Brick], [UInt32]) {
+        let maskBytes = RoomMemory.Brick.maskBytes
+        let occupiedStart = brickCount * coordinateBytes
+        let knownStart = occupiedStart + brickCount * maskBytes
+        let removedStart = knownStart + brickCount * maskBytes
+        return raw.withUnsafeBytes { bytes in
+            func int16(_ offset: Int) -> Int16 {
+                Int16(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: Int16.self))
+            }
+            let bricks = (0..<brickCount).map { index in
+                let coordinate = index * coordinateBytes
+                let mask = index * maskBytes
+                return RoomMemory.Brick(
+                    coordinate: RoomMemory.BrickCoordinate(i: int16(coordinate), j: int16(coordinate + 2), k: int16(coordinate + 4)),
+                    occupied: Array(raw[occupiedStart + mask ..< occupiedStart + mask + maskBytes]),
+                    known: Array(raw[knownStart + mask ..< knownStart + mask + maskBytes])
+                )
+            }
+            let removed = (0..<removedCount).map { index in
+                UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: removedStart + index * 4, as: UInt32.self))
+            }
+            return (bricks, removed)
         }
     }
 }
@@ -668,15 +828,6 @@ struct RoomCDRReader {
             )
         }
         return count
-    }
-
-    /// Reads a `uint8[]` whose length must be exactly `expectedCount`; returns where its bytes start.
-    mutating func byteSequence(expectedCount: Int, _ what: @autoclosure () -> String) throws -> Int {
-        let count = try self.count(elementSize: 1, what())
-        guard count == expectedCount else {
-            throw RoomMemoryCDRError.invalid("\(message) CDR: \(what()) holds \(count) bytes, expected \(expectedCount)")
-        }
-        return try take(count, what())
     }
 
     /// Rejects unread bytes beyond the padding the rmw layer may add.

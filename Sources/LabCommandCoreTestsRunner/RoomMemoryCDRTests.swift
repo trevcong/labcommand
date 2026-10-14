@@ -6,6 +6,9 @@ import LabCommandCore
 // Tests/Fixtures/room/golden/hand/*.hex were written byte by byte from the .msg files and the
 // CDR rules, not produced by the encoder, so encoding to them is not circular. Spark goldens
 // from rclpy (scripts/spark/make_room_memory_goldens.py, same values) are a follow-up.
+// DEFLATE and LZFSE output is not canonical, so the compressed goldens carry hand-built stored
+// blocks: they pin the bytes up to the payload, and the uncompressed payload the encoder's stream
+// must inflate to.
 
 private typealias Room = RoomMemory
 
@@ -61,11 +64,43 @@ private let goldenEpoch = Room.Epoch(
 
 private let goldenDelta = Room.MapBricks(
     header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 12, stamp: t10),
+    compression: .none,
     kind: .delta,
     baseEpoch: 42,
     voxelSize: 0.05,
     bricks: [Room.Brick(coordinate: Room.BrickCoordinate(i: -1, j: 2, k: -3), occupied: mask(0x01, last: 0x80), known: mask(0x03, last: 0x80))],
     removedBrickIndices: [0, 5]
+)
+
+private let goldenDeltaLZFSE: Room.MapBricks = {
+    var delta = goldenDelta
+    delta.compression = .lzfse
+    return delta
+}()
+
+private let goldenSnapshotZlib = Room.MapBricks(
+    header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 13, stamp: t10),
+    compression: .zlib,
+    kind: .snapshot,
+    baseEpoch: 0,
+    voxelSize: 0.05,
+    bricks: [
+        Room.Brick(coordinate: Room.BrickCoordinate(i: -1, j: 2, k: -3), occupied: mask(0x01, last: 0x80), known: mask(0x03, last: 0x80)),
+        Room.Brick(coordinate: Room.BrickCoordinate(i: 0, j: 0, k: 1), occupied: mask(0), known: [UInt8](repeating: 0xFF, count: Room.Brick.maskBytes)),
+    ]
+)
+
+private let goldenRequestMap = Room.RequestSync(
+    header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 2, stamp: t10),
+    since: Room.RequestSync.Position(epoch: 43, seq: 12),
+    topic: .mapBricks
+)
+
+private let goldenRequestNone = Room.RequestSync(
+    header: Room.Header(roomId: "lab-a", mapEpoch: Room.RequestSync.sinceNone, seq: 0,
+                        stamp: Room.Time(sec: 1_760_400_000, nanosec: 500_000_000)),
+    since: nil,
+    topic: .events
 )
 
 private let goldenMoved = Room.ChangeEvent(
@@ -85,6 +120,7 @@ private let goldenMoved = Room.ChangeEvent(
     lastSeen: t10,
     mask: Room.MapBricks(
         header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 0, stamp: t10),
+        compression: .none,
         kind: .snapshot,
         baseEpoch: 0,
         voxelSize: 0.05,
@@ -110,6 +146,16 @@ private let goldenAppeared = Room.ChangeEvent(
     mask: nil
 )
 
+/// Where a compressed golden keeps its payload, in stream positions (after the 4-byte header).
+private struct PayloadFraming {
+    /// The `uint32` payload length; the encoder must match the golden up to here.
+    var lengthPos: Int
+    /// The uncompressed payload, verbatim inside the hand-built stored block.
+    var verbatim: Range<Int>
+    /// The algorithm that inflates the payload, used here independently of the codec.
+    var algorithm: NSData.CompressionAlgorithm
+}
+
 /// One golden: its file, the decoder for its type, and the expected encoding of the expected value.
 private struct Golden {
     var name: String
@@ -117,19 +163,23 @@ private struct Golden {
     var encodeExpected: () throws -> Data
     /// Re-encodes whatever decodes, so the fuzz can check decode ⇒ valid.
     var reencode: (Data) throws -> Data
+    /// Nil when the encoder must reproduce every byte.
+    var framing: PayloadFraming?
 }
 
 private func golden<M: Equatable>(
     _ name: String,
     _ expected: M,
     decode: @escaping (Data) throws -> M,
-    encode: @escaping (M) throws -> Data
+    encode: @escaping (M) throws -> Data,
+    framing: PayloadFraming? = nil
 ) -> Golden {
     Golden(
         name: name,
         decodeMatches: { try decode($0) == expected },
         encodeExpected: { try encode(expected) },
-        reencode: { try encode(try decode($0)) }
+        reencode: { try encode(try decode($0)) },
+        framing: framing
     )
 }
 
@@ -139,11 +189,18 @@ private let littleEndianGoldens: [Golden] = [
     golden("map_bricks_delta_le", goldenDelta, decode: Room.MapBricks.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("change_event_moved_mask_le", goldenMoved, decode: Room.ChangeEvent.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("change_event_appeared_le", goldenAppeared, decode: Room.ChangeEvent.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("map_bricks_snapshot_zlib_le", goldenSnapshotZlib, decode: Room.MapBricks.decode(cdr:), encode: { try $0.encodedCDR() },
+           framing: PayloadFraming(lengthPos: 64, verbatim: 73..<341, algorithm: .zlib)),
+    golden("map_bricks_delta_lzfse_le", goldenDeltaLZFSE, decode: Room.MapBricks.decode(cdr:), encode: { try $0.encodedCDR() },
+           framing: PayloadFraming(lengthPos: 64, verbatim: 76..<218, algorithm: .lzfse)),
+    golden("request_sync_map_le", goldenRequestMap, decode: Room.RequestSync.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("request_sync_events_none_le", goldenRequestNone, decode: Room.RequestSync.decode(cdr:), encode: { try $0.encodedCDR() }),
 ]
 
 private let bigEndianGoldens: [Golden] = [
     golden("epoch_be", goldenEpoch, decode: Room.Epoch.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("map_bricks_delta_be", goldenDelta, decode: Room.MapBricks.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("request_sync_map_be", goldenRequestMap, decode: Room.RequestSync.decode(cdr:), encode: { try $0.encodedCDR() }),
 ]
 
 private enum Outcome: Equatable {
@@ -175,7 +232,12 @@ func testRoomGoldensDecodeAndEncode() {
         expect(decoded == .decoded, "golden \(golden.name): \(text)")
         do {
             let encoded = try golden.encodeExpected()
-            expect(encoded == bytes, "golden \(golden.name): encoder wrote \(encoded.count) bytes that differ from the hand bytes (\(bytes.count))")
+            if let framing = golden.framing {
+                try checkCompressedEncoding(golden.name, encoded: encoded, hand: bytes, framing)
+                expect(try golden.decodeMatches(encoded), "golden \(golden.name): the encoder's compressed bytes decode back to the value")
+            } else {
+                expect(encoded == bytes, "golden \(golden.name): encoder wrote \(encoded.count) bytes that differ from the hand bytes (\(bytes.count))")
+            }
         } catch {
             expect(false, "golden \(golden.name): encode threw \(error)")
         }
@@ -184,6 +246,19 @@ func testRoomGoldensDecodeAndEncode() {
         let (decoded, text) = outcome { try golden.decodeMatches(goldenBytes(golden.name)) }
         expect(decoded == .decoded, "golden \(golden.name): \(text)")
     }
+}
+
+/// The encoder's bytes match the hand bytes up to the payload length, the length counts the rest,
+/// and the encoder's own stream inflates (through Foundation, not the codec) to the hand payload.
+private func checkCompressedEncoding(_ name: String, encoded: Data, hand: Data, _ framing: PayloadFraming) throws {
+    let lengthAt = 4 + framing.lengthPos
+    expect(encoded.prefix(lengthAt) == hand.prefix(lengthAt), "golden \(name): encoder differs from the hand bytes before the payload")
+    let declared = encoded[lengthAt..<lengthAt + 4].reversed().reduce(0) { $0 << 8 | Int($1) }
+    let payload = encoded.suffix(from: lengthAt + 4)
+    expect(declared == payload.count, "golden \(name): payload length \(declared) is not the \(payload.count) bytes that follow")
+    let inflated = try (Data(payload) as NSData).decompressed(using: framing.algorithm) as Data
+    let verbatim = hand[(4 + framing.verbatim.lowerBound)..<(4 + framing.verbatim.upperBound)]
+    expect(inflated == verbatim, "golden \(name): encoder payload inflates to \(inflated.count) bytes, not the hand payload")
 }
 
 func testRoomGoldenSemantics() {
@@ -201,6 +276,28 @@ func testRoomGoldenSemantics() {
     expect(last.byte == 63 && last.mask == 0x80, "bitPosition(7,7,7) = byte 63, mask 0x80")
     let yStep = Room.Brick.bitPosition(x: 0, y: 1, z: 0)
     expect(yStep.byte == 1 && yStep.mask == 0x01, "bitPosition(0,1,0) = bit 8")
+
+    let allFree = goldenSnapshotZlib.bricks[1]
+    expect(allFree.evidence(x: 3, y: 4, z: 5) == .free, "an all-free brick is sent and reads free, not unknown")
+    expect(goldenRequestNone.since == nil && goldenRequestMap.since?.seq == 12, "SINCE_NONE decodes to a nil since")
+    expect(Room.MapBricks(header: goldenDelta.header, kind: .snapshot, baseEpoch: 0, voxelSize: 0.05, bricks: []).compression == .zlib,
+           "MapBricks compresses with zlib unless told otherwise")
+}
+
+func testRoomEmptyPayloadEveryCompression() {
+    // n_bricks 0 and n_removed 0: an empty payload stays empty under NONE, and zlib and lzfse still
+    // send a complete (non-empty) stream, such as raw DEFLATE 03 00.
+    for compression in Room.MapBricks.Compression.allCases {
+        let empty = Room.MapBricks(header: goldenDelta.header, compression: compression, kind: .snapshot, baseEpoch: 0, voxelSize: 0.05, bricks: [])
+        do {
+            let bytes = try empty.encodedCDR()
+            let payloadLength = bytes[(4 + 64)..<(4 + 68)].reversed().reduce(0) { $0 << 8 | Int($1) }
+            expect((payloadLength == 0) == (compression == .none), "empty \(compression) payload is \(payloadLength) bytes")
+            expect(try Room.MapBricks.decode(cdr: bytes) == empty, "empty \(compression) snapshot round-trips")
+        } catch {
+            expect(false, "empty \(compression) snapshot: \(error)")
+        }
+    }
 }
 
 func testRoomSliceAndPadding() {
@@ -240,6 +337,23 @@ private func patched(_ name: String, at pos: Int, _ replacement: [UInt8]) -> Dat
 }
 
 private func le32(_ value: UInt32) -> [UInt8] { withUnsafeBytes(of: value.littleEndian, Array.init) }
+private func le64(_ value: UInt64) -> [UInt8] { withUnsafeBytes(of: value.littleEndian, Array.init) }
+
+/// The zlib golden with its raw DEFLATE payload wrapped as RFC 1950 zlib (header 78 9c, Adler-32
+/// trailer), which is what Python's plain `zlib.compress(raw)` emits. The protocol carries raw DEFLATE.
+private func zlibWrappedSnapshot() -> Data {
+    let hand = [UInt8](goldenBytes("map_bricks_snapshot_zlib_le"))
+    let deflate = Array(hand[(4 + 68)...])
+    let raw = deflate.dropFirst(5)
+    var a: UInt32 = 1
+    var b: UInt32 = 0
+    for byte in raw {
+        a = (a + UInt32(byte)) % 65521
+        b = (b + a) % 65521
+    }
+    let wrapped = [0x78, 0x9c] + deflate + withUnsafeBytes(of: (b << 16 | a).bigEndian, Array.init)
+    return Data(hand.prefix(4 + 64) + le32(UInt32(wrapped.count)) + wrapped)
+}
 private func f32(_ value: Float) -> [UInt8] { le32(value.bitPattern) }
 
 func testRoomMalformedInputRejected() {
@@ -249,9 +363,20 @@ func testRoomMalformedInputRejected() {
     let event = { (data: Data) in try Room.ChangeEvent.decode(cdr: data) == goldenMoved }
     let appeared = { (data: Data) in try Room.ChangeEvent.decode(cdr: data) == goldenAppeared }
 
+    let snapshot = { (data: Data) in try Room.MapBricks.decode(cdr: data) == goldenSnapshotZlib }
+    let lzfseDelta = { (data: Data) in try Room.MapBricks.decode(cdr: data) == goldenDeltaLZFSE }
+    let request = { (data: Data) in try Room.RequestSync.decode(cdr: data) == goldenRequestMap }
+    let requestNoneMatches = { (data: Data) in try Room.RequestSync.decode(cdr: data) == goldenRequestNone }
+
     let delta = "map_bricks_delta_le"
     let moved = "change_event_moved_mask_le"
     let fresh = "change_event_appeared_le"
+    let zlib = "map_bricks_snapshot_zlib_le"
+    let lzfse = "map_bricks_delta_lzfse_le"
+    let requestMap = "request_sync_map_le"
+    let requestNone = "request_sync_events_none_le"
+    let none64 = [UInt8](repeating: 0xFF, count: 8)
+    let zlibWrapped = zlibWrappedSnapshot()
     var xcdr2 = [UInt8](goldenBytes("epoch_le"))
     xcdr2[1] = 0x07
 
@@ -270,19 +395,29 @@ func testRoomMalformedInputRejected() {
         ("MemoryStatus residual -1 m", .invalid, { try status(patched("memory_status_le", at: 56, f32(-1))) }),
         ("MemoryStatus window 0 s", .invalid, { try status(patched("memory_status_le", at: 60, f32(0))) }),
         ("MemoryStatus window +Inf", .invalid, { try status(patched("memory_status_le", at: 60, f32(.infinity))) }),
-        ("MapBricks kind 2", .invalid, { try bricks(patched(delta, at: 32, [2])) }),
-        ("snapshot with removed bricks", .invalid, { try bricks(patched(delta, at: 32, [0])) }),
+        ("MapBricks compression 3", .invalid, { try bricks(patched(delta, at: 32, [3])) }),
+        ("MapBricks kind 2", .invalid, { try bricks(patched(delta, at: 33, [2])) }),
+        ("snapshot with removed bricks", .invalid, { try bricks(patched(delta, at: 33, [0])) }),
+        ("delta map_epoch equal to base_epoch", .invalid, { try bricks(patched(delta, at: 8, le64(42))) }),
         ("voxel_size NaN", .invalid, { try bricks(patched(delta, at: 48, f32(.nan))) }),
         ("voxel_size 0", .invalid, { try bricks(patched(delta, at: 48, f32(0))) }),
         ("brick_dim 4", .unsupported, { try bricks(patched(delta, at: 52, [4])) }),
-        ("brick_ijk not 3 per brick", .invalid, { try bricks(patched(delta, at: 56, le32(2))) }),
-        ("brick_ijk count 2^32-1", .truncated, { try bricks(patched(delta, at: 56, le32(0xFFFF_FFFF))) }),
-        ("occ_bits 63 bytes", .invalid, { try bricks(patched(delta, at: 68, le32(63))) }),
-        ("occupied voxel not known", .invalid, { try bricks(patched(delta, at: 72, [0x05])) }),
-        ("removed_bricks_idx not increasing", .invalid, { try bricks(patched(delta, at: 212, le32(0))) }),
-        ("removed_bricks_idx count 2^32-1", .truncated, { try bricks(patched(delta, at: 204, le32(0xFFFF_FFFF))) }),
-        ("compression zstd", .unsupported, { try bricks(patched(delta, at: 216, [1])) }),
-        ("compression 2", .invalid, { try bricks(patched(delta, at: 216, [2])) }),
+        ("n_bricks 2 with a 1-brick payload", .invalid, { try bricks(patched(delta, at: 56, le32(2))) }),
+        ("n_bricks 2^32-1, past the 16 MiB payload limit", .invalid, { try bricks(patched(delta, at: 56, le32(0xFFFF_FFFF))) }),
+        ("n_removed 2^32-1, past the 16 MiB payload limit", .invalid, { try bricks(patched(delta, at: 60, le32(0xFFFF_FFFF))) }),
+        ("payload 141 bytes for 142", .invalid, { try bricks(patched(delta, at: 64, le32(141))) }),
+        ("payload length 2^32-1", .truncated, { try bricks(patched(delta, at: 64, le32(0xFFFF_FFFF))) }),
+        ("occupied voxel not known", .invalid, { try bricks(patched(delta, at: 74, [0x05])) }),
+        ("removed_bricks_idx not increasing", .invalid, { try bricks(patched(delta, at: 206, le32(0))) }),
+        ("COMPRESSION_ZLIB on an uncompressed payload", .invalid, { try bricks(patched(delta, at: 32, [1])) }),
+        ("COMPRESSION_LZFSE on an uncompressed payload", .invalid, { try bricks(patched(delta, at: 32, [2])) }),
+        ("zlib-wrapped stream (78 9c ... adler32)", .invalid, { try snapshot(zlibWrapped) }),
+        ("zlib stored block of 267 bytes for 268", .invalid, { try snapshot(patched(patched(zlib, at: 69, [0x0b]), at: 71, [0xf4])) }),
+        ("zlib stream cut short", .invalid, { try snapshot(Data(patched(zlib, at: 64, le32(272)).dropLast())) }),
+        ("zlib stream longer than n_bricks says", .invalid, { try snapshot(patched(zlib, at: 56, le32(1))) }),
+        ("empty zlib payload", .invalid, { try snapshot(Data(patched(patched(zlib, at: 56, le32(0)), at: 64, le32(0)).prefix(4 + 68))) }),
+        ("lzfse stream without its end marker", .invalid, { try lzfseDelta(Data(patched(lzfse, at: 64, le32(150)).dropLast(4))) }),
+        ("lzfse block count 141 for 142 bytes", .invalid, { try lzfseDelta(patched(lzfse, at: 72, le32(141))) }),
         ("ChangeEvent kind 3", .invalid, { try event(patched(moved, at: 40, [3])) }),
         ("ChangeEvent state 5", .invalid, { try event(patched(moved, at: 41, [5])) }),
         ("APPEARED with from_centroid", .invalid, { try event(patched(moved, at: 40, [0])) }),
@@ -298,16 +433,22 @@ func testRoomMalformedInputRejected() {
         ("last_seen before first_seen", .invalid, { try appeared(patched(fresh, at: 120, le32(1_760_400_009))) }),
         ("mask count 2", .invalid, { try event(patched(moved, at: 128, le32(2))) }),
         ("mask count 1 with no mask bytes", .truncated, { try appeared(patched(fresh, at: 128, le32(1))) }),
-        ("mask of KIND_DELTA", .invalid, { try event(patched(moved, at: 168, [1])) }),
-        ("mask occupied voxel not known", .invalid, { try event(patched(moved, at: 276, [0x00])) }),
-        ("mask brick with no known voxel", .invalid, { try event(patched(patched(moved, at: 208, [0x00]), at: 276, [0x00])) }),
-        ("mask compression zstd", .unsupported, { try event(patched(moved, at: 344, [1])) }),
+        ("mask of KIND_DELTA", .invalid, { try event(patched(moved, at: 169, [1])) }),
+        ("mask occupied voxel not known", .invalid, { try event(patched(moved, at: 274, [0x00])) }),
+        ("mask brick with no known voxel", .invalid, { try event(patched(patched(moved, at: 210, [0x00]), at: 274, [0x00])) }),
+        ("mask compression 3", .invalid, { try event(patched(moved, at: 168, [3])) }),
         ("mask room_id not the event's", .invalid, { try event(patched(moved, at: 136, [0x78])) }),
         ("mask map_epoch not the event's", .invalid, { try event(patched(moved, at: 144, le32(44))) }),
         ("mask stamp sec not the event's", .invalid, { try event(patched(moved, at: 160, le32(1_760_400_011))) }),
         ("mask stamp nanosec not the event's", .invalid, { try event(patched(moved, at: 164, le32(0))) }),
         ("mask seq 1", .invalid, { try event(patched(moved, at: 152, le32(1))) }),
         ("mask base_epoch 1", .invalid, { try event(patched(moved, at: 176, le32(1))) }),
+        ("RequestSync topic 2", .invalid, { try request(patched(requestMap, at: 48, [2])) }),
+        ("RequestSync map_epoch not since_epoch", .invalid, { try request(patched(requestMap, at: 8, le32(44))) }),
+        ("RequestSync since_seq SINCE_NONE alone", .invalid, { try request(patched(requestMap, at: 40, none64)) }),
+        ("RequestSync since_epoch SINCE_NONE alone", .invalid, { try request(patched(patched(requestMap, at: 32, none64), at: 8, none64)) }),
+        ("RequestSync since_epoch set, since_seq SINCE_NONE", .invalid, { try requestNoneMatches(patched(requestNone, at: 40, le64(0))) }),
+        ("RequestSync map_epoch 0 with SINCE_NONE", .invalid, { try requestNoneMatches(patched(requestNone, at: 16, le64(0))) }),
     ]
     for (label, want, body) in cases {
         let (got, text) = outcome(body)
@@ -328,6 +469,8 @@ func testRoomEncoderEnforcesContract() {
     allUnknown.bricks[0].known = mask(0)
     var snapshotWithRemovals = goldenDelta
     snapshotWithRemovals.kind = .snapshot
+    var deltaBackwards = goldenDelta
+    deltaBackwards.header.mapEpoch = 41
     var movedWithoutFrom = goldenMoved
     movedWithoutFrom.fromCentroid = nil
     var appearedWithFrom = goldenAppeared
@@ -354,6 +497,14 @@ func testRoomEncoderEnforcesContract() {
     nulRoom.header.roomId = "lab\u{0}x"
     var badNanos = goldenEpoch
     badNanos.header.stamp.nanosec = 1_000_000_000
+    var overLimit = goldenDelta
+    overLimit.removedBrickIndices = Array(0..<UInt32(4_194_271))
+    var requestSentinelSeq = goldenRequestMap
+    requestSentinelSeq.since?.seq = Room.RequestSync.sinceNone
+    var requestEpochMismatch = goldenRequestMap
+    requestEpochMismatch.header.mapEpoch = 44
+    var requestNoneWithEpoch = goldenRequestNone
+    requestNoneWithEpoch.header.mapEpoch = 0
 
     let cases: [(String, () throws -> Data)] = [
         ("duplicate brick", { try unsorted.encodedCDR() }),
@@ -361,6 +512,7 @@ func testRoomEncoderEnforcesContract() {
         ("occupied voxel not known", { try occupiedNotKnown.encodedCDR() }),
         ("all-unknown brick", { try allUnknown.encodedCDR() }),
         ("snapshot with removals", { try snapshotWithRemovals.encodedCDR() }),
+        ("delta map_epoch before base_epoch", { try deltaBackwards.encodedCDR() }),
         ("MOVED without from_centroid", { try movedWithoutFrom.encodedCDR() }),
         ("APPEARED with from_centroid", { try appearedWithFrom.encodedCDR() }),
         ("alpha 2", { try badAlpha.encodedCDR() }),
@@ -374,6 +526,10 @@ func testRoomEncoderEnforcesContract() {
         ("empty room_id", { try emptyRoom.encodedCDR() }),
         ("NUL in room_id", { try nulRoom.encodedCDR() }),
         ("nanosec 1e9", { try badNanos.encodedCDR() }),
+        ("payload 2 bytes past 16 MiB", { try overLimit.encodedCDR() }),
+        ("RequestSync since_seq SINCE_NONE", { try requestSentinelSeq.encodedCDR() }),
+        ("RequestSync map_epoch not since_epoch", { try requestEpochMismatch.encodedCDR() }),
+        ("RequestSync map_epoch 0 with no since", { try requestNoneWithEpoch.encodedCDR() }),
     ]
     for (label, body) in cases {
         do {
@@ -435,10 +591,16 @@ private struct MessageFactory {
                 removed.append(index)
             }
         }
+        var mapHeader = header()
+        let baseEpoch = kind == .delta ? random.next() >> 1 : 0
+        if kind == .delta {
+            mapHeader.mapEpoch = baseEpoch + 1 + UInt64(below(10))
+        }
         return Room.MapBricks(
-            header: header(),
+            header: mapHeader,
+            compression: Room.MapBricks.Compression.allCases[below(3)],
             kind: kind,
-            baseEpoch: kind == .delta ? random.next() : 0,
+            baseEpoch: baseEpoch,
             voxelSize: [0.02, 0.05, 0.1][below(3)],
             bricks: coordinates.sorted().map { brick($0) },
             removedBrickIndices: removed
@@ -494,6 +656,15 @@ private struct MessageFactory {
         )
     }
 
+    mutating func requestSync() -> Room.RequestSync {
+        var request = Room.RequestSync(header: header(), since: nil, topic: Room.RequestSync.Topic.allCases[below(2)])
+        if coin() {
+            request.since = Room.RequestSync.Position(epoch: random.next() >> 1, seq: random.next() >> 1)
+        }
+        request.header.mapEpoch = request.since?.epoch ?? Room.RequestSync.sinceNone
+        return request
+    }
+
     mutating func epoch() -> Room.Epoch {
         Room.Epoch(
             header: header(),
@@ -517,14 +688,19 @@ private func roundTrip<M: Equatable>(_ message: M, encode: (M) throws -> Data, d
     }
 }
 
+private let roundTripRounds = 300
+private let roundTripTypes = 5
+private let fuzzRoundsPerGolden = 1000
+
 func testRoomRandomRoundTrips() {
     var factory = MessageFactory(random: SplitMix64(seed: 0x00C0_FFEE))
-    for index in 0..<300 {
+    for index in 0..<roundTripRounds {
         roundTrip(factory.mapBricks(kind: index % 2 == 0 ? .snapshot : .delta),
                   encode: { try $0.encodedCDR() }, decode: Room.MapBricks.decode(cdr:), "MapBricks round trip \(index)")
         roundTrip(factory.changeEvent(), encode: { try $0.encodedCDR() }, decode: Room.ChangeEvent.decode(cdr:), "ChangeEvent round trip \(index)")
         roundTrip(factory.memoryStatus(), encode: { try $0.encodedCDR() }, decode: Room.MemoryStatus.decode(cdr:), "MemoryStatus round trip \(index)")
         roundTrip(factory.epoch(), encode: { try $0.encodedCDR() }, decode: Room.Epoch.decode(cdr:), "Epoch round trip \(index)")
+        roundTrip(factory.requestSync(), encode: { try $0.encodedCDR() }, decode: Room.RequestSync.decode(cdr:), "RequestSync round trip \(index)")
     }
 }
 
@@ -536,7 +712,7 @@ func testRoomMutatedInputNeverCrashes() {
     var rejected = 0
     for golden in littleEndianGoldens + bigEndianGoldens {
         let valid = [UInt8](goldenBytes(golden.name))
-        for round in 0..<1000 {
+        for round in 0..<fuzzRoundsPerGolden {
             var bytes = valid
             for _ in 0...(random.next() % 3) {
                 let index = Int(random.next() % UInt64(bytes.count))
@@ -562,23 +738,31 @@ func testRoomMutatedInputNeverCrashes() {
 
 // MARK: - Size Test
 
-private func compressed(_ data: Data, _ algorithm: NSData.CompressionAlgorithm) -> Int {
-    do {
-        return try (data as NSData).compressed(using: algorithm).length
-    } catch {
-        expect(false, "size test: \(algorithm) compression failed: \(error)")
-        return Int.max
+/// Encoded message sizes under each compression, in `Compression.allCases` order.
+private func encodedSizes(_ message: Room.MapBricks) throws -> [Int] {
+    try Room.MapBricks.Compression.allCases.map { compression in
+        var copy = message
+        copy.compression = compression
+        return try copy.encodedCDR().count
     }
 }
 
-private func sizeLine(_ label: String, bricks: Int, _ data: Data) -> String {
-    "\(label): \(bricks) bricks, raw \(data.count) B, zlib \(compressed(data, .zlib)) B, lzfse \(compressed(data, .lzfse)) B"
+private func encodedSizes(_ event: Room.ChangeEvent) throws -> [Int] {
+    try Room.MapBricks.Compression.allCases.map { compression in
+        var copy = event
+        copy.mask?.compression = compression
+        return try copy.encodedCDR().count
+    }
+}
+
+private func sizeLine(_ label: String, bricks: Int, _ sizes: [Int]) -> String {
+    "\(label): \(bricks) bricks, none \(sizes[0]) B, zlib \(sizes[1]) B, lzfse \(sizes[2]) B"
 }
 
 func testRoomSnapshotSizeBudget() {
     // A full-sphere accumulation (720 × 360 rays, seed 1) of the furnished 8 × 8 × 3 m room at
     // 5 cm voxels. Every brick with any evidence is sent, all-free ones included: an absent
-    // brick means UNKNOWN. zlib here is Apple's raw DEFLATE (RFC 1951) at level 5.
+    // brick means UNKNOWN. Sizes are whole encoded messages; zlib is Apple's raw DEFLATE at level 5.
     // With the floor at z = 0 the floor and walls straddle brick boundaries, so noisy hits fill a
     // second brick layer; the off-grid variant shifts the room by (0.2, 0.2, 0.1) m to measure that.
     let header = Room.Header(roomId: "lab", mapEpoch: 1, seq: 0, stamp: t10)
@@ -639,28 +823,27 @@ func testRoomSnapshotSizeBudget() {
 
     do {
         let snapshotBytes = try snapshot.encodedCDR()
-        let offGridBytes = try offGrid.encodedCDR()
-        let surfaceBytes = try surface.encodedCDR()
-        let deltaBytes = try delta.encodedCDR()
-        let eventBytes = try event.encodedCDR()
-        let statusBytes = try goldenStatus.encodedCDR()
-        let epochBytes = try goldenEpoch.encodedCDR()
-        expect(try Room.MapBricks.decode(cdr: snapshotBytes) == snapshot, "size test: snapshot round-trips")
+        expect(snapshot.compression == .zlib, "size test: the snapshot uses the default compression, zlib")
+        expect(try Room.MapBricks.decode(cdr: snapshotBytes) == snapshot, "size test: the zlib snapshot round-trips")
 
-        let zlib = compressed(snapshotBytes, .zlib)
-        let lzfse = compressed(snapshotBytes, .lzfse)
-        expect(zlib <= 500_000 && lzfse <= 500_000, "size test: snapshot compressed \(zlib) / \(lzfse) B exceeds 500 KB")
-        expect(compressed(offGridBytes, .zlib) <= 500_000 && compressed(offGridBytes, .lzfse) <= 500_000,
-               "size test: off-grid snapshot compressed exceeds 500 KB")
-        expect(snapshotBytes.count <= 2_000_000, "size test: raw snapshot \(snapshotBytes.count) B exceeds the 2 MB hard cap")
+        let snapshotSizes = try encodedSizes(snapshot)
+        let offGridSizes = try encodedSizes(offGrid)
+        let zlibIndex = Room.MapBricks.Compression.allCases.firstIndex(of: .zlib)!
+        expect(snapshotSizes[zlibIndex] == snapshotBytes.count, "size test: the default encoding is the zlib one")
+        expect(snapshotSizes[zlibIndex] <= 500_000 && offGridSizes[zlibIndex] <= 500_000,
+               "size test: zlib snapshot \(snapshotSizes[zlibIndex]) / off-grid \(offGridSizes[zlibIndex]) B exceeds the 500 KB target")
+        expect(snapshotSizes.allSatisfy { $0 <= 2_000_000 } && offGridSizes.allSatisfy { $0 <= 2_000_000 },
+               "size test: a snapshot exceeds the 2 MB hard cap under some compression")
         expect(!changed.isEmpty && !maskBricks.isEmpty, "size test: box added touches bricks")
 
-        print("  room memory size: " + sizeLine("snapshot (all observed bricks)", bricks: before.count, snapshotBytes))
-        print("  room memory size: " + sizeLine("snapshot, room off the brick grid", bricks: offGrid.bricks.count, offGridBytes))
-        print("  room memory size: " + sizeLine("surface bricks only (brief's model)", bricks: surface.bricks.count, surfaceBytes))
-        print("  room memory size: " + sizeLine("delta for the 25 cm box (removed \(removed.count))", bricks: changed.count, deltaBytes))
-        print("  room memory size: " + sizeLine("APPEARED event with mask", bricks: maskBricks.count, eventBytes))
-        print("  room memory size: MemoryStatus \(statusBytes.count) B (5-char room_id), Epoch \(epochBytes.count) B (3-char room_id)")
+        let request = try goldenRequestMap.encodedCDR()
+        print("  room memory size: " + sizeLine("snapshot (all observed bricks)", bricks: before.count, snapshotSizes))
+        print("  room memory size: " + sizeLine("snapshot, room off the brick grid", bricks: offGrid.bricks.count, offGridSizes))
+        print("  room memory size: " + sizeLine("surface bricks only (brief's model)", bricks: surface.bricks.count, try encodedSizes(surface)))
+        print("  room memory size: " + sizeLine("delta for the 25 cm box (removed \(removed.count))", bricks: changed.count, try encodedSizes(delta)))
+        print("  room memory size: " + sizeLine("APPEARED event, mask compressed as shown", bricks: maskBricks.count, try encodedSizes(event)))
+        print("  room memory size: MemoryStatus \(try goldenStatus.encodedCDR().count) B (5-char room_id), "
+              + "Epoch \(try goldenEpoch.encodedCDR().count) B, RequestSync \(request.count) B (3-char room_id)")
     } catch {
         expect(false, "size test: \(error)")
     }
@@ -670,20 +853,22 @@ func testRoomSnapshotSizeBudget() {
 
 func runRoomMemoryCDRTests() {
     testRoomGoldensDecodeAndEncode()
-    print("  room memory CDR: hand-derived goldens decode (LE and BE) and the encoder reproduces them"); passed()
+    print("  room memory CDR: \(littleEndianGoldens.count + bigEndianGoldens.count) hand-derived goldens decode (LE and BE); the encoder reproduces them (compressed: up to the payload, which inflates to the hand bytes)"); passed()
     testRoomGoldenSemantics()
-    print("  room memory CDR: NaN/0xFFFF decode to nil; brick bit order and UNKNOWN ≠ free"); passed()
+    print("  room memory CDR: NaN/0xFFFF/SINCE_NONE decode to nil; brick bit order; UNKNOWN ≠ free; zlib by default"); passed()
+    testRoomEmptyPayloadEveryCompression()
+    print("  room memory CDR: an empty payload round-trips under none, zlib and lzfse"); passed()
     testRoomSliceAndPadding()
     print("  room memory CDR: slices decode; ≤ 3 trailing pad bytes allowed, 4 rejected"); passed()
     testRoomTruncationAlwaysThrows()
     print("  room memory CDR safety: every truncation of every golden throws truncated"); passed()
     testRoomMalformedInputRejected()
-    print("  room memory CDR safety: bad encapsulation, enums, invariants, counts, and compression rejected"); passed()
+    print("  room memory CDR safety: bad encapsulation, enums, invariants, counts, payload limit, and compressed streams rejected"); passed()
     testRoomEncoderEnforcesContract()
     print("  room memory CDR: the encoder refuses messages that break the contract"); passed()
     testRoomRandomRoundTrips()
-    print("  room memory CDR: 1200 seeded random messages round-trip byte-identically"); passed()
+    print("  room memory CDR: \(roundTripRounds * roundTripTypes) seeded random messages round-trip byte-identically"); passed()
     testRoomMutatedInputNeverCrashes()
-    print("  room memory CDR safety: 7000 mutated goldens decode-and-re-encode or throw, never crash"); passed()
+    print("  room memory CDR safety: \(fuzzRoundsPerGolden * (littleEndianGoldens.count + bigEndianGoldens.count)) mutated goldens decode-and-re-encode or throw, never crash"); passed()
     testRoomSnapshotSizeBudget(); passed()
 }

@@ -10,6 +10,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ChangeEvent.msg"
   "msg/MemoryStatus.msg"
   "msg/Epoch.msg"
+  "msg/RequestSync.msg"
   DEPENDENCIES builtin_interfaces
 )
 

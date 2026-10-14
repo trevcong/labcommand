@@ -5,7 +5,7 @@ Scope: PR 0.1, 0.2 and 0.3 from `~/Developer/lc-tasks/RESEARCH_BRIEF.md` §3 Pha
 ## Gate (inherited from brief §3)
 
 - `swift build` and `./build.sh --no-install` show no new warnings. The only allowed warning is the existing `AppState.swift:371` `Thread.sleep` warning.
-- `swift run LabCommandCoreTestsRunner` passes. The baseline is 156 groups.
+- `swift run LabCommandCoreTestsRunner` passes. The baseline before Phase 0 is 156 groups; with Phase 0 it is 169.
 - No to-do or fix-me markers and no dead code in any new file: Swift, Markdown, `.msg`, scripts.
 - Doc comments on all public API.
 - No edits outside the files listed here.
@@ -19,9 +19,10 @@ Scope: PR 0.1, 0.2 and 0.3 from `~/Developer/lc-tasks/RESEARCH_BRIEF.md` §3 Pha
 | the §2.4 messages | every message, its legal ROS 2 `.msg` text, and a field table | done on the Mac |
 | every field has a unit and a "missing" rendering | each field table has unit, valid range, the wire encoding of "missing", and the rendering when it is missing or stale | done on the Mac |
 | state machines (memory state, event lifecycle) | transition tables with triggers and per-state rendering | done on the Mac |
-| resync rule | stated per topic | done on the Mac |
+| resync rule | stated per topic, with the `RequestSync` answer rule (D19) | done on the Mac |
 | honest-state rendering rules (UNKNOWN ≠ free, `alpha = NaN` ≠ 0) | own section | done on the Mac |
 | byte budget | §2.5 budget, exact wire sizes and the measured sizes from the 0.2 size test | done on the Mac |
+| Trevor's decisions on D5, D9, D19 (2026-10-14) | all-free bricks kept; `compression` before a packed payload, zlib by default; `RequestSync` and sync topics | done on the Mac; the parts of D19 beyond his field list are marked for his confirmation |
 | Codex review signs off | — | **deferred**: needs Codex |
 | Trevor answers Q1–Q4 | Q1–Q4 listed at the end, unanswered | **deferred**: needs Trevor |
 
@@ -31,12 +32,12 @@ The doc also has a "Decisions for review" section. It lists each place where §2
 
 | brief criterion | deliverable | status |
 |---|---|---|
-| `labcommand_msgs` package | `ros/labcommand_msgs/` with `package.xml`, `CMakeLists.txt`, `msg/{MapBricks,ChangeEvent,MemoryStatus,Epoch}.msg` | written; **colcon build deferred** (no ROS 2 on the Mac) |
-| Swift CDR codecs | `Sources/LabCommandCore/RoomMemoryMessages.swift` (types) and `RoomMemoryCDR.swift` (encode and decode, classic CDR, both byte orders on decode) | done on the Mac |
+| `labcommand_msgs` package | `ros/labcommand_msgs/` with `package.xml`, `CMakeLists.txt`, `msg/{MapBricks,ChangeEvent,MemoryStatus,Epoch,RequestSync}.msg` | written; **colcon build deferred** (no ROS 2 on the Mac) |
+| Swift CDR codecs | `Sources/LabCommandCore/RoomMemoryMessages.swift` (types) and `RoomMemoryCDR.swift` (encode and decode, classic CDR, both byte orders on decode; `MapBricks` payload under none, zlib and lzfse through the Compression framework) | done on the Mac |
 | round-trip tests | seeded random messages: encode, decode, compare, re-encode byte-identical | done on the Mac |
-| malformed input | truncation at every byte, invariant violations, unsupported encapsulation, compression and brick_dim, and a deterministic mutation fuzz | done on the Mac |
-| golden CDR bytes from `ros2` on the Spark decode identically | **substitute**: hand-derived golden bytes per the CDR spec, annotated per field, in `Tests/Fixtures/room/golden/hand/`. Decoded and re-encoded both ways. `scripts/spark/make_room_memory_goldens.py` would serialize the same values with `rclpy` | **Spark goldens deferred**: the script is written and not run |
-| size test: synthetic 8×8×3 m room snapshot ≤ 500 KB compressed, report the number | ray-cast synthetic room → `MapBricks` snapshot. Reports brick count, raw CDR bytes, and NSData `.zlib` (raw DEFLATE, RFC 1951, level 5) and `.lzfse` sizes. Asserts ≤ 500 KB | done on the Mac |
+| malformed input | truncation at every byte, invariant violations, unsupported encapsulation and brick_dim, bad or wrong-size compressed streams, the 16 MiB payload limit, and a deterministic mutation fuzz | done on the Mac |
+| golden CDR bytes from `ros2` on the Spark decode identically | **substitute**: 12 hand-derived goldens per the CDR spec, annotated per field, in `Tests/Fixtures/room/golden/hand/`. Decoded, and re-encoded exactly; for the 2 compressed ones, up to the payload, whose stream must inflate to the hand payload. `scripts/spark/make_room_memory_goldens.py` would serialize the same values with `rclpy` | **Spark goldens deferred**: the script is written and not run |
+| size test: synthetic 8×8×3 m room snapshot ≤ 500 KB compressed, report the number | ray-cast synthetic room → `MapBricks` snapshot. Reports brick count and whole-message sizes under none, zlib (the default; raw DEFLATE, RFC 1951, Apple level 5) and lzfse. Asserts the zlib snapshot ≤ 500 KB: measured 59,024 B (4,081 bricks; 546,926 B uncompressed, 54,091 B lzfse) | done on the Mac |
 
 ### PR 0.3: fixtures under `Tests/Fixtures/room/`
 
@@ -51,7 +52,8 @@ The doc also has a "Decisions for review" section. It lists each place where §2
 
 - Spark golden bytes. The script is written and not run. The follow-up adds a test that decodes `golden/spark/*.bin` and compares against the hand goldens.
 - `colcon build` of `labcommand_msgs` in the Jazzy container.
-- zstd (`compression = 1`). Foundation has no zstd, and §2.4's trailing `compression` byte can't describe a compressed CDR payload. The v1 codecs reject it with a typed error (decision D9 in the protocol doc).
+- A check that the deployed foxglove_bridge accepts client publishing of `RequestSync` (D19).
+- Spark-side LZFSE. Python's stdlib has none, so the Spark sends zlib (D9).
 - The 12 Oct box takes (Q4).
 - Expected `change-detect` outputs (needs the `change-detection` branch).
 - Codex sign-off and Trevor's answers to Q1–Q4.
@@ -59,7 +61,7 @@ The doc also has a "Decisions for review" section. It lists each place where §2
 ## Files
 
 - `docs/PHASE0-PLAN.md`, `docs/ROOM-MEMORY-PROTOCOL.md`
-- `ros/labcommand_msgs/{package.xml,CMakeLists.txt,msg/*.msg}`
+- `ros/labcommand_msgs/{package.xml,CMakeLists.txt,msg/*.msg}` (five messages, including `RequestSync.msg`)
 - `Sources/LabCommandCore/RoomMemoryMessages.swift`, `Sources/LabCommandCore/RoomMemoryCDR.swift`
 - `Sources/LabCommandCoreTestsRunner/RoomMemoryCDRTests.swift`, `SyntheticRoom.swift` (room, scanner, evidence grid), `RoomFixtureTests.swift` (scene catalog, generator, fixture tests), and the dispatch and test calls in `main.swift`
 - `Sources/LabCommandCoreTestsRunner/PointCloud2CDRTests.swift`: `CDRTestField`, `CDRTestCloud` and `cdrXYZICloud` lose `private`, so the generator reuses the existing PointCloud2 test encoder instead of duplicating it

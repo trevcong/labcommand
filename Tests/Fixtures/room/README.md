@@ -38,6 +38,8 @@ The scenes are deterministic: SplitMix64 noise, a fixed ray order, and Darwin li
 
 ## `golden/hand/`
 
-These are hand-derived CDR bytes for the four `labcommand_msgs` types. They were written from the `.msg` files and the rules in `docs/ROOM-MEMORY-PROTOCOL.md` §1, not produced by the encoder, and every span is annotated with its stream position. There are 5 little-endian files and 2 big-endian ones; the big-endian files are decode-only. The `.hex` format is whitespace-separated hex bytes, with `#` starting a comment.
+These are hand-derived CDR bytes for the five `labcommand_msgs` types. They were written from the `.msg` files and the rules in `docs/ROOM-MEMORY-PROTOCOL.md` §1 and §3, not produced by the encoder, and every span is annotated with its stream position. There are 9 little-endian files and 3 big-endian ones; the big-endian files are decode-only. The `.hex` format is whitespace-separated hex bytes, with `#` starting a comment.
+
+DEFLATE and LZFSE output is not canonical, so `map_bricks_snapshot_zlib_le.hex` and `map_bricks_delta_lzfse_le.hex` carry hand-built uncompressed blocks: a DEFLATE stored block and an LZFSE `bvx-` block. The encoder must match them up to the payload length, and its own compressed payload must inflate to their verbatim bytes. Every other little-endian golden is reproduced byte for byte.
 
 **Deferred.** `golden/spark/` will hold the same values serialized by `rclpy` on the Spark (`scripts/spark/make_room_memory_goldens.py`, not run yet).

@@ -11,15 +11,24 @@ runs on the Spark (inside a Jazzy container), by Trevor or an agent he authorize
 It writes <out_dir>/<name>.bin for each little-endian golden in Tests/Fixtures/room/golden/hand/
 (ROS 2 serializes in host byte order, so there are no big-endian Spark goldens). Copy them to
 Tests/Fixtures/room/golden/spark/ on the Mac. The follow-up test decodes each one with the Swift
-codec and requires the value of the matching hand golden ("decode identically"). The bytes should
-also match the .hex files, except for up to 3 bytes of trailing padding the rmw layer may add.
+codec and requires the value of the matching hand golden ("decode identically").
+
+The bytes should also match the .hex files, except for up to 3 bytes of trailing padding the rmw
+layer may add. That holds for the compressed goldens too, because their payloads are built by
+hand here exactly as in the .hex files: a raw DEFLATE stored block (checked with
+zlib.decompress(payload, -15)) and an LZFSE uncompressed block. Python's stdlib has no LZFSE, so
+the Spark cannot produce a compressed LZFSE stream; it sends COMPRESSION_ZLIB, made with
+zlib.compressobj(6, zlib.DEFLATED, -15). Such a stream is not byte-comparable with Apple's, which
+is why compressed messages are compared by decoded value.
 """
 
 import pathlib
+import struct
 import sys
+import zlib
 
 from builtin_interfaces.msg import Time
-from labcommand_msgs.msg import ChangeEvent, Epoch, MapBricks, MemoryStatus
+from labcommand_msgs.msg import ChangeEvent, Epoch, MapBricks, MemoryStatus, RequestSync
 from rclpy.serialization import serialize_message
 
 NAN = float("nan")
@@ -40,6 +49,43 @@ def common(msg, room_id, map_epoch, seq, sec, nanosec):
 
 def mask(first, last=0):
     return [first] + [0] * 62 + [last]
+
+
+def packed_payload(bricks, removed):
+    """The uncompressed MapBricks payload: all brick_ijk, all occ_bits, all known_bits, then
+    removed_bricks_idx, packed little endian with no padding. bricks: [((i, j, k), occ, known)]."""
+    ijk = b"".join(struct.pack("<3h", *coordinate) for coordinate, _, _ in bricks)
+    occupied = b"".join(bytes(occ) for _, occ, _ in bricks)
+    known = b"".join(bytes(kn) for _, _, kn in bricks)
+    return ijk + occupied + known + struct.pack(f"<{len(removed)}I", *removed)
+
+
+def deflate_stored(raw):
+    """One final raw DEFLATE stored block (RFC 1951 3.2.4), as in map_bricks_snapshot_zlib_le.hex."""
+    block = b"\x01" + struct.pack("<HH", len(raw), len(raw) ^ 0xFFFF) + raw
+    assert zlib.decompress(block, -15) == raw
+    return block
+
+
+def lzfse_uncompressed(raw):
+    """An LZFSE stream of one uncompressed block, as in map_bricks_delta_lzfse_le.hex."""
+    return b"bvx-" + struct.pack("<I", len(raw)) + raw + b"bvx$"
+
+
+def map_bricks(msg, compression, kind, base_epoch, bricks, removed, encode):
+    msg.compression = compression
+    msg.kind = kind
+    msg.base_epoch = base_epoch
+    msg.voxel_size = 0.05
+    msg.brick_dim = 8
+    msg.n_bricks = len(bricks)
+    msg.n_removed = len(removed)
+    msg.payload = list(encode(packed_payload(bricks, removed)))
+    return msg
+
+
+DELTA_BRICKS = [((-1, 2, -3), mask(0x01, 0x80), mask(0x03, 0x80))]
+DELTA_REMOVED = [0, 5]
 
 
 def memory_status_le():
@@ -66,30 +112,24 @@ def epoch_le():
 
 
 def map_bricks_delta_le():
-    msg = common(MapBricks(), "lab", 43, 12, *T10)
-    msg.kind = MapBricks.KIND_DELTA
-    msg.base_epoch = 42
-    msg.voxel_size = 0.05
-    msg.brick_dim = 8
-    msg.brick_ijk = [-1, 2, -3]
-    msg.occ_bits = mask(0x01, 0x80)
-    msg.known_bits = mask(0x03, 0x80)
-    msg.removed_bricks_idx = [0, 5]
-    msg.compression = MapBricks.COMPRESSION_NONE
-    return msg
+    return map_bricks(common(MapBricks(), "lab", 43, 12, *T10), MapBricks.COMPRESSION_NONE,
+                      MapBricks.KIND_DELTA, 42, DELTA_BRICKS, DELTA_REMOVED, bytes)
+
+
+def map_bricks_delta_lzfse_le():
+    return map_bricks(common(MapBricks(), "lab", 43, 12, *T10), MapBricks.COMPRESSION_LZFSE,
+                      MapBricks.KIND_DELTA, 42, DELTA_BRICKS, DELTA_REMOVED, lzfse_uncompressed)
+
+
+def map_bricks_snapshot_zlib_le():
+    bricks = DELTA_BRICKS + [((0, 0, 1), [0] * 64, [0xFF] * 64)]
+    return map_bricks(common(MapBricks(), "lab", 43, 13, *T10), MapBricks.COMPRESSION_ZLIB,
+                      MapBricks.KIND_SNAPSHOT, 0, bricks, [], deflate_stored)
 
 
 def change_event_moved_mask_le():
-    region = common(MapBricks(), "lab", 43, 0, *T10)
-    region.kind = MapBricks.KIND_SNAPSHOT
-    region.base_epoch = 0
-    region.voxel_size = 0.05
-    region.brick_dim = 8
-    region.brick_ijk = [3, -1, 0]
-    region.occ_bits = mask(0x01)
-    region.known_bits = mask(0x01)
-    region.removed_bricks_idx = []
-    region.compression = MapBricks.COMPRESSION_NONE
+    region = map_bricks(common(MapBricks(), "lab", 43, 0, *T10), MapBricks.COMPRESSION_NONE,
+                        MapBricks.KIND_SNAPSHOT, 0, [((3, -1, 0), mask(0x01), mask(0x01))], [], bytes)
 
     msg = common(ChangeEvent(), "lab", 43, 3, *T10)
     msg.event_id = 9
@@ -128,12 +168,32 @@ def change_event_appeared_le():
     return msg
 
 
+def request_sync_map_le():
+    msg = common(RequestSync(), "lab", 43, 2, *T10)
+    msg.since_epoch = 43
+    msg.since_seq = 12
+    msg.topic = RequestSync.TOPIC_MAP_BRICKS
+    return msg
+
+
+def request_sync_events_none_le():
+    msg = common(RequestSync(), "lab-a", RequestSync.SINCE_NONE, 0, 1760400000, 500000000)
+    msg.since_epoch = RequestSync.SINCE_NONE
+    msg.since_seq = RequestSync.SINCE_NONE
+    msg.topic = RequestSync.TOPIC_EVENTS
+    return msg
+
+
 GOLDENS = [
     memory_status_le,
     epoch_le,
     map_bricks_delta_le,
+    map_bricks_delta_lzfse_le,
+    map_bricks_snapshot_zlib_le,
     change_event_moved_mask_le,
     change_event_appeared_le,
+    request_sync_map_le,
+    request_sync_events_none_le,
 ]
 
 
