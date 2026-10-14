@@ -3,7 +3,8 @@
 Subscribes to each configured lidar with the sensor-data QoS and ``raw=True``, so frames go
 through the tested ``decode_pointcloud2`` rather than rclpy's deserializer. Publishes the
 codec's CDR bytes on ``/room_memory/status`` (1 Hz) and ``/room_memory/events``; the
-``labcommand_msgs`` classes only provide the type support.
+``labcommand_msgs`` classes only provide the type support. A rejected frame logs one warning
+per sensor per 10 s.
 """
 
 import time
@@ -17,6 +18,7 @@ from sensor_msgs.msg import PointCloud2
 
 from .memory import SENSORS, MemoryConfig, RoomMemory
 from .messages import Time
+from .rejectlog import RejectionLog
 
 STATUS_TOPIC = "/room_memory/status"
 EVENTS_TOPIC = "/room_memory/events"
@@ -56,10 +58,11 @@ class RoomMemoryNode(Node):
         reliable = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE)
         self.events = self.create_publisher(ChangeEventMsg, EVENTS_TOPIC, reliable)
         self.status = self.create_publisher(MemoryStatusMsg, STATUS_TOPIC, QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
+        self._rejections = RejectionLog()
         for name in self.config.sensors:
             sensor = SENSORS[name]
             self.create_subscription(
-                PointCloud2, sensor.topic, lambda data, name=name: self.memory.add_cdr(name, data),
+                PointCloud2, sensor.topic, lambda data, name=name: self._on_cloud(name, data),
                 qos_profile_sensor_data, raw=True,
             )
         self._last_status = time.monotonic()
@@ -69,6 +72,14 @@ class RoomMemoryNode(Node):
             f"room '{self.config.room_id}' sensors {list(self.config.sensors)} state {self.memory.state.name} "
             f"map_epoch {self.memory.map_epoch}"
         )
+
+    def _on_cloud(self, name, data):
+        if self.memory.add_cdr(name, data):
+            return
+        type_name, message = self.memory.channels[name].last_error
+        line = self._rejections.observe(name, type_name, message)
+        if line is not None:
+            self.get_logger().warning(line)
 
     def _close_window(self):
         start = time.perf_counter()

@@ -270,6 +270,7 @@ class _Channel:
         self.frames = []
         self.received = 0
         self.failed = 0
+        self.last_error = None  # None, or (type name, message). Never the exception or the frame.
         self.reference = VoxelLayer.empty()
         self.reference_windows = 0  # windows with usable points merged into the reference
         self.recent = deque(maxlen=recent_windows)  # one entry per closed window, empty when it had none
@@ -349,15 +350,24 @@ class RoomMemory:
         channel.frames.append(np.asarray(positions, dtype=np.float32).reshape(-1, 3))
 
     def add_cdr(self, sensor, data):
-        """Decodes one CDR PointCloud2 and queues it. Returns False when the frame is rejected."""
+        """Decodes one CDR PointCloud2 and queues it. Returns False when the frame is rejected.
+
+        On rejection, ``channel.last_error`` is ``(type name, message)``. The exception object
+        is not kept. An accepted frame sets ``last_error`` to ``None``.
+        """
         try:
             positions = decode_pointcloud2(data).positions
-        except Exception:  # any decode failure is a rejected frame, never a crash (PointCloudError and beyond)
+        except Exception as error:  # rejected frame, not a crash; BaseException still propagates
             channel = self.channels[sensor]
             channel.received += 1
             channel.failed += 1
+            # Type name and message only. The traceback would keep this frame and decoder locals.
+            type_name = type(error).__name__
+            message = str(error)
+            channel.last_error = (type_name, message)
             return False
         self.add_points(sensor, positions)
+        self.channels[sensor].last_error = None
         return True
 
     def _next_id(self):
