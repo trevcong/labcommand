@@ -79,15 +79,19 @@ public final class RigService: @unchecked Sendable {
             }
             try? await Task.sleep(for: .milliseconds(250))
             if proc.isRunning {
-                lock.lock()
-                self[keyPath: key] = proc
-                lock.unlock()
+                setTunnelProcess(proc, for: key)
                 if host.contains(".") { SparkHopCache.save(host) }
                 return nil
             }
             lastError = "tunnel to \(host) exited"
         }
         return lastError ?? "tunnel failed"
+    }
+    
+    private func setTunnelProcess(_ proc: Process, for key: ReferenceWritableKeyPath<RigService, Process?>) {
+        lock.lock()
+        self[keyPath: key] = proc
+        lock.unlock()
     }
 
     /// Both tunnels. Returns the first error, or nil.
@@ -99,6 +103,13 @@ public final class RigService: @unchecked Sendable {
 
     public func ensureAPITunnel() async -> String? {
         await startTunnel(port: Self.apiPort, key: \.apiTunnel)
+    }
+    
+    /// Sync helper: starts API tunnel in background if not already running.
+    /// Does not wait for completion — use for fire-and-forget scenarios.
+    private func ensureAPITunnelSync() {
+        if tunnelRunning(\.apiTunnel) || portOpen(Self.apiPort) { return }
+        Task { await ensureAPITunnel() }
     }
 
     public func stopTunnels() {
@@ -118,7 +129,7 @@ public final class RigService: @unchecked Sendable {
     /// GET status.json. Failure returns an honest apiDown/offline snapshot
     /// using the caller's last knowledge of Spark reachability.
     public func fetchStatus(sparkWasReachable: Bool) -> RigSnapshot {
-        _ = ensureAPITunnel()
+        ensureAPITunnelSync()
         let viewUp = viewPathUp
         guard let url = URL(string: "http://localhost:\(Self.apiPort)/status.json") else {
             return RigSnapshot.apiDown(reason: "bad URL", viewTunnelUp: viewUp)

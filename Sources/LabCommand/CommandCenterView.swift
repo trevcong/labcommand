@@ -368,9 +368,10 @@ struct CommandCenterView: View {
     private var calibrationBadge: some View {
         HStack(spacing: 4) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.orange)
+                .foregroundColor(LabTheme.warn)
             Text("JT128: Uncalibrated")
-                .font(.caption.bold())
+                .font(LabTheme.t(11, .semibold))
+                .foregroundColor(LabTheme.warn)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
