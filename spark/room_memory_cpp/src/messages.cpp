@@ -319,7 +319,8 @@ Bytes inflate_lzfse_apple(const Bytes& payload, std::size_t expected, const std:
     Bytes out(expected + 1);
     const std::size_t size = compression_decode_buffer(out.data(), out.size(), payload.data(), payload.size(), nullptr,
                                                        COMPRESSION_LZFSE);
-    if (size != expected) not_one_stream(what, payload.size(), "LZFSE", expected);
+    // compression_decode_buffer returns 0 on failure, so an empty result is only accepted from a bare "bvx$" (handled by the caller).
+    if (expected == 0 || size != expected) not_one_stream(what, payload.size(), "LZFSE", expected);
     out.resize(expected);
     return out;
 }

@@ -308,6 +308,28 @@ TEST(empty_zlib_payload_is_two_bytes) {
     CHECK(MapBricks::from_cdr(encoded) == message);
 }
 
+TEST(corrupt_compressed_lzfse_empty_map_is_rejected) {
+    const MapBricks none{head("lab", 1, 0), Compression::none, MapKind::snapshot, 0, f32(0.05), {}, {}};
+    MapBricks lzfse_message = none;
+    lzfse_message.compression = Compression::lzfse;
+    const Bytes plain = none.to_cdr();
+    MapBricks zlib_message = none;
+    zlib_message.compression = Compression::zlib;
+    const Bytes zipped = zlib_message.to_cdr();
+    std::size_t at = 0;
+    while (plain[at] == zipped[at]) ++at;  // the compression byte is the first difference
+    Bytes encoded = slice(plain, 0, plain.size() - 4);
+    encoded[at] = static_cast<std::uint8_t>(Compression::lzfse);
+    const Bytes empty_stream = {'b', 'v', 'x', '$'};
+    CHECK(MapBricks::from_cdr(join(join(encoded, u32le(4)), empty_stream)) == lzfse_message);
+    const Bytes corrupt = {'b', 'v', 'x', '2'};
+    if (lzfse_blocks_supported()) {
+        CHECK_THROWS(Invalid, MapBricks::from_cdr(join(join(encoded, u32le(4)), corrupt)));
+    } else {
+        CHECK_THROWS(Unsupported, MapBricks::from_cdr(join(join(encoded, u32le(4)), corrupt)));
+    }
+}
+
 TEST(map_bricks_rejections) {
     const std::vector<std::function<void(MapBricks&)>> changes = {
         [](MapBricks& b) { b.voxel_size = std::nanf(""); },
