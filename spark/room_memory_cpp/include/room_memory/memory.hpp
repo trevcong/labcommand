@@ -136,7 +136,8 @@ public:
 
     // Queues positions (3 floats per point, meters, sensor frame) for the current window.
     void add_points(const std::string& sensor, std::span<const float> xyz);
-    // Decodes one CDR PointCloud2 and queues it. Returns false when the frame is rejected.
+    // Decodes one CDR PointCloud2 and queues it. Returns false when the frame is rejected:
+    // any exception from the decoder counts as a failed frame, never escapes.
     bool add_cdr(const std::string& sensor, std::span<const std::uint8_t> data);
     // Integrates the queued frames. Returns the ChangeEvent messages to publish, in order.
     std::vector<msg::ChangeEvent> close_window(const msg::Time& stamp);

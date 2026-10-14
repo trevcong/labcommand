@@ -336,7 +336,7 @@ bool RoomMemory::add_cdr(const std::string& sensor, std::span<const std::uint8_t
     PointCloud cloud;
     try {
         cloud = decode_pointcloud2(data);
-    } catch (const PointCloudError&) {
+    } catch (const std::exception&) {  // PointCloudError, or any other decode failure (e.g. bad_alloc)
         ++channel.received;
         ++channel.failed;
         return false;

@@ -26,8 +26,15 @@ SWIFT = os.environ.get("CHANGE_DETECT")
 SNAPSHOTS = pathlib.Path(
     os.environ.get("ROOM_MEMORY_SNAPSHOTS", goldens.HERE.parents[2] / "Tests" / "Fixtures" / "room" / "snapshots")
 )
+# Codex P2: height = width = 2^22, point_step 2^20, row_step 0, no data. The fallback row_step
+# (2^42) x height overflows 64 bits; both decoders must reject it at the data-size check.
+OVERFLOWING_CLOUD = (
+    "000100000000000000000000010000000000000000004000000040000300000002000000780000000000000007000000010000000200"
+    "000079000000040000000700000001000000020000007a00000008000000070000000100000000000000000010000000000000000000"
+    "01"
+)
 
-pytestmark = pytest.mark.skipif(not (OFFLINE and REPLAY), reason="ROOM_MEMORY_OFFLINE / ROOM_MEMORY_REPLAY not set")
+pytestmark =pytest.mark.skipif(not (OFFLINE and REPLAY), reason="ROOM_MEMORY_OFFLINE / ROOM_MEMORY_REPLAY not set")
 
 
 def python_offline(args):
@@ -278,6 +285,7 @@ close 1760400001 0
 status 1760400002 0 1.0
 status 1760400003 0 1.0
 hex mid360 0001
+hex jt128 {OVERFLOWING_CLOUD}
 close 1760400004 0
 status 1760400004 0 0.5
 status 1760400005 0 0

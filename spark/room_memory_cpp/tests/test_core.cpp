@@ -452,6 +452,46 @@ TEST(boundary_octants_stay_inside_the_origin_end_box) {
     CHECK_EQ(samples, 56);
 }
 
+// Codex P2: with one to three usable rays, the other lanes retire before their first ray.
+// Axis-aligned rays from the start cell (0, 0, 0) mark every cell short of their end cell; a
+// return in the start cell is a ray dropped at setup, so usable < rays.
+TEST(fewer_usable_rays_than_lanes) {
+    Config config = evidence();
+    config.voxel_size = 1.0f;
+    config.origin = {0.5f, 0.5f, 0.5f};
+    const Cloud returns = {7.5f, 0.5f, 0.5f, 0.5f, -4.5f, 0.5f, 0.5f, 0.5f, 5.5f};
+    const std::int64_t lengths[3][3] = {{7, 0, 0}, {0, -5, 0}, {0, 0, 5}};
+    for (std::size_t usable = 1; usable <= 3; ++usable) {
+        Cloud after = {0.25f, 0.75f, 0.5f};
+        after.insert(after.end(), returns.begin(), returns.begin() + static_cast<std::ptrdiff_t>(3 * usable));
+        Keys expected;
+        for (std::size_t r = 0; r < usable; ++r) {
+            for (int a = 0; a < 3; ++a) {
+                const std::int64_t length = lengths[r][a];
+                for (std::int64_t n = 0; n < std::llabs(length); ++n) {
+                    const std::int64_t at = length > 0 ? n : -n;
+                    expected.push_back(pack(a == 0 ? at : 0, a == 1 ? at : 0, a == 2 ? at : 0));
+                }
+            }
+        }
+        sort_unique(expected);
+        const OccupancyMap map = occupancy_map(after, config);
+        CHECK_EQ(map.occupied.size(), usable + 1);
+        CHECK(ray_marks(map, config) == expected);
+        // Keep paths: the marks plus cells no ray reaches, on the dense grid and the hash.
+        Keys keep = expected;
+        keep.insert(keep.end(), {pack(3, 3, 3), pack(-2, 0, 0), pack(1, 1, 0)});
+        sort_unique(keep);
+        CHECK(ray_marks(map, config, &keep) == expected);
+        const std::uint64_t saved = tuning().dense_cell_limit;
+        tuning().dense_cell_limit = 0;
+        const Keys hashed = ray_marks(map, config, &keep);
+        const Keys listed = ray_marks(map, config);
+        tuning().dense_cell_limit = saved;
+        CHECK(hashed == expected && listed == expected);
+    }
+}
+
 // MARK: Determinism
 
 TEST(shuffled_and_duplicated_input_keeps_the_bytes) {

@@ -144,7 +144,9 @@ PointCloud decode_pointcloud2(std::span<const std::uint8_t> data) {
         throw PointCloudError("PointCloud2 CDR: point_step (" + std::to_string(point_step) + ") x width (" +
                               std::to_string(width) + ") exceeds row_step (" + std::to_string(row_step) + ")");
     }
-    if (row_step * height > data_length) {
+    // row_step * height > data_length, by division: a packed_row fallback near 2^64 would
+    // overflow the product (height > 0 since total > 0).
+    if (row_step > data_length / height) {
         throw PointCloudError("PointCloud2 CDR: data holds " + std::to_string(data_length) + " bytes but row_step (" +
                               std::to_string(row_step) + ") x height (" + std::to_string(height) + ") needs more");
     }

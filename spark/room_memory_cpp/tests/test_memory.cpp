@@ -22,6 +22,14 @@ const msg::Time kStart{1760400000, 0};
 
 msg::Time stamp(std::int64_t second) { return msg::Time{kStart.sec + second, 0}; }
 
+msg::Bytes unhex(const std::string& text) {
+    msg::Bytes out;
+    for (std::size_t n = 0; n + 1 < text.size(); n += 2) {
+        out.push_back(static_cast<std::uint8_t>(std::stoul(text.substr(n, 2), nullptr, 16)));
+    }
+    return out;
+}
+
 Keys keys(const std::vector<std::array<std::int64_t, 3>>& cells) {
     Keys out;
     for (const auto& c : cells) out.push_back(pack(c[0], c[1], c[2]));
@@ -266,6 +274,32 @@ TEST(inconsistent_saved_state_is_refused) {
     MemoryConfig coarse = mid360_config(dir.path.string());
     coarse.voxel_size = 0.1;
     CHECK_THROWS(std::invalid_argument, RoomMemory(coarse, kStart));
+}
+
+// Codex P2: row_step 0 falls back to point_step x width = 2^42, and 2^42 x height (2^22)
+// overflows 64 bits. Python rejects it at the data-size check, with this exact message; the
+// decoder must too, and add_cdr must count it as a failed frame instead of throwing.
+TEST(overflowing_cloud_size_is_rejected) {
+    const msg::Bytes cdr = unhex(
+        "000100000000000000000000010000000000000000004000000040000300000002000000780000000000000007000000010000000200"
+        "000079000000040000000700000001000000020000007a00000008000000070000000100000000000000000010000000000000000000"
+        "01");
+    std::string message;
+    try {
+        decode_pointcloud2(cdr);
+    } catch (const PointCloudError& error) {
+        message = error.what();
+    }
+    CHECK_EQ(message, std::string("PointCloud2 CDR: data holds 0 bytes but row_step (4398046511104) x height "
+                                  "(4194304) needs more"));
+    MemoryConfig config;
+    config.state_dir = std::nullopt;
+    config.reference_windows = 1;
+    RoomMemory memory(config, kStart);
+    memory.add_points("mid360", scenes::room_shell());
+    CHECK(!memory.add_cdr("jt128", cdr));
+    memory.close_window(stamp(0));
+    CHECK(memory.state() == MemoryState::building && memory.dropped_windows() == 1);
 }
 
 TEST(degraded_and_dropped_windows) {

@@ -236,7 +236,9 @@ void walk_all(const RayBatch& batch, const Box* keep, Visit&& visit) {
     {
         const int thread = detail::thread_index();
         std::size_t position = 0, end = 0;
-        Pack pack;
+        // Value-initialized: a lane that retires before its first put() (fewer usable rays
+        // than lanes) still holds defined cur / step / entered / t_delta for the lane loop.
+        Pack pack{};
         for (int a = 0; a < 3; ++a) pack.width[a] = keep ? static_cast<std::int32_t>(keep->high[a] - keep->low[a]) : 0;
         const auto load = [&](int lane) {
             Ray ray;
