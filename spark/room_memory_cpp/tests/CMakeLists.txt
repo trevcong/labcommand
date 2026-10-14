@@ -9,7 +9,7 @@ set(ROOM_MEMORY_SNAPSHOTS "${REPO_ROOT}/Tests/Fixtures/room/snapshots" CACHE PAT
 if(DEFINED ENV{ROOM_MEMORY_PHASE0_FIXTURES})
   set(PHASE0_DEFAULT "$ENV{ROOM_MEMORY_PHASE0_FIXTURES}")
 else()
-  set(PHASE0_DEFAULT "$ENV{HOME}/Developer/labcommand-memory/Tests/Fixtures/room/synthetic")
+  set(PHASE0_DEFAULT "${REPO_ROOT}/Tests/Fixtures/room/synthetic")
 endif()
 set(ROOM_MEMORY_PHASE0_FIXTURES "${PHASE0_DEFAULT}" CACHE PATH "Phase 0 synthetic fixtures")
 # Present at configure time means required: a missing directory then fails instead of skipping.
