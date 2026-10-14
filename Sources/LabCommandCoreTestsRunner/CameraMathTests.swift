@@ -182,6 +182,59 @@ func testFitDistanceAlgorithm() {
     )
 }
 
+/// Asserts the fitted bbox projects centered in NDC (within 0.02 on x and y)
+/// and the limiting axis half-span is 0.9 ± 0.03.
+private func runCenteredFitTest(name: String, bboxMin: Point3D, bboxMax: Point3D, aspect: Float) {
+    let fovY = CameraMath.defaultFovY
+    let (eye, center, distance) = CameraMath.fitToBounds(
+        min: bboxMin,
+        max: bboxMax,
+        fovY: fovY,
+        aspect: aspect,
+        margin: 0.9
+    )
+    expect(distance > 0 && distance.isFinite, "\(name): distance=\(distance) should be positive")
+
+    let mvp = CameraMath.perspective(fovY: fovY, aspect: aspect, near: 0.1, far: 1000)
+        * CameraMath.lookAt(eye: eye, center: center)
+
+    var minX = Float.greatestFiniteMagnitude, maxX = -Float.greatestFiniteMagnitude
+    var minY = Float.greatestFiniteMagnitude, maxY = -Float.greatestFiniteMagnitude
+    for (i, corner) in CameraMath.bboxCorners(min: bboxMin, max: bboxMax).enumerated() {
+        guard let ndc = mvp.transformToNDC(corner) else {
+            fputs("FAIL \(name): corner \(i) has w ≈ 0\n", stderr)
+            exit(1)
+        }
+        expect(ndc.z >= 0 && ndc.z <= 1, "\(name) corner \(i): NDC.z=\(ndc.z) out of [0, 1]")
+        minX = min(minX, ndc.x); maxX = max(maxX, ndc.x)
+        minY = min(minY, ndc.y); maxY = max(maxY, ndc.y)
+    }
+
+    let extents = "x=[\(minX), \(maxX)] y=[\(minY), \(maxY)]"
+    let centerX = (minX + maxX) / 2
+    let centerY = (minY + maxY) / 2
+    expect(abs(centerX) <= 0.02, "\(name): NDC x not centered (\(centerX)); \(extents)")
+    expect(abs(centerY) <= 0.02, "\(name): NDC y not centered (\(centerY)); \(extents)")
+
+    let span = max((maxX - minX) / 2, (maxY - minY) / 2)
+    expect(abs(span - 0.9) <= 0.03, "\(name): limiting span=\(span) not 0.9±0.03; \(extents)")
+}
+
+func testFitCenteredOnScreen() {
+    let boxes: [(String, Point3D, Point3D)] = [
+        ("room20x15x3", Point3D(x: -10, y: -7.5, z: 0), Point3D(x: 10, y: 7.5, z: 3)),
+        ("tall2x2x10", Point3D(x: -1, y: -1, z: 0), Point3D(x: 1, y: 1, z: 10)),
+        ("cube5", Point3D(x: -2.5, y: -2.5, z: -2.5), Point3D(x: 2.5, y: 2.5, z: 2.5)),
+        ("roomOffset", Point3D(x: 40, y: -37.5, z: 2), Point3D(x: 60, y: -22.5, z: 5)),
+    ]
+    let aspects: [(String, Float)] = [("16:9", 16.0 / 9.0), ("4:3", 4.0 / 3.0), ("1:1", 1.0)]
+    for (boxName, bMin, bMax) in boxes {
+        for (aspectName, aspect) in aspects {
+            runCenteredFitTest(name: "\(boxName)@\(aspectName)", bboxMin: bMin, bboxMax: bMax, aspect: aspect)
+        }
+    }
+}
+
 func testCameraOrientation() {
     // Test that camera orientation vectors are orthonormal
     let (f, r, u) = CameraMath.cameraOrientation(elevation: Float.pi / 6)
@@ -286,4 +339,6 @@ func runCameraMathTests() {
     print("  camera math: fit flat/wide cloud tight within margin"); passed()
     testFitCorridor30Deg()
     print("  camera math: fit 2×20×2 corridor at 30° elevation tight within margin"); passed()
+    testFitCenteredOnScreen()
+    print("  camera math: fit centers projected bbox in NDC with limiting span 0.9 (room/tall/cube/offset × 16:9/4:3/1:1)"); passed()
 }

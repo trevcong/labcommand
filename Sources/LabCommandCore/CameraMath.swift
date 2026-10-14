@@ -278,43 +278,142 @@ public enum CameraMath {
         return (forward, right, up)
     }
     
-    /// Compute camera parameters to fit a bounding box using exact fit algorithm.
-    /// Returns (eye position, center, distance).
+    /// Compute camera parameters to fit a bounding box, centered on screen.
+    ///
+    /// With an elevated perspective camera, aiming at the bbox center leaves the
+    /// projected box off-center (the near/top edge projects larger than the far
+    /// edge). Instead, the eye is solved in the camera basis so the projected
+    /// NDC extents are symmetric on both axes and the limiting axis reaches ±margin.
+    /// The look-at target is the bbox center shifted along the camera's
+    /// screen-right and screen-up directions.
+    /// Returns (eye position, look-at target, distance from eye to target).
     public static func fitToBounds(
         min: Point3D,
         max: Point3D,
         fovY: Float = defaultFovY,
         aspect: Float = 1.0,
         margin: Float = 0.9,
-        elevation: Float = defaultElevation
+        elevation: Float = defaultElevation,
+        near: Float = 0.1
     ) -> (eye: Point3D, center: Point3D, distance: Float) {
-        let center = Point3D(
+        let bboxCenter = Point3D(
             x: (min.x + max.x) * 0.5,
             y: (min.y + max.y) * 0.5,
             z: (min.z + max.z) * 0.5
         )
-        
-        let corners = bboxCorners(min: min, max: max)
+
         let (forward, right, up) = cameraOrientation(elevation: elevation)
-        
-        let distance = fitDistance(
-            corners: corners,
-            target: center,
-            forward: forward,
-            right: right,
-            up: up,
-            fovY: fovY,
-            aspect: aspect,
-            margin: margin
+        let tanY = tan(fovY / 2)
+        let tanX = tanY * aspect
+        let kx = margin * tanX
+        let ky = margin * tanY
+
+        // Corners in camera basis, relative to bbox center (keeps Float precision
+        // for boxes far from the origin).
+        var xs: [Float] = []
+        var ys: [Float] = []
+        var zs: [Float] = []
+        for p in bboxCorners(min: min, max: max) {
+            let q = Point3D(x: p.x - bboxCenter.x, y: p.y - bboxCenter.y, z: p.z - bboxCenter.z)
+            xs.append(dot(q, right))
+            ys.append(dot(q, up))
+            zs.append(dot(q, forward))
+        }
+
+        // Eye depth along forward at which each axis exactly touches ±margin when
+        // centered: the frustum planes x = ±k·(z - ez) pass through the extreme
+        // corners. ex - k·ez = max(x - k·z), ex + k·ez = min(x + k·z).
+        func tightDepth(_ c: [Float], _ k: Float) -> Float {
+            var a = -Float.greatestFiniteMagnitude
+            var b = Float.greatestFiniteMagnitude
+            for i in c.indices {
+                a = Swift.max(a, c[i] - k * zs[i])
+                b = Swift.min(b, c[i] + k * zs[i])
+            }
+            return (b - a) / (2 * k)
+        }
+
+        // The limiting axis needs the eye furthest back; also keep every corner
+        // in front of the near plane.
+        let minDepth = near + 0.001
+        let ez = Swift.min(
+            tightDepth(xs, kx),
+            tightDepth(ys, ky),
+            (zs.min() ?? 0) - minDepth
         )
-        
-        // Eye = center - distance * forward
+
+        // Lateral eye offset that makes max NDC == -min NDC for one axis.
+        // g(e) = max + min of (c - e)/(z - ez) is strictly decreasing in e,
+        // positive at min(c) and negative at max(c), so bisect.
+        func centeredOffset(_ c: [Float]) -> Float {
+            func g(_ e: Float) -> Float {
+                var hi = -Float.greatestFiniteMagnitude
+                var lo = Float.greatestFiniteMagnitude
+                for i in c.indices {
+                    let v = (c[i] - e) / (zs[i] - ez)
+                    hi = Swift.max(hi, v)
+                    lo = Swift.min(lo, v)
+                }
+                return hi + lo
+            }
+            var lo = c.min() ?? 0
+            var hi = c.max() ?? 0
+            for _ in 0..<64 {
+                let mid = (lo + hi) * 0.5
+                guard mid > lo, mid < hi else { break }
+                if g(mid) > 0 { lo = mid } else { hi = mid }
+            }
+            return (lo + hi) * 0.5
+        }
+
+        let ex = centeredOffset(xs)
+        let ey = centeredOffset(ys)
+
+        // Target sits on the view axis at the bbox center's depth.
+        let distance = -ez
+        var target = Point3D(
+            x: bboxCenter.x + ex * right.x + ey * up.x,
+            y: bboxCenter.y + ex * right.y + ey * up.y,
+            z: bboxCenter.z + ex * right.z + ey * up.z
+        )
+
+        // Verify with the actual view+projection and nudge the target along
+        // screen-right/up if the projected extents are still off-center.
+        let proj = perspective(fovY: fovY, aspect: aspect, near: near, far: distance * 4 + 1000)
+        let corners = bboxCorners(min: min, max: max)
+        for _ in 0..<3 {
+            let eye = Point3D(
+                x: target.x - distance * forward.x,
+                y: target.y - distance * forward.y,
+                z: target.z - distance * forward.z
+            )
+            let mvp = proj * lookAt(eye: eye, center: target)
+            var minX = Float.greatestFiniteMagnitude, maxX = -Float.greatestFiniteMagnitude
+            var minY = Float.greatestFiniteMagnitude, maxY = -Float.greatestFiniteMagnitude
+            for p in corners {
+                guard let ndc = mvp.transformToNDC(p) else { continue }
+                minX = Swift.min(minX, ndc.x); maxX = Swift.max(maxX, ndc.x)
+                minY = Swift.min(minY, ndc.y); maxY = Swift.max(maxY, ndc.y)
+            }
+            let cx = (minX + maxX) * 0.5
+            let cy = (minY + maxY) * 0.5
+            guard abs(cx) > 1e-4 || abs(cy) > 1e-4 else { break }
+            // NDC offset → world offset at the target's depth.
+            let sx = cx * tanX * distance
+            let sy = cy * tanY * distance
+            target = Point3D(
+                x: target.x + sx * right.x + sy * up.x,
+                y: target.y + sx * right.y + sy * up.y,
+                z: target.z + sx * right.z + sy * up.z
+            )
+        }
+
         let eye = Point3D(
-            x: center.x - distance * forward.x,
-            y: center.y - distance * forward.y,
-            z: center.z - distance * forward.z
+            x: target.x - distance * forward.x,
+            y: target.y - distance * forward.y,
+            z: target.z - distance * forward.z
         )
-        
-        return (eye, center, distance)
+
+        return (eye, target, distance)
     }
 }
