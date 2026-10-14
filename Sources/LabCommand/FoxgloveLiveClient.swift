@@ -3,41 +3,25 @@ import Combine
 import os
 import LabCommandCore
 
-/// The latest live cloud per sensor, already in `world`.
-struct LiveClouds {
-    var mid: PointCloudFrame?
-    var jt: PointCloudFrame?
-    /// Message rate per sensor as published by the bridge, before any throttling.
-    var hz: [SensorID: Double] = [:]
-    /// Changes whenever either cloud does — header stamps alone can repeat.
-    var revision = 0
-
-    func frame(_ sensor: SensorID) -> PointCloudFrame? {
-        switch sensor {
-        case .mid360: return mid
-        case .jt128: return jt
-        }
-    }
-
-    var sensors: Set<SensorID> {
-        Set(SensorID.allCases.filter { frame($0) != nil })
-    }
-
-    /// What the badge reports: shown points and rate, per sensor on screen.
-    var readings: [LiveViewMode.Reading] {
-        SensorID.allCases.compactMap { sensor in
-            frame(sensor).map { LiveViewMode.Reading(label: sensor.label, points: $0.count, hz: hz[sensor]) }
-        }
-    }
+/// What the LIVE badge reports about the clouds on screen. The clouds themselves
+/// don't pass through SwiftUI: the renderer pulls them from `LiveFrameMailbox`.
+struct LiveClouds: Equatable {
+    /// Shown points and delivered (rendered) rate, per sensor on screen.
+    var readings: [LiveViewMode.Reading] = []
+    var sensors: Set<SensorID> = []
 }
 
 /// Live lidar clouds for the 3D view, straight from foxglove_bridge on Spark
 /// (`ws://<spark>:8765`, subprotocol `foxglove.sdk.v1` or `foxglove.websocket.v1`).
 ///
-/// The socket, CDR decode, decimation and TF into `world` run off the main thread;
-/// this object only publishes the latest frame per sensor, at ~10 Hz. It is its own
-/// `ObservableObject` so those updates re-render the canvas, not everything that
-/// watches `AppState`.
+/// One socket per sensor, so a 3 MB JT128 frame never queues a Mid-360 frame
+/// behind it. Each socket's receive loop only parses headers and drops the raw
+/// payload into a latest-only slot; a decoder task per sensor decodes, moves the
+/// cloud into `world` and packs it for the GPU. The renderer pulls the newest
+/// packed cloud on every draw, so neither SwiftUI nor a polling timer sits between
+/// the socket and the screen. This object only drives the LIVE/SAMPLE state and
+/// the badge, and is its own `ObservableObject` so those updates re-render the
+/// canvas, not everything that watches `AppState`.
 @MainActor
 final class FoxgloveLiveClient: ObservableObject {
     @Published private(set) var clouds = LiveClouds()
@@ -48,6 +32,9 @@ final class FoxgloveLiveClient: ObservableObject {
     /// which would yank the camera out of the operator's hands.
     @Published private(set) var sourceGeneration = 0
 
+    /// Newest packed cloud per sensor, for the renderer to pull.
+    let mailbox = LiveFrameMailbox()
+
     /// Mission-log lines (`[FoxgloveLive] …`): connection state, subscriptions,
     /// first-frame point counts.
     var onLog: ((String, MissionEventKind) -> Void)?
@@ -57,13 +44,14 @@ final class FoxgloveLiveClient: ObservableObject {
 
     private let hosts: @Sendable () -> [String]
     private let port: Int
-    private let mailbox = LiveFrameMailbox()
     private var session: URLSession?
-    private var worker: Task<Void, Never>?
+    private var workers: [Task<Void, Never>] = []
     private var ticker: Task<Void, Never>?
     private var startedAt: TimeInterval = 0
     private var fallbackRequested = false
     private var hasBeenLive = false
+    private var lastBadgeAt: TimeInterval = 0
+    private var lastRateLogAt: TimeInterval = 0
     /// Sensors the last `mode=LIVE` line named.
     private var loggedLiveSensors: Set<SensorID> = []
 
@@ -80,8 +68,9 @@ final class FoxgloveLiveClient: ObservableObject {
     }
 
     func start() {
-        guard worker == nil else { return }
+        guard workers.isEmpty else { return }
         startedAt = ProcessInfo.processInfo.systemUptime
+        lastRateLogAt = startedAt
         fallbackRequested = false
 
         let config = URLSessionConfiguration.ephemeral
@@ -97,8 +86,10 @@ final class FoxgloveLiveClient: ObservableObject {
         }
         let hosts = self.hosts
         let port = self.port
-        worker = Task.detached(priority: .userInitiated) {
-            await LiveStream.run(hosts: hosts, port: port, session: session, sink: sink)
+        workers = SensorID.allCases.map { sensor in
+            Task.detached(priority: .userInitiated) {
+                await LiveStream.run(sensor: sensor, hosts: hosts, port: port, session: session, sink: sink)
+            }
         }
         ticker = Task { [weak self] in
             while !Task.isCancelled {
@@ -110,46 +101,70 @@ final class FoxgloveLiveClient: ObservableObject {
     }
 
     func stop() {
-        worker?.cancel()
+        workers.forEach { $0.cancel() }
         ticker?.cancel()
-        worker = nil
+        workers = []
         ticker = nil
         session?.invalidateAndCancel()
         session = nil
     }
 
-    // MARK: - Publishing (~10 Hz)
+    // MARK: - State and badge
 
     private func tick() {
         let now = ProcessInfo.processInfo.systemUptime
         let latest = mailbox.take(now: now, staleAfter: LiveStream.staleAfter)
 
         if isLive {
-            if latest.frames.isEmpty {
+            if latest.points.isEmpty {
                 leaveLive(latest.connectionEnded ? "connection lost" : "stream stopped")
-            } else if latest.revision != clouds.revision {
-                show(latest)
-                logLiveMode()            }
-        } else if let first = latest.firstFrameAt, !latest.frames.isEmpty,
-                  latest.expected.isSubset(of: latest.frames.keys) || now - first >= LiveStream.settle {
+            } else if now - lastBadgeAt >= LiveStream.badgeInterval || Set(latest.points.keys) != clouds.sensors {
+                show(latest, at: now)
+                logLiveMode()
+            }
+        } else if let first = latest.firstFrameAt, !latest.points.isEmpty,
+                  latest.expected.isSubset(of: latest.points.keys) || now - first >= LiveStream.settle {
             // Going live waits a beat for the second sensor so the one camera fit
             // frames both clouds rather than whichever arrived first.
-            enterLive(latest)
-        } else if latest.connectionEnded {
+            enterLive(latest, at: now)
+        } else if latest.connectionEnded, latest.expected.isEmpty, latest.points.isEmpty {
             requestFallback("no connection")
-        } else if latest.frames.isEmpty, now - startedAt >= LiveStream.fallbackAfter {
+        } else if latest.points.isEmpty, now - startedAt >= LiveStream.fallbackAfter {
             // Frames already arriving are settling into live, not missing.
             requestFallback("no live data after \(Int(LiveStream.fallbackAfter)) s")
         }
+
+        if now - lastRateLogAt >= LiveStream.rateLogInterval {
+            lastRateLogAt = now
+            logRates(latest)
+        }
     }
 
-    private func show(_ latest: LiveFrameMailbox.Snapshot) {
-        clouds = LiveClouds(
-            mid: latest.frames[.mid360],
-            jt: latest.frames[.jt128],
-            hz: latest.hz,
-            revision: latest.revision
-        )
+    private func show(_ latest: LiveFrameMailbox.Snapshot, at now: TimeInterval) {
+        lastBadgeAt = now
+        let readings = SensorID.allCases.compactMap { sensor in
+            latest.points[sensor].map { LiveViewMode.Reading(label: sensor.label, points: $0, hz: latest.renderedHz[sensor]) }
+        }
+        let next = LiveClouds(readings: readings, sensors: Set(latest.points.keys))
+        if next != clouds {
+            clouds = next
+        }
+    }
+
+    /// Delivered rate (frames the renderer actually drew, 2 s window) for the
+    /// operator, plus where the time goes for whoever chases a low number.
+    private func logRates(_ latest: LiveFrameMailbox.Snapshot) {
+        guard !latest.expected.isEmpty || !latest.points.isEmpty else { return }
+        func hz(_ value: Double?) -> String { String(format: "%.1f Hz", value ?? 0) }
+        func ms(_ value: Double?) -> String { value.map { String(format: "%.1f ms", $0) } ?? "–" }
+        let rates = SensorID.allCases.map { "\($0.label) \(hz(latest.renderedHz[$0]))" }.joined(separator: " ")
+        log("rate \(rates)", kind: .info, mission: false)
+
+        let timings = mailbox.drainTimings()
+        let stages = SensorID.allCases.map { sensor in
+            "\(sensor.label) in \(hz(latest.arrivalHz[sensor])) decode \(ms(timings.decodeMs[sensor]))"
+        }.joined(separator: " · ")
+        log("pipeline \(stages) · upload \(ms(timings.uploadMs))", kind: .info, mission: false)
     }
 
     /// `mode=LIVE` on entry, and again when a sensor joins or leaves the view —
@@ -161,8 +176,8 @@ final class FoxgloveLiveClient: ObservableObject {
         log("mode=\(LiveViewMode.live.rawValue) — \(LiveViewMode.summary(clouds.readings))", kind: .info, mission: false)
     }
 
-    private func enterLive(_ latest: LiveFrameMailbox.Snapshot) {
-        show(latest)
+    private func enterLive(_ latest: LiveFrameMailbox.Snapshot, at now: TimeInterval) {
+        show(latest, at: now)
         isLive = true
         fallbackRequested = false
         if !hasBeenLive {
@@ -170,7 +185,7 @@ final class FoxgloveLiveClient: ObservableObject {
             sourceGeneration += 1
         }
         let summary = SensorID.allCases
-            .compactMap { sensor in latest.frames[sensor].map { "\(sensor.label) \($0.count) pts" } }
+            .compactMap { sensor in latest.points[sensor].map { "\(sensor.label) \($0) pts" } }
             .joined(separator: ", ")
         log("streaming live clouds — \(summary)", kind: .info, mission: true)
         logLiveMode()
@@ -207,15 +222,18 @@ final class FoxgloveLiveClient: ObservableObject {
 
 // MARK: - Mailbox
 
-/// Hand-off between the socket task and the main-actor ticker: the newest frame per
-/// sensor, overwritten in place, so a slow UI drops frames instead of queueing them.
-private final class LiveFrameMailbox: Sendable {
+/// Hand-off from the decoders to the renderer and the main-actor ticker: the newest
+/// packed cloud per sensor, overwritten in place, so a slow consumer drops frames
+/// instead of queueing them. Also keeps the rate meters.
+final class LiveFrameMailbox: Sendable {
     struct Snapshot: Sendable {
-        var frames: [SensorID: PointCloudFrame] = [:]
-        /// Message rate for each sensor in `frames` that has one yet.
-        var hz: [SensorID: Double] = [:]
-        var revision = 0
-        /// Sensors the socket is subscribed to right now.
+        /// Points per sensor with a current cloud.
+        var points: [SensorID: Int] = [:]
+        /// Messages per second off the socket, before any frame is dropped.
+        var arrivalHz: [SensorID: Double] = [:]
+        /// Frames per second the renderer actually drew.
+        var renderedHz: [SensorID: Double] = [:]
+        /// Sensors subscribed right now.
         var expected: Set<SensorID> = []
         /// When the current run of frames began (system uptime).
         var firstFrameAt: TimeInterval?
@@ -223,32 +241,81 @@ private final class LiveFrameMailbox: Sendable {
         var connectionEnded = false
     }
 
+    struct Entry: Sendable {
+        /// Changes with every new cloud for the sensor; the renderer uploads on change.
+        var sequence: Int
+        var cloud: PackedCloud
+    }
+
+    struct Timings: Sendable {
+        var decodeMs: [SensorID: Double] = [:]
+        var uploadMs: Double?
+    }
+
+    private struct Average: Sendable {
+        var total: Double = 0
+        var count = 0
+        var mean: Double? { count > 0 ? total / Double(count) : nil }
+    }
+
     private struct State: Sendable {
-        var snapshot = Snapshot()
+        var entries: [SensorID: Entry] = [:]
+        var sequence = 0
+        var expected: Set<SensorID> = []
+        var firstFrameAt: TimeInterval?
+        var connectionEnded = false
         var receivedAt: [SensorID: TimeInterval] = [:]
-        var rates: [SensorID: ArrivalRate] = [:]
+        var arrivals: [SensorID: ArrivalRate] = [:]
+        var rendered: [SensorID: ArrivalRate] = [:]
+        var decode: [SensorID: Average] = [:]
+        var upload = Average()
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
 
-    func put(_ frame: PointCloudFrame, sensor: SensorID, at now: TimeInterval) {
+    func put(_ cloud: PackedCloud, sensor: SensorID, at now: TimeInterval, decodeMs: Double) {
         state.withLock { state in
-            if state.snapshot.frames.isEmpty {
-                state.snapshot.firstFrameAt = now
+            if state.entries.isEmpty {
+                state.firstFrameAt = now
             }
-            state.snapshot.frames[sensor] = frame
-            state.snapshot.revision += 1
+            state.sequence += 1
+            state.entries[sensor] = Entry(sequence: state.sequence, cloud: cloud)
             state.receivedAt[sensor] = now
+            state.decode[sensor, default: Average()].total += decodeMs
+            state.decode[sensor, default: Average()].count += 1
         }
     }
 
-    /// Every message for the sensor, including ones throttled before decoding.
-    func noteArrival(_ sensor: SensorID, at now: TimeInterval) {
-        state.withLock { $0.rates[sensor, default: ArrivalRate()].note(now) }
+    /// The renderer's pull, once per sensor per draw.
+    func latest(_ sensor: SensorID) -> Entry? {
+        state.withLock { $0.entries[sensor] }
     }
 
-    func setExpected(_ sensors: Set<SensorID>) {
-        state.withLock { $0.snapshot.expected = sensors }
+    /// A new cloud for the sensor went into a drawn frame.
+    func noteRendered(_ sensor: SensorID, at now: TimeInterval) {
+        state.withLock { $0.rendered[sensor, default: ArrivalRate()].note(now) }
+    }
+
+    func noteUpload(ms: Double) {
+        state.withLock {
+            $0.upload.total += ms
+            $0.upload.count += 1
+        }
+    }
+
+    /// Every message for the sensor, including ones a newer frame overwrote.
+    func noteArrival(_ sensor: SensorID, at now: TimeInterval) {
+        state.withLock { $0.arrivals[sensor, default: ArrivalRate()].note(now) }
+    }
+
+    func setExpected(_ sensor: SensorID, _ expected: Bool) {
+        state.withLock { state in
+            if expected {
+                state.expected.insert(sensor)
+            } else {
+                state.expected.remove(sensor)
+            }
+        }
     }
 
     /// The sensor's topic went away; its last cloud must not linger on screen.
@@ -256,52 +323,68 @@ private final class LiveFrameMailbox: Sendable {
         state.withLock { Self.remove(sensor, from: &$0) }
     }
 
-    func connectionEnded() {
+    func connectionEnded(_ sensor: SensorID) {
         state.withLock { state in
-            for sensor in SensorID.allCases {
-                Self.remove(sensor, from: &state)
-            }
-            state.snapshot.expected = []
-            state.snapshot.connectionEnded = true
+            Self.remove(sensor, from: &state)
+            state.expected.remove(sensor)
+            state.connectionEnded = true
         }
     }
 
-    /// The current frames, minus any sensor that has gone quiet for `staleAfter`.
+    /// The current state, minus any sensor that has gone quiet for `staleAfter`.
     func take(now: TimeInterval, staleAfter: TimeInterval) -> Snapshot {
         state.withLock { state in
             for (sensor, at) in state.receivedAt where now - at > staleAfter {
                 Self.remove(sensor, from: &state)
             }
-            var snapshot = state.snapshot
-            snapshot.hz = [:]
-            for sensor in snapshot.frames.keys {
-                snapshot.hz[sensor] = state.rates[sensor]?.hz(now: now)
+            var snapshot = Snapshot(expected: state.expected, firstFrameAt: state.firstFrameAt, connectionEnded: state.connectionEnded)
+            for (sensor, entry) in state.entries {
+                snapshot.points[sensor] = entry.cloud.frame.count
             }
-            state.snapshot.connectionEnded = false
+            for (sensor, rate) in state.arrivals {
+                snapshot.arrivalHz[sensor] = rate.perSecond(now: now)
+            }
+            for (sensor, rate) in state.rendered {
+                snapshot.renderedHz[sensor] = rate.perSecond(now: now)
+            }
+            state.connectionEnded = false
             return snapshot
         }
     }
 
+    /// Mean decode and upload times since the last call.
+    func drainTimings() -> Timings {
+        state.withLock { state in
+            var timings = Timings(uploadMs: state.upload.mean)
+            for (sensor, average) in state.decode {
+                timings.decodeMs[sensor] = average.mean
+            }
+            state.decode = [:]
+            state.upload = Average()
+            return timings
+        }
+    }
+
     private static func remove(_ sensor: SensorID, from state: inout State) {
-        state.rates[sensor] = nil
-        guard state.snapshot.frames.removeValue(forKey: sensor) != nil else { return }
+        state.arrivals[sensor] = nil
+        state.rendered[sensor] = nil
         state.receivedAt[sensor] = nil
-        state.snapshot.revision += 1
-        if state.snapshot.frames.isEmpty {
-            state.snapshot.firstFrameAt = nil
+        guard state.entries.removeValue(forKey: sensor) != nil else { return }
+        if state.entries.isEmpty {
+            state.firstFrameAt = nil
         }
     }
 }
 
 // MARK: - Socket
 
-/// The off-main half: connect, subscribe, decode, reconnect.
+/// The off-main half: connect, subscribe, decode, reconnect — one sensor per socket.
 private enum LiveStream {
     static let maxPointsPerSensor = 60_000
+    /// Live/sample state checks. Rendering doesn't wait on this.
     static let uiInterval: TimeInterval = 0.1
-    /// Frames closer together than this are dropped before decoding. A little under
-    /// the UI interval so arrival jitter doesn't halve a 10 Hz sensor.
-    static let minFrameInterval: TimeInterval = 0.08
+    static let badgeInterval: TimeInterval = 0.5
+    static let rateLogInterval: TimeInterval = 2
     static let fallbackAfter: TimeInterval = 3
     static let staleAfter: TimeInterval = 3
     /// How long going live waits for a subscribed sensor that hasn't sent yet. A
@@ -334,64 +417,58 @@ private enum LiveStream {
 
     /// Subscriptions are per connection — rebuilt from scratch on every reconnect.
     private struct Link {
+        let sensor: SensorID
         let endpoint: String
         var opened = false
         var topics: [UInt32: String] = [:]
-        var subscriptionByChannel: [UInt32: UInt32] = [:]
-        var sensorBySubscription: [UInt32: SensorID] = [:]
+        var channelId: UInt32?
+        var subscriptionId: UInt32?
         var nextSubscriptionId: UInt32 = 1
-        var lastAccepted: [SensorID: TimeInterval] = [:]
-        var reported: Set<SensorID> = []
-        var undecodable: Set<SensorID> = []
         var skipped: Set<UInt32> = []
-
-        var sensors: Set<SensorID> { Set(sensorBySubscription.values) }
     }
 
     static func run(
+        sensor: SensorID,
         hosts: @Sendable () -> [String],
         port: Int,
         session: URLSession,
         sink: Sink
     ) async {
-        var failures = 0
-        var hostIndex = 0
+        var rotation = StreamHostRotation()
         var announcedDown = false
 
         while !Task.isCancelled {
             let candidates = hosts()
-            guard !candidates.isEmpty else {
+            guard let host = rotation.host(in: candidates) else {
                 await sink.log("no Spark host to try", .error, !announcedDown)
                 announcedDown = true
-                sink.mailbox.connectionEnded()
+                sink.mailbox.connectionEnded(sensor)
                 try? await Task.sleep(nanoseconds: 30_000_000_000)
                 continue
             }
-            let host = candidates[hostIndex % candidates.count]
             let endpoint = "ws://\(host):\(port)"
-            await sink.log("connecting \(endpoint)", .info, !announcedDown)
+            await sink.log("connecting \(endpoint) (\(sensor.label))", .info, !announcedDown)
 
-            let end = await connect(endpoint: endpoint, session: session, sink: sink)
-            sink.mailbox.connectionEnded()
+            let end = await connect(sensor: sensor, endpoint: endpoint, session: session, sink: sink)
+            sink.mailbox.connectionEnded(sensor)
             if Task.isCancelled { break }
 
             if end.opened {
-                failures = 0
                 announcedDown = false
-                await sink.log("connection lost \(endpoint) — \(end.reason)", .info, true)
+                await sink.log("connection lost \(endpoint) (\(sensor.label)) — \(end.reason)", .info, true)
             } else {
-                failures += 1
-                hostIndex += 1
-                await sink.log("\(endpoint) unreachable — \(end.reason); retrying", .info, !announcedDown)
+                await sink.log("\(endpoint) unreachable (\(sensor.label)) — \(end.reason); retrying", .info, !announcedDown)
                 announcedDown = true
             }
 
-            let delay = FoxgloveProtocol.reconnectDelay(afterFailures: failures)
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            let delay = rotation.record(opened: end.opened, candidateCount: candidates.count)
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
         }
     }
 
-    private static func connect(endpoint: String, session: URLSession, sink: Sink) async -> ConnectionEnd {
+    private static func connect(sensor: SensorID, endpoint: String, session: URLSession, sink: Sink) async -> ConnectionEnd {
         guard let url = URL(string: endpoint) else {
             return ConnectionEnd(opened: false, reason: "bad URL")
         }
@@ -400,6 +477,12 @@ private enum LiveStream {
         let health = OSAllocatedUnfairLock(initialState: SocketHealth())
         socket.resume()
 
+        // Latest-only: a payload still waiting when the next arrives is replaced,
+        // so a slow decode drops stale frames and the receive loop never waits.
+        let (payloads, slot) = AsyncStream.makeStream(of: Data.self, bufferingPolicy: .bufferingNewest(1))
+        let decoder = Task.detached(priority: .userInitiated) {
+            await decode(payloads, sensor: sensor, sink: sink)
+        }
         let monitor = Task { await watch(socket, health: health) }
         defer {
             monitor.cancel()
@@ -407,11 +490,17 @@ private enum LiveStream {
         }
 
         // `receive()` doesn't notice task cancellation on its own.
-        return await withTaskCancellationHandler {
-            await receive(from: socket, endpoint: endpoint, health: health, sink: sink)
+        let end = await withTaskCancellationHandler {
+            await receive(from: socket, sensor: sensor, endpoint: endpoint, health: health, slot: slot, sink: sink)
         } onCancel: {
             socket.cancel(with: .goingAway, reason: nil)
         }
+        // Let an in-flight decode land before the caller clears this sensor, so a
+        // dead connection's last frame can't reappear after it.
+        slot.finish()
+        decoder.cancel()
+        await decoder.value
+        return end
     }
 
     /// Fails the socket when the server never greets us, or later goes silent: a
@@ -447,11 +536,13 @@ private enum LiveStream {
 
     private static func receive(
         from socket: URLSessionWebSocketTask,
+        sensor: SensorID,
         endpoint: String,
         health: OSAllocatedUnfairLock<SocketHealth>,
+        slot: AsyncStream<Data>.Continuation,
         sink: Sink
     ) async -> ConnectionEnd {
-        var link = Link(endpoint: endpoint)
+        var link = Link(sensor: sensor, endpoint: endpoint)
         do {
             while true {
                 let message = try await socket.receive()
@@ -464,7 +555,14 @@ private enum LiveStream {
                     try await handle(text: text, link: &link, socket: socket, sink: sink)
                 case .data(let frame):
                     if !link.opened { await markOpened(&link, serverName: "", sink: sink) }
-                    await handle(binary: frame, link: &link, sink: sink)
+                    // Header parse only; the decoder takes it from here.
+                    guard let data = FoxgloveProtocol.parseMessageData(frame),
+                          let subscriptionId = link.subscriptionId,
+                          data.subscriptionId == subscriptionId else {
+                        continue
+                    }
+                    sink.mailbox.noteArrival(sensor, at: ProcessInfo.processInfo.systemUptime)
+                    slot.yield(data.payload)
                 @unknown default:
                     break
                 }
@@ -472,6 +570,41 @@ private enum LiveStream {
         } catch {
             let reason = health.withLock { $0.failure } ?? describe(error, socket: socket)
             return ConnectionEnd(opened: link.opened, reason: reason)
+        }
+    }
+
+    /// Decode → `world` → GPU layout, one frame at a time, newest first.
+    private static func decode(_ payloads: AsyncStream<Data>, sensor: SensorID, sink: Sink) async {
+        var reported = false
+        var undecodable = false
+        for await payload in payloads {
+            let started = ProcessInfo.processInfo.systemUptime
+            let decoded: PointCloudFrame
+            do {
+                decoded = try PointCloud2CDR.decode(payload, maxPoints: maxPointsPerSensor)
+            } catch {
+                if !undecodable {
+                    undecodable = true
+                    await sink.log("\(sensor.label) frame not decodable — \(error)", .error, true)
+                }
+                continue
+            }
+            guard !decoded.isEmpty, !Task.isCancelled else { continue }
+
+            let world = RigTransforms.inWorld(decoded, sensor: sensor)
+            let cloud = PackedCloud(world)
+            let now = ProcessInfo.processInfo.systemUptime
+            sink.mailbox.put(cloud, sensor: sensor, at: now, decodeMs: (now - started) * 1000)
+
+            if !reported {
+                reported = true
+                let sourceFrame = decoded.frameId.flatMap { $0.isEmpty ? nil : $0 } ?? "no frame_id"
+                await sink.log(
+                    "\(sensor.label) first frame: \(world.count) pts shown (\(sourceFrame) → \(RigTransforms.worldFrame), \(payload.count) bytes on the wire)",
+                    .info,
+                    true
+                )
+            }
         }
     }
 
@@ -490,7 +623,7 @@ private enum LiveStream {
     private static func markOpened(_ link: inout Link, serverName: String, sink: Sink) async {
         link.opened = true
         let server = serverName.isEmpty ? "" : " (\(serverName))"
-        await sink.log("connected \(link.endpoint)\(server)", .info, true)
+        await sink.log("connected \(link.endpoint)\(server) for \(link.sensor.label)", .info, true)
     }
 
     // MARK: Text frames
@@ -515,17 +648,13 @@ private enum LiveStream {
             for channelId in channelIds {
                 let topic = link.topics.removeValue(forKey: channelId)
                 link.skipped.remove(channelId)
-                guard let subscriptionId = link.subscriptionByChannel.removeValue(forKey: channelId),
-                      let sensor = link.sensorBySubscription.removeValue(forKey: subscriptionId) else {
-                    continue
-                }
-                // Forget the sensor entirely so a re-advertised topic starts clean.
-                link.lastAccepted[sensor] = nil
-                link.reported.remove(sensor)
-                link.undecodable.remove(sensor)
-                sink.mailbox.drop(sensor)
-                sink.mailbox.setExpected(link.sensors)
-                await sink.log("\(topic ?? "channel \(channelId)") unadvertised — \(sensor.label) stream ended", .info, true)
+                guard channelId == link.channelId else { continue }
+                // Forget the subscription so a re-advertised topic starts clean.
+                link.channelId = nil
+                link.subscriptionId = nil
+                sink.mailbox.drop(link.sensor)
+                sink.mailbox.setExpected(link.sensor, false)
+                await sink.log("\(topic ?? "channel \(channelId)") unadvertised — \(link.sensor.label) stream ended", .info, true)
             }
         case .status(let level, let text):
             await sink.log("server status (level \(level)): \(text)", .info, false)
@@ -540,14 +669,10 @@ private enum LiveStream {
         socket: URLSessionWebSocketTask,
         sink: Sink
     ) async throws {
-        var requests: [FoxgloveProtocol.Subscription] = []
-        var lines: [String] = []
+        // One channel for this socket's sensor is plenty.
+        guard link.channelId == nil else { return }
 
-        for channel in channels {
-            guard let sensor = FoxgloveProtocol.liveSensor(forTopic: channel.topic),
-                  link.subscriptionByChannel[channel.id] == nil else {
-                continue
-            }
+        for channel in channels where FoxgloveProtocol.liveSensor(forTopic: channel.topic) == link.sensor {
             link.topics[channel.id] = channel.topic
 
             var refusal: String?
@@ -562,64 +687,19 @@ private enum LiveStream {
                 }
                 continue
             }
-            // One channel per sensor is plenty.
-            guard !link.sensors.contains(sensor) else { continue }
 
             let subscriptionId = link.nextSubscriptionId
             link.nextSubscriptionId += 1
-            link.subscriptionByChannel[channel.id] = subscriptionId
-            link.sensorBySubscription[subscriptionId] = sensor
-            requests.append(FoxgloveProtocol.Subscription(id: subscriptionId, channelId: channel.id))
+            try await socket.send(.string(FoxgloveProtocol.subscribeMessage([
+                FoxgloveProtocol.Subscription(id: subscriptionId, channelId: channel.id),
+            ])))
+            link.channelId = channel.id
+            link.subscriptionId = subscriptionId
+            sink.mailbox.setExpected(link.sensor, true)
 
             let schema = channel.schemaName.isEmpty ? "schema unnamed" : channel.schemaName
-            lines.append("subscribed \(channel.topic) → \(sensor.label) (\(schema), channel \(channel.id), sub \(subscriptionId))")
-        }
-
-        guard !requests.isEmpty else { return }
-        try await socket.send(.string(FoxgloveProtocol.subscribeMessage(requests)))
-        sink.mailbox.setExpected(link.sensors)
-        for line in lines {
-            await sink.log(line, .info, true)
-        }
-    }
-
-    // MARK: Binary frames
-
-    private static func handle(binary frame: Data, link: inout Link, sink: Sink) async {
-        guard let message = FoxgloveProtocol.parseMessageData(frame),
-              let sensor = link.sensorBySubscription[message.subscriptionId] else {
+            await sink.log("subscribed \(channel.topic) → \(link.sensor.label) (\(schema), channel \(channel.id), sub \(subscriptionId))", .info, true)
             return
-        }
-
-        // Throttle on the raw payload: a frame the UI would never show isn't decoded.
-        let now = ProcessInfo.processInfo.systemUptime
-        sink.mailbox.noteArrival(sensor, at: now)
-        if let last = link.lastAccepted[sensor], now - last < minFrameInterval {
-            return
-        }
-        link.lastAccepted[sensor] = now
-
-        let decoded: PointCloudFrame
-        do {
-            decoded = try PointCloud2CDR.decode(message.payload, maxPoints: maxPointsPerSensor)
-        } catch {
-            if link.undecodable.insert(sensor).inserted {
-                await sink.log("\(sensor.label) frame not decodable — \(error)", .error, true)
-            }
-            return
-        }
-        guard !decoded.isEmpty else { return }
-
-        let world = RigTransforms.inWorld(decoded, sensor: sensor)
-        sink.mailbox.put(world, sensor: sensor, at: now)
-
-        if link.reported.insert(sensor).inserted {
-            let sourceFrame = decoded.frameId.flatMap { $0.isEmpty ? nil : $0 } ?? "no frame_id"
-            await sink.log(
-                "\(sensor.label) first frame: \(world.count) pts shown (\(sourceFrame) → \(RigTransforms.worldFrame), \(message.payload.count) bytes on the wire)",
-                .info,
-                true
-            )
         }
     }
 }

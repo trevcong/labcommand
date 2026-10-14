@@ -175,6 +175,39 @@ func testFoxgloveReconnectBackoff() {
     expect(FoxgloveProtocol.reconnectDelay(afterFailures: -3) == 1, "nonsense input still waits a second")
 }
 
+func testStreamHostRotation() {
+    let hosts = FoxgloveProtocol.streamHosts(lastLAN: "192.168.68.65")
+    var rotation = StreamHostRotation()
+    expect(rotation.host(in: hosts) == "100.118.187.99", "the first attempt is the tailnet IP")
+
+    // Tailscale works: every reconnect goes back to it, never to the LAN hop.
+    for _ in 0..<3 {
+        let delay = rotation.record(opened: true, candidateCount: hosts.count)
+        expect(delay == 1 && rotation.host(in: hosts) == "100.118.187.99", "a dropped tailnet link redials the tailnet")
+    }
+
+    // Tailscale fails: the LAN hop right away, then back to Tailscale after a backoff.
+    var delay = rotation.record(opened: false, candidateCount: hosts.count)
+    expect(delay == 0 && rotation.host(in: hosts) == "192.168.68.65", "LAN only after the tailnet fails, without waiting")
+    delay = rotation.record(opened: false, candidateCount: hosts.count)
+    expect(delay == 1 && rotation.host(in: hosts) == "100.118.187.99", "a failed round restarts at the tailnet")
+    _ = rotation.record(opened: false, candidateCount: hosts.count)
+    delay = rotation.record(opened: false, candidateCount: hosts.count)
+    expect(delay == 2 && rotation.failedRounds == 2, "backoff grows per failed round, not per host: \(delay)")
+
+    // The LAN hop answering resets the round, so the next attempt is Tailscale again.
+    _ = rotation.record(opened: false, candidateCount: hosts.count)
+    _ = rotation.record(opened: true, candidateCount: hosts.count)
+    expect(rotation.host(in: hosts) == "100.118.187.99" && rotation.failedRounds == 0, "a success restarts at the tailnet")
+
+    // Only the tailnet IP known: retries stay on it.
+    var single = StreamHostRotation()
+    let only = FoxgloveProtocol.streamHosts(lastLAN: "100.118.187.99")
+    delay = single.record(opened: false, candidateCount: only.count)
+    expect(delay == 1 && single.host(in: only) == "100.118.187.99", "one host: back off and redial it")
+    expect(StreamHostRotation().host(in: []) == nil, "no hosts, nothing to dial")
+}
+
 func testLiveViewBadge() {
     expect(LiveViewMode.points(850) == "850 pts", "under 1k is exact")
     expect(LiveViewMode.points(19_912) == "19.9k pts", "thousands get one decimal, got \(LiveViewMode.points(19_912))")
@@ -206,6 +239,18 @@ func testArrivalRate() {
     let hz = rate.hz(now: 2.0) ?? 0
     expect(abs(hz - 10) < 0.01, "10 Hz arrivals read 10 Hz, got \(hz)")
     expect(rate.hz(now: 10) == nil, "a stream quiet past the window has no rate")
+
+    var rolling = ArrivalRate()
+    expect(rolling.perSecond(now: 0) == 0, "nothing delivered reads 0")
+    for i in 0..<40 {
+        rolling.note(Double(i) * 0.1)
+    }
+    let steady = rolling.perSecond(now: 3.95)
+    expect(abs(steady - 10) < 0.01, "10 frames/s over the 2 s window reads 10, got \(steady)")
+    var slow = ArrivalRate()
+    slow.note(5.0)
+    expect(slow.perSecond(now: 5.5) == 0.5, "one frame in the window reads 0.5 Hz, not unknown")
+    expect(slow.perSecond(now: 7.5) == 0, "a stopped stream decays to 0")
 }
 
 func runFoxgloveProtocolTests() {
@@ -225,8 +270,10 @@ func runFoxgloveProtocolTests() {
     print("  Foxglove: stream hosts are IPv4 literals, Tailscale IP first"); passed()
     testFoxgloveReconnectBackoff()
     print("  Foxglove: reconnect backoff 1 s → 30 s"); passed()
+    testStreamHostRotation()
+    print("  Foxglove: tailnet first every round; LAN hop only right after it fails"); passed()
     testLiveViewBadge()
     print("  live view: LIVE badge counts + Hz, SAMPLE badge wording"); passed()
     testArrivalRate()
-    print("  live view: arrival rate over a 2 s window; quiet stream has none"); passed()
+    print("  live view: arrival rate over a 2 s window; rolling per-second count decays to 0"); passed()
 }

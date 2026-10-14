@@ -370,7 +370,8 @@ struct CommandCenterView: View {
 /// The 3D canvas: live clouds while they stream, the sample cloud otherwise —
 /// never both, so a sensor that isn't live leaves its slot empty rather than
 /// backfilled by the sample. The badge says which one is on screen.
-/// Watches the live client directly so ~10 Hz cloud updates re-render only this.
+/// The renderer pulls live clouds itself at draw time; this view only follows the
+/// live/sample state and the badge.
 private struct LivePointCloudCanvas: View {
     @ObservedObject var live: FoxgloveLiveClient
     var sample: PointCloudFrame?
@@ -378,12 +379,12 @@ private struct LivePointCloudCanvas: View {
 
     var body: some View {
         DualPointCloudView(
-            midFrame: .constant(live.isLive ? live.clouds.mid : (sample?.sensor == .jt128 ? nil : sample)),
-            jtFrame: .constant(live.isLive ? live.clouds.jt : (sample?.sensor == .jt128 ? sample : nil)),
+            midFrame: .constant(live.isLive ? nil : (sample?.sensor == .jt128 ? nil : sample)),
+            jtFrame: .constant(live.isLive ? nil : (sample?.sensor == .jt128 ? sample : nil)),
             colorMode: colorMode,
             pointSize: 3.0,
-            revision: live.clouds.revision,
-            fitGeneration: live.sourceGeneration
+            fitGeneration: live.sourceGeneration,
+            liveFeed: live.isLive ? live.mailbox : nil
         )
         .overlay(alignment: .topLeading) {
             LiveModeBadge(

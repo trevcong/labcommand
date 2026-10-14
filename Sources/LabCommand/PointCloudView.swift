@@ -103,13 +103,18 @@ public struct DualPointCloudView: NSViewRepresentable {
     /// keep replacing the points without moving the camera.
     public var fitGeneration: Int?
     
-    public init(
+    /// Live clouds to pull on every draw. While set, `midFrame`/`jtFrame` are not
+    /// drawn and the camera fit for `fitGeneration` uses the live points.
+    var liveFeed: LiveFrameMailbox?
+    
+    init(
         midFrame: Binding<PointCloudFrame?>,
         jtFrame: Binding<PointCloudFrame?>,
         colorMode: PointCloudColorMode = .sensor,
         pointSize: Float = 4.0,
         revision: Int = 0,
-        fitGeneration: Int? = nil
+        fitGeneration: Int? = nil,
+        liveFeed: LiveFrameMailbox? = nil
     ) {
         self._midFrame = midFrame
         self._jtFrame = jtFrame
@@ -117,6 +122,7 @@ public struct DualPointCloudView: NSViewRepresentable {
         self.pointSize = pointSize
         self.revision = revision
         self.fitGeneration = fitGeneration
+        self.liveFeed = liveFeed
     }
     
     public func makeCoordinator() -> Coordinator {
@@ -152,6 +158,18 @@ public struct DualPointCloudView: NSViewRepresentable {
         
         renderer.colorMode = colorMode
         renderer.pointSize = pointSize
+        renderer.liveFeed = liveFeed
+        
+        let fitPending = fitGeneration != nil && context.coordinator.lastFitGeneration != fitGeneration
+        if liveFeed != nil {
+            if fitPending, renderer.fitToLive() {
+                context.coordinator.lastFitGeneration = fitGeneration
+                FileHandle.standardError.write(Data("[PointCloudView] camera fit to live clouds, 2nd–98th percentile (fit generation \(fitGeneration ?? 0))\n".utf8))
+            }
+            // Whatever static frames come back after live must load fresh.
+            context.coordinator.lastRevision = -1
+            return
+        }
         
         let midTs = midFrame?.timestamp
         let jtTs = jtFrame?.timestamp
@@ -159,7 +177,6 @@ public struct DualPointCloudView: NSViewRepresentable {
         let jtChanged = context.coordinator.lastJtTimestamp != jtTs || context.coordinator.lastJtCount != jtFrame?.count
         
         let revisionChanged = context.coordinator.lastRevision != revision
-        let fitPending = fitGeneration != nil && context.coordinator.lastFitGeneration != fitGeneration
         
         if midChanged || jtChanged || revisionChanged || fitPending {
             var frames: [PointCloudFrame] = []

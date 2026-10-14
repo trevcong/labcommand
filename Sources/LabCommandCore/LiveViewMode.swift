@@ -75,4 +75,11 @@ public struct ArrivalRate: Sendable {
         }
         return Double(recent.count - 1) / (last - first)
     }
+
+    /// Events in the last `window` seconds, per second. Unlike `hz`, a stream
+    /// slower than one event per window still reads (0.5 Hz for one), and a
+    /// stopped one decays to 0 instead of vanishing.
+    public func perSecond(now: TimeInterval) -> Double {
+        Double(times.filter { now - $0 < Self.window && $0 <= now }.count) / Self.window
+    }
 }

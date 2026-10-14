@@ -171,3 +171,37 @@ public enum FoxgloveProtocol {
         return min(30, pow(2, Double(min(failures - 1, 10))))
     }
 }
+
+/// Which `streamHosts` entry to dial next. Every round starts at the first host
+/// (the tailnet IP); a later host — the cached LAN hop, which DHCP may have moved
+/// — is tried only straight after the ones before it failed, so a working tailnet
+/// never waits out a dead lease's handshake timeout.
+public struct StreamHostRotation: Sendable, Equatable {
+    /// Position in the current round.
+    public private(set) var index = 0
+    /// Rounds in a row where every host failed; drives the backoff.
+    public private(set) var failedRounds = 0
+
+    public init() {}
+
+    public func host(in candidates: [String]) -> String? {
+        candidates.isEmpty ? nil : candidates[min(index, candidates.count - 1)]
+    }
+
+    /// Record how the attempt on `host(in:)` ended; returns the wait before the next one.
+    public mutating func record(opened: Bool, candidateCount: Int) -> TimeInterval {
+        if opened {
+            // A link that worked and dropped: the same first-choice round again.
+            index = 0
+            failedRounds = 0
+            return FoxgloveProtocol.reconnectDelay(afterFailures: 0)
+        }
+        index += 1
+        if index < candidateCount {
+            return 0
+        }
+        index = 0
+        failedRounds += 1
+        return FoxgloveProtocol.reconnectDelay(afterFailures: failedRounds)
+    }
+}

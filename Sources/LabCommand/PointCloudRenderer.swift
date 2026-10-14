@@ -18,6 +18,71 @@ public enum PointCloudColorMode: Int, CaseIterable, Sendable {
     }
 }
 
+/// One point as the shader reads it: 32 bytes (`SIMD3<Float>` strides 16).
+struct PointVertex: Sendable {
+    var position: SIMD3<Float>
+    var intensity: Float
+    var sensorID: UInt32
+    var _padding: UInt32 = 0
+
+    /// 0 = Mid-360, 1 = JT128, 2 = unknown (neutral color).
+    static func sensorIndex(_ sensor: SensorID?) -> UInt32 {
+        switch sensor {
+        case .mid360: return 0
+        case .jt128: return 1
+        case nil: return 2
+        }
+    }
+}
+
+/// A cloud already in the GPU's vertex layout, packed off the main thread so a
+/// draw only has to copy bytes. Keeps its frame for camera fits and counts.
+struct PackedCloud: Sendable {
+    let frame: PointCloudFrame
+    let vertices: [PointVertex]
+    let zMin: Float
+    let zMax: Float
+
+    /// Intensity is normalized per frame to [0, 1]; a cloud without a usable
+    /// intensity spread reads 1.
+    init(_ frame: PointCloudFrame) {
+        let count = frame.count
+        let sensorIndex = PointVertex.sensorIndex(frame.sensor)
+        var zMin = Float.greatestFiniteMagnitude
+        var zMax = -Float.greatestFiniteMagnitude
+
+        let vertices = frame.positions.withUnsafeBufferPointer { positions in
+            frame.intensities.withUnsafeBufferPointer { intensities in
+                var minI = Float.greatestFiniteMagnitude
+                var maxI = -Float.greatestFiniteMagnitude
+                for value in intensities {
+                    minI = min(minI, value)
+                    maxI = max(maxI, value)
+                }
+                let range = maxI - minI
+                let scale: Float = range > 0.001 ? 1 / range : 0
+                let withIntensity = min(intensities.count, count)
+
+                return [PointVertex](unsafeUninitializedCapacity: count) { out, initialized in
+                    for i in 0..<count {
+                        let p = positions[i]
+                        let intensity: Float = i < withIntensity && scale > 0 ? (intensities[i] - minI) * scale : 1
+                        out[i] = PointVertex(position: SIMD3(p.x, p.y, p.z), intensity: intensity, sensorID: sensorIndex)
+                        zMin = min(zMin, p.z)
+                        zMax = max(zMax, p.z)
+                    }
+                    initialized = count
+                }
+            }
+        }
+
+        self.frame = frame
+        self.vertices = vertices
+        self.zMin = count > 0 ? zMin : 0
+        self.zMax = count > 0 ? zMax : 0
+    }
+}
+
 /// Metal renderer for point cloud visualization.
 /// Renders millions of points at 60fps using instanced geometry.
 /// Z-up coordinate system. Metal depth range [0, 1].
@@ -83,15 +148,32 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     /// Set when bounds are loaded but drawable size isn't known yet.
     private var needsInitialFit: Bool = false
     
-    // MARK: - Vertex Layout
-    
-    private struct PointVertex {
-        var position: SIMD3<Float>
-        var intensity: Float
-        var sensorID: UInt32
-        var _padding: UInt32 = 0
+    // MARK: - Live Layers
+
+    /// While set, every draw pulls the newest cloud per sensor from here instead
+    /// of drawing what `load` gave it.
+    var liveFeed: LiveFrameMailbox? {
+        didSet {
+            guard liveFeed !== oldValue else { return }
+            liveLayers = [:]
+        }
     }
-    
+
+    /// One sensor's live cloud on the GPU. A ring of buffers so an upload never
+    /// writes one that a frame still in flight reads: at most two other frames are
+    /// in flight once a draw holds the semaphore, and they use the current and
+    /// previous slots, so the next slot is free.
+    private struct LiveLayer {
+        var ring: [MTLBuffer] = []
+        var capacity = 0
+        var slot = 0
+        var count = 0
+        var sequence = -1
+        var zMin: Float = 0
+        var zMax: Float = 0
+    }
+    private var liveLayers: [SensorID: LiveLayer] = [:]
+
     // MARK: - Init
     
     public override init() {
@@ -188,146 +270,39 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     
     /// Load a PointCloudFrame from LabCommandCore.
     public func load(_ frame: PointCloudFrame) {
-        guard let device = device, !frame.isEmpty else {
-            vertexBuffer = nil
-            pointCount = 0
-            boundingBox = nil
-            return
-        }
-        
-        // Sensor index: 0=Mid-360, 1=JT128, 2=unknown/nil (neutral color)
-        let sensorIndex: UInt32 = {
-            switch frame.sensor {
-            case .mid360: return 0
-            case .jt128: return 1
-            case nil: return 2
-            }
-        }()
-        
-        // Find intensity range for per-frame normalization
-        var minI: Float = .greatestFiniteMagnitude
-        var maxI: Float = -.greatestFiniteMagnitude
-        for i in frame.intensities {
-            minI = min(minI, i)
-            maxI = max(maxI, i)
-        }
-        let intensityRange = maxI - minI
-        
-        var bbMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
-        var bbMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
-        
-        var vertices: [PointVertex] = []
-        vertices.reserveCapacity(frame.count)
-        
-        for i in 0..<frame.count {
-            let p = frame.positions[i]
-            var intensity: Float = 1.0
-            if i < frame.intensities.count {
-                let raw = frame.intensities[i]
-                intensity = intensityRange > 0.001 ? (raw - minI) / intensityRange : 1.0
-            }
-            
-            let pos = SIMD3<Float>(p.x, p.y, p.z)
-            vertices.append(PointVertex(
-                position: pos,
-                intensity: intensity,
-                sensorID: sensorIndex
-            ))
-            
-            bbMin = min(bbMin, pos)
-            bbMax = max(bbMax, pos)
-        }
-        
-        boundingBox = (bbMin, bbMax)
-        heightMin = bbMin.z
-        heightMax = max(bbMax.z, bbMin.z + 0.001)
-        
-        vertexBuffer = device.makeBuffer(
-            bytes: vertices,
-            length: vertices.count * MemoryLayout<PointVertex>.stride,
-            options: .storageModeShared
-        )
-        pointCount = frame.count
-        
-        // Schedule fit-to-bounds for when drawable size is known
-        needsInitialFit = true
-        hasFittedInitialBounds = false
-        fitToBoundsIfReady()
+        load(frames: [frame])
     }
     
     /// Load multiple frames with sensor coloring.
     ///
     /// - Parameter fitCamera: Refit the camera to the new bounds. Pass false for
-    ///   live updates so the points change under a camera that stays put; a fit
+    ///   updates that should change the points under a camera that stays put; a fit
     ///   still waiting on the first drawable size is left pending either way.
     public func load(frames: [PointCloudFrame], fitCamera: Bool = true) {
-        guard let device = device else {
+        let packed = frames.filter { !$0.isEmpty }.map(PackedCloud.init)
+        let total = packed.reduce(0) { $0 + $1.vertices.count }
+        guard let device = device, total > 0 else {
             vertexBuffer = nil
             pointCount = 0
             boundingBox = nil
             return
         }
         
-        var allVertices: [PointVertex] = []
-        allVertices.reserveCapacity(frames.reduce(0) { $0 + $1.count })
-        var bbMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
-        var bbMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
-        
-        for frame in frames {
-            let sensorIndex: UInt32 = {
-                switch frame.sensor {
-                case .mid360: return 0
-                case .jt128: return 1
-                case nil: return 2
-                }
-            }()
-            
-            // Find intensity range for per-frame normalization
-            var minI: Float = .greatestFiniteMagnitude
-            var maxI: Float = -.greatestFiniteMagnitude
-            for i in frame.intensities {
-                minI = min(minI, i)
-                maxI = max(maxI, i)
-            }
-            let intensityRange = maxI - minI
-            
-            for i in 0..<frame.count {
-                let p = frame.positions[i]
-                var intensity: Float = 1.0
-                if i < frame.intensities.count {
-                    let raw = frame.intensities[i]
-                    intensity = intensityRange > 0.001 ? (raw - minI) / intensityRange : 1.0
-                }
-                
-                let pos = SIMD3<Float>(p.x, p.y, p.z)
-                allVertices.append(PointVertex(
-                    position: pos,
-                    intensity: intensity,
-                    sensorID: sensorIndex
-                ))
-                
-                bbMin = min(bbMin, pos)
-                bbMax = max(bbMax, pos)
-            }
-        }
-        
-        guard !allVertices.isEmpty else {
-            vertexBuffer = nil
-            pointCount = 0
-            boundingBox = nil
+        guard let buffer = device.makeBuffer(length: total * MemoryLayout<PointVertex>.stride, options: .storageModeShared) else {
             return
         }
-        
-        boundingBox = (bbMin, bbMax)
-        heightMin = bbMin.z
-        heightMax = max(bbMax.z, bbMin.z + 0.001)
-        
-        vertexBuffer = device.makeBuffer(
-            bytes: allVertices,
-            length: allVertices.count * MemoryLayout<PointVertex>.stride,
-            options: .storageModeShared
-        )
-        pointCount = allVertices.count
+        var offset = 0
+        for cloud in packed {
+            cloud.vertices.withUnsafeBytes { bytes in
+                (buffer.contents() + offset).copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+                offset += bytes.count
+            }
+        }
+        vertexBuffer = buffer
+        pointCount = total
+        heightMin = packed.map(\.zMin).min() ?? 0
+        heightMax = max(packed.map(\.zMax).max() ?? 1, heightMin + 0.001)
+        boundingBox = Self.fitBounds(packed.map(\.frame.positions))
         
         // Schedule fit-to-bounds for when drawable size is known
         if fitCamera {
@@ -337,6 +312,80 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         fitToBoundsIfReady()
     }
     
+    /// Fit the camera to the live clouds now in `liveFeed`. False when there are none.
+    @discardableResult
+    public func fitToLive() -> Bool {
+        guard let feed = liveFeed else { return false }
+        let clouds = SensorID.allCases.compactMap { feed.latest($0)?.cloud.frame.positions }
+        guard let bounds = Self.fitBounds(clouds) else { return false }
+        if let raw = RobustBounds.percentile(clouds, lower: 0, upper: 1, maxSamples: 0) {
+            func box(_ lo: Point3D, _ hi: Point3D) -> String {
+                String(format: "x %.1f…%.1f y %.1f…%.1f z %.1f…%.1f m", lo.x, hi.x, lo.y, hi.y, lo.z, hi.z)
+            }
+            let fit = box(Point3D(x: bounds.min.x, y: bounds.min.y, z: bounds.min.z), Point3D(x: bounds.max.x, y: bounds.max.y, z: bounds.max.z))
+            FileHandle.standardError.write(Data("[PointCloudView] live fit box \(fit) (raw min/max \(box(raw.min, raw.max)))\n".utf8))
+        }
+        boundingBox = bounds
+        needsInitialFit = true
+        hasFittedInitialBounds = false
+        fitToBoundsIfReady()
+        return true
+    }
+    
+    /// The box the camera frames: 2nd–98th percentile per axis, so a few stray
+    /// returns far outside the room don't shrink the room to a corner of the view.
+    private static func fitBounds(_ clouds: [[Point3D]]) -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
+        guard let bounds = RobustBounds.percentile(clouds) else { return nil }
+        return (
+            SIMD3(bounds.min.x, bounds.min.y, bounds.min.z),
+            SIMD3(bounds.max.x, bounds.max.y, bounds.max.z)
+        )
+    }
+    
+    /// Copy any newer live cloud into its layer's next ring slot. Runs inside
+    /// `draw`, after the semaphore, so it never writes a buffer the GPU reads.
+    private func refreshLiveLayers(from feed: LiveFrameMailbox) {
+        guard let device = device else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        var uploaded = false
+        for sensor in SensorID.allCases {
+            var layer = liveLayers[sensor] ?? LiveLayer()
+            guard let entry = feed.latest(sensor) else {
+                layer.count = 0
+                liveLayers[sensor] = layer
+                continue
+            }
+            guard entry.sequence != layer.sequence else { continue }
+            
+            let vertices = entry.cloud.vertices
+            if vertices.count > layer.capacity {
+                // Headroom so frame-to-frame jitter in point count doesn't reallocate.
+                let capacity = vertices.count + vertices.count / 4
+                let ring = (0..<Self.uniformBufferCount).compactMap { _ in
+                    device.makeBuffer(length: capacity * MemoryLayout<PointVertex>.stride, options: .storageModeShared)
+                }
+                guard ring.count == Self.uniformBufferCount else { continue }
+                layer.ring = ring
+                layer.capacity = capacity
+            }
+            let slot = (layer.slot + 1) % layer.ring.count
+            vertices.withUnsafeBytes { bytes in
+                layer.ring[slot].contents().copyMemory(from: bytes.baseAddress!, byteCount: bytes.count)
+            }
+            layer.slot = slot
+            layer.count = vertices.count
+            layer.sequence = entry.sequence
+            layer.zMin = entry.cloud.zMin
+            layer.zMax = entry.cloud.zMax
+            liveLayers[sensor] = layer
+            feed.noteRendered(sensor, at: now)
+            uploaded = true
+        }
+        if uploaded {
+            feed.noteUpload(ms: (ProcessInfo.processInfo.systemUptime - now) * 1000)
+        }
+    }
+    
     // MARK: - Camera Control
     
     public func setViewMatrix(_ matrix: simd_float4x4) {
@@ -344,6 +393,7 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     }
     
     public func resetCamera() {
+        if fitToLive() { return }
         hasFittedInitialBounds = false
         needsInitialFit = true
         fitToBoundsIfReady()
@@ -414,17 +464,29 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     public func draw(in view: MTKView) {
         guard let pipelineState = pipelineState,
               let commandQueue = commandQueue,
+              !uniformBuffers.isEmpty,
+              liveFeed != nil || (vertexBuffer != nil && pointCount > 0),
               let drawable = view.currentDrawable,
-              let renderPassDescriptor = view.currentRenderPassDescriptor,
-              let vertexBuffer = vertexBuffer,
-              pointCount > 0,
-              !uniformBuffers.isEmpty else {
+              let renderPassDescriptor = view.currentRenderPassDescriptor else {
             return
         }
-        
+
         // Wait for an available buffer slot
         _ = bufferSemaphore.wait(timeout: .distantFuture)
-        
+
+        var draws: [(buffer: MTLBuffer, count: Int)] = []
+        if let feed = liveFeed {
+            refreshLiveLayers(from: feed)
+            let layers = SensorID.allCases.compactMap { liveLayers[$0] }.filter { $0.count > 0 }
+            draws = layers.map { ($0.ring[$0.slot], $0.count) }
+            if let low = layers.map(\.zMin).min(), let high = layers.map(\.zMax).max() {
+                heightMin = low
+                heightMax = max(high, low + 0.001)
+            }
+        } else if let vertexBuffer {
+            draws = [(vertexBuffer, pointCount)]
+        }
+
         uniformBufferIndex = (uniformBufferIndex + 1) % Self.uniformBufferCount
         let uniformBuffer = uniformBuffers[uniformBufferIndex]
         
@@ -454,9 +516,11 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         
         encoder.setRenderPipelineState(pipelineState)
         encoder.setDepthStencilState(depthState)
-        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
         encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
-        encoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: pointCount)
+        for draw in draws {
+            encoder.setVertexBuffer(draw.buffer, offset: 0, index: 0)
+            encoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: draw.count)
+        }
         encoder.endEncoding()
         
         commandBuffer.present(drawable)
