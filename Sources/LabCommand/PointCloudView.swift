@@ -32,6 +32,7 @@ public struct PointCloudView: NSViewRepresentable {
     public func makeNSView(context: Context) -> NSView {
         let renderer = PointCloudRenderer()
         let camera = PointCloudCamera()
+        renderer.camera = camera
         context.coordinator.renderer = renderer
         context.coordinator.camera = camera
         
@@ -348,6 +349,7 @@ public struct DualPointCloudView: NSViewRepresentable {
     public func makeNSView(context: Context) -> NSView {
         let renderer = PointCloudRenderer()
         let camera = PointCloudCamera()
+        renderer.camera = camera
         context.coordinator.renderer = renderer
         context.coordinator.camera = camera
         

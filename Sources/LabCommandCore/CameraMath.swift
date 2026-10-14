@@ -728,4 +728,9 @@ public enum CameraMath {
     public static func sanitize(_ v: Float3, default defaultValue: Float3) -> Float3 {
         isInvalid(v) ? defaultValue : v
     }
+    
+    /// Returns the length (magnitude) of a vector.
+    public static func length(_ v: Float3) -> Float {
+        float3Length(v)
+    }
 }

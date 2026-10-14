@@ -77,7 +77,6 @@ public final class RigService: @unchecked Sendable {
                 lastError = error.localizedDescription
                 continue
             }
-            Thread.sleep(forTimeInterval: 0.25)
             if proc.isRunning {
                 lock.lock()
                 self[keyPath: key] = proc

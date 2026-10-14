@@ -72,16 +72,8 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     /// Current bounding box of loaded points.
     private var boundingBox: (min: SIMD3<Float>, max: SIMD3<Float>)?
     
-    /// True once we've received a real nonzero drawable size from MTKView.
-    /// Starts false; the default aspect (16:9) is just a placeholder.
-    private var hasValidDrawableSize: Bool = false
-    
-    /// Tracks whether we've done the initial fit with valid drawable size.
-    /// Prevents re-fitting on every resize while ensuring first fit uses real aspect.
-    private var hasFittedInitialBounds: Bool = false
-    
-    /// Set when bounds are loaded but drawable size isn't known yet.
-    private var needsInitialFit: Bool = false
+    /// Weak reference to camera controller for aspect ratio updates.
+    weak var camera: PointCloudCamera?
     
     // MARK: - Vertex Layout
     
@@ -248,11 +240,6 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             options: .storageModeShared
         )
         pointCount = frame.count
-        
-        // Schedule fit-to-bounds for when drawable size is known
-        needsInitialFit = true
-        hasFittedInitialBounds = false
-        fitToBoundsIfReady()
     }
     
     /// Load multiple frames with sensor coloring.
@@ -323,11 +310,6 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             options: .storageModeShared
         )
         pointCount = allVertices.count
-        
-        // Schedule fit-to-bounds for when drawable size is known
-        needsInitialFit = true
-        hasFittedInitialBounds = false
-        fitToBoundsIfReady()
     }
     
     // MARK: - Camera Control
@@ -337,71 +319,18 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     }
     
     public func resetCamera() {
-        hasFittedInitialBounds = false
-        needsInitialFit = true
-        fitToBoundsIfReady()
-    }
-    
-    /// Fit camera if we have both bounds and a valid drawable size.
-    /// Called from loadFrame, drawable size change, and resetCamera.
-    private func fitToBoundsIfReady() {
-        guard needsInitialFit,
-              hasValidDrawableSize,
-              boundingBox != nil else {
-            return
-        }
-        fitToBounds(logOnce: !hasFittedInitialBounds)
-        hasFittedInitialBounds = true
-        needsInitialFit = false
-    }
-    
-    /// Fit camera to show all loaded points using exact fit algorithm.
-    /// Uses the real elevated camera orientation to compute distance.
-    public func fitToBounds(logOnce: Bool = false) {
-        guard let bb = boundingBox else {
-            // No bounds, use default view
-            let eye = SIMD3<Float>(0, -5, 3)
-            let center = SIMD3<Float>(0, 0, 0)
-            let up = SIMD3<Float>(0, 0, 1)
-            viewMatrix = Self.lookAt(eye: eye, center: center, up: up)
-            return
-        }
-        
-        // Convert SIMD bounds to Point3D for CameraMath
-        let bbMin = Point3D(x: bb.min.x, y: bb.min.y, z: bb.min.z)
-        let bbMax = Point3D(x: bb.max.x, y: bb.max.y, z: bb.max.z)
-        
-        // Use CameraMath's exact fit algorithm
-        let (eyeP, centerP, distance) = CameraMath.fitToBounds(
-            min: bbMin,
-            max: bbMax,
-            fovY: Self.fovY,
-            aspect: aspect,
-            margin: 0.9,
-            elevation: CameraMath.defaultElevation
-        )
-        
-        // Convert back to SIMD
-        let eye = SIMD3<Float>(eyeP.x, eyeP.y, eyeP.z)
-        let target = SIMD3<Float>(centerP.x, centerP.y, centerP.z)
-        let up = SIMD3<Float>(0, 0, 1)
-        viewMatrix = Self.lookAt(eye: eye, center: target, up: up)
-        
-        if logOnce {
-            print("[fitToBounds] target=\(target), distance=\(distance), aspect=\(aspect)")
-        }
+        camera?.resetToFitBounds()
     }
     
     // MARK: - MTKViewDelegate
     
     public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         guard size.width > 0, size.height > 0 else { return }
-        hasValidDrawableSize = true
         aspect = Float(size.width / size.height)
         projectionMatrix = Self.perspective(fovY: Self.fovY, aspect: aspect, near: 0.01, far: 1000)
         
-        // On first valid drawable size with loaded bounds, fit camera
-        fitToBoundsIfReady()
+        // Forward aspect ratio to camera for aspect-aware fitting
+        camera?.setAspectRatio(aspect)
     }
     
     public func draw(in view: MTKView) {

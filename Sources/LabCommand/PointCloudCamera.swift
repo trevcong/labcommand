@@ -70,6 +70,12 @@ final class PointCloudCamera: ObservableObject {
     /// Bounds for orbit target clamping (fly mode is unclamped)
     var boundingBox: (min: Float3, max: Float3)? = nil
     
+    /// True once we've received a valid aspect ratio from the view.
+    private var hasValidAspect: Bool = false
+    
+    /// True when bounds are set but we haven't fitted yet with valid aspect.
+    private var needsInitialFit: Bool = false
+    
     // MARK: - Interpolation Targets
     
     private var targetDistance: Float = 10.0
@@ -298,6 +304,8 @@ final class PointCloudCamera: ObservableObject {
     
     func setBounds(min: Float3, max: Float3) {
         boundingBox = (min: min, max: max)
+        // Mark that we need to fit when we get a valid aspect ratio
+        needsInitialFit = true
     }
     
     func clearBounds() {
@@ -309,26 +317,19 @@ final class PointCloudCamera: ObservableObject {
         let center = CameraMath.boundsCenter(min: bounds.min, max: bounds.max)
         guard !CameraMath.isInvalid(center) else { return }
         
-        let size = bounds.max - bounds.min
-        guard !CameraMath.isInvalid(size) else { return }
+        let extent = bounds.max - bounds.min
+        guard !CameraMath.isInvalid(extent) else { return }
         
-        // Use the largest extent to ensure the whole cloud fits
-        let maxExtent = max(size.x, max(size.y, size.z))
-        guard maxExtent > 0 else { return }
+        let radius = CameraMath.length(extent) * 0.5
+        guard radius > 0 else { return }
         
-        // Calculate distance to fit the cloud based on vertical FOV
-        // Account for the view angle - looking from above means we see more horizontal extent
-        let fovRad = fieldOfView * .pi / 180.0
+        // Aspect-aware distance calculation: use the tighter of horizontal or vertical FOV
+        let fovY = fieldOfView * .pi / 180.0
+        let fovX = 2 * atan(tan(fovY / 2) * aspectRatio)
+        let effectiveFov = min(fovX, fovY)
+        let fitDistance = radius / sin(effectiveFov / 2) * 1.2
+        
         let viewElevation: Float = Float.pi / 6  // 30° above horizon
-        
-        // When looking down at an angle, the vertical extent appears compressed
-        // We need to fit both the horizontal extent and the compressed vertical
-        let horizontalExtent = max(size.x, size.y)
-        let verticalExtent = size.z / cos(viewElevation) + horizontalExtent * sin(viewElevation)
-        let effectiveExtent = max(horizontalExtent, verticalExtent)
-        
-        // Distance to fit the effective extent in view with 20% margin
-        let fitDistance = (effectiveExtent * 0.5) / tan(fovRad * 0.5) * 1.4
         
         if mode == .orbit {
             // Center the orbit target on the cloud center
@@ -355,12 +356,23 @@ final class PointCloudCamera: ObservableObject {
             targetPitch = pitch
         }
         
+        print("[fitToBounds] center=\(center), distance=\(fitDistance), aspect=\(aspectRatio)")
         updateMatrices()
     }
     
     func setAspectRatio(_ aspect: Float) {
         guard !CameraMath.isInvalid(aspect) && aspect > 0 else { return }
         aspectRatio = aspect
+        
+        // On first valid aspect with loaded bounds, trigger initial fit
+        if !hasValidAspect {
+            hasValidAspect = true
+            if needsInitialFit {
+                resetToFitBounds()
+                needsInitialFit = false
+            }
+        }
+        
         updateMatrices()
     }
 }
