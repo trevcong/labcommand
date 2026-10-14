@@ -84,4 +84,5 @@ print("  StatusAggregation: buildSnapshot summary lines match overall status"); 
 testStatusAggregationCombineWorstWins()
 print("  StatusAggregation: combine worst-wins order (error > disconnected > unknown > connected)"); passed()
 runPointCloudDecoderTests()
+runPointCloud2CDRTests()
 print("PASS LabCommandCoreTestsRunner (\(passCount) groups)")
