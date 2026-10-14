@@ -36,6 +36,7 @@ from .messages import (
 )
 
 _INT16 = (-(1 << 15), (1 << 15) - 1)
+_NO_POINTS = np.zeros((0, 3), dtype=np.float32)
 _KINDS = {"appeared": EventKind.APPEARED, "disappeared": EventKind.DISAPPEARED, "moved": EventKind.MOVED}
 _ROOM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
@@ -269,8 +270,8 @@ class _Channel:
         self.received = 0
         self.failed = 0
         self.reference = VoxelLayer.empty()
-        self.reference_windows = 0
-        self.recent = deque(maxlen=recent_windows)
+        self.reference_windows = 0  # windows with usable points merged into the reference
+        self.recent = deque(maxlen=recent_windows)  # one entry per closed window, empty when it had none
         self.tracker = CandidateTracker()
         self.hz = None
 
@@ -372,16 +373,23 @@ class RoomMemory:
             if channel.failed and not frames:
                 dropped = True
             channel.failed = 0
-            if not frames:
-                continue
-            points = np.concatenate(frames)
             if self.state == MemoryState.BUILDING:
-                window = occupancy_map(points, self.change)
-                channel.reference = channel.reference.merge(VoxelLayer.observe(window, self.change))
-                channel.reference_windows += 1
+                # A sensor's reference freezes at its own quota while the others catch up, and
+                # only windows with at least one occupied voxel count toward it.
+                if frames and channel.reference_windows < self.config.reference_windows:
+                    window = occupancy_map(np.concatenate(frames), self.change)
+                    if len(window.occupied):
+                        channel.reference = channel.reference.merge(VoxelLayer.observe(window, self.change))
+                        channel.reference_windows += 1
+                continue
+            points = np.concatenate(frames) if frames else _NO_POINTS
+            window = occupancy_map(points, self.change) if frames else None
+            # A window without usable points still ages the recent layer, but sends nothing.
+            if window is None or not len(window.occupied):
+                channel.recent.append(_NO_POINTS)
                 continue
             channel.recent.append(points)
-            recent = occupancy_map(np.concatenate(channel.recent), self.change)
+            recent = window if len(channel.recent) == 1 else occupancy_map(np.concatenate(channel.recent), self.change)
             reference = channel.reference
             report = diff(reference.as_occupancy(self.config.voxel_size), recent, self.change, reference.known)
             for state, candidate in channel.tracker.update(report.regions, stamp, self._next_id):

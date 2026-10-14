@@ -210,6 +210,63 @@ def test_degraded_and_dropped_windows(tmp_path):
     assert status.state == MemoryState.DEGRADED and (status.mid360_hz, status.jt128_hz) == (0, 0)
 
 
+def test_windows_without_usable_points_do_not_build_the_reference(tmp_path):
+    room = scenes.room_shell()
+    memory = mid360_memory(tmp_path, max_range=15.0)
+    unusable = [np.zeros((0, 3), dtype=np.float32), np.full((50, 3), np.nan, dtype=np.float32), room + 50]
+    for second, cloud in enumerate(unusable):
+        memory.add_points("mid360", cloud)
+        assert memory.close_window(stamp(second)) == []
+    assert memory.state == MemoryState.BUILDING and memory.map_epoch == 0
+    assert memory.channels["mid360"].reference_windows == 0
+    assert not reference_path(tmp_path, "lab", "mid360").exists()
+
+    for second in range(3, 6):
+        memory.add_points("mid360", room)
+        memory.close_window(stamp(second))
+    assert memory.state == MemoryState.TRACKING and memory.map_epoch == 1
+    memory.add_points("mid360", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))]))
+    events = memory.close_window(stamp(6))
+    assert [(e.kind, e.state) for e in events] == [(EventKind.APPEARED, EventState.CANDIDATE)]
+
+
+def test_each_sensor_reference_freezes_at_its_own_window_count():
+    room = scenes.room_shell()
+    box = scenes.box_shell((0.3, 1.2, 0.3))
+    memory = RoomMemory(MemoryConfig(state_dir=None, max_range=None, reference_windows=1), START)
+    memory.add_points("mid360", room)
+    memory.close_window(stamp(0))
+    assert memory.state == MemoryState.BUILDING
+    # The JT128 arrives late; the box placed meanwhile is not part of the Mid-360 reference.
+    memory.add_points("mid360", np.concatenate([room, box]))
+    memory.add_points("jt128", room)
+    assert memory.close_window(stamp(1)) == []
+    assert memory.state == MemoryState.TRACKING
+    assert memory.channels["mid360"].reference_windows == 1
+    memory.add_points("mid360", np.concatenate([room, box]))
+    events = memory.close_window(stamp(2))
+    assert [(e.kind, e.state, e.sensors) for e in events] == [
+        (EventKind.APPEARED, EventState.CANDIDATE, SENSOR_MID360),
+    ]
+
+
+def test_recent_observations_age_through_missing_windows(tmp_path):
+    room = scenes.room_shell()
+    memory = mid360_memory(tmp_path, state_dir=None, recent_windows=3)
+    second = build_reference(memory, room)
+    memory.add_points("mid360", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))]))
+    appeared = memory.close_window(stamp(second))
+    assert [(e.kind, e.state) for e in appeared] == [(EventKind.APPEARED, EventState.CANDIDATE)]
+    # Outage: one window with no frames, one whose only frame is rejected.
+    assert memory.close_window(stamp(second + 1)) == []
+    assert memory.add_cdr("mid360", b"\x00\x01\x00\x00") is False
+    assert memory.close_window(stamp(second + 2)) == []
+    memory.add_points("mid360", room)
+    expired = memory.close_window(stamp(second + 3))
+    assert [(e.event_id, e.state) for e in expired] == [(appeared[0].event_id, EventState.EXPIRED)]
+    assert expired[0].last_seen == stamp(second)
+
+
 def test_config_rejections():
     with pytest.raises(ValueError):
         RoomMemory(MemoryConfig(sensors=("velodyne",)), START)
