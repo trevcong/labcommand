@@ -1,9 +1,11 @@
 # Fixture roots: the shared goldens live next to the Python oracle and in the repository's
-# Tests/Fixtures; ROOM_MEMORY_CD_FIXTURES / ROOM_MEMORY_PHASE0_FIXTURES override them at run time.
+# Tests/Fixtures; ROOM_MEMORY_CD_FIXTURES / ROOM_MEMORY_SNAPSHOTS / ROOM_MEMORY_PHASE0_FIXTURES
+# override them at run time.
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
 set(ROOM_MEMORY_PYTHON_PACKAGE "${REPO_ROOT}/spark/room_memory" CACHE PATH "The Python oracle package (room_memory)")
 set(ROOM_MEMORY_FIXTURES "${ROOM_MEMORY_PYTHON_PACKAGE}/tests/fixtures" CACHE PATH "Swift and hand goldens")
-set(ROOM_MEMORY_CD_FIXTURES "${REPO_ROOT}/Tests/Fixtures/change-detection" CACHE PATH "change-detection fixtures")
+set(ROOM_MEMORY_CD_FIXTURES "${REPO_ROOT}/Tests/Fixtures/change-detection" CACHE PATH "change-detection goldens")
+set(ROOM_MEMORY_SNAPSHOTS "${REPO_ROOT}/Tests/Fixtures/room/snapshots" CACHE PATH "Snapshot pairs (a/, b/) of the change-detection goldens")
 if(DEFINED ENV{ROOM_MEMORY_PHASE0_FIXTURES})
   set(PHASE0_DEFAULT "$ENV{ROOM_MEMORY_PHASE0_FIXTURES}")
 else()
@@ -23,6 +25,7 @@ target_include_directories(room_memory_test_support PUBLIC ${CMAKE_CURRENT_SOURC
 target_compile_definitions(room_memory_test_support PUBLIC
   ROOM_MEMORY_FIXTURES="${ROOM_MEMORY_FIXTURES}"
   ROOM_MEMORY_CD_FIXTURES="${ROOM_MEMORY_CD_FIXTURES}"
+  ROOM_MEMORY_SNAPSHOTS="${ROOM_MEMORY_SNAPSHOTS}"
   ROOM_MEMORY_PHASE0_FIXTURES="${ROOM_MEMORY_PHASE0_FIXTURES}"
   ROOM_MEMORY_REQUIRE_PHASE0=${REQUIRE_PHASE0})
 
@@ -49,7 +52,7 @@ add_test(NAME cli COMMAND test_cli)
 foreach(sensor jt128 mid360)
   add_test(NAME offline_binary_${sensor}
            COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:room_memory_offline>
-                   -DBEFORE=${ROOM_MEMORY_CD_FIXTURES}/a-${sensor}.bin -DAFTER=${ROOM_MEMORY_CD_FIXTURES}/b-${sensor}.bin
+                   -DBEFORE=${ROOM_MEMORY_SNAPSHOTS}/a/${sensor}.bin -DAFTER=${ROOM_MEMORY_SNAPSHOTS}/b/${sensor}.bin
                    -DGOLDEN=${ROOM_MEMORY_CD_FIXTURES}/${sensor}.json
                    -P ${CMAKE_CURRENT_SOURCE_DIR}/compare_cli.cmake)
 endforeach()
@@ -60,7 +63,7 @@ if(ROOM_MEMORY_PYTHON)
     add_test(NAME differential_omp${threads}
              COMMAND ${ROOM_MEMORY_PYTHON} -m pytest -q -p no:cacheprovider ${CMAKE_CURRENT_SOURCE_DIR}/differential)
     set_tests_properties(differential_omp${threads} PROPERTIES
-      ENVIRONMENT "OMP_NUM_THREADS=${threads};ROOM_MEMORY_PYTHON_PACKAGE=${ROOM_MEMORY_PYTHON_PACKAGE};ROOM_MEMORY_OFFLINE=$<TARGET_FILE:room_memory_offline>;ROOM_MEMORY_REPLAY=$<TARGET_FILE:room_memory_replay>;ROOM_MEMORY_CD_FIXTURES=${ROOM_MEMORY_CD_FIXTURES};ROOM_MEMORY_PHASE0_FIXTURES=${ROOM_MEMORY_PHASE0_FIXTURES}"
+      ENVIRONMENT "OMP_NUM_THREADS=${threads};ROOM_MEMORY_PYTHON_PACKAGE=${ROOM_MEMORY_PYTHON_PACKAGE};ROOM_MEMORY_OFFLINE=$<TARGET_FILE:room_memory_offline>;ROOM_MEMORY_REPLAY=$<TARGET_FILE:room_memory_replay>;ROOM_MEMORY_SNAPSHOTS=${ROOM_MEMORY_SNAPSHOTS};ROOM_MEMORY_PHASE0_FIXTURES=${ROOM_MEMORY_PHASE0_FIXTURES}"
       TIMEOUT 1800)
   endforeach()
 endif()

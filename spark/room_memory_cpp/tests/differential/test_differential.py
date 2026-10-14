@@ -23,7 +23,9 @@ from room_memory import offline
 OFFLINE = os.environ.get("ROOM_MEMORY_OFFLINE")
 REPLAY = os.environ.get("ROOM_MEMORY_REPLAY")
 SWIFT = os.environ.get("CHANGE_DETECT")
-CD = pathlib.Path(os.environ.get("ROOM_MEMORY_CD_FIXTURES", goldens.HERE.parents[2] / "Tests" / "Fixtures" / "change-detection"))
+SNAPSHOTS = pathlib.Path(
+    os.environ.get("ROOM_MEMORY_SNAPSHOTS", goldens.HERE.parents[2] / "Tests" / "Fixtures" / "room" / "snapshots")
+)
 
 pytestmark = pytest.mark.skipif(not (OFFLINE and REPLAY), reason="ROOM_MEMORY_OFFLINE / ROOM_MEMORY_REPLAY not set")
 
@@ -123,7 +125,7 @@ def test_flag_grid(tmp_path, base):
                                    ["--voxel-size", "0.1", "--no-pair"]])
 def test_real_fixtures(flags):
     for sensor in ("jt128", "mid360"):
-        assert_same([*flags, str(CD / f"a-{sensor}.bin"), str(CD / f"b-{sensor}.bin")])
+        assert_same([*flags, str(SNAPSHOTS / "a" / f"{sensor}.bin"), str(SNAPSHOTS / "b" / f"{sensor}.bin")])
     if goldens.PHASE0_DIR.is_dir():
         for _, before, after in goldens.phase0_pairs():
             assert_same([*flags, str(goldens.PHASE0_DIR / before), str(goldens.PHASE0_DIR / after)])
@@ -142,11 +144,11 @@ def test_text_mode(tmp_path):
     paths = write_pair(tmp_path, "moved", *goldens._moved_pair())
     for flags in (["--text"], ["--text", "--no-evidence"], ["--text", "--min-voxels", "1", "--unobserved"]):
         assert_same([*flags, *paths], text_mode=True)
-    assert_same(["--text", "--min-extent", "1", str(CD / "a-mid360.bin"), str(CD / "b-mid360.bin")], text_mode=True)
+    assert_same(["--text", "--min-extent", "1", str(SNAPSHOTS / "a" / "mid360.bin"), str(SNAPSHOTS / "b" / "mid360.bin")], text_mode=True)
 
 
 def test_errors_exit_alike(tmp_path):
-    good = str(CD / "a-mid360.bin")
+    good = str(SNAPSHOTS / "a" / "mid360.bin")
     bad = tmp_path / "broken.bin"
     bad.write_bytes(b"\x00\x01\x00\x00\x01")
     cases = [[], [good], ["--bogus", good, good], ["--tolerance", "9", good, good], ["--ray-stride", "3", good, good],

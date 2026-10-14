@@ -17,6 +17,7 @@ namespace {
 
 const std::filesystem::path kSwift = std::filesystem::path(ROOM_MEMORY_FIXTURES) / "swift";
 const std::filesystem::path kChangeDetection = harness::env_or("ROOM_MEMORY_CD_FIXTURES", ROOM_MEMORY_CD_FIXTURES);
+const std::filesystem::path kSnapshots = harness::env_or("ROOM_MEMORY_SNAPSHOTS", ROOM_MEMORY_SNAPSHOTS);
 const std::filesystem::path kPhase0 = harness::env_or("ROOM_MEMORY_PHASE0_FIXTURES", ROOM_MEMORY_PHASE0_FIXTURES);
 
 const char* kClearLine =
@@ -74,8 +75,8 @@ void snapshot_goldens() {
     Config config;
     config.evidence_of_absence = true;
     for (const char* sensor : {"jt128", "mid360"}) {
-        const std::string text = record(positions(kChangeDetection / (std::string("a-") + sensor + ".bin")),
-                                        positions(kChangeDetection / (std::string("b-") + sensor + ".bin")), config);
+        const std::string text = record(positions(kSnapshots / "a" / (std::string(sensor) + ".bin")),
+                                        positions(kSnapshots / "b" / (std::string(sensor) + ".bin")), config);
         if (text != harness::read_text(kChangeDetection / (std::string(sensor) + ".json"))) {
             throw harness::Failure(std::string("snapshot golden differs: ") + sensor);
         }
@@ -142,16 +143,16 @@ TEST(clear_line_is_the_spec_literal) {
 TEST(shuffled_snapshot_keeps_the_golden) {
     Config config;
     config.evidence_of_absence = true;
-    const auto before = scenes::shuffled(positions(kChangeDetection / "a-mid360.bin"), 7);
-    const auto after = scenes::shuffled(positions(kChangeDetection / "b-mid360.bin"), 11);
+    const auto before = scenes::shuffled(positions(kSnapshots / "a" / "mid360.bin"), 7);
+    const auto after = scenes::shuffled(positions(kSnapshots / "b" / "mid360.bin"), 11);
     CHECK(record(before, after, config) == harness::read_text(kChangeDetection / "mid360.json"));
 }
 
 TEST(cli_prints_the_snapshot_goldens) {
     for (const char* sensor : {"jt128", "mid360"}) {
         std::ostringstream out, err;
-        const int code = offline::run({"--evidence", "--json", (kChangeDetection / (std::string("a-") + sensor + ".bin")).string(),
-                                       (kChangeDetection / (std::string("b-") + sensor + ".bin")).string()},
+        const int code = offline::run({"--evidence", "--json", (kSnapshots / "a" / (std::string(sensor) + ".bin")).string(),
+                                       (kSnapshots / "b" / (std::string(sensor) + ".bin")).string()},
                                       out, err);
         CHECK_EQ(code, 0);
         CHECK(out.str() == harness::read_text(kChangeDetection / (std::string(sensor) + ".json")));

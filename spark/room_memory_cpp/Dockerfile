@@ -23,12 +23,13 @@ COPY spark/room_memory_cpp src/room_memory_cpp
 # The Python package is the oracle of the differential tests; it is not installed or run.
 COPY spark/room_memory /oracle/room_memory
 COPY Tests/Fixtures/change-detection fixtures/change-detection
+COPY Tests/Fixtures/room/snapshots fixtures/room/snapshots
 
 RUN . /opt/ros/jazzy/setup.sh \
     && colcon build --packages-select labcommand_msgs room_memory_cpp --cmake-args \
         -DCMAKE_BUILD_TYPE=Release -DROOM_MEMORY_NATIVE=OFF "-DCMAKE_CXX_FLAGS=${CPU_FLAGS}" \
         -DROOM_MEMORY_PYTHON=/usr/bin/python3 -DROOM_MEMORY_PYTHON_PACKAGE=/oracle/room_memory \
-        -DROOM_MEMORY_CD_FIXTURES=/ws/fixtures/change-detection
+        -DROOM_MEMORY_CD_FIXTURES=/ws/fixtures/change-detection -DROOM_MEMORY_SNAPSHOTS=/ws/fixtures/room/snapshots
 
 RUN . /opt/ros/jazzy/setup.sh && . install/setup.sh \
     && colcon test --packages-select room_memory_cpp --event-handlers console_direct+ \

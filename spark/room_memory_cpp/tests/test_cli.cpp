@@ -10,9 +10,9 @@ using namespace room_memory;
 
 namespace {
 
-const std::filesystem::path kChangeDetection = harness::env_or("ROOM_MEMORY_CD_FIXTURES", ROOM_MEMORY_CD_FIXTURES);
+const std::filesystem::path kSnapshots = harness::env_or("ROOM_MEMORY_SNAPSHOTS", ROOM_MEMORY_SNAPSHOTS);
 
-std::string fixture(const char* name) { return (kChangeDetection / name).string(); }
+std::string fixture(const char* side, const char* name) { return (kSnapshots / side / name).string(); }
 
 struct Run {
     int code;
@@ -36,15 +36,15 @@ std::vector<std::string> lines(const std::string& text) {
 }  // namespace
 
 TEST(text_block) {
-    Run r = run({"--text", "--", fixture("a-mid360.bin"), fixture("b-mid360.bin")});
+    Run r = run({"--text", "--", fixture("a", "mid360.bin"), fixture("b", "mid360.bin")});
     CHECK_EQ(r.code, 0);
     std::vector<std::string> out = lines(r.out);
-    CHECK_EQ(out[0], std::string("before: a-mid360.bin  points=20064  voxels=7592  dropped=0"));
+    CHECK_EQ(out[0], std::string("before: mid360.bin  points=20064  voxels=7592  dropped=0"));
     CHECK_EQ(out[2],
              std::string("voxel_size_m=0.050  tolerance=1  min_points=1  min_voxels=6  min_extent=2  pair_moves=true"));
     CHECK_EQ(out[3], std::string("appeared_voxels=255  disappeared_voxels=104  unknown_voxels=1286"));
     CHECK(out.size() == 6 && out[5] == "regions=0");
-    r = run({"--text", "--min-extent", "1", "--", fixture("a-mid360.bin"), fixture("b-mid360.bin")});
+    r = run({"--text", "--min-extent", "1", "--", fixture("a", "mid360.bin"), fixture("b", "mid360.bin")});
     CHECK_EQ(r.code, 0);
     out = lines(r.out);
     CHECK_EQ(out[5], std::string("regions=1"));
@@ -68,16 +68,16 @@ TEST(input_and_config_errors) {
     const std::string before = (missing / "a.pcd").string(), after = (missing / "b.pcd").string();
     Run r = run({before, after});
     CHECK(r.code == 1 && r.err.find("expected a .bin file") != std::string::npos);
-    r = run({"--tolerance", "9", fixture("a-mid360.bin"), fixture("b-mid360.bin")});
+    r = run({"--tolerance", "9", fixture("a", "mid360.bin"), fixture("b", "mid360.bin")});
     CHECK(r.code == 1 && r.err.find("tolerance") != std::string::npos);
 }
 
 TEST(opt_out_flags_select_the_swift_defaults) {
-    Run r = run({"--no-evidence", fixture("a-mid360.bin"), fixture("b-mid360.bin")});
+    Run r = run({"--no-evidence", fixture("a", "mid360.bin"), fixture("b", "mid360.bin")});
     CHECK(r.code == 0 && r.out.find("\"evidence\":false") != std::string::npos);
-    r = run({"--no-evidence", "--text", fixture("a-mid360.bin"), fixture("b-mid360.bin")});
+    r = run({"--no-evidence", "--text", fixture("a", "mid360.bin"), fixture("b", "mid360.bin")});
     CHECK(r.code == 0 && r.out.find("unknown_voxels") == std::string::npos);
-    const auto call = offline::parse_args({fixture("a-mid360.bin"), fixture("b-mid360.bin")}, false, false);
+    const auto call = offline::parse_args({fixture("a", "mid360.bin"), fixture("b", "mid360.bin")}, false, false);
     CHECK(call && !call->config.evidence_of_absence && !call->emit_json);
 }
 
