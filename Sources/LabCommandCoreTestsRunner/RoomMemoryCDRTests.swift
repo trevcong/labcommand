@@ -302,6 +302,12 @@ func testRoomMalformedInputRejected() {
         ("mask occupied voxel not known", .invalid, { try event(patched(moved, at: 276, [0x00])) }),
         ("mask brick with no known voxel", .invalid, { try event(patched(patched(moved, at: 208, [0x00]), at: 276, [0x00])) }),
         ("mask compression zstd", .unsupported, { try event(patched(moved, at: 344, [1])) }),
+        ("mask room_id not the event's", .invalid, { try event(patched(moved, at: 136, [0x78])) }),
+        ("mask map_epoch not the event's", .invalid, { try event(patched(moved, at: 144, le32(44))) }),
+        ("mask stamp sec not the event's", .invalid, { try event(patched(moved, at: 160, le32(1_760_400_011))) }),
+        ("mask stamp nanosec not the event's", .invalid, { try event(patched(moved, at: 164, le32(0))) }),
+        ("mask seq 1", .invalid, { try event(patched(moved, at: 152, le32(1))) }),
+        ("mask base_epoch 1", .invalid, { try event(patched(moved, at: 176, le32(1))) }),
     ]
     for (label, want, body) in cases {
         let (got, text) = outcome(body)
@@ -330,6 +336,16 @@ func testRoomEncoderEnforcesContract() {
     badAlpha.alpha = 2
     var deltaMask = goldenMoved
     deltaMask.mask?.kind = .delta
+    var maskOtherRoom = goldenMoved
+    maskOtherRoom.mask?.header.roomId = "lab-b"
+    var maskOtherEpoch = goldenMoved
+    maskOtherEpoch.mask?.header.mapEpoch = 42
+    var maskOtherStamp = goldenMoved
+    maskOtherStamp.mask?.header.stamp.nanosec = 0
+    var maskWithSeq = goldenMoved
+    maskWithSeq.mask?.header.seq = 3
+    var maskWithBase = goldenMoved
+    maskWithBase.mask?.baseEpoch = 42
     var sentinelHz = goldenStatus
     sentinelHz.mid360Hz = 0xFFFF
     var emptyRoom = goldenEpoch
@@ -349,6 +365,11 @@ func testRoomEncoderEnforcesContract() {
         ("APPEARED with from_centroid", { try appearedWithFrom.encodedCDR() }),
         ("alpha 2", { try badAlpha.encodedCDR() }),
         ("delta as mask", { try deltaMask.encodedCDR() }),
+        ("mask room_id not the event's", { try maskOtherRoom.encodedCDR() }),
+        ("mask map_epoch not the event's", { try maskOtherEpoch.encodedCDR() }),
+        ("mask stamp not the event's", { try maskOtherStamp.encodedCDR() }),
+        ("mask seq 3", { try maskWithSeq.encodedCDR() }),
+        ("mask base_epoch 42", { try maskWithBase.encodedCDR() }),
         ("0xFFFF as a measured rate", { try sentinelHz.encodedCDR() }),
         ("empty room_id", { try emptyRoom.encodedCDR() }),
         ("NUL in room_id", { try nulRoom.encodedCDR() }),

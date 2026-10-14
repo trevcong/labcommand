@@ -38,13 +38,15 @@ enum RoomFixtures {
             Scene(name: "rig_shifted", extra: [], sensor: nominal + rigShift, seed: 1, sec: 1_760_400_040, nanosec: 0),
         ]
         for step in 0..<personFrames {
+            // 0.25 s per frame from 1_760_400_050; whole seconds carry into sec so nanosec stays < 1e9.
+            let offsetNs = step * 250_000_000
             scenes.append(Scene(
                 name: "person_\(step)",
                 extra: [("person", SyntheticRoom.person(step: step))],
                 sensor: nominal,
                 seed: 10 + UInt64(step),
-                sec: 1_760_400_050,
-                nanosec: UInt32(step) * 250_000_000
+                sec: 1_760_400_050 + Int32(offsetNs / 1_000_000_000),
+                nanosec: UInt32(offsetNs % 1_000_000_000)
             ))
         }
         return scenes
@@ -162,6 +164,23 @@ private func readFixture(_ path: String) -> Data {
     return data
 }
 
+/// The header stamp of a PointCloud2 CDR fixture: int32 sec and uint32 nanosec right after the
+/// 4-byte encapsulation header, in the byte order it names. PointCloud2CDR folds them into a Date,
+/// which hides an out-of-range nanosec, so the tests read the raw fields.
+private func expectValidStamp(_ path: String) {
+    let bytes = [UInt8](readFixture(path))
+    guard bytes.count >= 12, bytes[0] == 0x00, bytes[1] <= 0x01 else {
+        expect(false, "room fixture \(path): no CDR header stamp")
+        return
+    }
+    let field = { (offset: Int) -> UInt32 in
+        let value = bytes[offset..<offset + 4].reversed().reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+        return bytes[1] == 0x01 ? value : value.byteSwapped
+    }
+    let nanosec = field(8)
+    expect(nanosec < 1_000_000_000, "room fixture \(path): stamp nanosec \(nanosec) is not below 1e9")
+}
+
 private func decodeCloud(_ path: String) -> PointCloudFrame {
     do {
         return try PointCloud2CDR.decode(readFixture(path))
@@ -177,7 +196,9 @@ func testRoomSnapshotFixturesDecode() {
     var counts: [String] = []
     for take in ["a", "b"] {
         for (sensor, frameId) in [("jt128", "hesai_lidar"), ("mid360", "livox_frame")] {
-            let frame = decodeCloud("\(RoomFixtures.root)/snapshots/\(take)/\(sensor).bin")
+            let path = "\(RoomFixtures.root)/snapshots/\(take)/\(sensor).bin"
+            expectValidStamp(path)
+            let frame = decodeCloud(path)
             expect(frame.frameId == frameId, "snapshot \(take)/\(sensor): frame_id '\(frame.frameId ?? "nil")'")
             expect(frame.count > 10_000, "snapshot \(take)/\(sensor): only \(frame.count) finite points")
             counts.append("\(take)/\(sensor) \(frame.count)")
@@ -191,6 +212,7 @@ func testRoomSyntheticFixturesMatchGenerator() {
         let path = "\(RoomFixtures.syntheticDirectory)/\(scene.file)"
         expect(readFixture(path) == RoomFixtures.encodedCloud(scene),
                "synthetic \(scene.file) differs from the generator; rerun generate-room-fixtures")
+        expectValidStamp(path)
         let frame = decodeCloud(path)
         expect(frame.count == SyntheticScanner.fixture.azimuthCount * SyntheticScanner.fixture.elevationCount,
                "synthetic \(scene.file): \(frame.count) points")

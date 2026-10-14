@@ -309,6 +309,22 @@ extension RoomMemory.ChangeEvent {
                 throw RoomMemoryCDRError.invalid("\(context): mask must be KIND_SNAPSHOT")
             }
             try mask.validate("\(context) mask[0]")
+            // D14: the mask is a snapshot of the parent's map, stamped like the parent, with seq 0.
+            guard mask.header.roomId == header.roomId else {
+                throw RoomMemoryCDRError.invalid("\(context): mask room_id '\(mask.header.roomId)' is not the event's '\(header.roomId)'")
+            }
+            guard mask.header.mapEpoch == header.mapEpoch else {
+                throw RoomMemoryCDRError.invalid("\(context): mask map_epoch \(mask.header.mapEpoch) is not the event's \(header.mapEpoch)")
+            }
+            guard mask.header.stamp == header.stamp else {
+                throw RoomMemoryCDRError.invalid("\(context): mask stamp is not the event's stamp")
+            }
+            guard mask.header.seq == 0 else {
+                throw RoomMemoryCDRError.invalid("\(context): mask seq \(mask.header.seq) must be 0")
+            }
+            guard mask.baseEpoch == 0 else {
+                throw RoomMemoryCDRError.invalid("\(context): mask base_epoch \(mask.baseEpoch) must be 0")
+            }
         }
     }
 }
