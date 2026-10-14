@@ -317,17 +317,30 @@ final class PointCloudCamera: ObservableObject {
         let center = CameraMath.boundsCenter(min: bounds.min, max: bounds.max)
         guard !CameraMath.isInvalid(center) else { return }
         
-        let extent = bounds.max - bounds.min
-        guard !CameraMath.isInvalid(extent) else { return }
+        let halfX = (bounds.max.x - bounds.min.x) / 2
+        let halfY = (bounds.max.y - bounds.min.y) / 2
+        let halfZ = (bounds.max.z - bounds.min.z) / 2
         
-        let radius = CameraMath.length(extent) * 0.5
-        guard radius > 0 else { return }
+        guard halfX > 0 || halfY > 0 || halfZ > 0 else { return }
         
-        // Aspect-aware distance calculation: use the tighter of horizontal or vertical FOV
+        // FOV for each axis
         let fovY = fieldOfView * .pi / 180.0
         let fovX = 2 * atan(tan(fovY / 2) * aspectRatio)
-        let effectiveFov = min(fovX, fovY)
-        let fitDistance = radius / sin(effectiveFov / 2) * 1.2
+        
+        // Corners closer to camera (at Y = min) project larger due to perspective.
+        // Account for this by scaling halfWidth by a perspective factor.
+        let perspectiveFactor: Float = 1.0 + (halfX > 0 ? halfY * tan(fovX / 2) / halfX : 0)
+        let halfWidth = halfX * perspectiveFactor
+        
+        // Camera looks at an angle (elevation). Z and Y contribute to screen vertical.
+        let halfHeight = halfZ + halfY * 0.3
+        
+        // Distance needed for each axis to fit in view
+        let distForWidth = halfWidth / tan(fovX / 2)
+        let distForHeight = halfHeight / tan(fovY / 2)
+        
+        // Take max (limiting axis) and apply 1.1 margin for 80-90% fill
+        let fitDistance = max(distForWidth, distForHeight) * 1.1
         
         let viewElevation: Float = Float.pi / 6  // 30° above horizon
         
