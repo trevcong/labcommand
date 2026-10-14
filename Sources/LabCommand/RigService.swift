@@ -62,7 +62,7 @@ public final class RigService: @unchecked Sendable {
     }
 
     @discardableResult
-    private func startTunnel(port: Int, key: ReferenceWritableKeyPath<RigService, Process?>) async -> String? {
+    private func startTunnel(port: Int, key: ReferenceWritableKeyPath<RigService, Process?>) -> String? {
         if tunnelRunning(key) || portOpen(port) { return nil }
         var lastError: String?
         for host in hostOrder() {
@@ -77,9 +77,10 @@ public final class RigService: @unchecked Sendable {
                 lastError = error.localizedDescription
                 continue
             }
-            try? await Task.sleep(for: .milliseconds(250))
             if proc.isRunning {
-                setTunnelProcess(proc, for: key)
+                lock.lock()
+                self[keyPath: key] = proc
+                lock.unlock()
                 if host.contains(".") { SparkHopCache.save(host) }
                 return nil
             }
@@ -87,29 +88,16 @@ public final class RigService: @unchecked Sendable {
         }
         return lastError ?? "tunnel failed"
     }
-    
-    private func setTunnelProcess(_ proc: Process, for key: ReferenceWritableKeyPath<RigService, Process?>) {
-        lock.lock()
-        self[keyPath: key] = proc
-        lock.unlock()
-    }
 
     /// Both tunnels. Returns the first error, or nil.
-    public func ensureTunnels() async -> String? {
-        let apiErr = await startTunnel(port: Self.apiPort, key: \.apiTunnel)
-        let viewErr = await startTunnel(port: Self.viewPort, key: \.viewTunnel)
+    public func ensureTunnels() -> String? {
+        let apiErr = startTunnel(port: Self.apiPort, key: \.apiTunnel)
+        let viewErr = startTunnel(port: Self.viewPort, key: \.viewTunnel)
         return apiErr ?? viewErr
     }
 
-    public func ensureAPITunnel() async -> String? {
-        await startTunnel(port: Self.apiPort, key: \.apiTunnel)
-    }
-    
-    /// Sync helper: starts API tunnel in background if not already running.
-    /// Does not wait for completion — use for fire-and-forget scenarios.
-    private func ensureAPITunnelSync() {
-        if tunnelRunning(\.apiTunnel) || portOpen(Self.apiPort) { return }
-        Task { await ensureAPITunnel() }
+    public func ensureAPITunnel() -> String? {
+        startTunnel(port: Self.apiPort, key: \.apiTunnel)
     }
 
     public func stopTunnels() {
@@ -129,7 +117,7 @@ public final class RigService: @unchecked Sendable {
     /// GET status.json. Failure returns an honest apiDown/offline snapshot
     /// using the caller's last knowledge of Spark reachability.
     public func fetchStatus(sparkWasReachable: Bool) -> RigSnapshot {
-        ensureAPITunnelSync()
+        _ = ensureAPITunnel()
         let viewUp = viewPathUp
         guard let url = URL(string: "http://localhost:\(Self.apiPort)/status.json") else {
             return RigSnapshot.apiDown(reason: "bad URL", viewTunnelUp: viewUp)

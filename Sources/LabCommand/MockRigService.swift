@@ -89,14 +89,14 @@ public final class MockRigService: @unchecked Sendable {
     public var isAPITunnelRunning: Bool { fixtureName != "spark-offline" }
     public var viewPathUp: Bool { fixtureViewTunnelUp }
     
-    public func ensureTunnels() async -> String? {
+    public func ensureTunnels() -> String? {
         if fixtureName == "spark-offline" {
             return "mock: Spark not reachable"
         }
         return nil
     }
     
-    public func ensureAPITunnel() async -> String? {
+    public func ensureAPITunnel() -> String? {
         if fixtureName == "spark-offline" {
             return "mock: Spark not reachable"
         }
@@ -165,8 +165,8 @@ public protocol RigServiceProtocol: Sendable {
     var isAPITunnelRunning: Bool { get }
     var viewPathUp: Bool { get }
     
-    func ensureTunnels() async -> String?
-    func ensureAPITunnel() async -> String?
+    func ensureTunnels() -> String?
+    func ensureAPITunnel() -> String?
     func stopTunnels()
     func fetchStatus(sparkWasReachable: Bool) -> RigSnapshot
     func postAction(_ name: String, arg: String?, extra: [String: Any]) -> (ok: Bool, message: String)

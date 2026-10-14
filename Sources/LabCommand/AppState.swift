@@ -219,7 +219,7 @@ final class AppState: ObservableObject {
     func startRig() {
         let restarting = rig.stackRunning
         runAction(restarting ? "restart rig" : "start rig", kind: .start) { io, _ in
-            if let terr = await io.ensureTunnels() {
+            if let terr = io.ensureTunnels() {
                 return "tunnels: \(terr)"
             }
             let r = io.postAction(restarting ? "restart" : "start")
@@ -303,7 +303,8 @@ final class AppState: ObservableObject {
 
     func startView() {
         runAction("view", kind: .info) { io, _ in
-            await io.ensureTunnels()
+            _ = io.ensureTunnels()
+            return nil
         }
     }
 
@@ -318,7 +319,7 @@ final class AppState: ObservableObject {
     private func runAction(
         _ name: String,
         kind: MissionEventKind = .info,
-        work: @escaping @Sendable (RigServiceProtocol, CaptureSessionSpec) async -> String?,
+        work: @escaping @Sendable (RigServiceProtocol, CaptureSessionSpec) -> String?,
         after: ((Bool) -> Void)? = nil
     ) {
         guard !isActing else { return }
@@ -329,7 +330,7 @@ final class AppState: ObservableObject {
         let spec = session
         let sparkWasUp = rig.sparkReachable
         Task.detached(priority: .userInitiated) {
-            let err = await work(io, spec)
+            let err = work(io, spec)
             try? await Task.sleep(for: .seconds(3.5))
             let rig = io.fetchStatus(sparkWasReachable: sparkWasUp)
             await MainActor.run {
