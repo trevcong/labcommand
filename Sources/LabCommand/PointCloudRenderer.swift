@@ -58,12 +58,19 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     public var colorMode: PointCloudColorMode = .intensity
     public var pointSize: Float = 4.0
     
-    // MARK: - Camera (static for this PR)
+    /// Field of view in radians (45 degrees).
+    public static let fovY: Float = Float.pi / 4
+    
+    // MARK: - Camera
     
     private var viewMatrix: simd_float4x4
     private var projectionMatrix: simd_float4x4
+    private var aspect: Float = 16.0 / 9.0
     private var heightMin: Float = 0
     private var heightMax: Float = 1
+    
+    /// Current bounding box of loaded points.
+    private var boundingBox: (min: SIMD3<Float>, max: SIMD3<Float>)?
     
     // MARK: - Vertex Layout
     
@@ -87,7 +94,7 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         self.viewMatrix = Self.lookAt(eye: eye, center: center, up: up)
         
         // Initialize projection with default 16:9 aspect
-        self.projectionMatrix = Self.perspective(fovY: Float.pi / 4, aspect: 16.0 / 9.0, near: 0.01, far: 1000)
+        self.projectionMatrix = Self.perspective(fovY: Self.fovY, aspect: 16.0 / 9.0, near: 0.01, far: 1000)
         
         super.init()
         
@@ -173,6 +180,7 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         guard let device = device, !frame.isEmpty else {
             vertexBuffer = nil
             pointCount = 0
+            boundingBox = nil
             return
         }
         
@@ -194,8 +202,8 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         }
         let intensityRange = maxI - minI
         
-        var minZ: Float = .greatestFiniteMagnitude
-        var maxZ: Float = -.greatestFiniteMagnitude
+        var bbMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var bbMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
         
         var vertices: [PointVertex] = []
         vertices.reserveCapacity(frame.count)
@@ -205,22 +213,23 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             var intensity: Float = 1.0
             if i < frame.intensities.count {
                 let raw = frame.intensities[i]
-                // Normalize to [0, 1] using per-frame min/max
                 intensity = intensityRange > 0.001 ? (raw - minI) / intensityRange : 1.0
             }
             
+            let pos = SIMD3<Float>(p.x, p.y, p.z)
             vertices.append(PointVertex(
-                position: SIMD3<Float>(p.x, p.y, p.z),
+                position: pos,
                 intensity: intensity,
                 sensorID: sensorIndex
             ))
             
-            minZ = min(minZ, p.z)
-            maxZ = max(maxZ, p.z)
+            bbMin = min(bbMin, pos)
+            bbMax = max(bbMax, pos)
         }
         
-        heightMin = minZ
-        heightMax = max(maxZ, minZ + 0.001)
+        boundingBox = (bbMin, bbMax)
+        heightMin = bbMin.z
+        heightMax = max(bbMax.z, bbMin.z + 0.001)
         
         vertexBuffer = device.makeBuffer(
             bytes: vertices,
@@ -228,6 +237,8 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             options: .storageModeShared
         )
         pointCount = frame.count
+        
+        fitToBounds()
     }
     
     /// Load multiple frames with sensor coloring.
@@ -235,12 +246,13 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         guard let device = device else {
             vertexBuffer = nil
             pointCount = 0
+            boundingBox = nil
             return
         }
         
         var allVertices: [PointVertex] = []
-        var minZ: Float = .greatestFiniteMagnitude
-        var maxZ: Float = -.greatestFiniteMagnitude
+        var bbMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var bbMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
         
         for frame in frames {
             let sensorIndex: UInt32 = {
@@ -268,25 +280,28 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
                     intensity = intensityRange > 0.001 ? (raw - minI) / intensityRange : 1.0
                 }
                 
+                let pos = SIMD3<Float>(p.x, p.y, p.z)
                 allVertices.append(PointVertex(
-                    position: SIMD3<Float>(p.x, p.y, p.z),
+                    position: pos,
                     intensity: intensity,
                     sensorID: sensorIndex
                 ))
                 
-                minZ = min(minZ, p.z)
-                maxZ = max(maxZ, p.z)
+                bbMin = min(bbMin, pos)
+                bbMax = max(bbMax, pos)
             }
         }
         
         guard !allVertices.isEmpty else {
             vertexBuffer = nil
             pointCount = 0
+            boundingBox = nil
             return
         }
         
-        heightMin = minZ
-        heightMax = max(maxZ, minZ + 0.001)
+        boundingBox = (bbMin, bbMax)
+        heightMin = bbMin.z
+        heightMax = max(bbMax.z, bbMin.z + 0.001)
         
         vertexBuffer = device.makeBuffer(
             bytes: allVertices,
@@ -294,6 +309,8 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             options: .storageModeShared
         )
         pointCount = allVertices.count
+        
+        fitToBounds()
     }
     
     // MARK: - Camera Control
@@ -303,8 +320,32 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     }
     
     public func resetCamera() {
-        let eye = SIMD3<Float>(0, -5, 3)
-        let center = SIMD3<Float>(0, 0, 0)
+        fitToBounds()
+    }
+    
+    /// Fit camera to show all loaded points.
+    /// Centers on bounding box and positions camera at distance to show all corners.
+    public func fitToBounds() {
+        guard let bb = boundingBox else {
+            // No bounds, use default view
+            let eye = SIMD3<Float>(0, -5, 3)
+            let center = SIMD3<Float>(0, 0, 0)
+            let up = SIMD3<Float>(0, 0, 1)
+            viewMatrix = Self.lookAt(eye: eye, center: center, up: up)
+            return
+        }
+        
+        let center = (bb.min + bb.max) * 0.5
+        let extent = bb.max - bb.min
+        let radius = length(extent) * 0.5
+        
+        // Distance = radius / sin(fov/2) * margin
+        // This ensures the bounding sphere fits within the view frustum
+        let halfFov = Self.fovY * 0.5
+        let distance = max(radius / sin(halfFov) * 1.2, 0.1)
+        
+        // Position camera looking from Y-negative toward center, Z-up
+        let eye = center + SIMD3<Float>(0, -distance, distance * 0.3)
         let up = SIMD3<Float>(0, 0, 1)
         viewMatrix = Self.lookAt(eye: eye, center: center, up: up)
     }
@@ -313,8 +354,8 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     
     public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         guard size.width > 0, size.height > 0 else { return }
-        let aspect = Float(size.width / size.height)
-        projectionMatrix = Self.perspective(fovY: Float.pi / 4, aspect: aspect, near: 0.01, far: 1000)
+        aspect = Float(size.width / size.height)
+        projectionMatrix = Self.perspective(fovY: Self.fovY, aspect: aspect, near: 0.01, far: 1000)
     }
     
     public func draw(in view: MTKView) {
