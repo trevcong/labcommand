@@ -87,7 +87,7 @@ public enum VoxelKey: Sendable {
 /// in cubic meters, not a mesh volume.
 public enum ChangeDetection: Sendable {
     /// Knobs for occupancy, dilation, clustering, move pairing, and free-space evidence.
-    /// Distances are meters. `tolerance` and `minVoxels` are voxel counts.
+    /// Distances are meters. `tolerance`, `minVoxels`, and `minExtent` are voxel counts.
     public struct Config: Sendable, Equatable {
         /// Edge length of one voxel, in meters. Default 0.05.
         public var voxelSize: Float
@@ -101,6 +101,10 @@ public enum ChangeDetection: Sendable {
         public var tolerance: Int
         /// Drops a connected component smaller than this many voxels.
         public var minVoxels: Int
+        /// Drops a component whose axis-aligned box covers fewer voxels than this
+        /// on any axis. Default 2 (0.10 m at the default voxel). A one-cell scan
+        /// streak cannot reach it. `1` keeps every component that clears `minVoxels`.
+        public var minExtent: Int
         /// When true, pairs an appeared cluster with a disappeared cluster into one moved region.
         public var pairMoves: Bool
         /// Largest centroid gap, in meters, that can still be one moved object.
@@ -121,14 +125,15 @@ public enum ChangeDetection: Sendable {
         public var reportUnobserved: Bool
 
         /// Defaults: 0.05 m voxels, no range clip, `minPoints` 1, `tolerance` 1 voxel,
-        /// `minVoxels` 6, move pairing on, `maxMove` 1.5 m, `moveCountRatio` 2,
-        /// evidence off, origin at the coordinate origin, `rayStride` 1.
+        /// `minVoxels` 6, `minExtent` 2 voxels, move pairing on, `maxMove` 1.5 m,
+        /// `moveCountRatio` 2, evidence off, origin at the coordinate origin, `rayStride` 1.
         public init() {
             voxelSize = 0.05
             maxRange = nil
             minPoints = 1
             tolerance = 1
             minVoxels = 6
+            minExtent = 2
             pairMoves = true
             maxMove = 1.5
             moveCountRatio = 2
@@ -214,11 +219,11 @@ public enum ChangeDetection: Sendable {
         /// Regions in v2 order: kind (`moved`, `appeared`, `disappeared`, `unobserved`),
         /// then `voxelCount` descending, then `minKey` ascending, then `fromMinKey`.
         public var regions: [Region]
-        /// Appeared voxels after dilation and before the `minVoxels` cut.
+        /// Appeared voxels after dilation and before the `minVoxels` and `minExtent` cuts.
         public var appearedVoxels: Int
-        /// Disappeared voxels after dilation and before the `minVoxels` cut.
+        /// Disappeared voxels after dilation and before the `minVoxels` and `minExtent` cuts.
         public var disappearedVoxels: Int
-        /// Before-occupied voxels that evidence left unknown, before the `minVoxels` cut.
+        /// Before-occupied voxels that evidence left unknown, before the `minVoxels` and `minExtent` cuts.
         /// Zero when evidence is off. Dilation does not move a voxel into or out of this count.
         public var unknownVoxels: Int
         /// Occupied voxels in the before map.
@@ -262,7 +267,8 @@ public enum ChangeDetection: Sendable {
     /// map occupies something within `tolerance` voxels (Chebyshev). With evidence
     /// on, a before-only voxel is a disappeared candidate only when an after-ray
     /// traverses it; otherwise it counts as unknown. Surviving voxels are clustered
-    /// with 26-connectivity. Components smaller than `minVoxels` are dropped.
+    /// with 26-connectivity. Components smaller than `minVoxels`, or thinner than
+    /// `minExtent` voxels on any axis, are dropped.
     /// When `pairMoves` is set, a mutually nearest appeared/disappeared pair of
     /// similar size becomes one `.moved` region. Equal binary32 distances do not pair.
     ///
@@ -298,11 +304,17 @@ public enum ChangeDetection: Sendable {
         let carved = carve(onlyBefore: onlyBefore, after: after, config: config, inverse: inverse)
         let disappeared = surviving(carved.free, against: after.occupied, tolerance: config.tolerance)
 
-        let appearedClusters = clusters(appeared, voxelSize: config.voxelSize, minVoxels: config.minVoxels)
-        let disappearedClusters = clusters(disappeared, voxelSize: config.voxelSize, minVoxels: config.minVoxels)
+        let appearedClusters = clusters(
+            appeared, voxelSize: config.voxelSize, minVoxels: config.minVoxels, minExtent: config.minExtent
+        )
+        let disappearedClusters = clusters(
+            disappeared, voxelSize: config.voxelSize, minVoxels: config.minVoxels, minExtent: config.minExtent
+        )
         let unobservedClusters: [Cluster]
         if config.evidenceOfAbsence, config.reportUnobserved {
-            unobservedClusters = clusters(carved.unknown, voxelSize: config.voxelSize, minVoxels: config.minVoxels)
+            unobservedClusters = clusters(
+                carved.unknown, voxelSize: config.voxelSize, minVoxels: config.minVoxels, minExtent: config.minExtent
+            )
         } else {
             unobservedClusters = []
         }
@@ -380,6 +392,7 @@ public enum ChangeDetection: Sendable {
         text += ",\"min_points\":\(config.minPoints)"
         text += ",\"tolerance\":\(config.tolerance)"
         text += ",\"min_voxels\":\(config.minVoxels)"
+        text += ",\"min_extent\":\(config.minExtent)"
         text += ",\"pair_moves\":\(config.pairMoves ? "true" : "false")"
         text += ",\"max_move_bits\":\(jsonBits(config.maxMove))"
         text += ",\"move_count_ratio_bits\":\(jsonBits(config.moveCountRatio))"
@@ -1064,7 +1077,12 @@ public enum ChangeDetection: Sendable {
         var minKey: Int64
     }
 
-    private static func clusters(_ keys: Set<Int64>, voxelSize: Float, minVoxels: Int) -> [Cluster] {
+    private static func clusters(
+        _ keys: Set<Int64>,
+        voxelSize: Float,
+        minVoxels: Int,
+        minExtent: Int
+    ) -> [Cluster] {
         if keys.isEmpty { return [] }
         let seeds = Array(keys)
         var visited = Set<Int64>(minimumCapacity: keys.count)
@@ -1124,7 +1142,12 @@ public enum ChangeDetection: Sendable {
                 }
             }
 
-            guard count >= minVoxels else { continue }
+            let spanI = iMax - iMin + 1
+            let spanJ = jMax - jMin + 1
+            let spanK = kMax - kMin + 1
+            guard count >= minVoxels, spanI >= minExtent, spanJ >= minExtent, spanK >= minExtent else {
+                continue
+            }
             let n = Double(count)
             let size = Double(voxelSize)
             let centroid = Point3D(
@@ -1417,6 +1440,9 @@ public enum ChangeDetection: Sendable {
         }
         if config.minVoxels < 1 {
             throw Failure.invalidConfig("minVoxels must be >= 1")
+        }
+        if config.minExtent < 1 {
+            throw Failure.invalidConfig("minExtent must be >= 1 voxel")
         }
         if !(0...4).contains(config.tolerance) {
             throw Failure.invalidConfig("tolerance must be in 0...4 voxels")

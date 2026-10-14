@@ -12,8 +12,8 @@ private func usage() -> Never {
     emitError(
         """
         change-detect [--voxel-size m] [--max-range m] [--min-points n]
-                      [--tolerance n] [--min-voxels n] [--max-move m]
-                      [--no-pair] [--evidence] [--origin x,y,z]
+                      [--tolerance n] [--min-voxels n] [--min-extent n]
+                      [--max-move m] [--no-pair] [--evidence] [--origin x,y,z]
                       [--ray-stride n] [--unobserved] [--json]
                       <before.pcd|before.bin> <after.pcd|after.bin>
 
@@ -79,6 +79,10 @@ private func parseConfig(_ args: [String]) -> Invocation {
             let text = requireValue(args, &index)
             guard let value = Int(text) else { usage() }
             config.minVoxels = value
+        case "--min-extent":
+            let text = requireValue(args, &index)
+            guard let value = Int(text) else { usage() }
+            config.minExtent = value
         case "--max-move":
             let text = requireValue(args, &index)
             guard let value = Float(text) else { usage() }
@@ -202,7 +206,7 @@ let afterName = URL(fileURLWithPath: afterPath).lastPathComponent
 print("before: \(beforeName)  points=\(beforeFrame.count)  voxels=\(beforeMap.occupied.count)  dropped=\(beforeMap.droppedPoints)")
 print("after:  \(afterName)  points=\(afterFrame.count)  voxels=\(afterMap.occupied.count)  dropped=\(afterMap.droppedPoints)")
 print(
-    "voxel_size_m=\(format(config.voxelSize, 3))  tolerance=\(config.tolerance)  min_points=\(config.minPoints)  min_voxels=\(config.minVoxels)  pair_moves=\(config.pairMoves)"
+    "voxel_size_m=\(format(config.voxelSize, 3))  tolerance=\(config.tolerance)  min_points=\(config.minPoints)  min_voxels=\(config.minVoxels)  min_extent=\(config.minExtent)  pair_moves=\(config.pairMoves)"
 )
 if config.evidenceOfAbsence {
     print("appeared_voxels=\(report.appearedVoxels)  disappeared_voxels=\(report.disappearedVoxels)  unknown_voxels=\(report.unknownVoxels)")

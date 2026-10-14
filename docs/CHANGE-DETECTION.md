@@ -18,7 +18,7 @@ Saved frames (`~/Developer/lc-tasks/snapshots/a/`, and `b/` about 10 s later, sa
 | `mid360.bin` | 521,881 | `livox_frame` | 20,064 | CDR little-endian, `point_step` 26, xyz+intensity float32 |
 | `jt128.bin` | 2,995,397 | `hesai_lidar` | 115,200 | same layout |
 
-Both headers are `00 01 00 00` (CDR LE). `PointCloud2CDR.decode` already accepts that layout. `snapshots/b/jt128.bin` is the same length as `a/` and is not byte-identical. `snapshots/b/mid360.bin` is 519,385 bytes (19,968 points). Same-file against itself is the empty-diff smoke check. On `a/` against `b/` with the defaults below, the JT128 pair prints `regions=0` (46 appeared and 36 disappeared voxels, all under `minVoxels`) and the Mid-360 pair prints 4 regions of 7–22 voxels (255 appeared and 268 disappeared voxels before the cut). That is a few thin wall patches on the sparser sensor, not a room-sized diff, so the defaults stay at tolerance 1 and `minVoxels` 6. `--tolerance 2` (10 cm) clears the Mid-360 pair to `regions=0` when a two-cell slide should not count.
+Both headers are `00 01 00 00` (CDR LE). `PointCloud2CDR.decode` already accepts that layout. `snapshots/b/jt128.bin` is the same length as `a/` and is not byte-identical. `snapshots/b/mid360.bin` is 519,385 bytes (19,968 points). Same-file against itself is the empty-diff smoke check. On `a/` against `b/` with evidence on and the defaults below, both pairs print `regions=0`. The counts behind that cut are in [Static-room blips](#static-room-blips): at `minVoxels` 1 the Mid-360 still has one appeared sheet of 7 voxels, one cell thick, and `minExtent` 2 is what drops it.
 
 `LabCommandCore` is one SPM target, one type-family per file, public `enum` namespaces (`RobustBounds`, `PointCloud2CDR`, `RigTransforms`). Tests live in `Sources/LabCommandCoreTestsRunner`, are plain `expect` functions, and are registered from `main.swift`. `swift test` / XCTest is unused (CLT installs may not have it). `Package.swift` is tools 5.9, macOS 14.
 
@@ -67,6 +67,7 @@ public enum ChangeDetection {
         public var minPoints: Int            // 1
         public var tolerance: Int            // 1 voxel, Chebyshev
         public var minVoxels: Int            // 6
+        public var minExtent: Int            // 2 voxels on every AABB axis
         public var pairMoves: Bool           // true
         public var maxMove: Float            // 1.5 m between centroids
         public var moveCountRatio: Float     // 2: larger count / smaller count
@@ -170,7 +171,7 @@ public enum VoxelKey {
 
 - `voxelSize` is non-finite or `<= 0`
 - `maxRange` is non-nil and (non-finite or `<= 0`)
-- `minPoints < 1` or `minVoxels < 1`
+- `minPoints < 1`, `minVoxels < 1`, or `minExtent < 1`
 - `tolerance` is outside `0...4`
 - `maxMove < 0` or non-finite
 - `moveCountRatio < 1` or non-finite
@@ -232,7 +233,9 @@ Cluster the surviving appeared keys and the surviving disappeared keys as two se
 - `boundsMax` = `(iMax + 1, jMax + 1, kMax + 1) * voxelSize` (exclusive corner of the high cell)
 - `volume` = `Float(voxelCount) * voxelSize³` (occupied volume)
 
-Drop a component with `voxelCount < minVoxels`. Default 6: a one-to-five-voxel speckle that dilation did not absorb goes away, and the synthetic box below is hundreds of voxels.
+Drop a component when `voxelCount < minVoxels`, or when any AABB edge covers fewer than `minExtent` voxels (`iMax - iMin + 1`, and the same for `j` and `k`). Defaults are `minVoxels` 6 and `minExtent` 2.
+
+`minExtent` 2 is 0.10 m at the 0.05 m voxel. A component that is one cell thick fails it at any length. The static Mid-360 pair's only component above 6 voxels is that shape: 7 voxels in a 5×3×1 box. Raising `minVoxels` to 8 would hide the sheet too, and it would leave the 0.10 m shell (8 voxels, 2×2×2) with no count margin, so the count cut stays at 6. The extent cut is the one a one-cell streak cannot reach. `minExtent` 1 keeps every component that passes `minVoxels`. The 0.40 m shell in the added, removed, and moved tests is 296 voxels (49× the count cut) and 8 cells on each edge (4× the extent cut). The same generator at side 0.10 m is 8 voxels and 2 cells on each edge: it still adds, removes, and moves, two voxels above the count cut, on the extent floor.
 
 ### Moved pairing
 
@@ -268,7 +271,7 @@ Sort for output, because `Set` iteration order changes per process:
 3. Centroid `x`, then `y`, then `z`, ascending
 4. For `moved`, `fromCentroid` the same way as a final tie-break
 
-`Report.appearedVoxels` and `disappearedVoxels` count keys after dilation and before the `minVoxels` cut, so a test can see that a speck existed and was then dropped.
+`Report.appearedVoxels` and `disappearedVoxels` count keys after dilation and before the `minVoxels` and `minExtent` cuts, so a test can see that a speck or a one-cell sheet existed and was then dropped.
 
 ### Complexity
 
@@ -312,8 +315,8 @@ Product name `change-detect`, target `ChangeDetect`, path `Sources/ChangeDetect/
 
 ```text
 change-detect [--voxel-size m] [--max-range m] [--min-points n]
-              [--tolerance n] [--min-voxels n] [--max-move m]
-              [--no-pair] <before.pcd|before.bin> <after.pcd|after.bin>
+              [--tolerance n] [--min-voxels n] [--min-extent n]
+              [--max-move m] [--no-pair] <before.pcd|before.bin> <after.pcd|after.bin>
 ```
 
 Two positional paths are required. Flags override `Config` and default to the library defaults. `--no-pair` sets `pairMoves` false. Unknown flags and a wrong arity print usage to stderr and exit 1.
@@ -330,7 +333,7 @@ Stdout, one stable block, seconds as milliseconds with one decimal:
 ```text
 before: mid360.bin  points=20064  voxels=12345  dropped=0
 after:  mid360.bin  points=20064  voxels=12345  dropped=0
-voxel_size_m=0.050  tolerance=1  min_points=1  min_voxels=6  pair_moves=true
+voxel_size_m=0.050  tolerance=1  min_points=1  min_voxels=6  min_extent=2  pair_moves=true
 appeared_voxels=0  disappeared_voxels=0
 elapsed_ms=12.3
 regions=0
@@ -370,11 +373,11 @@ Groups:
 
 7. **Noise only.** Start from one dense room+box cloud. Build the before frame by adding a seeded offset in `[-0.01, 0.01]` m on each axis and dropping every point whose seeded draw is `< 0.20`. Build the after frame with a different seed, same ranges. Default config (`tolerance == 1`, `minVoxels == 6`). Expect zero regions. ±1 cm is less than one 5 cm cell, so a point crosses at most one face; dilation absorbs it. A wall cell holds several grid points, and a neighbor cell remains occupied unless a whole neighborhood is deleted, which a 20% drop on this grid does not do. Also assert that the identical cloud compared with itself yields zero regions and `appearedVoxels == 0`.
 
-8. **Threshold.** Room plus box, plus two isolated points that occupy two voxels far from the box. `minVoxels == 6` reports only the box. `minVoxels == 1` reports the box and the speck (`appearedVoxels` includes the speck in both runs).
+8. **Threshold.** Room plus box, plus two isolated points that occupy two voxels far from the box. `minVoxels == 6` reports only the box. `minVoxels == 1` with `minExtent == 1` reports the box and the speck (`appearedVoxels` includes the speck in both runs). The speck is one cell thick, so the default `minExtent` would drop it even at `minVoxels` 1.
 
 9. **Mismatch.** `diff` of a 0.05 m map and a 0.10 m map throws `voxelSizeMismatch`. `tolerance == 5` throws `invalidConfig`.
 
-10. **Performance.** 80,000 points on the room-scale surface grid (repeat the grid with a half-cell jitter pattern if the shell is shorter than 80k, still deterministic). The after cloud is the same points plus a seeded ±1 cm shift and an 8,000-point patch relocated by 1 m (a real change, so clustering does work). Time the second `compare`. Assert elapsed `< 3 s` when `_isDebugAssertConfiguration()` is true and `< 0.1 s` otherwise. Print the measured milliseconds in the passing line.
+10. **Performance.** 80,000 points on the room-scale surface grid (repeat the grid with a half-cell jitter pattern if the shell is shorter than 80k, still deterministic). The after cloud is the same points plus a seeded ±1 cm shift and an 8,000-point patch relocated by 1 m (a real change, so clustering does work). The patch is a one-cell surface, so this call sets `minExtent` 1. The other knobs stay at the defaults. Time the second `compare`. Assert elapsed `< 3 s` when `_isDebugAssertConfiguration()` is true and `< 0.1 s` otherwise. Print the measured milliseconds in the passing line.
 
 The noise-only group and the performance group use separate builders. The performance cloud is large; the behavior tests stay on the small room.
 
@@ -393,11 +396,11 @@ Pre-existing warnings in other files are left as they are.
 
 ## Risks
 
-- **Sparse real returns.** The noise-only guarantee is for the dense synthetic grid. A Mid-360 or JT128 surface cell often holds one return. Independent dropout then creates disappeared voxels, and dilation only saves them when a neighbor survived. `snapshots/a` against `snapshots/b` (rig unmoved, ~10 s apart) is `regions=0` on the JT128 and 4 regions on the Mid-360 at the defaults. Those leftovers are 7–22 voxel wall patches. Raising `minVoxels` to 24 would hide them and also hide any real change under 24 cells, so the default stays 6. `--tolerance 2` absorbs the patches instead, because the other scan still occupies the surface within 10 cm.
+- **Sparse real returns.** The noise-only guarantee is for the dense synthetic grid. A Mid-360 or JT128 surface cell often holds one return. Independent dropout then creates disappeared voxels, and dilation only saves them when a neighbor survived. With evidence on, most of those candidates become unknown rather than disappeared. What remains on the static Mid-360 pair is one-cell-thick, and `minExtent` 2 drops it. See [Static-room blips](#static-room-blips). `--tolerance 2` still absorbs a two-cell slide when that is the motion that should not count. A streak that staircases to two cells on every axis still has to clear `minVoxels` 6. On these two pairs the largest such component is 5 voxels.
 - **Cell faces.** A point parked on a boundary flips cells under a sub-millimeter shift. The synthetic grids are inset from faces. Real clouds will sit on faces; tolerance 1 covers a one-cell flip when the motion is shorter than `voxelSize`. Jitter larger than the voxel (a 1 cm shift in a 5 mm grid) crosses more than one cell and shows up as change. `tolerance` has to be at least `ceil(jitter / voxelSize)`.
 - **Rig motion.** If the tripod moves between snapshots, the whole room is a change. This module does not register clouds.
 - **Cross-sensor files.** `livox_frame` vs `hesai_lidar` will report a room-sized diff. The CLI does not refuse it.
-- **Small objects.** Anything under `minVoxels` cells is dropped on purpose. At 0.05 m and 6 voxels, a cup-sized blob can disappear while a 0.4 m box cannot. Lower `--min-voxels` when looking for small objects, and expect more speckle.
+- **Small objects.** Anything under `minVoxels` cells, or thinner than `minExtent` cells on any axis, is dropped on purpose. At 0.05 m that is a blob under 6 voxels, or a sheet one cell (0.05 m) thick no matter how long. A 0.10 m shell still passes (8 voxels, 2×2×2). A 0.40 m shell cannot be dropped by either default. Lower `--min-voxels` and `--min-extent 1` when looking for a one-cell sheet, and expect the static-room streak back.
 - **Moved false pairs.** Two similar blobs inside `maxMove` with no closer candidate become one `moved` region. The ambiguity gate (the 1.5× second-candidate rule) is what keeps a swap of two identical boxes from being labeled cleanly; that case stays unpaired and should not be asserted as `moved`.
 - **Volume is a voxel count.** A one-return wall becomes a 5 cm slab. `volume` is `count * size³`, the occupied cells, not a mesh volume. A `moved` region's `volume` is the appeared side only.
 - **Release vs debug.** The 100 ms bar is `-O` only. Judging the budget from `swift run` without `-c release` will fail a correct implementation.
@@ -522,11 +525,11 @@ With evidence on, the after cloud has three states per voxel:
 - **Free.** Some cast ray's traversal contains the voxel, and the voxel is not occupied. Occupied wins over free.
 - **Unknown.** Everything else. Unknown is not stored as a set. It is the complement, and only before-occupied keys are classified against it.
 
-A before-occupied voxel that the after map still occupies is unchanged. A before-occupied voxel that is free in the after map is a disappeared candidate. A before-occupied voxel that is unknown increments `unknownVoxels` and is not a disappeared candidate. Dilation then runs on the disappeared candidates only, against `after.occupied`, with the same Chebyshev `tolerance` as v1. A candidate suppressed by dilation is neither disappeared nor unknown: a neighbor explains it, and it increments neither count. `appearedVoxels` and `disappearedVoxels` stay post-dilation and pre-`minVoxels`. `unknownVoxels` is pre-`minVoxels`. Appeared candidates are the v1 set and do not consult the free set.
+A before-occupied voxel that the after map still occupies is unchanged. A before-occupied voxel that is free in the after map is a disappeared candidate. A before-occupied voxel that is unknown increments `unknownVoxels` and is not a disappeared candidate. Dilation then runs on the disappeared candidates only, against `after.occupied`, with the same Chebyshev `tolerance` as v1. A candidate suppressed by dilation is neither disappeared nor unknown: a neighbor explains it, and it increments neither count. `appearedVoxels` and `disappearedVoxels` stay post-dilation and pre-`minVoxels` / pre-`minExtent`. `unknownVoxels` is pre-cut the same way. Appeared candidates are the v1 set and do not consult the free set.
 
 Tolerance does not move an unknown voxel into the disappeared set, and it does not remove it from `unknownVoxels`. A surface that slides toward the sensor leaves the old cell in shadow. That cell stays unknown. A slide away from the sensor, shorter than `tolerance` cells, is free and then suppressed. Both outcomes are required.
 
-`.unobserved` is optional output for the unknown before-occupied keys. Cluster them with the same 26-connectivity, the same geometry, and the same `minVoxels` cut. They take kind `.unobserved`, they sit in `regions` under the v2 order, and they do not enter move pairing. With `reportUnobserved == false` the count is still reported and the regions are not built. An unobserved object is not a change: it cannot become `.moved`, and it is not a disappeared region that failed a threshold.
+`.unobserved` is optional output for the unknown before-occupied keys. Cluster them with the same 26-connectivity, the same geometry, and the same `minVoxels` and `minExtent` cuts. They take kind `.unobserved`, they sit in `regions` under the v2 order, and they do not enter move pairing. With `reportUnobserved == false` the count is still reported and the regions are not built. An unobserved object is not a change: it cannot become `.moved`, and it is not a disappeared region that failed a threshold.
 
 #### Which rays
 
@@ -601,7 +604,7 @@ The loop count is at most `|di| + |dj| + |dk|`. Reaching the cap without landing
 
 `ChangeDetection.json(report:before:after:config:) -> String` is the golden encoder. It is hand-written. `JSONEncoder` is not a substitute: key order and number formatting differ. The CLI `--json` writes that string followed by a single `\n` and nothing else on stdout. Exit codes stay as in v1. The human text block is the output when `--json` is absent. Text floats stay at the v1 decimal widths and are not bit-exact. With evidence on, the text summary line gains `unknown_voxels=<n>` after `disappeared_voxels`. With evidence off that token stays absent, so a v1 grep of the summary line still matches. `.unobserved` prints as the kind word `unobserved` and omits `from_*`.
 
-`--evidence` sets `evidenceOfAbsence`. `--origin x,y,z` sets the origin, default `0,0,0`. `--ray-stride n` and `--unobserved` set the other two fields. Unknown flags still print usage and exit 1.
+`--evidence` sets `evidenceOfAbsence`. `--origin x,y,z` sets the origin, default `0,0,0`. `--ray-stride n` and `--unobserved` set the other two fields. `--min-extent n` sets `minExtent` in voxels (default 2). Unknown flags still print usage and exit 1.
 
 The function return has no leading or trailing whitespace. Encoding:
 
@@ -617,17 +620,17 @@ The function return has no leading or trailing whitespace. Encoding:
 
 Top-level key order: `schema`, `evidence`, `report_unobserved`, `origin_bits`, `ray_stride`, `config`, `before`, `after`, `appeared_voxels`, `disappeared_voxels`, `unknown_voxels`, `regions`.
 
-`schema` is the string `labcommand.change-detection.v2`. `origin_bits` is `[x, y, z]`. `config` key order: `voxel_size_bits`, `max_range_bits`, `min_points`, `tolerance`, `min_voxels`, `pair_moves`, `max_move_bits`, `move_count_ratio_bits`. `before` and `after` key order: `points`, `accepted`, `dropped`, `voxels`, with `points = accepted + dropped`. There is no elapsed-time field and no filename. Timing stays on the human block.
+`schema` is the string `labcommand.change-detection.v2`. `origin_bits` is `[x, y, z]`. `config` key order: `voxel_size_bits`, `max_range_bits`, `min_points`, `tolerance`, `min_voxels`, `min_extent`, `pair_moves`, `max_move_bits`, `move_count_ratio_bits`. `min_extent` is the integer voxel count. `before` and `after` key order: `points`, `accepted`, `dropped`, `voxels`, with `points = accepted + dropped`. There is no elapsed-time field and no filename. Timing stays on the human block.
 
 Region key order: `kind`, `voxel_count`, `min_key`, `centroid_bits`, `bounds_min_bits`, `bounds_max_bits`, `volume_bits`, then for `.moved` only: `from_voxel_count`, `from_min_key`, `from_centroid_bits`, `from_bounds_min_bits`, `from_bounds_max_bits`. Bit arrays are `[x, y, z]`. `kind` is `appeared`, `disappeared`, `moved`, or `unobserved`.
 
 Golden for the clear-line-of-sight fixture in the tests section, which is the library string the in-runner test compares. The CLI file is that string plus `\n`.
 
 ```text
-{"schema":"labcommand.change-detection.v2","evidence":true,"report_unobserved":false,"origin_bits":["00000000","00000000","00000000"],"ray_stride":1,"config":{"voxel_size_bits":"3d4ccccd","max_range_bits":null,"min_points":1,"tolerance":0,"min_voxels":6,"pair_moves":true,"max_move_bits":"3fc00000","move_count_ratio_bits":"40000000"},"before":{"points":9,"accepted":9,"dropped":0,"voxels":9},"after":{"points":1,"accepted":1,"dropped":0,"voxels":1},"appeared_voxels":0,"disappeared_voxels":8,"unknown_voxels":0,"regions":[{"kind":"disappeared","voxel_count":8,"min_key":"4611776178381914112","centroid_bits":["3f99999a","3ccccccd","3ccccccd"],"bounds_min_bits":["3f800000","00000000","00000000"],"bounds_max_bits":["3fb33333","3d4ccccd","3d4ccccd"],"volume_bits":"3a83126f"}]}
+{"schema":"labcommand.change-detection.v2","evidence":true,"report_unobserved":false,"origin_bits":["00000000","00000000","00000000"],"ray_stride":1,"config":{"voxel_size_bits":"3d4ccccd","max_range_bits":null,"min_points":1,"tolerance":0,"min_voxels":6,"min_extent":1,"pair_moves":true,"max_move_bits":"3fc00000","move_count_ratio_bits":"40000000"},"before":{"points":9,"accepted":9,"dropped":0,"voxels":9},"after":{"points":1,"accepted":1,"dropped":0,"voxels":1},"appeared_voxels":0,"disappeared_voxels":8,"unknown_voxels":0,"regions":[{"kind":"disappeared","voxel_count":8,"min_key":"4611776178381914112","centroid_bits":["3f99999a","3ccccccd","3ccccccd"],"bounds_min_bits":["3f800000","00000000","00000000"],"bounds_max_bits":["3fb33333","3d4ccccd","3d4ccccd"],"volume_bits":"3a83126f"}]}
 ```
 
-`min_key` `4611776178381914112` unpacks to `(20, 0, 0)`. The centroid and the AABB are the v2 formulas on indices `i = 20...27`, `j = 0`, `k = 0` at voxel size `0.05` (`0x3d4ccccd`).
+`min_key` `4611776178381914112` unpacks to `(20, 0, 0)`. The centroid and the AABB are the v2 formulas on indices `i = 20...27`, `j = 0`, `k = 0` at voxel size `0.05` (`0x3d4ccccd`). `min_extent` is 1 in this fixture because the column is one cell thick. The library default, and the snapshot goldens, use 2.
 
 ### Performance budget
 
@@ -655,7 +658,7 @@ Three hollow boxes. A cell of the inclusive index box is kept when any axis sits
 
 The before cloud is the shell plus A, B, and C: 89,320 points. The after cloud is those same points with box A translated by +20 cells in `i` (1.00 m; new i is 40...47). B, C, and the shell stay. Both clouds have 89,320 points. That is the ~80k indoor sample: one return per surface voxel, a few boxes, sensor at the center.
 
-Config: voxel size 0.05, `maxRange` nil, evidence on, `rayStride` 1, `tolerance` 1, `minVoxels` 6, `pairMoves` true, origin `(0, 0, 0)`. Warm one untimed `compare`, time the second. Assert elapsed `< 3 s` when `_isDebugAssertConfiguration()` is true and `< 0.1 s` otherwise. The relocated box is a real change, so the timed call clusters. Print the milliseconds.
+Config: voxel size 0.05, `maxRange` nil, evidence on, `rayStride` 1, `tolerance` 1, `minVoxels` 6, `minExtent` 2, `pairMoves` true, origin `(0, 0, 0)`. Warm one untimed `compare`, time the second. Assert elapsed `< 3 s` when `_isDebugAssertConfiguration()` is true and `< 0.1 s` otherwise. The relocated box is a real change, so the timed call clusters. Print the milliseconds.
 
 The shell alone is about 10.5×10⁶ index-Manhattan steps at stride 1. An open-addressed `Int64` probe on every visited cell of that walk measured about 111 ms in release before occupancy is added, which misses a 100 ms `compare`. A dense bit grid of the same walk measured 22 ms release and 230 ms debug. The shipped free-set is that bit grid when the ray index AABB is at most 32 MiB (256×2²⁰ cells): membership of a marked key matches the open-addressed table, and the occupied map stays `Set<Int64>`. Above 32 MiB the free-set is a private open-addressed `Int64` table of the before-only keys a ray actually visits (load factor at most 1/2, hash not seeded per process). Raising `rayStride` is not the fix.
 
@@ -678,11 +681,28 @@ k = Int((x >> 42) % 599) - 299
 keep when i*i + j*j + k*k <= 299*299 and the index triple is new
 ```
 
-Each point is the cell center `(Float32(index) + 0.5) * voxelSize`, one binary32 add and one binary32 multiply, per axis. The after cloud is that list. For the first 8,000 points in generation order, add `Float32(1)` to `x` when the moved point still passes the binary32 `maxRange` test at 15 m; otherwise keep the original point. Config: voxel size 0.05, `maxRange` 15, evidence on, `tolerance` 1, `minVoxels` 6, `pairMoves` true, origin `(0,0,0)`. Run once at `rayStride` 1 and once at `rayStride` 64. Warm one untimed `compare` per stride, time the second. Print both millisecond figures. Do not assert a limit.
+Each point is the cell center `(Float32(index) + 0.5) * voxelSize`, one binary32 add and one binary32 multiply, per axis. The after cloud is that list. For the first 8,000 points in generation order, add `Float32(1)` to `x` when the moved point still passes the binary32 `maxRange` test at 15 m; otherwise keep the original point. Config: voxel size 0.05, `maxRange` 15, evidence on, `tolerance` 1, `minVoxels` 6, `minExtent` 2, `pairMoves` true, origin `(0,0,0)`. Run once at `rayStride` 1 and once at `rayStride` 64. Warm one untimed `compare` per stride, time the second. Print both millisecond figures. Do not assert a limit.
+
+### Static-room blips
+
+Measured on the copied rig snapshots with evidence on, tolerance 1, `minVoxels` 1, `minExtent` 1, pairing on, voxel size 0.05 m, origin `(0, 0, 0)`. `minExtent` 1 turns the span gate off so every component is a region. `voxelCount` on a moved region is the appeared side.
+
+| Sensor | Regions | Voxel-count histogram | Pre-cut appeared / disappeared / unknown |
+|---|---|---|---|
+| JT128 | 50 | 1×44, 2×4, 3×2 | 46 / 14 / 854 |
+| Mid-360 | 272 | 1×234, 2×22, 3×10, 4×4, 5×1, 7×1 | 255 / 104 / 1286 |
+
+The JT128 maximum is 3 voxels. One of those two 3-voxel regions is 2×2×2 cells. Everything else on that pair is one cell thick on some axis.
+
+The Mid-360 maximum is one appeared region of 7 voxels, AABB 5×3×1 cells (0.25 m × 0.15 m × 0.05 m). That is the non-repetitive petal: a sheet one cell thick. Ten other Mid-360 regions are at least 2 cells on every axis, and the largest of those has 5 voxels, which `minVoxels` 6 already drops.
+
+So the defaults split the two shapes. `minVoxels` 6 removes the specks, including every static component that is already two cells thick. `minExtent` 2 removes the 7-voxel sheet, and any longer sheet that stays one cell thick. Together both goldens are `regions` empty. The pre-cut counts above stay in the JSON, so the streak is visible as voxels and not as a region.
+
+The runner's extent group builds a 7-voxel 5×3×1 sheet and expects no region at the defaults, and the same sheet back when `minExtent` is 1. It also adds, removes, and moves a 0.10 m shell (8 voxels, 2×2×2): two voxels over the count cut, and exactly the extent floor. The 0.40 m added, removed, and moved groups assert 296 voxels and a 0.40 m edge on each axis, 49× the count cut and 4× the extent cut.
 
 ### Snapshot goldens
 
-`change-detect --evidence --json` on the rig snapshots, sensor origin `(0, 0, 0)` because those clouds are already in the sensor frame. Defaults otherwise (voxel 0.05 m, tolerance 1, `minVoxels` 6, `rayStride` 1, pairing on).
+`change-detect --evidence --json` on the rig snapshots, sensor origin `(0, 0, 0)` because those clouds are already in the sensor frame. Defaults otherwise (voxel 0.05 m, tolerance 1, `minVoxels` 6, `minExtent` 2, `rayStride` 1, pairing on). Both files have an empty `regions` array.
 
 | Before | After | Golden |
 |---|---|---|
@@ -693,7 +713,7 @@ The four inputs are copied beside the goldens as `a-jt128.bin`, `b-jt128.bin`, `
 
 ### Tests
 
-Points are cell centers under the formula above. Origin is `(0, 0, 0)` unless a test says otherwise. Evidence on, `rayStride` 1, `tolerance` 0, `minVoxels` 6, voxel size 0.05, `pairMoves` true, `maxRange` nil, unless a test says otherwise. `tolerance` 0 keeps dilation from swallowing the cell next to an occluder; the tests are about evidence.
+Points are cell centers under the formula above. Origin is `(0, 0, 0)` unless a test says otherwise. Evidence on, `rayStride` 1, `tolerance` 0, `minVoxels` 6, `minExtent` 1, voxel size 0.05, `pairMoves` true, `maxRange` nil, unless a test says otherwise. `tolerance` 0 keeps dilation from swallowing the cell next to an occluder. `minExtent` 1 keeps these one-cell columns; the tests are about evidence, and the streak gate is covered by the extent group above. The indoor timing call sets `minExtent` 2.
 
 1. **Occluded back face.** Before centers at `i = 8...15` (front), `i = 16` (occluder), and `i = 20...27` (back), all with `j = 0`, `k = 0`. After is only the occluder. The one ray ends at the center of voxel 16, so the walk marks `i = 0...15` and stops before 16. The front is free: one `.disappeared` region, `voxelCount` 8, AABB of `i = 8...15`. The back is unknown: `unknownVoxels == 8`, and no disappeared region contains those keys. The occluder is in both maps, so `appearedVoxels == 0`. With `reportUnobserved` true, one `.unobserved` region has the AABB of `i = 20...27` and is not `.disappeared`.
 

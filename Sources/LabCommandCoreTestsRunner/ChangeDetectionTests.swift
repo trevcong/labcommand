@@ -158,6 +158,13 @@ private func expectBox(
     expect(region.boundsMax.x - region.boundsMin.x < 0.70, "\(label) x span reaches the walls \(region.boundsMax.x - region.boundsMin.x)")
     expect(region.boundsMax.y - region.boundsMin.y < 0.70, "\(label) y span reaches the walls")
     expect(region.boundsMax.z - region.boundsMin.z < 0.70, "\(label) z span reaches the walls")
+    // 0.40 m shell: 296 voxels is 49× minVoxels 6, and each edge is 8 cells against minExtent 2.
+    expect(region.voxelCount == 296, "\(label) voxelCount \(region.voxelCount)")
+    let spanX = region.boundsMax.x - region.boundsMin.x
+    let spanY = region.boundsMax.y - region.boundsMin.y
+    let spanZ = region.boundsMax.z - region.boundsMin.z
+    expect(near(spanX, 0.40, 0.001) && near(spanY, 0.40, 0.001) && near(spanZ, 0.40, 0.001),
+           "\(label) span \(spanX) \(spanY) \(spanZ)")
 }
 
 // MARK: - Groups
@@ -342,7 +349,8 @@ func testChangeDetectionNoiseOnly() {
     let after = frame(jitter(cloud, seed: 0xD1B5_4A32_D192_ED03))
     let report = must({ try ChangeDetection.compare(before, after) }, "noise")
     let defaults = ChangeDetection.Config()
-    expect(defaults.tolerance == 1 && defaults.minVoxels == 6, "noise uses the default tolerance and minVoxels")
+    expect(defaults.tolerance == 1 && defaults.minVoxels == 6 && defaults.minExtent == 2,
+           "noise uses the default tolerance, minVoxels, and minExtent")
     expect(defaults.rayStride == 1 && defaults.evidenceOfAbsence == false, "rayStride defaults to 1 and evidence is off")
     expect(report.regions.isEmpty,
            "±1 cm and 20% dropout should leave no region, got \(report.regions.count) appearedVoxels=\(report.appearedVoxels) disappearedVoxels=\(report.disappearedVoxels)")
@@ -362,6 +370,7 @@ func testChangeDetectionThreshold() {
     tight.minVoxels = 6
     var loose = ChangeDetection.Config()
     loose.minVoxels = 1
+    loose.minExtent = 1
     let dropped = must({ try ChangeDetection.compare(before, after, config: tight) }, "minVoxels 6")
     let kept = must({ try ChangeDetection.compare(before, after, config: loose) }, "minVoxels 1")
     expect(dropped.regions.count == 1 && dropped.regions[0].kind == .appeared,
@@ -371,6 +380,48 @@ func testChangeDetectionThreshold() {
     expect(kept.regions[1].voxelCount == 2 && kept.regions[1].kind == .appeared, "the speck is two voxels")
     expect(dropped.appearedVoxels == kept.appearedVoxels, "the cut does not change the pre-threshold count")
     expect(dropped.appearedVoxels == dropped.regions[0].voxelCount + 2, "appearedVoxels includes the speck")
+}
+
+/// A one-cell sheet is the Mid-360 static blip. A 0.10 m shell is the object that must still pass.
+func testChangeDetectionExtent() {
+    let sheet = [
+        cellPoint(0, 0, 0), cellPoint(1, 0, 0), cellPoint(2, 0, 0), cellPoint(3, 0, 0), cellPoint(4, 0, 0),
+        cellPoint(1, 1, 0), cellPoint(2, 2, 0),
+    ]
+    let streak = must({ try ChangeDetection.compare(frame([]), frame(sheet)) }, "streak")
+    expect(streak.appearedVoxels == 7, "streak keeps its voxels before the cut, got \(streak.appearedVoxels)")
+    expect(streak.regions.isEmpty, "a 5×3×1 sheet is not a change, regions \(streak.regions.count)")
+
+    var open = ChangeDetection.Config()
+    open.minExtent = 1
+    let kept = must({ try ChangeDetection.compare(frame([]), frame(sheet), config: open) }, "streak open")
+    expect(kept.regions.count == 1 && kept.regions[0].voxelCount == 7 && kept.regions[0].kind == .appeared,
+           "minExtent 1 keeps the seven-voxel sheet")
+
+    let center = Point3D(x: 1, y: 0.5, z: 0.30)
+    let room = roomShell()
+    let small = boxShell(center: center, side: 0.10)
+    let added = must({ try ChangeDetection.compare(frame(room), frame(room + small)) }, "10 cm added")
+    expect(added.regions.count == 1 && added.regions[0].kind == .appeared, "10 cm box appears")
+    guard let appeared = added.regions.first else { return }
+    expect(appeared.voxelCount == 8, "10 cm voxelCount \(appeared.voxelCount)")
+    expect(near(appeared.boundsMax.x - appeared.boundsMin.x, 0.10, 0.001), "10 cm x span")
+    expect(near(appeared.boundsMax.y - appeared.boundsMin.y, 0.10, 0.001), "10 cm y span")
+    expect(near(appeared.boundsMax.z - appeared.boundsMin.z, 0.10, 0.001), "10 cm z span")
+    expect(appeared.voxelCount >= 6 + 2, "10 cm count clears minVoxels 6")
+
+    let removed = must({ try ChangeDetection.compare(frame(room + small), frame(room)) }, "10 cm removed")
+    expect(removed.regions.count == 1 && removed.regions[0].kind == .disappeared, "10 cm box disappears")
+    expect(removed.regions[0].voxelCount == 8, "10 cm removed voxelCount \(removed.regions[0].voxelCount)")
+
+    let beforeCenter = Point3D(x: 0, y: 0.5, z: 0.30)
+    let beforeBox = boxShell(center: beforeCenter, side: 0.10)
+    let afterBox = beforeBox.map { Point3D(x: $0.x + 1, y: $0.y, z: $0.z) }
+    let moved = must({
+        try ChangeDetection.compare(frame(room + beforeBox), frame(room + afterBox))
+    }, "10 cm moved")
+    expect(moved.regions.count == 1 && moved.regions[0].kind == .moved, "10 cm box moves")
+    expect(moved.regions[0].voxelCount == 8 && moved.regions[0].fromVoxelCount == 8, "10 cm move keeps both shells")
 }
 
 func testChangeDetectionMismatch() {
@@ -429,6 +480,16 @@ func testChangeDetectionMismatch() {
     } catch {
         expect(false, "far origin threw \(error)")
     }
+
+    var thin = ChangeDetection.Config()
+    thin.minExtent = 0
+    do {
+        _ = try ChangeDetection.occupancyMap(room, config: thin)
+        expect(false, "minExtent 0 should throw")
+    } catch ChangeDetection.Failure.invalidConfig {
+    } catch {
+        expect(false, "minExtent 0 threw \(error)")
+    }
 }
 
 private func seconds(_ duration: Duration) -> Double {
@@ -478,10 +539,14 @@ func testChangeDetectionPerformance() -> Double {
     }
     let before = frame(points)
     let after = frame(shifted)
-    _ = must({ try ChangeDetection.compare(before, after) }, "warmup")
+    // The relocated patch is a room surface, one cell thick. The streak gate would
+    // drop it and the timer would not cluster a real change.
+    var config = ChangeDetection.Config()
+    config.minExtent = 1
+    _ = must({ try ChangeDetection.compare(before, after, config: config) }, "warmup")
     let clock = ContinuousClock()
     let start = clock.now
-    let report = must({ try ChangeDetection.compare(before, after) }, "timed compare")
+    let report = must({ try ChangeDetection.compare(before, after, config: config) }, "timed compare")
     let elapsed = seconds(start.duration(to: clock.now))
     expect(report.beforeVoxels > 0 && !report.regions.isEmpty, "the relocated patch is a real change")
     let limit = compareBudgetSeconds(debug: _isDebugAssertConfiguration())
@@ -509,7 +574,8 @@ private func evidenceConfig(
     minPoints: Int = 1,
     reportUnobserved: Bool = false,
     stride: Int = 1,
-    origin: Point3D = Point3D(x: 0, y: 0, z: 0)
+    origin: Point3D = Point3D(x: 0, y: 0, z: 0),
+    minExtent: Int = 1
 ) -> ChangeDetection.Config {
     var config = ChangeDetection.Config()
     config.evidenceOfAbsence = true
@@ -519,6 +585,8 @@ private func evidenceConfig(
     config.reportUnobserved = reportUnobserved
     config.rayStride = stride
     config.origin = origin
+    // Column fixtures are one cell thick. Callers that diff a real box pass 2.
+    config.minExtent = minExtent
     return config
 }
 
@@ -543,7 +611,7 @@ private func clearLinePair() -> (before: [Point3D], after: [Point3D]) {
     (column(Array(20...27) + [40]), column([40]))
 }
 
-private let clearLineGolden = "{\"schema\":\"labcommand.change-detection.v2\",\"evidence\":true,\"report_unobserved\":false,\"origin_bits\":[\"00000000\",\"00000000\",\"00000000\"],\"ray_stride\":1,\"config\":{\"voxel_size_bits\":\"3d4ccccd\",\"max_range_bits\":null,\"min_points\":1,\"tolerance\":0,\"min_voxels\":6,\"pair_moves\":true,\"max_move_bits\":\"3fc00000\",\"move_count_ratio_bits\":\"40000000\"},\"before\":{\"points\":9,\"accepted\":9,\"dropped\":0,\"voxels\":9},\"after\":{\"points\":1,\"accepted\":1,\"dropped\":0,\"voxels\":1},\"appeared_voxels\":0,\"disappeared_voxels\":8,\"unknown_voxels\":0,\"regions\":[{\"kind\":\"disappeared\",\"voxel_count\":8,\"min_key\":\"4611776178381914112\",\"centroid_bits\":[\"3f99999a\",\"3ccccccd\",\"3ccccccd\"],\"bounds_min_bits\":[\"3f800000\",\"00000000\",\"00000000\"],\"bounds_max_bits\":[\"3fb33333\",\"3d4ccccd\",\"3d4ccccd\"],\"volume_bits\":\"3a83126f\"}]}"
+private let clearLineGolden = "{\"schema\":\"labcommand.change-detection.v2\",\"evidence\":true,\"report_unobserved\":false,\"origin_bits\":[\"00000000\",\"00000000\",\"00000000\"],\"ray_stride\":1,\"config\":{\"voxel_size_bits\":\"3d4ccccd\",\"max_range_bits\":null,\"min_points\":1,\"tolerance\":0,\"min_voxels\":6,\"min_extent\":1,\"pair_moves\":true,\"max_move_bits\":\"3fc00000\",\"move_count_ratio_bits\":\"40000000\"},\"before\":{\"points\":9,\"accepted\":9,\"dropped\":0,\"voxels\":9},\"after\":{\"points\":1,\"accepted\":1,\"dropped\":0,\"voxels\":1},\"appeared_voxels\":0,\"disappeared_voxels\":8,\"unknown_voxels\":0,\"regions\":[{\"kind\":\"disappeared\",\"voxel_count\":8,\"min_key\":\"4611776178381914112\",\"centroid_bits\":[\"3f99999a\",\"3ccccccd\",\"3ccccccd\"],\"bounds_min_bits\":[\"3f800000\",\"00000000\",\"00000000\"],\"bounds_max_bits\":[\"3fb33333\",\"3d4ccccd\",\"3d4ccccd\"],\"volume_bits\":\"3a83126f\"}]}"
 
 func testChangeDetectionOccluded() {
     let before = column(Array(8...15) + [16] + Array(20...27))
@@ -627,6 +695,7 @@ func testChangeDetectionEvidenceOrder() {
     var config = ChangeDetection.Config()
     config.tolerance = 0
     config.minVoxels = 1
+    config.minExtent = 1
     config.pairMoves = false
     let report = diffRecord([], after, config, "min-key order").report
     expect(report.regions.count == 2, "two same-size regions \(report.regions.count)")
@@ -671,7 +740,7 @@ func testChangeDetectionDeterminism() {
     let room = roomShell()
     let beforeBox = boxShell(center: Point3D(x: 0, y: 0.5, z: 0.30))
     let afterBox = beforeBox.map { Point3D(x: $0.x + 1, y: $0.y, z: $0.z) }
-    let movedConfig = evidenceConfig(tolerance: 1, minVoxels: 6)
+    let movedConfig = evidenceConfig(tolerance: 1, minVoxels: 6, minExtent: 2)
     let movedBefore = room + beforeBox
     let movedAfter = room + afterBox
     let moved = diffRecord(movedBefore, movedAfter, movedConfig, "moved")
@@ -732,7 +801,7 @@ func testChangeDetectionIndoorPerformance() -> Double {
            "indoor clouds are 89320 points, got \(beforePoints.count) and \(afterPoints.count)")
     let before = frame(beforePoints)
     let after = frame(afterPoints)
-    let config = evidenceConfig(tolerance: 1, minVoxels: 6)
+    let config = evidenceConfig(tolerance: 1, minVoxels: 6, minExtent: 2)
     _ = must({ try ChangeDetection.compare(before, after, config: config) }, "indoor warmup")
     let clock = ContinuousClock()
     let start = clock.now
@@ -779,7 +848,7 @@ private func longRayClouds() -> (before: [Point3D], after: [Point3D]) {
 }
 
 private func timeLongRay(before: PointCloudFrame, after: PointCloudFrame, stride: Int) -> Double {
-    var config = evidenceConfig(tolerance: 1, minVoxels: 6, stride: stride)
+    var config = evidenceConfig(tolerance: 1, minVoxels: 6, stride: stride, minExtent: 2)
     config.maxRange = 15
     _ = must({ try ChangeDetection.compare(before, after, config: config) }, "long-ray warmup stride \(stride)")
     let clock = ContinuousClock()
@@ -857,6 +926,8 @@ func runChangeDetectionTests() {
     print("  ChangeDetection: ±1 cm jitter and 20% dropout leave no region; a cloud matches itself"); passed()
     testChangeDetectionThreshold()
     print("  ChangeDetection: minVoxels drops a two-voxel speck and still counts it"); passed()
+    testChangeDetectionExtent()
+    print("  ChangeDetection: a one-cell sheet drops; a 10 cm shell still adds, removes, and moves"); passed()
     testChangeDetectionMismatch()
     print("  ChangeDetection: voxel-size mismatch, tolerance 5, rayStride, and origin are rejected"); passed()
     testChangeDetectionOccluded()
