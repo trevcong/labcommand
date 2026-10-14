@@ -9,10 +9,26 @@ private let gridPhase: Float = 0.007
 private struct SplitMix {
     var state: UInt64
 
-    mutating func unit() -> Float {
+    mutating func next() -> UInt64 {
         state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
-        return Float(state >> 40) / Float(1 << 24)
+        return state
     }
+
+    mutating func unit() -> Float {
+        Float(next() >> 40) / Float(1 << 24)
+    }
+}
+
+private func shuffledPoints(_ points: [Point3D], seed: UInt64) -> [Point3D] {
+    var out = points
+    var rng = SplitMix(state: seed)
+    var index = out.count
+    while index > 1 {
+        index -= 1
+        let swap = Int(rng.next() % UInt64(index + 1))
+        out.swapAt(index, swap)
+    }
+    return out
 }
 
 /// Samples in `[low + phase, high)` on the 0.02 m lattice, off cell faces.
@@ -258,6 +274,7 @@ func testChangeDetectionBoxAdded() {
     guard let region = report.regions.first else { return }
     expectBox(region, kind: .appeared, center: center, label: "added")
     expect(report.disappearedVoxels == 0, "the room cancels")
+    expect(report.unknownVoxels == 0, "evidence off reports no unknown voxels")
     expect(report.appearedVoxels == region.voxelCount, "the box is the whole appeared set")
     expect(region.fromCentroid == nil && region.fromVoxelCount == nil, "an appearance has no from-pose")
 }
@@ -324,8 +341,9 @@ func testChangeDetectionNoiseOnly() {
     let before = frame(jitter(cloud, seed: 0x9E37_79B9_7F4A_7C15))
     let after = frame(jitter(cloud, seed: 0xD1B5_4A32_D192_ED03))
     let report = must({ try ChangeDetection.compare(before, after) }, "noise")
-    expect(ChangeDetection.Config().tolerance == 1 && ChangeDetection.Config().minVoxels == 6,
-           "noise uses the default tolerance and minVoxels")
+    let defaults = ChangeDetection.Config()
+    expect(defaults.tolerance == 1 && defaults.minVoxels == 6, "noise uses the default tolerance and minVoxels")
+    expect(defaults.rayStride == 1 && defaults.evidenceOfAbsence == false, "rayStride defaults to 1 and evidence is off")
     expect(report.regions.isEmpty,
            "±1 cm and 20% dropout should leave no region, got \(report.regions.count) appearedVoxels=\(report.appearedVoxels) disappearedVoxels=\(report.disappearedVoxels)")
 
@@ -379,6 +397,37 @@ func testChangeDetectionMismatch() {
     } catch ChangeDetection.Failure.invalidConfig {
     } catch {
         expect(false, "tolerance 5 threw \(error)")
+    }
+
+    var stride = ChangeDetection.Config()
+    stride.rayStride = 3
+    do {
+        _ = try ChangeDetection.occupancyMap(room, config: stride)
+        expect(false, "rayStride 3 should throw")
+    } catch ChangeDetection.Failure.invalidConfig {
+    } catch {
+        expect(false, "rayStride 3 threw \(error)")
+    }
+
+    var origin = ChangeDetection.Config()
+    origin.origin = Point3D(x: .nan, y: 0, z: 0)
+    do {
+        _ = try ChangeDetection.occupancyMap(room, config: origin)
+        expect(false, "a non-finite origin should throw")
+    } catch ChangeDetection.Failure.invalidConfig {
+    } catch {
+        expect(false, "non-finite origin threw \(error)")
+    }
+
+    var far = ChangeDetection.Config()
+    far.evidenceOfAbsence = true
+    far.origin = Point3D(x: 80_000, y: 0, z: 0)
+    do {
+        _ = try ChangeDetection.occupancyMap(room, config: far)
+        expect(false, "an origin outside the grid should throw when evidence is on")
+    } catch ChangeDetection.Failure.invalidConfig {
+    } catch {
+        expect(false, "far origin threw \(error)")
     }
 }
 
@@ -440,6 +489,357 @@ func testChangeDetectionPerformance() -> Double {
     return elapsed * 1000
 }
 
+// MARK: - Evidence
+
+private func axisCenter(_ index: Int) -> Float {
+    (Float(index) + 0.5) * 0.05
+}
+
+private func cellPoint(_ i: Int, _ j: Int, _ k: Int) -> Point3D {
+    Point3D(x: axisCenter(i), y: axisCenter(j), z: axisCenter(k))
+}
+
+private func column(_ indices: [Int]) -> [Point3D] {
+    indices.map { cellPoint($0, 0, 0) }
+}
+
+private func evidenceConfig(
+    tolerance: Int = 0,
+    minVoxels: Int = 6,
+    minPoints: Int = 1,
+    reportUnobserved: Bool = false,
+    stride: Int = 1,
+    origin: Point3D = Point3D(x: 0, y: 0, z: 0)
+) -> ChangeDetection.Config {
+    var config = ChangeDetection.Config()
+    config.evidenceOfAbsence = true
+    config.tolerance = tolerance
+    config.minVoxels = minVoxels
+    config.minPoints = minPoints
+    config.reportUnobserved = reportUnobserved
+    config.rayStride = stride
+    config.origin = origin
+    return config
+}
+
+private func diffRecord(
+    _ before: [Point3D],
+    _ after: [Point3D],
+    _ config: ChangeDetection.Config,
+    _ label: String
+) -> (report: ChangeDetection.Report, json: String) {
+    let beforeMap = must({ try ChangeDetection.occupancyMap(frame(before), config: config) }, "\(label) before")
+    let afterMap = must({ try ChangeDetection.occupancyMap(frame(after), config: config) }, "\(label) after")
+    let report = must({ try ChangeDetection.diff(beforeMap, afterMap, config: config) }, label)
+    return (report, ChangeDetection.json(report: report, before: beforeMap, after: afterMap, config: config))
+}
+
+private func expectBound(_ value: Float, _ index: Int, _ label: String, exclusive: Bool) {
+    let expected = exclusive ? Float(index + 1) * 0.05 : Float(index) * 0.05
+    expect(value == expected, "\(label) \(value) vs \(expected)")
+}
+
+private func clearLinePair() -> (before: [Point3D], after: [Point3D]) {
+    (column(Array(20...27) + [40]), column([40]))
+}
+
+private let clearLineGolden = "{\"schema\":\"labcommand.change-detection.v2\",\"evidence\":true,\"report_unobserved\":false,\"origin_bits\":[\"00000000\",\"00000000\",\"00000000\"],\"ray_stride\":1,\"config\":{\"voxel_size_bits\":\"3d4ccccd\",\"max_range_bits\":null,\"min_points\":1,\"tolerance\":0,\"min_voxels\":6,\"pair_moves\":true,\"max_move_bits\":\"3fc00000\",\"move_count_ratio_bits\":\"40000000\"},\"before\":{\"points\":9,\"accepted\":9,\"dropped\":0,\"voxels\":9},\"after\":{\"points\":1,\"accepted\":1,\"dropped\":0,\"voxels\":1},\"appeared_voxels\":0,\"disappeared_voxels\":8,\"unknown_voxels\":0,\"regions\":[{\"kind\":\"disappeared\",\"voxel_count\":8,\"min_key\":\"4611776178381914112\",\"centroid_bits\":[\"3f99999a\",\"3ccccccd\",\"3ccccccd\"],\"bounds_min_bits\":[\"3f800000\",\"00000000\",\"00000000\"],\"bounds_max_bits\":[\"3fb33333\",\"3d4ccccd\",\"3d4ccccd\"],\"volume_bits\":\"3a83126f\"}]}"
+
+func testChangeDetectionOccluded() {
+    let before = column(Array(8...15) + [16] + Array(20...27))
+    let after = column([16])
+    let hidden = diffRecord(before, after, evidenceConfig(), "occluded")
+    expect(hidden.report.appearedVoxels == 0, "occluder is in both maps, appeared \(hidden.report.appearedVoxels)")
+    expect(hidden.report.unknownVoxels == 8, "back face unknown \(hidden.report.unknownVoxels)")
+    expect(hidden.report.disappearedVoxels == 8, "front free \(hidden.report.disappearedVoxels)")
+    expect(hidden.report.regions.count == 1, "one disappeared region, got \(hidden.report.regions.count)")
+    guard let front = hidden.report.regions.first else { return }
+    expect(front.kind == .disappeared && front.voxelCount == 8, "front region \(front.kind) \(front.voxelCount)")
+    expectBound(front.boundsMin.x, 8, "front min x", exclusive: false)
+    expectBound(front.boundsMax.x, 15, "front max x", exclusive: true)
+    expect(front.boundsMin.y == 0 && front.boundsMin.z == 0, "front yz min")
+    expect(front.boundsMax.y == 0.05 && front.boundsMax.z == 0.05, "front yz max")
+
+    var show = evidenceConfig()
+    show.reportUnobserved = true
+    let full = diffRecord(before, after, show, "occluded unobserved").report
+    let kinds = full.regions.map { "\($0.kind.rawValue):\($0.voxelCount)" }.joined(separator: ",")
+    expect(full.regions.count == 2, "disappeared plus unobserved, got \(kinds)")
+    expect(full.regions[0].kind == .disappeared && full.regions[0].voxelCount == 8, "front stays disappeared")
+    expect(full.regions[1].kind == .unobserved && full.regions[1].voxelCount == 8, "back is unobserved, not disappeared")
+    expectBound(full.regions[1].boundsMin.x, 20, "back min x", exclusive: false)
+    expectBound(full.regions[1].boundsMax.x, 27, "back max x", exclusive: true)
+    expect(full.unknownVoxels == 8, "reporting regions does not change the unknown count")
+}
+
+func testChangeDetectionClearLine() {
+    let pair = clearLinePair()
+    let record = diffRecord(pair.before, pair.after, evidenceConfig(), "clear line")
+    expect(record.report.appearedVoxels == 0, "backstop is in both maps")
+    expect(record.report.unknownVoxels == 0, "the column is free, unknown \(record.report.unknownVoxels)")
+    expect(record.report.disappearedVoxels == 8, "eight free voxels")
+    expect(record.report.regions.count == 1, "one region \(record.report.regions.count)")
+    guard let region = record.report.regions.first else { return }
+    expect(region.kind == .disappeared && region.voxelCount == 8, "disappeared column")
+    expect(region.minKey == 4_611_776_178_381_914_112, "min key \(region.minKey)")
+    expect(record.json == clearLineGolden, "clear-line JSON drifted")
+}
+
+func testChangeDetectionDiagonalTie() {
+    let origin = cellPoint(0, 0, 0)
+    let before = [
+        cellPoint(0, 0, 0),
+        cellPoint(1, 1, 1),
+        cellPoint(2, 2, 2),
+        cellPoint(1, 0, 0),
+        cellPoint(3, 3, 3),
+    ]
+    let config = evidenceConfig(minVoxels: 1, reportUnobserved: true, origin: origin)
+    let report = diffRecord(before, [cellPoint(3, 3, 3)], config, "diagonal").report
+    let kinds = report.regions.map { "\($0.kind.rawValue):\($0.voxelCount)" }.joined(separator: ",")
+    expect(report.appearedVoxels == 0, "endpoint is in both maps")
+    expect(report.disappearedVoxels == 3, "diagonal cells \(report.disappearedVoxels)")
+    expect(report.unknownVoxels == 1, "face neighbor \(report.unknownVoxels)")
+    expect(report.regions.count == 2, "two regions \(kinds)")
+    expect(report.regions[0].kind == .disappeared && report.regions[0].voxelCount == 3, "diagonal region")
+    expect(report.regions[1].kind == .unobserved && report.regions[1].voxelCount == 1, "unobserved face neighbor")
+    expectBound(report.regions[1].boundsMin.x, 1, "neighbor min x", exclusive: false)
+    expect(report.regions[1].boundsMin.y == 0 && report.regions[1].boundsMin.z == 0, "neighbor stays off the diagonal")
+}
+
+func testChangeDetectionSlide() {
+    let toward = diffRecord(column([20]), column([19]), evidenceConfig(tolerance: 1, minVoxels: 1), "slide toward").report
+    expect(toward.unknownVoxels == 1, "old cell stays in shadow \(toward.unknownVoxels)")
+    expect(toward.disappearedVoxels == 0, "shadow is not a disappearance")
+    expect(toward.appearedVoxels == 0, "the one-cell slide toward the sensor is dilated away")
+
+    let away = diffRecord(column([20]), column([21]), evidenceConfig(tolerance: 1, minVoxels: 1), "slide away").report
+    expect(away.unknownVoxels == 0 && away.disappearedVoxels == 0 && away.appearedVoxels == 0,
+           "slide away is free then suppressed, unknown \(away.unknownVoxels) disappeared \(away.disappearedVoxels) appeared \(away.appearedVoxels)")
+}
+
+func testChangeDetectionEvidenceOrder() {
+    // A line on x from i=0...5, and a line on y at i=1. Same count. The x line
+    // has the smaller min key and the larger centroid x.
+    var after: [Point3D] = []
+    for i in 0...5 { after.append(cellPoint(i, 0, 0)) }
+    for j in 20...25 { after.append(cellPoint(1, j, 0)) }
+    var config = ChangeDetection.Config()
+    config.tolerance = 0
+    config.minVoxels = 1
+    config.pairMoves = false
+    let report = diffRecord([], after, config, "min-key order").report
+    expect(report.regions.count == 2, "two same-size regions \(report.regions.count)")
+    expect(report.regions[0].voxelCount == 6 && report.regions[1].voxelCount == 6, "equal counts")
+    expect(report.regions[0].minKey < report.regions[1].minKey, "minKey ascending")
+    expect(report.regions[0].centroid.x > report.regions[1].centroid.x,
+           "centroid x would have ordered them the other way")
+
+    config.pairMoves = true
+    let tied = diffRecord(
+        [cellPoint(-20, 0, 0), cellPoint(20, 0, 0)],
+        [cellPoint(0, 0, 0)],
+        config,
+        "distance tie"
+    ).report
+    expect(!tied.regions.contains { $0.kind == .moved }, "equal distances stay unpaired")
+    expect(tied.regions.count == 3, "one appeared and two disappeared, got \(tied.regions.count)")
+}
+
+func testChangeDetectionDeterminism() {
+    let pair = clearLinePair()
+    let before = pair.before + pair.before
+    let after = pair.after + pair.after
+    let once = evidenceConfig(minPoints: 1)
+    let original = diffRecord(before, after, once, "duplicated")
+    let shuffled = diffRecord(
+        shuffledPoints(before, seed: 0xC0FFEE),
+        shuffledPoints(after, seed: 0xC0FFEE),
+        once,
+        "shuffled"
+    )
+    expect(shuffled.report == original.report, "shuffled report matches")
+    expect(shuffled.json == original.json, "shuffled JSON matches")
+
+    var counted = once
+    counted.minPoints = 2
+    let doubled = diffRecord(before, after, counted, "minPoints 2")
+    let expected = original.json.replacingOccurrences(of: "\"min_points\":1", with: "\"min_points\":2")
+    expect(doubled.json == expected, "minPoints 2 JSON matches except min_points")
+    expect(doubled.report.regions == original.report.regions, "minPoints 2 occupancy is unchanged")
+
+    let room = roomShell()
+    let beforeBox = boxShell(center: Point3D(x: 0, y: 0.5, z: 0.30))
+    let afterBox = beforeBox.map { Point3D(x: $0.x + 1, y: $0.y, z: $0.z) }
+    let movedConfig = evidenceConfig(tolerance: 1, minVoxels: 6)
+    let movedBefore = room + beforeBox
+    let movedAfter = room + afterBox
+    let moved = diffRecord(movedBefore, movedAfter, movedConfig, "moved")
+    let movedShuffle = diffRecord(
+        shuffledPoints(movedBefore, seed: 0xC0FFEE),
+        shuffledPoints(movedAfter, seed: 0xC0FFEE),
+        movedConfig,
+        "moved shuffle"
+    )
+    expect(movedShuffle.report == moved.report, "shuffled move report matches")
+    expect(movedShuffle.json == moved.json, "shuffled move JSON matches")
+}
+
+func testChangeDetectionWideGridFallback() {
+    let before = [cellPoint(10, 10, 10), cellPoint(700, 700, 700)]
+    let after = [cellPoint(700, 700, 700)]
+    let report = diffRecord(before, after, evidenceConfig(minVoxels: 1), "wide fallback").report
+    expect(report.disappearedVoxels == 1, "the diagonal still marks (10,10,10), disappeared \(report.disappearedVoxels)")
+    expect(report.unknownVoxels == 0, "the cell is not unknown")
+    expect(report.appearedVoxels == 0, "the endpoint is in both maps")
+    expect(report.regions.count == 1 && report.regions[0].kind == .disappeared, "one disappeared cell")
+}
+
+private func indoorPoints(moveBoxA: Bool) -> [Point3D] {
+    let voxel: Float = 0.05
+    func center(_ index: Int) -> Float { (Float(index) + 0.5) * voxel }
+    func point(_ i: Int, _ j: Int, _ k: Int) -> Point3D {
+        Point3D(x: center(i), y: center(j), z: center(k))
+    }
+    var points: [Point3D] = []
+    points.reserveCapacity(90_000)
+    for i in -80..<80 {
+        for j in -80..<80 {
+            for k in -30..<30 where i == -80 || i == 79 || j == -80 || j == 79 || k == -30 || k == 29 {
+                points.append(point(i, j, k))
+            }
+        }
+    }
+    func addBox(i0: Int, i1: Int, j0: Int, j1: Int, k0: Int, k1: Int, shiftI: Int) {
+        for i in i0...i1 {
+            for j in j0...j1 {
+                for k in k0...k1 where i == i0 || i == i1 || j == j0 || j == j1 || k == k0 || k == k1 {
+                    points.append(point(i + shiftI, j, k))
+                }
+            }
+        }
+    }
+    addBox(i0: 20, i1: 27, j0: -10, j1: -3, k0: -8, k1: -1, shiftI: moveBoxA ? 20 : 0)
+    addBox(i0: -30, i1: -23, j0: 16, j1: 23, k0: -4, k1: 3, shiftI: 0)
+    addBox(i0: -6, i1: 5, j0: -28, j1: -17, k0: 4, k1: 13, shiftI: 0)
+    return points
+}
+
+func testChangeDetectionIndoorPerformance() -> Double {
+    let beforePoints = indoorPoints(moveBoxA: false)
+    let afterPoints = indoorPoints(moveBoxA: true)
+    expect(beforePoints.count == 89_320 && afterPoints.count == 89_320,
+           "indoor clouds are 89320 points, got \(beforePoints.count) and \(afterPoints.count)")
+    let before = frame(beforePoints)
+    let after = frame(afterPoints)
+    let config = evidenceConfig(tolerance: 1, minVoxels: 6)
+    _ = must({ try ChangeDetection.compare(before, after, config: config) }, "indoor warmup")
+    let clock = ContinuousClock()
+    let start = clock.now
+    let report = must({ try ChangeDetection.compare(before, after, config: config) }, "indoor timed")
+    let elapsed = seconds(start.duration(to: clock.now))
+    let summary = report.regions.map { "\($0.kind.rawValue):\($0.voxelCount)" }.joined(separator: ",")
+    expect(report.regions.contains { $0.kind == .moved }, "the relocated box is a moved region (\(summary))")
+    let limit = compareBudgetSeconds(debug: _isDebugAssertConfiguration())
+    expect(elapsed < limit, "indoor compare took \(elapsed) s, limit \(limit) s")
+    return elapsed * 1000
+}
+
+private func longRayClouds() -> (before: [Point3D], after: [Point3D]) {
+    let voxel: Float = 0.05
+    var state: UInt64 = 0x15A6
+    var seen = Set<Int64>(minimumCapacity: 80_000)
+    var points: [Point3D] = []
+    points.reserveCapacity(80_000)
+    while points.count < 80_000 {
+        state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        let i = Int(state % 599) - 299
+        let j = Int((state >> 21) % 599) - 299
+        let k = Int((state >> 42) % 599) - 299
+        if i * i + j * j + k * k > 299 * 299 { continue }
+        guard let key = VoxelKey.pack(i: i, j: j, k: k), seen.insert(key).inserted else { continue }
+        points.append(Point3D(
+            x: (Float(i) + 0.5) * voxel,
+            y: (Float(j) + 0.5) * voxel,
+            z: (Float(k) + 0.5) * voxel
+        ))
+    }
+    var after = points
+    let maxRange: Float = 15
+    let maxRange2 = maxRange * maxRange
+    for index in 0..<8_000 {
+        var moved = after[index]
+        moved.x += Float(1)
+        let range2 = (moved.x * moved.x + moved.y * moved.y) + moved.z * moved.z
+        if range2 <= maxRange2 {
+            after[index] = moved
+        }
+    }
+    return (points, after)
+}
+
+private func timeLongRay(before: PointCloudFrame, after: PointCloudFrame, stride: Int) -> Double {
+    var config = evidenceConfig(tolerance: 1, minVoxels: 6, stride: stride)
+    config.maxRange = 15
+    _ = must({ try ChangeDetection.compare(before, after, config: config) }, "long-ray warmup stride \(stride)")
+    let clock = ContinuousClock()
+    let start = clock.now
+    _ = must({ try ChangeDetection.compare(before, after, config: config) }, "long-ray stride \(stride)")
+    return seconds(start.duration(to: clock.now)) * 1000
+}
+
+func testChangeDetectionLongRayBenchmark() -> (stride1: Double, stride64: Double) {
+    let clouds = longRayClouds()
+    expect(clouds.before.count == 80_000 && clouds.after.count == 80_000, "long-ray clouds are 80k points")
+    let before = frame(clouds.before)
+    let after = frame(clouds.after)
+    let stride1 = timeLongRay(before: before, after: after, stride: 1)
+    let stride64 = timeLongRay(before: before, after: after, stride: 64)
+    return (stride1, stride64)
+}
+
+private func expectSameBytes(_ got: Data, _ want: Data, _ label: String) {
+    if got == want { return }
+    let count = min(got.count, want.count)
+    var index = 0
+    while index < count && got[index] == want[index] {
+        index += 1
+    }
+    expect(false, "\(label) JSON differs at byte \(index) (got \(got.count), file \(want.count))")
+}
+
+func testChangeDetectionSnapshotGoldens() -> (jt128: ChangeDetection.Report, mid360: ChangeDetection.Report, jt128ms: Double, mid360ms: Double) {
+    func load(_ name: String) -> Data {
+        let path = "Tests/Fixtures/change-detection/\(name)"
+        guard let data = FileManager.default.contents(atPath: path) else {
+            expect(false, "missing \(path)")
+            return Data()
+        }
+        return data
+    }
+    func check(_ sensor: String) -> (ChangeDetection.Report, Double) {
+        let beforeData = load("a-\(sensor).bin")
+        let afterData = load("b-\(sensor).bin")
+        let golden = load("\(sensor).json")
+        let before = must({ try PointCloud2CDR.decode(beforeData) }, "\(sensor) before")
+        let after = must({ try PointCloud2CDR.decode(afterData) }, "\(sensor) after")
+        var config = ChangeDetection.Config()
+        config.evidenceOfAbsence = true
+        let clock = ContinuousClock()
+        let start = clock.now
+        let beforeMap = must({ try ChangeDetection.occupancyMap(before, config: config) }, "\(sensor) map")
+        let afterMap = must({ try ChangeDetection.occupancyMap(after, config: config) }, "\(sensor) map")
+        let report = must({ try ChangeDetection.diff(beforeMap, afterMap, config: config) }, "\(sensor) diff")
+        let elapsed = seconds(start.duration(to: clock.now)) * 1000
+        let encoded = Data((ChangeDetection.json(report: report, before: beforeMap, after: afterMap, config: config) + "\n").utf8)
+        expectSameBytes(encoded, golden, sensor)
+        return (report, elapsed)
+    }
+    let jt128 = check("jt128")
+    let mid360 = check("mid360")
+    return (jt128.0, mid360.0, jt128.1, mid360.1)
+}
+
 func runChangeDetectionTests() {
     testChangeDetectionKeyMath()
     print("  ChangeDetection: pack/unpack round-trips; floor quantization; non-finite points drop"); passed()
@@ -458,8 +858,32 @@ func runChangeDetectionTests() {
     testChangeDetectionThreshold()
     print("  ChangeDetection: minVoxels drops a two-voxel speck and still counts it"); passed()
     testChangeDetectionMismatch()
-    print("  ChangeDetection: voxel-size mismatch and tolerance 5 are rejected"); passed()
+    print("  ChangeDetection: voxel-size mismatch, tolerance 5, rayStride, and origin are rejected"); passed()
+    testChangeDetectionOccluded()
+    print("  ChangeDetection: an occluder frees the front face and leaves the back unknown"); passed()
+    testChangeDetectionClearLine()
+    print("  ChangeDetection: a clear line of sight is the v2 JSON golden"); passed()
+    testChangeDetectionDiagonalTie()
+    print("  ChangeDetection: a corner tie steps the diagonal and leaves the face neighbor unknown"); passed()
+    testChangeDetectionSlide()
+    print("  ChangeDetection: a slide toward the sensor stays unknown; a slide away is suppressed"); passed()
+    testChangeDetectionEvidenceOrder()
+    print("  ChangeDetection: regions sort by min key, and equal move distances stay unpaired"); passed()
+    testChangeDetectionDeterminism()
+    print("  ChangeDetection: shuffled input and minPoints 2 keep the same JSON"); passed()
+    testChangeDetectionWideGridFallback()
+    print("  ChangeDetection: a ray outside the bit grid still marks the cell it crosses"); passed()
     let milliseconds = testChangeDetectionPerformance()
     let budget = compareBudgetLabel(debug: _isDebugAssertConfiguration())
     print("  ChangeDetection: 80k compare \(String(format: "%.1f", milliseconds)) ms (\(budget))"); passed()
+    let indoor = testChangeDetectionIndoorPerformance()
+    print("  ChangeDetection: indoor evidence stride 1 \(String(format: "%.1f", indoor)) ms (\(budget))"); passed()
+    let longRay = testChangeDetectionLongRayBenchmark()
+    print("  ChangeDetection: long-ray stride 1 \(String(format: "%.1f", longRay.stride1)) ms, stride 64 \(String(format: "%.1f", longRay.stride64)) ms (printed)"); passed()
+    let snapshots = testChangeDetectionSnapshotGoldens()
+    func regionLine(_ report: ChangeDetection.Report) -> String {
+        "regions=\(report.regions.count) appeared=\(report.appearedVoxels) disappeared=\(report.disappearedVoxels) unknown=\(report.unknownVoxels)"
+    }
+    print("  ChangeDetection: jt128 golden \(regionLine(snapshots.jt128)) \(String(format: "%.1f", snapshots.jt128ms)) ms"); passed()
+    print("  ChangeDetection: mid360 golden \(regionLine(snapshots.mid360)) \(String(format: "%.1f", snapshots.mid360ms)) ms"); passed()
 }

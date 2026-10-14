@@ -13,7 +13,9 @@ private func usage() -> Never {
         """
         change-detect [--voxel-size m] [--max-range m] [--min-points n]
                       [--tolerance n] [--min-voxels n] [--max-move m]
-                      [--no-pair] <before.pcd|before.bin> <after.pcd|after.bin>
+                      [--no-pair] [--evidence] [--origin x,y,z]
+                      [--ray-stride n] [--unobserved] [--json]
+                      <before.pcd|before.bin> <after.pcd|after.bin>
 
         """
     )
@@ -31,8 +33,27 @@ private func requireValue(_ args: [String], _ index: inout Int) -> String {
     return value
 }
 
-private func parseConfig(_ args: [String]) -> (ChangeDetection.Config, String, String) {
+private struct Invocation {
+    var config: ChangeDetection.Config
+    var json: Bool
+    var before: String
+    var after: String
+}
+
+private func parseOrigin(_ text: String) -> Point3D? {
+    let parts = text.split(separator: ",", omittingEmptySubsequences: false)
+    guard parts.count == 3,
+          let x = Float(parts[0]),
+          let y = Float(parts[1]),
+          let z = Float(parts[2]) else {
+        return nil
+    }
+    return Point3D(x: x, y: y, z: z)
+}
+
+private func parseConfig(_ args: [String]) -> Invocation {
     var config = ChangeDetection.Config()
+    var json = false
     var paths: [String] = []
     var index = 0
     while index < args.count {
@@ -64,6 +85,23 @@ private func parseConfig(_ args: [String]) -> (ChangeDetection.Config, String, S
             config.maxMove = value
         case "--no-pair":
             config.pairMoves = false
+        case "--evidence":
+            config.evidenceOfAbsence = true
+        case "--origin":
+            guard index + 1 < args.count else { usage() }
+            index += 1
+            let text = args[index]
+            if text.hasPrefix("--") { usage() }
+            guard let origin = parseOrigin(text) else { usage() }
+            config.origin = origin
+        case "--ray-stride":
+            let text = requireValue(args, &index)
+            guard let value = Int(text) else { usage() }
+            config.rayStride = value
+        case "--unobserved":
+            config.reportUnobserved = true
+        case "--json":
+            json = true
         case "--":
             paths.append(contentsOf: args[(index + 1)...])
             index = args.count
@@ -74,7 +112,7 @@ private func parseConfig(_ args: [String]) -> (ChangeDetection.Config, String, S
         index += 1
     }
     guard paths.count == 2 else { usage() }
-    return (config, paths[0], paths[1])
+    return Invocation(config: config, json: json, before: paths[0], after: paths[1])
 }
 
 private func loadCloud(_ path: String) throws -> PointCloudFrame {
@@ -124,7 +162,11 @@ private func describe(_ error: Error) -> String {
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
-let (config, beforePath, afterPath) = parseConfig(arguments)
+private let invocation = parseConfig(arguments)
+let config = invocation.config
+let beforePath = invocation.before
+let afterPath = invocation.after
+let emitJSON = invocation.json
 
 let beforeFrame: PointCloudFrame
 let afterFrame: PointCloudFrame
@@ -150,6 +192,11 @@ do {
     fail(describe(error))
 }
 
+if emitJSON {
+    print(ChangeDetection.json(report: report, before: beforeMap, after: afterMap, config: config))
+    exit(0)
+}
+
 let beforeName = URL(fileURLWithPath: beforePath).lastPathComponent
 let afterName = URL(fileURLWithPath: afterPath).lastPathComponent
 print("before: \(beforeName)  points=\(beforeFrame.count)  voxels=\(beforeMap.occupied.count)  dropped=\(beforeMap.droppedPoints)")
@@ -157,7 +204,11 @@ print("after:  \(afterName)  points=\(afterFrame.count)  voxels=\(afterMap.occup
 print(
     "voxel_size_m=\(format(config.voxelSize, 3))  tolerance=\(config.tolerance)  min_points=\(config.minPoints)  min_voxels=\(config.minVoxels)  pair_moves=\(config.pairMoves)"
 )
-print("appeared_voxels=\(report.appearedVoxels)  disappeared_voxels=\(report.disappearedVoxels)")
+if config.evidenceOfAbsence {
+    print("appeared_voxels=\(report.appearedVoxels)  disappeared_voxels=\(report.disappearedVoxels)  unknown_voxels=\(report.unknownVoxels)")
+} else {
+    print("appeared_voxels=\(report.appearedVoxels)  disappeared_voxels=\(report.disappearedVoxels)")
+}
 print("elapsed_ms=\(format(Float(elapsed), 1))")
 print("regions=\(report.regions.count)")
 for (index, region) in report.regions.enumerated() {
