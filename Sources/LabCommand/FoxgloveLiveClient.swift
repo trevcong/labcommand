@@ -12,7 +12,7 @@ struct LiveClouds {
 }
 
 /// Live lidar clouds for the 3D view, straight from foxglove_bridge on Spark
-/// (`ws://<spark>:8765`, subprotocol `foxglove.websocket.v1`).
+/// (`ws://<spark>:8765`, subprotocol `foxglove.sdk.v1` or `foxglove.websocket.v1`).
 ///
 /// The socket, CDR decode, decimation and TF into `world` run off the main thread;
 /// this object only publishes the latest frame per sensor, at ~10 Hz. It is its own
@@ -28,7 +28,8 @@ final class FoxgloveLiveClient: ObservableObject {
     /// which would yank the camera out of the operator's hands.
     @Published private(set) var sourceGeneration = 0
 
-    /// Mission-log lines: connection state, subscriptions, first-frame point counts.
+    /// Mission-log lines (`[FoxgloveLive] …`): connection state, subscriptions,
+    /// first-frame point counts.
     var onLog: ((String, MissionEventKind) -> Void)?
     /// No live data within `fallbackAfter`, the socket failed, or the stream stopped.
     var onFallback: (() -> Void)?
@@ -158,9 +159,12 @@ final class FoxgloveLiveClient: ObservableObject {
     }
 
     private func log(_ text: String, kind: MissionEventKind, mission: Bool) {
-        print("[FoxgloveLive] \(text)")
+        let line = "[FoxgloveLive] \(text)"
+        // stderr, not print(): stdout is block-buffered off a TTY, so a killed or
+        // redirected app would lose exactly the lines that explain a dead stream.
+        FileHandle.standardError.write(Data((line + "\n").utf8))
         if mission {
-            onLog?("live view: \(text)", kind)
+            onLog?(line, kind)
         }
     }
 }
@@ -259,7 +263,7 @@ private enum LiveStream {
 
     struct Sink: Sendable {
         let mailbox: LiveFrameMailbox
-        /// (text, kind, alsoMissionLog). Everything is printed; only state changes
+        /// (text, kind, alsoMissionLog). Everything goes to stderr; only state changes
         /// reach the mission log, so an offline Spark can't flood it with retries.
         let log: @MainActor @Sendable (String, MissionEventKind, Bool) -> Void
     }
@@ -339,7 +343,7 @@ private enum LiveStream {
         guard let url = URL(string: endpoint) else {
             return ConnectionEnd(opened: false, reason: "bad URL")
         }
-        let socket = session.webSocketTask(with: url, protocols: [FoxgloveProtocol.subprotocol])
+        let socket = session.webSocketTask(with: url, protocols: FoxgloveProtocol.subprotocols)
         socket.maximumMessageSize = maxMessageBytes
         let health = OSAllocatedUnfairLock(initialState: SocketHealth())
         socket.resume()
@@ -422,6 +426,11 @@ private enum LiveStream {
     private static func describe(_ error: Error, socket: URLSessionWebSocketTask) -> String {
         if socket.closeCode != .invalid {
             return "server closed the socket (code \(socket.closeCode.rawValue))"
+        }
+        // A refused upgrade (e.g. an unsupported subprotocol) is otherwise just
+        // "bad server response".
+        if let http = socket.response as? HTTPURLResponse, http.statusCode != 101 {
+            return "handshake refused (HTTP \(http.statusCode)) — \(error.localizedDescription)"
         }
         return error.localizedDescription
     }

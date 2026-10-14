@@ -1,10 +1,14 @@
 import Foundation
 
-/// The slice of the Foxglove WebSocket protocol (`foxglove.websocket.v1`) the live
-/// 3D view needs: channel advertisements in, subscriptions out, message data in.
+/// The slice of the Foxglove WebSocket protocol the live 3D view needs: channel
+/// advertisements in, subscriptions out, message data in.
 /// Pure parsing — the socket lives in the app's `FoxgloveLiveClient`.
 public enum FoxgloveProtocol {
-    public static let subprotocol = "foxglove.websocket.v1"
+    /// Offered in this order on the upgrade. Spark's foxglove_bridge (built on
+    /// foxglove-sdk-cpp v0.25.1, ROS jazzy) answers HTTP 400 unless `foxglove.sdk.v1`
+    /// is offered; older bridges only know `foxglove.websocket.v1`. The message
+    /// format the live view uses is the same for both.
+    public static let subprotocols = ["foxglove.sdk.v1", "foxglove.websocket.v1"]
     public static let cdrEncoding = "cdr"
 
     /// Binary opcode 0x01: uint32 LE subscription id, uint64 LE receive time (ns), payload.

@@ -139,7 +139,9 @@ func testFoxgloveMessageDataFeedsCDRDecoder() {
 }
 
 func testFoxgloveLiveTopics() {
-    expect(FoxgloveProtocol.subprotocol == "foxglove.websocket.v1", "subprotocol name")
+    // foxglove-sdk-cpp bridges refuse the upgrade (HTTP 400) without sdk.v1.
+    expect(FoxgloveProtocol.subprotocols.first == "foxglove.sdk.v1", "sdk.v1 offered first")
+    expect(FoxgloveProtocol.subprotocols.contains("foxglove.websocket.v1"), "legacy subprotocol still offered")
     expect(FoxgloveProtocol.liveSensor(forTopic: "/livox/lidar") == .mid360, "/livox/lidar is the Mid-360")
     expect(FoxgloveProtocol.liveSensor(forTopic: "/lidar_points") == .jt128, "/lidar_points is the JT128")
     for topic in ["/livox/imu", "/cloud_registered", "/Laser_map", "livox/lidar", "/lidar_points/extra", ""] {
