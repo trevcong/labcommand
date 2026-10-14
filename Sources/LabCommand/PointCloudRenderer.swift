@@ -355,12 +355,8 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         needsInitialFit = false
     }
     
-    /// Fit camera to show all loaded points using projected bbox extents.
-    /// Uses projected bbox fit (not bounding-sphere) for better fill on flat/wide clouds.
-    /// Camera looks from Y-negative toward center (Z-up convention):
-    /// - X extent → screen horizontal (width)
-    /// - Z extent → screen vertical (height)
-    /// - Y extent → depth (along view direction)
+    /// Fit camera to show all loaded points using exact fit algorithm.
+    /// Uses the real elevated camera orientation to compute distance.
     public func fitToBounds(logOnce: Bool = false) {
         guard let bb = boundingBox else {
             // No bounds, use default view
@@ -371,24 +367,23 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             return
         }
         
-        let target = (bb.min + bb.max) * 0.5
+        // Convert SIMD bounds to Point3D for CameraMath
+        let bbMin = Point3D(x: bb.min.x, y: bb.min.y, z: bb.min.z)
+        let bbMax = Point3D(x: bb.max.x, y: bb.max.y, z: bb.max.z)
         
-        // Half-extents perpendicular to view direction
-        let halfWidth = (bb.max.x - bb.min.x) / 2   // screen horizontal
-        let halfHeight = (bb.max.z - bb.min.z) / 2  // screen vertical
+        // Use CameraMath's exact fit algorithm
+        let (eyeP, centerP, distance) = CameraMath.fitToBounds(
+            min: bbMin,
+            max: bbMax,
+            fovY: Self.fovY,
+            aspect: aspect,
+            margin: 0.9,
+            elevation: CameraMath.defaultElevation
+        )
         
-        // Compute horizontal FOV from vertical FOV and aspect ratio
-        let fovX = 2 * atan(tan(Self.fovY / 2) * aspect)
-        
-        // Distance needed for each axis to fit in view
-        let distForWidth = halfWidth / tan(fovX / 2)
-        let distForHeight = halfHeight / tan(Self.fovY / 2)
-        
-        // Take the max (limiting axis) and apply 1.1 margin for 80-90% fill
-        let distance = max(max(distForWidth, distForHeight) * 1.1, 0.1)
-        
-        // Position camera looking from Y-negative toward center, Z-up
-        let eye = target + SIMD3<Float>(0, -distance, distance * 0.3)
+        // Convert back to SIMD
+        let eye = SIMD3<Float>(eyeP.x, eyeP.y, eyeP.z)
+        let target = SIMD3<Float>(centerP.x, centerP.y, centerP.z)
         let up = SIMD3<Float>(0, 0, 1)
         viewMatrix = Self.lookAt(eye: eye, center: target, up: up)
         

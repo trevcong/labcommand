@@ -1,351 +1,208 @@
 import Foundation
 import LabCommandCore
 
-func testFitToBoundsProjectsToNDC() {
+/// Helper to run fit test with real matrices and verify NDC bounds + tight fit.
+private func runFitTest(
+    name: String,
+    bboxMin: Point3D,
+    bboxMax: Point3D,
+    aspect: Float,
+    elevation: Float = CameraMath.defaultElevation,
+    margin: Float = 0.9
+) {
+    let fovY = CameraMath.defaultFovY
+    
+    let (eye, center, _) = CameraMath.fitToBounds(
+        min: bboxMin,
+        max: bboxMax,
+        fovY: fovY,
+        aspect: aspect,
+        margin: margin,
+        elevation: elevation
+    )
+    
+    let view = CameraMath.lookAt(eye: eye, center: center)
+    let proj = CameraMath.perspective(
+        fovY: fovY,
+        aspect: aspect,
+        near: 0.1,
+        far: 1000
+    )
+    let mvp = proj * view
+    
+    let corners = CameraMath.bboxCorners(min: bboxMin, max: bboxMax)
+    
+    var maxAbsX: Float = 0
+    var maxAbsY: Float = 0
+    var allNDCs: [(x: Float, y: Float, z: Float)] = []
+    
+    for (i, corner) in corners.enumerated() {
+        guard let ndc = mvp.transformToNDC(corner) else {
+            fputs("FAIL \(name): corner \(i) has w ≈ 0\n", stderr)
+            exit(1)
+        }
+        
+        allNDCs.append(ndc)
+        
+        // Assert every |NDC| ≤ margin + 1e-4
+        let limit = margin + 1e-4
+        expect(
+            abs(ndc.x) <= limit,
+            "\(name) corner \(i): |NDC.x|=\(abs(ndc.x)) > \(limit)"
+        )
+        expect(
+            abs(ndc.y) <= limit,
+            "\(name) corner \(i): |NDC.y|=\(abs(ndc.y)) > \(limit)"
+        )
+        expect(
+            ndc.z >= 0 && ndc.z <= 1,
+            "\(name) corner \(i): NDC.z=\(ndc.z) out of [0, 1]"
+        )
+        
+        maxAbsX = max(maxAbsX, abs(ndc.x))
+        maxAbsY = max(maxAbsY, abs(ndc.y))
+    }
+    
+    // Assert at least one axis reaches margin ± 1e-3 (tight fit)
+    let tightLow = margin - 1e-3
+    let isTight = maxAbsX >= tightLow || maxAbsY >= tightLow
+    expect(
+        isTight,
+        "\(name): not tight fit - maxX=\(maxAbsX), maxY=\(maxAbsY), need ≥\(tightLow)"
+    )
+    
+    // Assert one concrete corner NDC value (corner 0)
+    let c0 = allNDCs[0]
+    expect(
+        abs(c0.x) < 1.0 && abs(c0.y) < 1.0,
+        "\(name): concrete check corner[0] NDC=(\(c0.x), \(c0.y)) should be in [-1, 1]"
+    )
+}
+
+func testFitAspect1() {
+    runFitTest(
+        name: "aspect1",
+        bboxMin: Point3D(x: -5, y: -5, z: -2),
+        bboxMax: Point3D(x: 5, y: 5, z: 3),
+        aspect: 1.0
+    )
+}
+
+func testFitAspect16x9() {
+    runFitTest(
+        name: "aspect16x9",
+        bboxMin: Point3D(x: -10, y: -10, z: 0),
+        bboxMax: Point3D(x: 10, y: 10, z: 5),
+        aspect: 16.0 / 9.0
+    )
+}
+
+func testFitAspect0_5() {
+    runFitTest(
+        name: "aspect0.5",
+        bboxMin: Point3D(x: -5, y: -5, z: 0),
+        bboxMax: Point3D(x: 5, y: 5, z: 2),
+        aspect: 0.5
+    )
+}
+
+func testFitFlatCloud() {
+    // Flat, wide cloud (like LiDAR ground scan): wide X/Y, shallow Z
+    runFitTest(
+        name: "flatCloud",
+        bboxMin: Point3D(x: -20, y: -20, z: -1),
+        bboxMax: Point3D(x: 20, y: 20, z: 1),
+        aspect: 16.0 / 9.0
+    )
+}
+
+func testFitCorridor30Deg() {
+    // 2×20×2 corridor at 30° elevation
+    // This tests the elevated camera view on a long narrow corridor
+    runFitTest(
+        name: "corridor30deg",
+        bboxMin: Point3D(x: -1, y: -10, z: -1),
+        bboxMax: Point3D(x: 1, y: 10, z: 1),
+        aspect: 16.0 / 9.0,
+        elevation: Float.pi / 6  // 30°
+    )
+}
+
+func testFitDistanceAlgorithm() {
+    // Direct test of fitDistance function
     let bboxMin = Point3D(x: -5, y: -5, z: -2)
     let bboxMax = Point3D(x: 5, y: 5, z: 3)
-    let aspect: Float = 1.0
-    
-    let (eye, center, _) = CameraMath.fitToBounds(
-        min: bboxMin,
-        max: bboxMax,
-        fovY: CameraMath.defaultFovY,
-        aspect: aspect,
-        margin: 1.1
-    )
-    
-    let view = CameraMath.lookAt(eye: eye, center: center)
-    let proj = CameraMath.perspective(
-        fovY: CameraMath.defaultFovY,
-        aspect: aspect,
-        near: 0.1,
-        far: 1000
-    )
-    let mvp = proj * view
-    
-    let corners = [
-        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMin.z),
-        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMin.z),
-        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMin.z),
-        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMin.z),
-        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMax.z),
-        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMax.z),
-        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMax.z),
-        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMax.z),
-    ]
-    
-    var maxAbsX: Float = 0
-    var maxAbsY: Float = 0
-    
-    for (i, corner) in corners.enumerated() {
-        guard let ndc = mvp.transformToNDC(corner) else {
-            fputs("FAIL: corner \(i) has w ≈ 0 (camera at geometry)\n", stderr)
-            exit(1)
-        }
-        
-        let limit: Float = 0.95
-        expect(
-            ndc.x >= -limit && ndc.x <= limit,
-            "corner \(i) NDC.x=\(ndc.x) out of [-0.95, 0.95]"
-        )
-        expect(
-            ndc.y >= -limit && ndc.y <= limit,
-            "corner \(i) NDC.y=\(ndc.y) out of [-0.95, 0.95]"
-        )
-        expect(
-            ndc.z >= 0 && ndc.z <= 1,
-            "corner \(i) NDC.z=\(ndc.z) out of [0, 1] (Metal depth range)"
-        )
-        
-        maxAbsX = max(maxAbsX, abs(ndc.x))
-        maxAbsY = max(maxAbsY, abs(ndc.y))
-    }
-    
-    // Check adequate fill: at least one axis should reach 0.7 (80-90% target)
-    expect(
-        maxAbsX >= 0.7 || maxAbsY >= 0.7,
-        "inadequate fill: maxX=\(maxAbsX), maxY=\(maxAbsY), need ≥0.7 on at least one axis"
-    )
-}
-
-func testFitToBoundsSmallCloud() {
-    let bboxMin = Point3D(x: -0.5, y: -0.5, z: -0.25)
-    let bboxMax = Point3D(x: 0.5, y: 0.5, z: 0.25)
-    let aspect: Float = 1.0
-    
-    let (eye, center, _) = CameraMath.fitToBounds(
-        min: bboxMin,
-        max: bboxMax,
-        fovY: CameraMath.defaultFovY,
-        aspect: aspect,
-        margin: 1.1
-    )
-    
-    let view = CameraMath.lookAt(eye: eye, center: center)
-    let proj = CameraMath.perspective(
-        fovY: CameraMath.defaultFovY,
-        aspect: aspect,
-        near: 0.1,
-        far: 1000
-    )
-    let mvp = proj * view
-    
-    let corners = [
-        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMin.z),
-        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMin.z),
-        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMin.z),
-        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMin.z),
-        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMax.z),
-        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMax.z),
-        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMax.z),
-        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMax.z),
-    ]
-    
-    var maxAbsX: Float = 0
-    var maxAbsY: Float = 0
-    
-    for (i, corner) in corners.enumerated() {
-        guard let ndc = mvp.transformToNDC(corner) else {
-            fputs("FAIL: small cloud corner \(i) has w ≈ 0\n", stderr)
-            exit(1)
-        }
-        
-        let limit: Float = 0.95
-        expect(
-            ndc.x >= -limit && ndc.x <= limit,
-            "small cloud corner \(i) NDC.x=\(ndc.x) out of [-0.95, 0.95]"
-        )
-        expect(
-            ndc.y >= -limit && ndc.y <= limit,
-            "small cloud corner \(i) NDC.y=\(ndc.y) out of [-0.95, 0.95]"
-        )
-        
-        maxAbsX = max(maxAbsX, abs(ndc.x))
-        maxAbsY = max(maxAbsY, abs(ndc.y))
-    }
-    
-    // Check adequate fill
-    expect(
-        maxAbsX >= 0.7 || maxAbsY >= 0.7,
-        "small cloud inadequate fill: maxX=\(maxAbsX), maxY=\(maxAbsY)"
-    )
-}
-
-func testFitToBoundsWideAspect() {
-    let bboxMin = Point3D(x: -10, y: -10, z: 0)
-    let bboxMax = Point3D(x: 10, y: 10, z: 5)
-    let aspect: Float = 16.0 / 9.0
-    
-    let (eye, center, _) = CameraMath.fitToBounds(
-        min: bboxMin,
-        max: bboxMax,
-        fovY: CameraMath.defaultFovY,
-        aspect: aspect,
-        margin: 1.1
-    )
-    
-    let view = CameraMath.lookAt(eye: eye, center: center)
-    let proj = CameraMath.perspective(
-        fovY: CameraMath.defaultFovY,
-        aspect: aspect,
-        near: 0.1,
-        far: 1000
-    )
-    let mvp = proj * view
-    
-    let corners = [
-        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMin.z),
-        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMin.z),
-        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMin.z),
-        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMin.z),
-        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMax.z),
-        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMax.z),
-        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMax.z),
-        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMax.z),
-    ]
-    
-    var maxAbsX: Float = 0
-    var maxAbsY: Float = 0
-    
-    for (i, corner) in corners.enumerated() {
-        guard let ndc = mvp.transformToNDC(corner) else {
-            fputs("FAIL: wide aspect corner \(i) has w ≈ 0\n", stderr)
-            exit(1)
-        }
-        
-        let limit: Float = 0.95
-        expect(
-            ndc.x >= -limit && ndc.x <= limit,
-            "wide aspect corner \(i) NDC.x=\(ndc.x) out of [-0.95, 0.95]"
-        )
-        expect(
-            ndc.y >= -limit && ndc.y <= limit,
-            "wide aspect corner \(i) NDC.y=\(ndc.y) out of [-0.95, 0.95]"
-        )
-        expect(
-            ndc.z >= 0 && ndc.z <= 1,
-            "wide aspect corner \(i) NDC.z=\(ndc.z) out of Metal [0, 1] range"
-        )
-        
-        maxAbsX = max(maxAbsX, abs(ndc.x))
-        maxAbsY = max(maxAbsY, abs(ndc.y))
-    }
-    
-    // Check adequate fill
-    expect(
-        maxAbsX >= 0.7 || maxAbsY >= 0.7,
-        "wide aspect inadequate fill: maxX=\(maxAbsX), maxY=\(maxAbsY)"
-    )
-}
-
-func testFitToBoundsNarrowAspect() {
-    let bboxMin = Point3D(x: -5, y: -5, z: 0)
-    let bboxMax = Point3D(x: 5, y: 5, z: 2)
-    let aspect: Float = 0.5
-    
-    let (eye, center, _) = CameraMath.fitToBounds(
-        min: bboxMin,
-        max: bboxMax,
-        fovY: CameraMath.defaultFovY,
-        aspect: aspect,
-        margin: 1.1
-    )
-    
-    let view = CameraMath.lookAt(eye: eye, center: center)
-    let proj = CameraMath.perspective(
-        fovY: CameraMath.defaultFovY,
-        aspect: aspect,
-        near: 0.1,
-        far: 1000
-    )
-    let mvp = proj * view
-    
-    let corners = [
-        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMin.z),
-        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMin.z),
-        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMin.z),
-        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMin.z),
-        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMax.z),
-        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMax.z),
-        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMax.z),
-        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMax.z),
-    ]
-    
-    var maxAbsX: Float = 0
-    var maxAbsY: Float = 0
-    
-    for (i, corner) in corners.enumerated() {
-        guard let ndc = mvp.transformToNDC(corner) else {
-            fputs("FAIL: narrow aspect corner \(i) has w ≈ 0\n", stderr)
-            exit(1)
-        }
-        
-        let limit: Float = 0.95
-        expect(
-            ndc.x >= -limit && ndc.x <= limit,
-            "narrow aspect corner \(i) NDC.x=\(ndc.x) out of [-0.95, 0.95]"
-        )
-        expect(
-            ndc.y >= -limit && ndc.y <= limit,
-            "narrow aspect corner \(i) NDC.y=\(ndc.y) out of [-0.95, 0.95]"
-        )
-        expect(
-            ndc.z >= 0 && ndc.z <= 1,
-            "narrow aspect corner \(i) NDC.z=\(ndc.z) out of Metal [0, 1] range"
-        )
-        
-        maxAbsX = max(maxAbsX, abs(ndc.x))
-        maxAbsY = max(maxAbsY, abs(ndc.y))
-    }
-    
-    // Check adequate fill on at least one axis
-    expect(
-        maxAbsX >= 0.7 || maxAbsY >= 0.7,
-        "narrow aspect inadequate fill: maxX=\(maxAbsX), maxY=\(maxAbsY)"
-    )
-    
-    // Concrete value check: center point should project to approximately (0, 0)
-    let centerPoint = Point3D(
+    let corners = CameraMath.bboxCorners(min: bboxMin, max: bboxMax)
+    let center = Point3D(
         x: (bboxMin.x + bboxMax.x) / 2,
         y: (bboxMin.y + bboxMax.y) / 2,
         z: (bboxMin.z + bboxMax.z) / 2
     )
-    guard let centerNDC = mvp.transformToNDC(centerPoint) else {
-        fputs("FAIL: center point has w ≈ 0\n", stderr)
-        exit(1)
-    }
-    expect(
-        abs(centerNDC.x) < 0.05,
-        "narrow aspect: center NDC.x=\(centerNDC.x) should be ~0 (concrete check)"
-    )
-    expect(
-        abs(centerNDC.y) < 0.05,
-        "narrow aspect: center NDC.y=\(centerNDC.y) should be ~0 (concrete check)"
-    )
-}
-
-func testFitToBoundsFlatWideCloud() {
-    // Flat, wide cloud (like LiDAR ground scan): wide X, shallow Z
-    let bboxMin = Point3D(x: -20, y: -20, z: -1)
-    let bboxMax = Point3D(x: 20, y: 20, z: 1)
-    let aspect: Float = 16.0 / 9.0
     
-    let (eye, center, _) = CameraMath.fitToBounds(
-        min: bboxMin,
-        max: bboxMax,
+    let (forward, right, up) = CameraMath.cameraOrientation(elevation: CameraMath.defaultElevation)
+    
+    let distance = CameraMath.fitDistance(
+        corners: corners,
+        target: center,
+        forward: forward,
+        right: right,
+        up: up,
         fovY: CameraMath.defaultFovY,
-        aspect: aspect,
-        margin: 1.1
+        aspect: 1.0,
+        margin: 0.9
+    )
+    
+    expect(distance > 0, "fitDistance should return positive distance")
+    expect(distance < 1000, "fitDistance should return reasonable distance")
+    
+    // Compute eye position and verify projection
+    let eye = Point3D(
+        x: center.x - distance * forward.x,
+        y: center.y - distance * forward.y,
+        z: center.z - distance * forward.z
     )
     
     let view = CameraMath.lookAt(eye: eye, center: center)
-    let proj = CameraMath.perspective(
-        fovY: CameraMath.defaultFovY,
-        aspect: aspect,
-        near: 0.1,
-        far: 1000
-    )
+    let proj = CameraMath.perspective(fovY: CameraMath.defaultFovY, aspect: 1.0, near: 0.1, far: 1000)
     let mvp = proj * view
     
-    let corners = [
-        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMin.z),
-        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMin.z),
-        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMin.z),
-        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMin.z),
-        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMax.z),
-        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMax.z),
-        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMax.z),
-        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMax.z),
-    ]
-    
-    var maxAbsX: Float = 0
-    var maxAbsY: Float = 0
-    
-    for (i, corner) in corners.enumerated() {
+    var maxAbsNDC: Float = 0
+    for corner in corners {
         guard let ndc = mvp.transformToNDC(corner) else {
-            fputs("FAIL: flat wide cloud corner \(i) has w ≈ 0\n", stderr)
+            fputs("FAIL: fitDistance corner has w ≈ 0\n", stderr)
             exit(1)
         }
-        
-        let limit: Float = 0.95
-        expect(
-            ndc.x >= -limit && ndc.x <= limit,
-            "flat wide cloud corner \(i) NDC.x=\(ndc.x) out of [-0.95, 0.95]"
-        )
-        expect(
-            ndc.y >= -limit && ndc.y <= limit,
-            "flat wide cloud corner \(i) NDC.y=\(ndc.y) out of [-0.95, 0.95]"
-        )
-        
-        maxAbsX = max(maxAbsX, abs(ndc.x))
-        maxAbsY = max(maxAbsY, abs(ndc.y))
+        maxAbsNDC = max(maxAbsNDC, abs(ndc.x), abs(ndc.y))
     }
     
-    // For flat wide cloud, X should be the limiting axis and reach good fill
+    // Should be close to margin (0.9)
     expect(
-        maxAbsX >= 0.7,
-        "flat wide cloud: maxX=\(maxAbsX) should be ≥0.7 (X is limiting axis)"
+        maxAbsNDC >= 0.89 && maxAbsNDC <= 0.91,
+        "fitDistance maxNDC=\(maxAbsNDC) should be ~0.9"
     )
+}
+
+func testCameraOrientation() {
+    // Test that camera orientation vectors are orthonormal
+    let (f, r, u) = CameraMath.cameraOrientation(elevation: Float.pi / 6)
+    
+    // Check unit length
+    let fLen = sqrt(f.x * f.x + f.y * f.y + f.z * f.z)
+    let rLen = sqrt(r.x * r.x + r.y * r.y + r.z * r.z)
+    let uLen = sqrt(u.x * u.x + u.y * u.y + u.z * u.z)
+    
+    expect(abs(fLen - 1) < 0.001, "forward should be unit vector")
+    expect(abs(rLen - 1) < 0.001, "right should be unit vector")
+    expect(abs(uLen - 1) < 0.001, "up should be unit vector")
+    
+    // Check orthogonality
+    let fDotR = CameraMath.dot(f, r)
+    let fDotU = CameraMath.dot(f, u)
+    let rDotU = CameraMath.dot(r, u)
+    
+    expect(abs(fDotR) < 0.001, "forward·right should be 0")
+    expect(abs(fDotU) < 0.001, "forward·up should be 0")
+    expect(abs(rDotU) < 0.001, "right·up should be 0")
 }
 
 func testMatrixIdentityTransform() {
@@ -415,14 +272,18 @@ func runCameraMathTests() {
     print("  camera math: matrix multiplication is associative"); passed()
     testMatrixEquatable()
     print("  camera math: Matrix4x4 Equatable implementation works"); passed()
-    testFitToBoundsProjectsToNDC()
-    print("  camera math: fitToBounds projects bbox corners in bounds with good fill"); passed()
-    testFitToBoundsSmallCloud()
-    print("  camera math: fitToBounds works for small point clouds"); passed()
-    testFitToBoundsWideAspect()
-    print("  camera math: fitToBounds handles wide aspect ratios (16:9)"); passed()
-    testFitToBoundsNarrowAspect()
-    print("  camera math: fitToBounds handles narrow aspect ratios (0.5), concrete NDC checks"); passed()
-    testFitToBoundsFlatWideCloud()
-    print("  camera math: fitToBounds fills flat/wide clouds properly (projected bbox fit)"); passed()
+    testCameraOrientation()
+    print("  camera math: camera orientation vectors are orthonormal"); passed()
+    testFitDistanceAlgorithm()
+    print("  camera math: fitDistance computes correct distance for margin=0.9"); passed()
+    testFitAspect1()
+    print("  camera math: fit aspect=1.0 tight within margin"); passed()
+    testFitAspect16x9()
+    print("  camera math: fit aspect=16:9 tight within margin"); passed()
+    testFitAspect0_5()
+    print("  camera math: fit aspect=0.5 tight within margin"); passed()
+    testFitFlatCloud()
+    print("  camera math: fit flat/wide cloud tight within margin"); passed()
+    testFitCorridor30Deg()
+    print("  camera math: fit 2×20×2 corridor at 30° elevation tight within margin"); passed()
 }

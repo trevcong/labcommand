@@ -100,6 +100,30 @@ public enum CameraMath {
     /// Field of view used by the point cloud renderer (45 degrees).
     public static let defaultFovY: Float = Float.pi / 4
     
+    /// Default elevation angle for camera (30 degrees above horizontal).
+    public static let defaultElevation: Float = Float.pi / 6
+    
+    /// Normalize a Point3D vector.
+    public static func normalize(_ v: Point3D) -> Point3D {
+        let len = sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+        guard len > 0.0001 else { return Point3D(x: 0, y: 0, z: 1) }
+        return Point3D(x: v.x / len, y: v.y / len, z: v.z / len)
+    }
+    
+    /// Cross product of two Point3D vectors.
+    public static func cross(_ a: Point3D, _ b: Point3D) -> Point3D {
+        Point3D(
+            x: a.y * b.z - a.z * b.y,
+            y: a.z * b.x - a.x * b.z,
+            z: a.x * b.y - a.y * b.x
+        )
+    }
+    
+    /// Dot product of two Point3D vectors.
+    public static func dot(_ a: Point3D, _ b: Point3D) -> Float {
+        a.x * b.x + a.y * b.y + a.z * b.z
+    }
+    
     /// Look-at view matrix. Z-up convention.
     public static func lookAt(
         eye: Point3D,
@@ -166,19 +190,103 @@ public enum CameraMath {
         )
     }
     
-    /// Compute camera parameters to fit a bounding box using projected extents.
+    /// Computes camera distance to fit bbox corners within margin m of NDC [-1,1].
+    /// - corners: 8 bbox corner points
+    /// - target: bbox center
+    /// - f: camera's forward unit vector (from eye toward target)
+    /// - r: camera's right unit vector
+    /// - u: camera's up unit vector
+    /// - fovY: vertical field of view in radians
+    /// - aspect: width/height
+    /// - margin: NDC margin (0.9 = fill 90% of screen)
+    /// - near: near plane distance
+    /// Returns: distance d such that camera is at target - d*f
+    public static func fitDistance(
+        corners: [Point3D],
+        target: Point3D,
+        forward f: Point3D,
+        right r: Point3D,
+        up u: Point3D,
+        fovY: Float,
+        aspect: Float,
+        margin m: Float = 0.9,
+        near: Float = 0.1
+    ) -> Float {
+        let tanY = tan(fovY / 2)
+        let tanX = tanY * aspect
+        
+        var dMax: Float = near + 0.001
+        
+        for p in corners {
+            // q = p - target (corner relative to target)
+            let qx = p.x - target.x
+            let qy = p.y - target.y
+            let qz = p.z - target.z
+            
+            // Project onto camera axes
+            let x = qx * r.x + qy * r.y + qz * r.z  // q·r
+            let y = qx * u.x + qy * u.y + qz * u.z  // q·u
+            let z = qx * f.x + qy * f.y + qz * f.z  // q·f (positive = toward far side)
+            
+            // |NDC| ≤ m requires: d ≥ |x|/(m*tanX) - z  AND  d ≥ |y|/(m*tanY) - z
+            let dForX = abs(x) / (m * tanX) - z
+            let dForY = abs(y) / (m * tanY) - z
+            
+            dMax = Swift.max(dMax, dForX, dForY)
+        }
+        
+        return Swift.max(dMax, near + 0.001)
+    }
+    
+    /// Generate the 8 corners of a bounding box.
+    public static func bboxCorners(min: Point3D, max: Point3D) -> [Point3D] {
+        [
+            Point3D(x: min.x, y: min.y, z: min.z),
+            Point3D(x: max.x, y: min.y, z: min.z),
+            Point3D(x: min.x, y: max.y, z: min.z),
+            Point3D(x: max.x, y: max.y, z: min.z),
+            Point3D(x: min.x, y: min.y, z: max.z),
+            Point3D(x: max.x, y: min.y, z: max.z),
+            Point3D(x: min.x, y: max.y, z: max.z),
+            Point3D(x: max.x, y: max.y, z: max.z),
+        ]
+    }
+    
+    /// Compute camera orientation vectors for elevated view.
+    /// Camera looks from Y-negative toward target, elevated by elevation angle.
+    /// Returns (forward, right, up) unit vectors.
+    public static func cameraOrientation(
+        elevation: Float = defaultElevation,
+        worldUp: Point3D = Point3D(x: 0, y: 0, z: 1)
+    ) -> (forward: Point3D, right: Point3D, up: Point3D) {
+        // Forward direction: looking from -Y toward origin, tilted down by elevation
+        // At elevation=0: forward = (0, 1, 0) (looking along +Y)
+        // At elevation>0: forward tilts down, so z component becomes negative
+        let cosE = cos(elevation)
+        let sinE = sin(elevation)
+        let forward = Point3D(x: 0, y: cosE, z: -sinE)
+        
+        // Right is always along +X for Y-negative camera
+        let right = Point3D(x: 1, y: 0, z: 0)
+        
+        // Up = cross(forward, right) but normalized
+        // forward × right = (cosE * 0 - (-sinE) * 0, (-sinE) * 1 - 0 * 0, 0 * 0 - cosE * 1)
+        //                 = (0, -sinE, -cosE)
+        // But we want up to point generally toward +Z, so negate
+        let up = Point3D(x: 0, y: sinE, z: cosE)
+        
+        return (forward, right, up)
+    }
+    
+    /// Compute camera parameters to fit a bounding box using exact fit algorithm.
     /// Returns (eye position, center, distance).
-    /// Uses projected bbox fit (not bounding-sphere) for better fill on flat/wide clouds.
-    /// Camera looks from Y-negative toward center (Z-up convention):
-    /// - X extent → screen horizontal (width)
-    /// - Z extent → screen vertical (height)
-    /// - Y extent → depth (along view direction)
     public static func fitToBounds(
         min: Point3D,
         max: Point3D,
         fovY: Float = defaultFovY,
         aspect: Float = 1.0,
-        margin: Float = 1.1
+        margin: Float = 0.9,
+        elevation: Float = defaultElevation
     ) -> (eye: Point3D, center: Point3D, distance: Float) {
         let center = Point3D(
             x: (min.x + max.x) * 0.5,
@@ -186,25 +294,25 @@ public enum CameraMath {
             z: (min.z + max.z) * 0.5
         )
         
-        // Half-extents perpendicular to view direction
-        let halfWidth = (max.x - min.x) / 2   // screen horizontal
-        let halfHeight = (max.z - min.z) / 2  // screen vertical
+        let corners = bboxCorners(min: min, max: max)
+        let (forward, right, up) = cameraOrientation(elevation: elevation)
         
-        // Compute horizontal FOV from vertical FOV and aspect ratio
-        let fovX = 2 * atan(tan(fovY / 2) * aspect)
+        let distance = fitDistance(
+            corners: corners,
+            target: center,
+            forward: forward,
+            right: right,
+            up: up,
+            fovY: fovY,
+            aspect: aspect,
+            margin: margin
+        )
         
-        // Distance needed for each axis to fit in view
-        let distForWidth = halfWidth / tan(fovX / 2)
-        let distForHeight = halfHeight / tan(fovY / 2)
-        
-        // Take the max (limiting axis) and apply margin for 80-90% fill
-        let distance = Swift.max(Swift.max(distForWidth, distForHeight) * margin, 0.1)
-        
-        // Position camera looking from Y-negative toward center
+        // Eye = center - distance * forward
         let eye = Point3D(
-            x: center.x,
-            y: center.y - distance,
-            z: center.z + distance * 0.3
+            x: center.x - distance * forward.x,
+            y: center.y - distance * forward.y,
+            z: center.z - distance * forward.z
         )
         
         return (eye, center, distance)
