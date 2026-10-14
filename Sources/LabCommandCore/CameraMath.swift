@@ -166,15 +166,19 @@ public enum CameraMath {
         )
     }
     
-    /// Compute camera parameters to fit a bounding box.
+    /// Compute camera parameters to fit a bounding box using projected extents.
     /// Returns (eye position, center, distance).
-    /// Accounts for aspect ratio to ensure bbox fits in both horizontal and vertical directions.
+    /// Uses projected bbox fit (not bounding-sphere) for better fill on flat/wide clouds.
+    /// Camera looks from Y-negative toward center (Z-up convention):
+    /// - X extent → screen horizontal (width)
+    /// - Z extent → screen vertical (height)
+    /// - Y extent → depth (along view direction)
     public static func fitToBounds(
         min: Point3D,
         max: Point3D,
         fovY: Float = defaultFovY,
         aspect: Float = 1.0,
-        margin: Float = 1.2
+        margin: Float = 1.1
     ) -> (eye: Point3D, center: Point3D, distance: Float) {
         let center = Point3D(
             x: (min.x + max.x) * 0.5,
@@ -182,15 +186,19 @@ public enum CameraMath {
             z: (min.z + max.z) * 0.5
         )
         
-        let dx = max.x - min.x
-        let dy = max.y - min.y
-        let dz = max.z - min.z
-        let radius = sqrt(dx * dx + dy * dy + dz * dz) * 0.5
+        // Half-extents perpendicular to view direction
+        let halfWidth = (max.x - min.x) / 2   // screen horizontal
+        let halfHeight = (max.z - min.z) / 2  // screen vertical
         
-        // Account for aspect ratio: compute horizontal FOV and use the smaller
+        // Compute horizontal FOV from vertical FOV and aspect ratio
         let fovX = 2 * atan(tan(fovY / 2) * aspect)
-        let effectiveFov = Swift.min(fovX, fovY)
-        let distance = Swift.max(radius / sin(effectiveFov / 2) * margin, 0.1)
+        
+        // Distance needed for each axis to fit in view
+        let distForWidth = halfWidth / tan(fovX / 2)
+        let distForHeight = halfHeight / tan(fovY / 2)
+        
+        // Take the max (limiting axis) and apply margin for 80-90% fill
+        let distance = Swift.max(Swift.max(distForWidth, distForHeight) * margin, 0.1)
         
         // Position camera looking from Y-negative toward center
         let eye = Point3D(

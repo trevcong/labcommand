@@ -11,7 +11,7 @@ func testFitToBoundsProjectsToNDC() {
         max: bboxMax,
         fovY: CameraMath.defaultFovY,
         aspect: aspect,
-        margin: 1.2
+        margin: 1.1
     )
     
     let view = CameraMath.lookAt(eye: eye, center: center)
@@ -34,26 +34,38 @@ func testFitToBoundsProjectsToNDC() {
         Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMax.z),
     ]
     
+    var maxAbsX: Float = 0
+    var maxAbsY: Float = 0
+    
     for (i, corner) in corners.enumerated() {
         guard let ndc = mvp.transformToNDC(corner) else {
             fputs("FAIL: corner \(i) has w ≈ 0 (camera at geometry)\n", stderr)
             exit(1)
         }
         
-        let limit: Float = 0.9
+        let limit: Float = 0.95
         expect(
             ndc.x >= -limit && ndc.x <= limit,
-            "corner \(i) NDC.x=\(ndc.x) out of [-0.9, 0.9]"
+            "corner \(i) NDC.x=\(ndc.x) out of [-0.95, 0.95]"
         )
         expect(
             ndc.y >= -limit && ndc.y <= limit,
-            "corner \(i) NDC.y=\(ndc.y) out of [-0.9, 0.9]"
+            "corner \(i) NDC.y=\(ndc.y) out of [-0.95, 0.95]"
         )
         expect(
             ndc.z >= 0 && ndc.z <= 1,
             "corner \(i) NDC.z=\(ndc.z) out of [0, 1] (Metal depth range)"
         )
+        
+        maxAbsX = max(maxAbsX, abs(ndc.x))
+        maxAbsY = max(maxAbsY, abs(ndc.y))
     }
+    
+    // Check adequate fill: at least one axis should reach 0.7 (80-90% target)
+    expect(
+        maxAbsX >= 0.7 || maxAbsY >= 0.7,
+        "inadequate fill: maxX=\(maxAbsX), maxY=\(maxAbsY), need ≥0.7 on at least one axis"
+    )
 }
 
 func testFitToBoundsSmallCloud() {
@@ -66,7 +78,7 @@ func testFitToBoundsSmallCloud() {
         max: bboxMax,
         fovY: CameraMath.defaultFovY,
         aspect: aspect,
-        margin: 1.2
+        margin: 1.1
     )
     
     let view = CameraMath.lookAt(eye: eye, center: center)
@@ -89,22 +101,34 @@ func testFitToBoundsSmallCloud() {
         Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMax.z),
     ]
     
+    var maxAbsX: Float = 0
+    var maxAbsY: Float = 0
+    
     for (i, corner) in corners.enumerated() {
         guard let ndc = mvp.transformToNDC(corner) else {
             fputs("FAIL: small cloud corner \(i) has w ≈ 0\n", stderr)
             exit(1)
         }
         
-        let limit: Float = 0.9
+        let limit: Float = 0.95
         expect(
             ndc.x >= -limit && ndc.x <= limit,
-            "small cloud corner \(i) NDC.x=\(ndc.x) out of [-0.9, 0.9]"
+            "small cloud corner \(i) NDC.x=\(ndc.x) out of [-0.95, 0.95]"
         )
         expect(
             ndc.y >= -limit && ndc.y <= limit,
-            "small cloud corner \(i) NDC.y=\(ndc.y) out of [-0.9, 0.9]"
+            "small cloud corner \(i) NDC.y=\(ndc.y) out of [-0.95, 0.95]"
         )
+        
+        maxAbsX = max(maxAbsX, abs(ndc.x))
+        maxAbsY = max(maxAbsY, abs(ndc.y))
     }
+    
+    // Check adequate fill
+    expect(
+        maxAbsX >= 0.7 || maxAbsY >= 0.7,
+        "small cloud inadequate fill: maxX=\(maxAbsX), maxY=\(maxAbsY)"
+    )
 }
 
 func testFitToBoundsWideAspect() {
@@ -117,7 +141,7 @@ func testFitToBoundsWideAspect() {
         max: bboxMax,
         fovY: CameraMath.defaultFovY,
         aspect: aspect,
-        margin: 1.2
+        margin: 1.1
     )
     
     let view = CameraMath.lookAt(eye: eye, center: center)
@@ -140,26 +164,38 @@ func testFitToBoundsWideAspect() {
         Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMax.z),
     ]
     
+    var maxAbsX: Float = 0
+    var maxAbsY: Float = 0
+    
     for (i, corner) in corners.enumerated() {
         guard let ndc = mvp.transformToNDC(corner) else {
             fputs("FAIL: wide aspect corner \(i) has w ≈ 0\n", stderr)
             exit(1)
         }
         
-        let limit: Float = 0.9
+        let limit: Float = 0.95
         expect(
             ndc.x >= -limit && ndc.x <= limit,
-            "wide aspect corner \(i) NDC.x=\(ndc.x) out of [-0.9, 0.9]"
+            "wide aspect corner \(i) NDC.x=\(ndc.x) out of [-0.95, 0.95]"
         )
         expect(
             ndc.y >= -limit && ndc.y <= limit,
-            "wide aspect corner \(i) NDC.y=\(ndc.y) out of [-0.9, 0.9]"
+            "wide aspect corner \(i) NDC.y=\(ndc.y) out of [-0.95, 0.95]"
         )
         expect(
             ndc.z >= 0 && ndc.z <= 1,
             "wide aspect corner \(i) NDC.z=\(ndc.z) out of Metal [0, 1] range"
         )
+        
+        maxAbsX = max(maxAbsX, abs(ndc.x))
+        maxAbsY = max(maxAbsY, abs(ndc.y))
     }
+    
+    // Check adequate fill
+    expect(
+        maxAbsX >= 0.7 || maxAbsY >= 0.7,
+        "wide aspect inadequate fill: maxX=\(maxAbsX), maxY=\(maxAbsY)"
+    )
 }
 
 func testFitToBoundsNarrowAspect() {
@@ -172,7 +208,7 @@ func testFitToBoundsNarrowAspect() {
         max: bboxMax,
         fovY: CameraMath.defaultFovY,
         aspect: aspect,
-        margin: 1.2
+        margin: 1.1
     )
     
     let view = CameraMath.lookAt(eye: eye, center: center)
@@ -204,14 +240,14 @@ func testFitToBoundsNarrowAspect() {
             exit(1)
         }
         
-        let limit: Float = 0.9
+        let limit: Float = 0.95
         expect(
             ndc.x >= -limit && ndc.x <= limit,
-            "narrow aspect corner \(i) NDC.x=\(ndc.x) out of [-0.9, 0.9]"
+            "narrow aspect corner \(i) NDC.x=\(ndc.x) out of [-0.95, 0.95]"
         )
         expect(
             ndc.y >= -limit && ndc.y <= limit,
-            "narrow aspect corner \(i) NDC.y=\(ndc.y) out of [-0.9, 0.9]"
+            "narrow aspect corner \(i) NDC.y=\(ndc.y) out of [-0.95, 0.95]"
         )
         expect(
             ndc.z >= 0 && ndc.z <= 1,
@@ -222,16 +258,10 @@ func testFitToBoundsNarrowAspect() {
         maxAbsY = max(maxAbsY, abs(ndc.y))
     }
     
-    // With aspect 0.5 (tall/narrow viewport), horizontal FOV is smaller than vertical,
-    // so the x coordinates should be closer to the edges (larger absolute values)
-    // because we fit to the smaller dimension
+    // Check adequate fill on at least one axis
     expect(
-        maxAbsX > 0.3,
-        "narrow aspect: max |NDC.x|=\(maxAbsX) should be > 0.3 (bbox uses horizontal space)"
-    )
-    expect(
-        maxAbsY > 0.3,
-        "narrow aspect: max |NDC.y|=\(maxAbsY) should be > 0.3 (bbox uses vertical space)"
+        maxAbsX >= 0.7 || maxAbsY >= 0.7,
+        "narrow aspect inadequate fill: maxX=\(maxAbsX), maxY=\(maxAbsY)"
     )
     
     // Concrete value check: center point should project to approximately (0, 0)
@@ -251,6 +281,70 @@ func testFitToBoundsNarrowAspect() {
     expect(
         abs(centerNDC.y) < 0.05,
         "narrow aspect: center NDC.y=\(centerNDC.y) should be ~0 (concrete check)"
+    )
+}
+
+func testFitToBoundsFlatWideCloud() {
+    // Flat, wide cloud (like LiDAR ground scan): wide X, shallow Z
+    let bboxMin = Point3D(x: -20, y: -20, z: -1)
+    let bboxMax = Point3D(x: 20, y: 20, z: 1)
+    let aspect: Float = 16.0 / 9.0
+    
+    let (eye, center, _) = CameraMath.fitToBounds(
+        min: bboxMin,
+        max: bboxMax,
+        fovY: CameraMath.defaultFovY,
+        aspect: aspect,
+        margin: 1.1
+    )
+    
+    let view = CameraMath.lookAt(eye: eye, center: center)
+    let proj = CameraMath.perspective(
+        fovY: CameraMath.defaultFovY,
+        aspect: aspect,
+        near: 0.1,
+        far: 1000
+    )
+    let mvp = proj * view
+    
+    let corners = [
+        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMin.z),
+        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMin.z),
+        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMin.z),
+        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMin.z),
+        Point3D(x: bboxMin.x, y: bboxMin.y, z: bboxMax.z),
+        Point3D(x: bboxMax.x, y: bboxMin.y, z: bboxMax.z),
+        Point3D(x: bboxMin.x, y: bboxMax.y, z: bboxMax.z),
+        Point3D(x: bboxMax.x, y: bboxMax.y, z: bboxMax.z),
+    ]
+    
+    var maxAbsX: Float = 0
+    var maxAbsY: Float = 0
+    
+    for (i, corner) in corners.enumerated() {
+        guard let ndc = mvp.transformToNDC(corner) else {
+            fputs("FAIL: flat wide cloud corner \(i) has w ≈ 0\n", stderr)
+            exit(1)
+        }
+        
+        let limit: Float = 0.95
+        expect(
+            ndc.x >= -limit && ndc.x <= limit,
+            "flat wide cloud corner \(i) NDC.x=\(ndc.x) out of [-0.95, 0.95]"
+        )
+        expect(
+            ndc.y >= -limit && ndc.y <= limit,
+            "flat wide cloud corner \(i) NDC.y=\(ndc.y) out of [-0.95, 0.95]"
+        )
+        
+        maxAbsX = max(maxAbsX, abs(ndc.x))
+        maxAbsY = max(maxAbsY, abs(ndc.y))
+    }
+    
+    // For flat wide cloud, X should be the limiting axis and reach good fill
+    expect(
+        maxAbsX >= 0.7,
+        "flat wide cloud: maxX=\(maxAbsX) should be ≥0.7 (X is limiting axis)"
     )
 }
 
@@ -322,11 +416,13 @@ func runCameraMathTests() {
     testMatrixEquatable()
     print("  camera math: Matrix4x4 Equatable implementation works"); passed()
     testFitToBoundsProjectsToNDC()
-    print("  camera math: fitToBounds projects all 8 bbox corners within NDC [-0.9, 0.9]"); passed()
+    print("  camera math: fitToBounds projects bbox corners in bounds with good fill"); passed()
     testFitToBoundsSmallCloud()
     print("  camera math: fitToBounds works for small point clouds"); passed()
     testFitToBoundsWideAspect()
     print("  camera math: fitToBounds handles wide aspect ratios (16:9)"); passed()
     testFitToBoundsNarrowAspect()
     print("  camera math: fitToBounds handles narrow aspect ratios (0.5), concrete NDC checks"); passed()
+    testFitToBoundsFlatWideCloud()
+    print("  camera math: fitToBounds fills flat/wide clouds properly (projected bbox fit)"); passed()
 }

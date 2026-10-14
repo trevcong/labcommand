@@ -355,9 +355,12 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         needsInitialFit = false
     }
     
-    /// Fit camera to show all loaded points.
-    /// Centers on bounding box and positions camera at distance to show all corners.
-    /// Accounts for aspect ratio to ensure bbox fits in both horizontal and vertical directions.
+    /// Fit camera to show all loaded points using projected bbox extents.
+    /// Uses projected bbox fit (not bounding-sphere) for better fill on flat/wide clouds.
+    /// Camera looks from Y-negative toward center (Z-up convention):
+    /// - X extent → screen horizontal (width)
+    /// - Z extent → screen vertical (height)
+    /// - Y extent → depth (along view direction)
     public func fitToBounds(logOnce: Bool = false) {
         guard let bb = boundingBox else {
             // No bounds, use default view
@@ -369,13 +372,20 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         }
         
         let target = (bb.min + bb.max) * 0.5
-        let extent = bb.max - bb.min
-        let radius = length(extent) * 0.5
         
-        // Account for aspect ratio: compute horizontal FOV and use the smaller
+        // Half-extents perpendicular to view direction
+        let halfWidth = (bb.max.x - bb.min.x) / 2   // screen horizontal
+        let halfHeight = (bb.max.z - bb.min.z) / 2  // screen vertical
+        
+        // Compute horizontal FOV from vertical FOV and aspect ratio
         let fovX = 2 * atan(tan(Self.fovY / 2) * aspect)
-        let effectiveFov = min(fovX, Self.fovY)
-        let distance = max(radius / sin(effectiveFov / 2) * 1.2, 0.1)
+        
+        // Distance needed for each axis to fit in view
+        let distForWidth = halfWidth / tan(fovX / 2)
+        let distForHeight = halfHeight / tan(Self.fovY / 2)
+        
+        // Take the max (limiting axis) and apply 1.1 margin for 80-90% fill
+        let distance = max(max(distForWidth, distForHeight) * 1.1, 0.1)
         
         // Position camera looking from Y-negative toward center, Z-up
         let eye = target + SIMD3<Float>(0, -distance, distance * 0.3)
