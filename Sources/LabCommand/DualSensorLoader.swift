@@ -5,7 +5,7 @@ import LabCommandCore
 /// Uses PointCloudDecoder from LabCommandCore and applies RigSpec extrinsics.
 ///
 /// **Transform Convention (R·p−t):**
-/// Each sensor's extrinsics define `t` = the sensor's optical center position relative to the rig origin (Mid-360 IMU).
+/// Each sensor's extrinsics define `t` = the IMU origin in the lidar frame (from FAST-LIO mid360.yaml).
 /// To bring points into the IMU frame: `p_imu = R * p_sensor - t`
 ///
 /// **Resource Loading:**

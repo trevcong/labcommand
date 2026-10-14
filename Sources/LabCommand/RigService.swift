@@ -62,7 +62,7 @@ public final class RigService: @unchecked Sendable {
     }
 
     @discardableResult
-    private func startTunnel(port: Int, key: ReferenceWritableKeyPath<RigService, Process?>) -> String? {
+    private func startTunnel(port: Int, key: ReferenceWritableKeyPath<RigService, Process?>) async -> String? {
         if tunnelRunning(key) || portOpen(port) { return nil }
         var lastError: String?
         for host in hostOrder() {
@@ -77,6 +77,7 @@ public final class RigService: @unchecked Sendable {
                 lastError = error.localizedDescription
                 continue
             }
+            try? await Task.sleep(for: .milliseconds(250))
             if proc.isRunning {
                 lock.lock()
                 self[keyPath: key] = proc
@@ -90,14 +91,14 @@ public final class RigService: @unchecked Sendable {
     }
 
     /// Both tunnels. Returns the first error, or nil.
-    public func ensureTunnels() -> String? {
-        let apiErr = startTunnel(port: Self.apiPort, key: \.apiTunnel)
-        let viewErr = startTunnel(port: Self.viewPort, key: \.viewTunnel)
+    public func ensureTunnels() async -> String? {
+        let apiErr = await startTunnel(port: Self.apiPort, key: \.apiTunnel)
+        let viewErr = await startTunnel(port: Self.viewPort, key: \.viewTunnel)
         return apiErr ?? viewErr
     }
 
-    public func ensureAPITunnel() -> String? {
-        startTunnel(port: Self.apiPort, key: \.apiTunnel)
+    public func ensureAPITunnel() async -> String? {
+        await startTunnel(port: Self.apiPort, key: \.apiTunnel)
     }
 
     public func stopTunnels() {

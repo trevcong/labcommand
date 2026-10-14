@@ -70,18 +70,17 @@ public struct SensorExtrinsics: Sendable, Equatable {
 ///
 /// **Transform Convention (R·p−t):**
 /// To bring sensor points into the IMU frame: `p_imu = R * p_sensor - t`
-/// where `t` is the sensor's optical center position relative to the IMU.
+/// where `t` is the IMU origin in the lidar frame.
 ///
 /// **Extrinsics Source:**
-/// - Mid-360: Livox SDK calibration — optical center offset from IMU
+/// - Mid-360: FAST-LIO mid360.yaml — IMU origin in lidar frame
 /// - JT128: Placeholder (not yet calibrated)
 public enum RigSpec {
     
     // MARK: - Sensor Extrinsics
     
-    /// Mid-360 extrinsics: optical center offset from IMU.
-    /// Source: Livox SDK extrinsic calibration.
-    /// The Mid-360's optical center is at (11.0, 23.29, −44.12) mm from its IMU.
+    /// Mid-360 extrinsics: IMU origin in the lidar frame.
+    /// Source: FAST-LIO mid360.yaml extrinsic calibration.
     /// Transform: p_imu = p_lidar - (0.011, 0.02329, -0.04412)
     public static let mid360Extrinsics = SensorExtrinsics(
         rotation: nil,

@@ -180,21 +180,27 @@ struct CommandCenterView: View {
                 .frame(width: 200)
             }
             
-            DualPointCloudView(
-                midFrame: $state.mid360Frame,
-                jtFrame: $state.jt128Frame,
-                colorMode: state.pointCloudColorMode,
-                pointSize: 3.0
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(
-                RoundedRectangle(cornerRadius: LabTheme.radius, style: .continuous)
-                    .fill(LabTheme.surface)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: LabTheme.radius, style: .continuous)
-                    .stroke(LabTheme.line, lineWidth: 1)
-            )
+            ZStack(alignment: .topTrailing) {
+                DualPointCloudView(
+                    midFrame: $state.mid360Frame,
+                    jtFrame: $state.jt128Frame,
+                    colorMode: state.pointCloudColorMode,
+                    pointSize: 3.0
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(
+                    RoundedRectangle(cornerRadius: LabTheme.radius, style: .continuous)
+                        .fill(LabTheme.surface)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: LabTheme.radius, style: .continuous)
+                        .stroke(LabTheme.line, lineWidth: 1)
+                )
+                
+                if !RigSpec.jt128IsCalibrated && state.jt128Frame != nil {
+                    calibrationBadge
+                }
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -357,6 +363,22 @@ struct CommandCenterView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private var calibrationBadge: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundColor(.orange)
+            Text("JT128: Uncalibrated")
+                .font(.caption.bold())
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color.black.opacity(0.7))
+        )
+        .padding(8)
     }
 
     private func performAction(_ action: RigAction) {
