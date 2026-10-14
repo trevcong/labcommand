@@ -1,0 +1,55 @@
+# room_memory: plan (Phase 2, PR 2.1 / 2.2, offline)
+
+Scope: research brief §2.2 steps 1, 3, 4, 5 and the persistence half of 7, and §3 Phase 2 rows PR 2.1 and PR 2.2, as far as they can be built and tested on the Mac without ROS or the Spark. Contracts: `docs/CHANGE-DETECTION.md` (v2, the parity spec) and `docs/ROOM-MEMORY-PROTOCOL.md` plus `ros/labcommand_msgs/` on the Phase 0 branch (`labcommand-memory`). This branch follows the revised Phase 0 decisions: `compression` sits in the header before one `uint8[] payload` (zlib = raw DEFLATE by default), `RequestSync` exists, and all-free bricks are sent.
+
+## Layout
+
+| path | role | ROS imports |
+|---|---|---|
+| `room_memory/core/pointcloud2.py` | CDR `sensor_msgs/PointCloud2` decode, same rules as `PointCloud2CDR.swift` | none |
+| `room_memory/core/change_detection.py` | quantizer, key packing, occupancy, dilation, 26-connected clusters, moved pairing, 3D DDA evidence, canonical JSON | none (numpy) |
+| `room_memory/messages.py` | CDR codecs for `MapBricks`, `ChangeEvent`, `MemoryStatus`, `Epoch`, `RequestSync`; validation symmetric with the Swift codec (D16) | none |
+| `room_memory/memory.py` | three-state voxel layers, bricks, reference/recent layers, save/load, candidate tracker, the window engine the node drives | none |
+| `room_memory/node.py` | thin rclpy node: raw CDR subscriptions, window timer, 1 Hz `MemoryStatus`, `ChangeEvent` | rclpy |
+| `room_memory/offline.py` | `python -m room_memory.offline <before> <after>`: by default the output of `change-detect --evidence --json`; accepts the `change-detect` flags, plus `--no-evidence` / `--text` for the Swift defaults | none |
+| `launch/room_memory.launch.py`, `Dockerfile`, `package.xml`, `setup.py` | Jazzy packaging; not built or deployed here | — |
+| `tests/` | pytest; hand CDR goldens and Swift-produced JSON goldens under `tests/fixtures/` | rclpy only in `test_node.py` (skipped without it) |
+
+## Parity rules (the port reproduces the Swift bytes)
+
+- Every value the spec calls binary32 is a `numpy.float32` scalar or array: `inverse = f32(1) / voxel_size`, the quantizer product, range test `(x*x + y*y) + z*z`, AABB and volume products, the DDA (`dir`, `tDelta`, `tMax`, accumulated `tMax += tDelta`), centroid distance with `np.sqrt`, count ratio. Centroids are binary64 `((sum / n) + 0.5) * size` rounded once to binary32. Bits are written with `.view(uint32)`.
+- Floor is the spec's truncate-and-adjust on binary32 `q` inside the `|q| < 2^20` guard.
+- Occupied sets are sorted unique `int64` key arrays; membership is `searchsorted`. No hash order reaches any output.
+- Representative ray endpoint: one argsort on the voxel key, then segmented minima (`minimum.reduceat`) of the x order key, of y among the x ties, of z among the y ties; order keys invert exactly to the binary32 coordinates.
+- DDA: all rays walk in lockstep as numpy arrays (iteration counter = `steps`, since every ray starts together), with the spec's order: `tMax < 0 → 0`, then the NaN check, `current == end` before marking, cap `|di|+|dj|+|dk|`, then the per-axis clamp (an axis on its endpoint index gets `tMax = +inf`), and ties step every tied axis still short of its end. The clamp keeps each axis between its start and end index, so every visited cell is inside the origin–end box and packs; the spec's box skip and pack-failure exit never fire and are not coded. Marks are packed keys; for the map layers all marks are kept. For the diff only marks on the before-only candidates matter, so (exactly, because every axis steps monotonically toward its end) a ray is dropped once it has left the candidates' index box in its step direction, and membership is a dense boolean grid over that box when it holds ≤ 2²⁵ cells, else a binary search. No dense grid over the whole ray AABB (JT128 ranges make it too large).
+- Clusters: breadth-first walk over a Python set of keys; geometry from exact integer index sums, so visit order cannot matter. A component drops under `min_voxels` voxels or under `min_extent` cells on any axis of its index box (default 2; the snapshot goldens are `regions` empty because of it).
+
+## Memory model (PR 2.2)
+
+- A `VoxelLayer` is two sorted key arrays, `occupied ⊆ known`; free = known − occupied; everything else is UNKNOWN.
+- One window: occupancy of the accumulated points (`maxRange` clip), free = every cell an after-ray marks (the spec DDA from the sensor origin), occupied wins.
+- Per sensor until the JT128↔Mid-360 extrinsic exists (brief R1): Mid-360 = `/livox/lidar`, `per_sensor_hz[0]`, sensor bit 0; JT128 = `/lidar_points`, `[1]`, bit 1. Points stay in each sensor's frame, origin (0, 0, 0).
+- Reference layer: union of the first `reference_windows` windows per configured sensor. When every configured sensor has them, state BUILDING → TRACKING, `map_epoch` 0 → 1, references saved. Recent layer: the last `recent_windows` windows. Change = core `diff(reference.occupied, recent)` with evidence on, so a reference voxel the recent rays do not traverse is UNKNOWN, not DISAPPEARED; and with `before_known = reference.known` (an engine-only extension, off in the offline CLI and the goldens), so a recent voxel the reference never observed is new coverage, not APPEARED. Both kinds therefore need evidence in both layers (protocol §4.2).
+- Save/load: one `MapBricks` snapshot (zlib) per sensor, `<state_dir>/<room_id>/reference-<sensor>.cdr`, written atomically. It carries `room_id`, `map_epoch`, `voxel_size` and the bricks, so reload restores an identical epoch and identical bricks. Bricks: `floor(v / 8)`, bit `x + 8y + 64z`, canonical `(i, j, k)` order, all-free bricks kept, all-unknown omitted.
+
+## Node behaviour, and what is deliberately not here
+
+- State: BUILDING, TRACKING, DEGRADED (a configured sensor measured 0 Hz, or the last window was dropped). RIG_MOVED and PAUSED are never emitted: the rig-pose guard and operator actions are PR 2.3 / 3.1. `pose_residual_m` is NaN ("guard not run"); `coverage_known_frac` is NaN (room volume not configured). `n_bricks` is the sum over per-sensor references. Loading a saved reference goes straight to TRACKING with the guard not run.
+- Events: one message per transition only. A region that has no open candidate of the same kind sharing a voxel starts a CANDIDATE; a candidate with no matching region in the next window goes EXPIRED. CONFIRMED is never sent: the persistence filter, T_commit and moved supersession are PR 2.3. `alpha` is NaN; `evidence` is the share of region voxels known in both layers (1.0 by construction now that both kinds require it); the mask holds the region's voxels (zlib). `event_id` starts at `node_start_unix_ms << 20`, unique per room across restarts while the Spark clock does not step back.
+- Not built or run here: `docker build` (pulls `ros:jazzy`, which is network beyond pip), `colcon build`, any Spark contact. The container build needs `ros/labcommand_msgs` from the Phase 0 branch in the build context. MapBricks/Epoch publishing, the sync topics and the bridge whitelist are PR 2.4.
+
+## Deviations from the Swift side
+
+- LZFSE: Python's standard library has none. The decoder reads LZFSE streams made of uncompressed blocks (`bvx-`, which is what `map_bricks_delta_lzfse_le.hex` holds) and raises *unsupported* for compressed LZFSE blocks; the encoder writes NONE or ZLIB only (the Spark sends zlib, protocol §3.1).
+- The Python inflaters also reject bytes after the end of a compressed stream; Apple's does not detect them (protocol §3.1 notes the same asymmetry).
+- The offline CLI reads `.bin` (CDR PointCloud2) only, not `.pcd`.
+
+## Tests and gate
+
+- Golden parity: `Tests/Fixtures/change-detection/{jt128,mid360}.json` byte for byte on the committed `.bin` pairs, through both the library and `python -m room_memory.offline --evidence --json`.
+- Extra goldens produced by `swift run -c release change-detect` on scenes generated by `tests/scenes.py` (indoor 89,320-point room, box add/remove/move, moved without pairing, occluded column, diagonal tie, equal-distance tie, 3D occluded back face, long-ray stride 16/64, jitter, the 5×3×1 sheet at `min_extent` 2 and 1, the 0.10 m shell add/remove/move, the tied boundary return at voxel 1 on the bit grid and the open-addressed walker). One-cell column scenes pass `--min-extent 1`, as the spec's evidence tests do, stored in `tests/fixtures/swift/`; `tests/make_swift_goldens.py` regenerates them. Phase 0 synthetic pairs are compared against stored Swift output when the Phase 0 worktree is present.
+- Shuffled-input determinism, synthetic box add/remove/move, occluded back face → UNKNOWN, spec's long-ray stride table (5,014 / 2,586 / 1,275 rays), extent gate, boundary endpoint (16 disappeared / 4 unknown; the unclamped walk gives 18 / 2) and the 56-endpoint octant sweep.
+- Codecs: hand goldens copied to `tests/fixtures/hand/` with sha256 provenance; decode all, re-encode the uncompressed little-endian ones byte for byte, every truncation throws, validation rejects what Swift rejects.
+- Memory: brick round trip, save → load identical epoch and bricks, engine BUILDING → TRACKING, occluded removal stays UNKNOWN, candidate → expired lifecycle.
+- numpy: the suite runs under numpy 2.x (NEP 50) and 1.26 (Ubuntu 24.04's `python3-numpy`, value-based casting); every binary32 operand is an explicit `float32`, so both give the same bytes.
+- Gate: `pytest` passes on the Mac, `swift run LabCommandCoreTestsRunner` still passes, no TODO/FIXME or dead code. Timings reported for the indoor case (warm-up, then time the compare only, evidence off and on).

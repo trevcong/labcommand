@@ -1,0 +1,23 @@
+# labcommand_msgs/MemoryStatus, CDR little endian. Derived by hand from MemoryStatus.msg and
+# the classic-CDR rules in docs/ROOM-MEMORY-PROTOCOL.md, not from the Swift encoder.
+# "pos" counts from the byte after the 4-byte encapsulation header; alignment is relative to it.
+# Covers: 5-char room_id -> 6 pad bytes before a uint64; uint8 -> uint32 pad; NaN = missing float;
+# 0xFFFF = unmeasured rate next to a measured 10 Hz.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+06 00 00 00                 # pos 0   room_id length 6 (5 chars + NUL)
+6c 61 62 2d 61 00           # pos 4   "lab-a\0"
+00 00 00 00 00 00           # pos 10  pad to 8
+2a 00 00 00 00 00 00 00     # pos 16  map_epoch 42
+07 00 00 00 00 00 00 00     # pos 24  seq 7
+80 92 ed 68                 # pos 32  stamp.sec 1760400000
+00 65 cd 1d                 # pos 36  stamp.nanosec 500000000
+01                          # pos 40  state TRACKING
+00 00 00                    # pos 41  pad to 4
+80 0c 00 00                 # pos 44  n_bricks 3200
+02 00 00 00                 # pos 48  n_open_events 2
+00 00 40 3f                 # pos 52  coverage_known_frac 0.75
+00 00 c0 7f                 # pos 56  pose_residual_m NaN (guard has not run)
+00 00 80 3f                 # pos 60  window_s 1.0
+0a 00                       # pos 64  per_sensor_hz[0] Mid-360 10 Hz
+ff ff                       # pos 66  per_sensor_hz[1] JT128 HZ_UNAVAILABLE
+03 00 00 00                 # pos 68  dropped_windows 3

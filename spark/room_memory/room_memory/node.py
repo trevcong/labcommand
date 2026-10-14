@@ -1,0 +1,105 @@
+"""Thin rclpy node around ``RoomMemory``: raw CDR in, codec bytes out.
+
+Subscribes to each configured lidar with the sensor-data QoS and ``raw=True``, so frames go
+through the tested ``decode_pointcloud2`` rather than rclpy's deserializer. Publishes the
+codec's CDR bytes on ``/room_memory/status`` (1 Hz) and ``/room_memory/events``; the
+``labcommand_msgs`` classes only provide the type support.
+"""
+
+import time
+
+import rclpy
+from labcommand_msgs.msg import ChangeEvent as ChangeEventMsg
+from labcommand_msgs.msg import MemoryStatus as MemoryStatusMsg
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import PointCloud2
+
+from .memory import SENSORS, MemoryConfig, RoomMemory
+from .messages import Time
+
+STATUS_TOPIC = "/room_memory/status"
+EVENTS_TOPIC = "/room_memory/events"
+
+
+def _time(node):
+    sec, nanosec = node.get_clock().now().seconds_nanoseconds()
+    return Time(int(sec), int(nanosec))
+
+
+class RoomMemoryNode(Node):
+    """ROS 2 wrapper: parameters → ``MemoryConfig``, timers → windows and status."""
+
+    def __init__(self, **kwargs):
+        super().__init__("room_memory", **kwargs)
+        defaults = MemoryConfig()
+        params = {
+            "room_id": defaults.room_id,
+            "sensors": list(defaults.sensors),
+            "voxel_size": defaults.voxel_size,
+            "max_range": defaults.max_range,
+            "tolerance": defaults.tolerance,
+            "min_voxels": defaults.min_voxels,
+            "min_extent": defaults.min_extent,
+            "window_s": defaults.window_s,
+            "reference_windows": defaults.reference_windows,
+            "recent_windows": defaults.recent_windows,
+            "state_dir": defaults.state_dir,
+        }
+        values = {name: self.declare_parameter(name, value).value for name, value in params.items()}
+        values["sensors"] = tuple(values["sensors"])
+        values["max_range"] = values["max_range"] if values["max_range"] > 0 else None
+        values["state_dir"] = values["state_dir"] or None
+        self.config = MemoryConfig(**values)
+        self.memory = RoomMemory(self.config, _time(self))
+
+        reliable = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE)
+        self.events = self.create_publisher(ChangeEventMsg, EVENTS_TOPIC, reliable)
+        self.status = self.create_publisher(MemoryStatusMsg, STATUS_TOPIC, QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
+        for name in self.config.sensors:
+            sensor = SENSORS[name]
+            self.create_subscription(
+                PointCloud2, sensor.topic, lambda data, name=name: self.memory.add_cdr(name, data),
+                qos_profile_sensor_data, raw=True,
+            )
+        self._last_status = time.monotonic()
+        self.create_timer(self.config.window_s, self._close_window)
+        self.create_timer(1.0, self._publish_status)
+        self.get_logger().info(
+            f"room '{self.config.room_id}' sensors {list(self.config.sensors)} state {self.memory.state.name} "
+            f"map_epoch {self.memory.map_epoch}"
+        )
+
+    def _close_window(self):
+        start = time.perf_counter()
+        cpu = time.process_time()
+        events = self.memory.close_window(_time(self))
+        for event in events:
+            self.events.publish(event.to_cdr())
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        cpu_ms = (time.process_time() - cpu) * 1000
+        self.get_logger().info(
+            f"window {elapsed_ms:.1f} ms wall, {cpu_ms:.1f} ms cpu, {len(events)} event messages, "
+            f"state {self.memory.state.name}"
+        )
+        if elapsed_ms > self.config.window_s * 1000:
+            self.get_logger().warning(f"window took {elapsed_ms:.0f} ms, longer than window_s")
+
+    def _publish_status(self):
+        now = time.monotonic()
+        message = self.memory.status(_time(self), now - self._last_status)
+        self._last_status = now
+        self.status.publish(message.to_cdr())
+
+
+def main(args=None):
+    """Entry point for ``ros2 run room_memory room_memory_node``."""
+    rclpy.init(args=args)
+    node = RoomMemoryNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()

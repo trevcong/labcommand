@@ -1,0 +1,5 @@
+.build
+build
+spark/.venv-local
+**/__pycache__
+**/.pytest_cache
