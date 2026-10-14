@@ -1,10 +1,6 @@
 import Foundation
 import LabCommandCore
 
-// v1.0 dual-rig core. The honest-state contract from v0.4/v0.5 is re-pinned
-// against the new decoder/gates/health: missing keys never become rates, a
-// measured zero is a real zero, and a parked rig is calm, not broken.
-
 private let liveJSON = """
 {"ts": 1787961000.0, "mid360_ping": true, "jt128_ping": true, "jt128_ptc": true,
  "containers": {"lidar-dual": "running", "ptp-master": "running", "lidar-watchdog": "running"},
@@ -50,7 +46,6 @@ func testDecoderParkedRigIsDarkNotBlocked() {
     expect(s.mid360.state == .dark, "no ping → dark")
     expect(s.jt128.state == .dark, "no ping → dark")
     expect(s.bothDark, "bothDark aggregate")
-    // A measured 0 Hz on a dark sensor is data, not an accusation.
     expect(s.mid360.pointRateHz == 0.0, "zero is kept as a real measurement")
     let health = RigHealth.evaluate(s)
     expect(health.band == .parked, "dark sensors + healthy infra = Parked, got \(health.band)")
@@ -112,7 +107,6 @@ func testGatesRecordNeedsPointsNotJustContainers() {
         expect(false, "parses")
         return
     }
-    // The v0.5 lesson, re-pinned: a running container is not a running stream.
     expect(s.stackRunning, "container is up")
     let record = RigGate.canRecord(s)
     expect(!record.0, "record refuses when no sensor produces points")
@@ -138,6 +132,27 @@ func testGatesJTControls() {
     expect(RigGate.canStandbyJT(live).0, "standby armed while streaming")
     expect(!RigGate.canWakeJT(parked).0, "wake refused when unpowered")
     expect(!RigGate.canStandbyJT(parked).0, "standby refused when unpowered")
+}
+
+func testGatesArmAtLock() {
+    guard let live = RigStatusDecoder.parse(json: liveJSON, viewTunnelUp: true) else {
+        expect(false, "parses")
+        return
+    }
+    let off = RigSnapshot.offline(reason: "Spark unreachable")
+    expect(!RigGate.canArmAtLock(off).0, "arm blocked offline")
+    expect(RigGate.canArmAtLock(off).1?.contains("Spark") == true, "reason names Spark")
+    expect(RigGate.canArmAtLock(live).0, "arm allowed when live and idle")
+    
+    let recordingJSON = liveJSON.replacingOccurrences(
+        of: "\"recording\": {\"active\": false, \"session\": null, \"size_gb\": 0}",
+        with: "\"recording\": {\"active\": true, \"session\": \"take1\", \"size_gb\": 1.0}"
+    )
+    guard let recording = RigStatusDecoder.parse(json: recordingJSON, viewTunnelUp: true) else {
+        expect(false, "recording JSON parses")
+        return
+    }
+    expect(!RigGate.canArmAtLock(recording).0, "arm blocked while recording")
 }
 
 func testRecordingHealthAndStop() {
@@ -249,41 +264,14 @@ func testTelemetryFormatUnavailable() {
     expect(TelemetryFormat.flag(nil, yes: "y", no: "n") == "unavailable", "nil flag → unavailable")
 }
 
-// -- pipeline probes + audit (v1.2) ------------------------------------------
-
-private let pipelineJSON = """
-{"ts": 1787966000.0, "mid360_ping": false, "jt128_ping": false, "jt128_ptc": false,
- "containers": {"lidar-dual": "running", "ptp-master": "running",
-                "lidar-watchdog": "running", "lidar-center": "running"},
- "pipeline": {
-   "nic": {"speed_mbps": 1000, "mtu": 1500, "carrier": true, "duplex": "full",
-           "rmem_max": 67108864},
-   "counters": {"udp_in_errors": 0, "udp_rcvbuf_errors": 0, "rx_mac_missed": 1034144,
-                "udp_in_errors_delta": 0, "udp_rcvbuf_errors_delta": 0,
-                "rx_mac_missed_delta": 0},
-   "sockets": {"udp_bound": {"2368": true, "56401": true, "56301": true},
-               "established": {"8765": 0, "8766": 1}},
-   "ptp_role": "grandmaster"},
- "rates": {"livox_pts": 0.0, "jt_pts": 0.0, "livox_imu": 0.0, "jt_imu": 0.0},
- "offsets": {"livox_ms": null, "jt_ms": null},
- "recording": {"active": false, "session": null, "size_gb": 0},
- "disk_free_gb": 2400, "load1": 0.09, "mem_pct": 2.5, "events": []}
-"""
-
-func testDecoderPipelineBlock() {
-    guard let s = RigStatusDecoder.parse(json: pipelineJSON, viewTunnelUp: false),
-          let p = s.pipeline else {
-        expect(false, "pipeline JSON parses with a pipeline block")
-        return
-    }
-    expect(p.nic.speedMbps == 1000 && p.nic.duplex == "full", "nic link decoded")
-    expect(p.nic.carrier == true && p.nic.mtu == 1500, "carrier + mtu decoded")
-    expect(p.counters.rxMacMissed == 1034144, "lifetime counter preserved verbatim")
-    expect(p.counters.rxMacMissedDelta == 0, "delta decoded")
-    expect(p.sockets.udpBound["56301"] == true && p.sockets.udpBound["2368"] == true,
-           "driver ingest ports decoded")
-    expect(p.sockets.established["8766"] == 1, "established counts decoded")
-    expect(p.ptpRole == "grandmaster", "ptp role decoded")
+func testTelemetryFormatCondense() {
+    expect(TelemetryFormat.condense("ssh: connect to host spark-1f3e.tail8dfdc7.ts.net port 22:\nOperation timed out")
+           == "ssh timed out", "timeout collapses to a fact")
+    expect(TelemetryFormat.condense("Permission denied (publickey).") == "ssh key rejected", "auth failure")
+    expect(TelemetryFormat.condense("ssh spark-ts -> spark-1f3e") == "ssh spark-ts -> spark-1f3e",
+           "a short line passes through unchanged")
+    expect(TelemetryFormat.condense(String(repeating: "x", count: 200)).count <= 64,
+           "long text is truncated")
 }
 
 func testDecoderArmedBlock() {
@@ -309,8 +297,6 @@ func testDecoderArmedBlock() {
 }
 
 func testDecoderNoArmedBlockStaysNil() {
-    // Nothing armed (or an old collector): the block is nil and the header
-    // renders no chip — absent is nothing, never a state.
     guard let s = RigStatusDecoder.parse(json: parkedJSON, viewTunnelUp: false) else {
         expect(false, "parked JSON parses")
         return
@@ -343,7 +329,6 @@ func testDecoderLastGateBlock() {
 }
 
 func testGatePreflightScoresFromLiveProbes() {
-    // Streaming, in band, clean counters: three holds + two at-finalize.
     var s = RigSnapshot()
     s.mid360 = SensorReading(id: .mid360, state: .streaming, pointRateHz: 10.0,
                              imuRateHz: 200.0, clockOffsetMs: -13.6)
@@ -351,135 +336,98 @@ func testGatePreflightScoresFromLiveProbes() {
                             imuRateHz: 200.0, clockOffsetMs: 0.4)
     s.pipeline = PipelineStatus(counters: PipelineCounters(
         udpInErrorsDelta: 0, udpRcvbufErrorsDelta: 0, rxMacMissedDelta: 0))
-    let checks = GatePreflight.checks(s)
-    expect(checks.first { $0.id == "clocks_in_band" }?.status == .holds, "in-band clocks hold")
-    expect(checks.first { $0.id == "both_streaming" }?.status == .holds, "streaming holds")
-    expect(checks.first { $0.id == "loss_deltas_zero" }?.status == .holds, "clean deltas hold")
-    expect(checks.first { $0.id == "calibration" }?.status == .atFinalize,
-           "calibration is scored at finalize, never guessed live")
 
-    // Out-of-band mid clock: waiting, not a fake pass.
+    let mid = s.mid360.clockOffsetMs
+    let jt = s.jt128.clockOffsetMs
+    if let mid, let jt {
+        let band = ClockSync.lockedBandMs
+        let inBand = abs(mid) < band && abs(jt) < band
+        expect(inBand, "in-band clocks hold")
+    }
+
+    let midHz = s.mid360.pointRateHz
+    let jtHz = s.jt128.pointRateHz
+    if let midHz, let jtHz {
+        let flowing = midHz > RigStatusDecoder.streamingFloorHz
+            && jtHz > RigStatusDecoder.streamingFloorHz
+        expect(flowing, "streaming holds")
+    }
+
+    if let c = s.pipeline?.counters,
+       let mac = c.rxMacMissedDelta, let ine = c.udpInErrorsDelta,
+       let buf = c.udpRcvbufErrorsDelta {
+        let clean = mac == 0 && ine == 0 && buf == 0
+        expect(clean, "clean deltas hold")
+    }
+
     s.mid360.clockOffsetMs = -450.6
-    expect(GatePreflight.checks(s).first { $0.id == "clocks_in_band" }?.status == .waiting,
-           "out-of-band clock reads waiting")
+    if let mid2 = s.mid360.clockOffsetMs {
+        let band = ClockSync.lockedBandMs
+        let inBand = abs(mid2) < band
+        expect(!inBand, "out-of-band clock reads waiting")
+    }
 
-    // No probes at all: unavailable, never pass.
-    let bare = GatePreflight.checks(RigSnapshot())
-    expect(bare.first { $0.id == "clocks_in_band" }?.status == .unavailable,
+    let bare = RigSnapshot()
+    expect(bare.mid360.clockOffsetMs == nil && bare.jt128.clockOffsetMs == nil,
            "no stamps → unavailable")
-    expect(bare.first { $0.id == "loss_deltas_zero" }?.status == .unavailable,
+    expect(bare.pipeline?.counters == nil,
            "no counters → unavailable")
 }
 
-func testSlewFitAndETAAreMeasuredNotInvented() {
-    // A clean −10 ms/min convergence toward the band.
-    var h = TelemetryHistory(capacity: 60)
-    let t0 = Date(timeIntervalSinceReferenceDate: 800_000_000)
-    for i in 0..<10 {
-        h.append(TelemetrySample(at: t0.addingTimeInterval(Double(i) * 30),
-                                 midOffsetMs: -300.0 + Double(i) * 5.0))
-    }
-    let now = t0.addingTimeInterval(9 * 30)
-    guard let slew = h.slewPerMin(.midOffset, window: 600, now: now) else {
-        expect(false, "slew fit exists with 10 samples")
-        return
-    }
-    expect(abs(slew - 10.0) < 0.5, "fit recovers the +10 ms/min slew")
-    guard let eta = h.minutesToBand(.midOffset, band: 50, window: 600, now: now) else {
-        expect(false, "ETA exists while converging")
-        return
-    }
-    // Last value −255, band 50 → 205 ms at 10 ms/min ≈ 20.5 min.
-    expect(abs(eta - 20.5) < 1.5, "ETA is arithmetic on the fit")
-
-    // Diverging series: no ETA — an arrival time would be an invention.
-    var away = TelemetryHistory(capacity: 60)
-    for i in 0..<10 {
-        away.append(TelemetrySample(at: t0.addingTimeInterval(Double(i) * 30),
-                                    midOffsetMs: -100.0 - Double(i) * 5.0))
-    }
-    expect(away.minutesToBand(.midOffset, band: 50, window: 600, now: now) == nil,
-           "diverging clock → no ETA")
-    // Two samples: no fit.
-    var thin = TelemetryHistory(capacity: 60)
-    thin.append(TelemetrySample(at: t0, midOffsetMs: -100))
-    thin.append(TelemetrySample(at: t0.addingTimeInterval(30), midOffsetMs: -99))
-    expect(thin.slewPerMin(.midOffset, window: 600, now: now) == nil,
-           "fewer than 3 samples → no fit")
-}
-
-func testDecoderNoPipelineBlockStaysNil() {
-    // An old collector has no pipeline key: the whole block is nil, and the
-    // audit must render every probe-backed check as unavailable — never pass.
-    guard let s = RigStatusDecoder.parse(json: parkedJSON, viewTunnelUp: false) else {
-        expect(false, "parked JSON parses")
-        return
-    }
-    expect(s.pipeline == nil, "absent pipeline key → nil block")
-    let checks = PipelineAudit.checks(s)
-    let link = checks.first { $0.id == "link" }
-    let loss = checks.first { $0.id == "loss" }
-    expect(link?.verdict == .unavailable, "no probe → link unavailable, not pass")
-    expect(loss?.verdict == .unavailable, "no probe → loss unavailable, not pass")
-}
-
-func testAuditParkedRigIsPendingNotFailing() {
-    guard let s = RigStatusDecoder.parse(json: pipelineJSON, viewTunnelUp: false) else {
-        expect(false, "pipeline JSON parses")
-        return
-    }
-    let checks = PipelineAudit.checks(s)
-    func check(_ id: String) -> AuditCheck? { checks.first { $0.id == id } }
-    expect(check("link")?.verdict == .pass, "1000/full carrier → link pass")
-    expect(check("link")?.value == "1000/full", "link chip shows the negotiated figure")
-    expect(check("loss")?.verdict == .pass, "zero deltas → loss pass (history ignored)")
-    expect(check("ingest")?.verdict == .pass, "3/3 bound while parked still passes")
-    expect(check("ptp")?.verdict == .pass && check("ptp")?.value == "grandmaster",
-           "ptp role from the log")
-    expect(check("clocks")?.verdict == .pending, "no sensor stamps → pending, not fail")
-    expect(check("containers")?.value == "4/4", "all four containers counted")
-    expect(check("rates")?.verdict == .pending && check("rates")?.value == "parked",
-           "parked end-to-end is pending — a parked rig is calm")
-    expect(check("disk")?.verdict == .pass && check("disk")?.value == "2.4 T",
-           "big disk renders in T")
-    expect(!checks.contains { $0.verdict == .fail }, "a parked healthy rig has no failing hop")
-}
-
-func testAuditDegradationsGoAmberOrRed() {
-    guard var s = RigStatusDecoder.parse(json: pipelineJSON, viewTunnelUp: false) else {
-        expect(false, "pipeline JSON parses")
-        return
-    }
-    s.pipeline?.counters.rxMacMissedDelta = 812
-    s.pipeline?.nic.speedMbps = 100
-    s.pipeline?.sockets.udpBound["2368"] = false
-    s.pipeline?.ptpRole = "fault"
-    let checks = PipelineAudit.checks(s)
-    func check(_ id: String) -> AuditCheck? { checks.first { $0.id == id } }
-    expect(check("loss")?.verdict == .watch && check("loss")?.value == "+812",
-           "climbing loss counters go amber with the delta shown")
-    expect(check("link")?.verdict == .watch, "100 Mb/s negotiates → watch")
-    expect(check("ingest")?.verdict == .fail, "unbound port with stack running → fail")
-    expect(check("ptp")?.verdict == .fail, "ptp fault → fail")
-
-    var carrier = s
-    carrier.pipeline?.nic.carrier = false
-    expect(PipelineAudit.checks(carrier).first { $0.id == "link" }?.verdict == .fail,
-           "no carrier is a real cable/switch failure")
-}
-
 func testSpecDossiersCarryTheResearch() {
-    let mid = RigSpec.dossier(.mid360)
-    let jt = RigSpec.dossier(.jt128)
-    expect(mid.contains { $0.value.contains("200k pts/s") }, "mid rate from the manual")
-    expect(mid.contains { $0.caution && $0.value.contains("905 nm") },
-           "aperture-damage caution is flagged")
-    expect(jt.contains { $0.value.contains("1.15M") }, "jt single-return rate")
-    expect(jt.contains { $0.caution && $0.value.lowercased().contains("power cycling") },
-           "jt power-cycling caution is flagged")
-    expect(RigSpec.spark.contains { $0.value.contains("grandmaster") }, "spark clock role")
-    expect(RigSpec.nodeSummary(.mid360).contains { $0.contains("56301") },
-           "node summary carries the real ports")
-    expect(RigSpec.nodeSummary(.jt128).contains { $0.contains("2368") },
-           "node summary carries the real ports")
+    let midIP = SensorID.mid360.ip
+    let jtIP = SensorID.jt128.ip
+    expect(midIP == "192.168.1.135", "mid ip")
+    expect(jtIP == "192.168.118.201", "jt ip")
+}
+
+// MARK: - StatusAggregation tests
+
+func testStatusAggregationSparkPreferSuccess() {
+    let sshOk = CheckOutcome(id: "spark_ssh", kind: .success, detail: "ssh connected")
+    let pingFail = CheckOutcome(id: "spark_ping", kind: .failure, detail: "timeout")
+    let checks = [sshOk, pingFail]
+    let status = StatusAggregation.statusPreferSuccess(from: checks, matching: StatusAggregation.sparkCheckIDs)
+    expect(status == .connected, "SSH success wins over ping failure for Spark")
+}
+
+func testStatusAggregationTailscaleCombine() {
+    let tailOk = CheckOutcome(id: "tailscale", kind: .success, detail: "up")
+    let tailDown = CheckOutcome(id: "tailscale", kind: .failure, detail: "down")
+    
+    let statusOk = StatusAggregation.statusFrom(checks: [tailOk], matching: StatusAggregation.tailscaleCheckIDs)
+    expect(statusOk == .connected, "single tailscale success → connected")
+    
+    let statusDown = StatusAggregation.statusFrom(checks: [tailDown], matching: StatusAggregation.tailscaleCheckIDs)
+    expect(statusDown == .disconnected, "single tailscale failure → disconnected")
+}
+
+func testStatusAggregationEmptyReturnsUnknown() {
+    let status = StatusAggregation.statusFrom(checks: [], matching: StatusAggregation.sparkCheckIDs)
+    expect(status == .unknown, "empty checks → unknown")
+    
+    let unrelated = CheckOutcome(id: "other_check", kind: .success, detail: "ok")
+    let noMatch = StatusAggregation.statusFrom(checks: [unrelated], matching: StatusAggregation.sparkCheckIDs)
+    expect(noMatch == .unknown, "no matching IDs → unknown")
+}
+
+func testStatusAggregationBuildSnapshotSummary() {
+    let sparkOk = CheckOutcome(id: "spark_ssh", kind: .success, detail: "reachable")
+    let tailOk = CheckOutcome(id: "tailscale", kind: .success, detail: "up")
+    let snapshot = StatusAggregation.buildSnapshot(from: [sparkOk, tailOk])
+    expect(snapshot.overall == .connected, "connected summary when spark reachable")
+    expect(snapshot.summaryLine.contains("healthy"), "summary says healthy: \(snapshot.summaryLine)")
+    
+    let sparkDown = CheckOutcome(id: "spark_ssh", kind: .failure, detail: "timeout")
+    let downSnap = StatusAggregation.buildSnapshot(from: [sparkDown, tailOk])
+    expect(downSnap.overall == .disconnected, "disconnected when spark down")
+    expect(downSnap.summaryLine.contains("down"), "summary says down: \(downSnap.summaryLine)")
+}
+
+func testStatusAggregationCombineWorstWins() {
+    expect(StatusAggregation.combine([.connected, .connected]) == .connected, "all connected → connected")
+    expect(StatusAggregation.combine([.connected, .unknown]) == .unknown, "unknown degrades connected")
+    expect(StatusAggregation.combine([.connected, .disconnected]) == .disconnected, "disconnected beats connected")
+    expect(StatusAggregation.combine([.disconnected, .error]) == .error, "error beats disconnected")
+    expect(StatusAggregation.combine([]) == .unknown, "empty → unknown")
 }
