@@ -107,6 +107,12 @@ public enum FoxgloveProtocol {
         return "{\"op\":\"subscribe\",\"subscriptions\":[\(entries)]}"
     }
 
+    /// `{"op":"unsubscribe","subscriptionIds":[<subId>,…]}`
+    public static func unsubscribeMessage(_ subscriptionIds: [UInt32]) -> String {
+        let ids = subscriptionIds.map(String.init).joined(separator: ",")
+        return "{\"op\":\"unsubscribe\",\"subscriptionIds\":[\(ids)]}"
+    }
+
     // MARK: Server → client (binary)
 
     public struct MessageData: Sendable, Equatable {

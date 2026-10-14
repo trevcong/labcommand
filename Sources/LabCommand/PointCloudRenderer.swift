@@ -324,7 +324,7 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
                 String(format: "x %.1f…%.1f y %.1f…%.1f z %.1f…%.1f m", lo.x, hi.x, lo.y, hi.y, lo.z, hi.z)
             }
             let fit = box(Point3D(x: bounds.min.x, y: bounds.min.y, z: bounds.min.z), Point3D(x: bounds.max.x, y: bounds.max.y, z: bounds.max.z))
-            FileHandle.standardError.write(Data("[PointCloudView] live fit box \(fit) (raw min/max \(box(raw.min, raw.max)))\n".utf8))
+            FileHandle.standardError.write(Data("[PointCloudView] captured fit box \(fit) (raw min/max \(box(raw.min, raw.max)))\n".utf8))
         }
         boundingBox = bounds
         needsInitialFit = true

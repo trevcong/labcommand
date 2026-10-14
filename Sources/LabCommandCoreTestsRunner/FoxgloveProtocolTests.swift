@@ -71,6 +71,11 @@ func testFoxgloveSubscribeMessage() {
     expect(object?["op"] as? String == "subscribe", "op is subscribe")
     expect(subscriptions?.count == 2, "two subscriptions")
     expect(subscriptions?[1]["id"] as? Int == 2 && subscriptions?[1]["channelId"] as? Int == 12, "ids are JSON numbers")
+
+    let unsubscribe = FoxgloveProtocol.unsubscribeMessage([1, 2])
+    expect(unsubscribe == #"{"op":"unsubscribe","subscriptionIds":[1,2]}"#, "unsubscribe wire text, got \(unsubscribe)")
+    let unsubscribeObject = (try? JSONSerialization.jsonObject(with: Data(unsubscribe.utf8))) as? [String: Any]
+    expect(unsubscribeObject?["subscriptionIds"] as? [Int] == [1, 2], "unsubscribe ids are JSON numbers")
 }
 
 private func messageDataFrame(opcode: UInt8, subscriptionId: UInt32, timestamp: UInt64, payload: [UInt8]) -> Data {
@@ -247,7 +252,28 @@ func testLiveViewBadge() {
     expect(summary == "Mid-360 19.9k pts 10.0 Hz, JT128 60k pts", "log summary, got \(summary)")
     let unmeasured = LiveViewMode.liveBadge([.init(label: "JT128", points: 60_000, hz: nil)])
     expect(unmeasured == "LIVE · JT128 60k pts", "an unmeasured rate is omitted, got \(unmeasured)")
+    let timed = LiveViewMode.liveBadge([.init(label: "Mid-360", points: 19_912, hz: 10)], remaining: 101.2)
+    expect(timed == "LIVE · Mid-360 19.9k pts 10.0 Hz · 1:42 left", "remaining time rounds up, got \(timed)")
+    let connecting = LiveViewMode.liveBadge([], remaining: 120)
+    expect(connecting == "LIVE · connecting… · 2:00 left", "live before any frame, got \(connecting)")
+    expect(LiveViewMode.minutesSeconds(0.2) == "0:01", "never 0:00 while time is left")
+
     expect(LiveViewMode.sampleBadge == "SAMPLE — not live data", "sample badge wording")
+    expect(LiveViewMode.offBadge(sampleShown: false) == "OFF", "off with nothing on screen")
+    expect(LiveViewMode.offBadge(sampleShown: true) == "OFF · SAMPLE — not live data", "off with the sample standing in")
+
+    let utc = TimeZone(secondsFromGMT: 0)!
+    // 2026-10-14 10:42:13 UTC.
+    let capturedAt = Date(timeIntervalSince1970: 1_791_974_533)
+    let snapshot = LiveViewMode.snapshotBadge(capturedAt: capturedAt, points: [.mid360: 19_912, .jt128: 60_000], timeZone: utc)
+    expect(snapshot == "SNAPSHOT 10:42:13 · Mid-360 19.9k pts · JT128 60k pts", "snapshot badge, got \(snapshot)")
+    let partial = LiveViewMode.snapshotBadge(capturedAt: capturedAt, points: [.mid360: 850], timeZone: utc)
+    expect(partial == "SNAPSHOT 10:42:13 · Mid-360 850 pts · JT128 no frame", "a timed-out sensor reads missing, got \(partial)")
+    let local = LiveViewMode.snapshotBadge(capturedAt: capturedAt, points: [:], timeZone: TimeZone(secondsFromGMT: -5 * 3600)!)
+    expect(local.hasPrefix("SNAPSHOT 05:42:13"), "capture time is in the given zone, got \(local)")
+    expect(LiveViewMode.snapshotSummary([.jt128: 60_000]) == "Mid-360 no frame, JT128 60k pts", "snapshot log summary")
+    let capturing = LiveViewMode.capturingBadge([.init(label: "Mid-360", points: 19_912, hz: nil)])
+    expect(capturing == "SNAPSHOT · capturing… · Mid-360 19.9k pts", "capturing badge, got \(capturing)")
 }
 
 func testArrivalRate() {
@@ -281,7 +307,7 @@ func runFoxgloveProtocolTests() {
     testFoxgloveChannelSchemaCheck()
     print("  Foxglove: only PointCloud2 schemas are subscribable"); passed()
     testFoxgloveSubscribeMessage()
-    print("  Foxglove: subscribe wire text"); passed()
+    print("  Foxglove: subscribe / unsubscribe wire text"); passed()
     testFoxgloveMessageData()
     print("  Foxglove: binary 0x01 header (LE sub id + timestamp), slices, other opcodes ignored"); passed()
     testFoxgloveMessageDataFeedsCDRDecoder()
@@ -295,7 +321,7 @@ func runFoxgloveProtocolTests() {
     testStreamHostRotation()
     print("  Foxglove: rounds start at the last working host (tailnet until one works); the rest only right after it fails"); passed()
     testLiveViewBadge()
-    print("  live view: LIVE badge counts + Hz, SAMPLE badge wording"); passed()
+    print("  live view: OFF / SNAPSHOT hh:mm:ss / LIVE badges, counts + Hz + time left, SAMPLE wording"); passed()
     testArrivalRate()
     print("  live view: arrival rate over a 2 s window; rolling per-second count decays to 0"); passed()
 }

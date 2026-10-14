@@ -54,9 +54,10 @@ final class AppState: ObservableObject {
     /// Current point cloud frame for 3D canvas.
     @Published var currentFrame: PointCloudFrame?
     @Published var pointCloudColorMode: PointCloudColorMode = .height
-    /// Live lidar clouds from Spark. Publishes on its own so 10 Hz frames don't
-    /// invalidate everything that observes AppState.
-    let live = FoxgloveLiveClient()
+    /// Lidar clouds from Spark, on request only. Publishes on its own so live
+    /// updates don't invalidate everything that observes AppState. Mock mode is
+    /// for working without Spark — it doesn't reach for the real rig.
+    let live = FoxgloveLiveClient(isAvailable: MockMode.parseArgs() == nil)
 
     private let service: ConnectivityService
     private let rigIO: RigServiceProtocol
@@ -65,7 +66,6 @@ final class AppState: ObservableObject {
     private var fastTimer: Timer?
     /// Watchdog lines already forwarded into the mission log.
     private var seenWatchdogLines: Set<String> = []
-    private var sampleLoadAttempted = false
     private var adoptedSensorColors = false
 
     init(
@@ -89,38 +89,34 @@ final class AppState: ObservableObject {
     func start() {
         refresh(manual: true)
         restartTimer()
-        startLiveClouds()
+        setUpPointClouds()
     }
-    
-    /// Stream the real clouds into the 3D canvas; the sample PCD stands in until
-    /// they arrive, and again whenever they stop.
-    private func startLiveClouds() {
-        // Mock mode is for working without Spark — don't reach for the real rig.
-        guard MockMode.parseArgs() == nil else {
-            loadSamplePointCloudIfNeeded()
-            return
-        }
+
+    /// The 3D canvas opens no socket on its own: the sample PCD stands in until
+    /// the operator takes a snapshot or goes live.
+    private func setUpPointClouds() {
         live.onLog = { [weak self] text, kind in
             self?.appendLog(text, kind: kind)
         }
-        live.onFallback = { [weak self] in
-            self?.loadSamplePointCloudIfNeeded()
-        }
-        live.onLive = { [weak self] in
+        live.onCaptured = { [weak self] in
             // Two sensors in one view read best by sensor color. Once only: after
             // that the picker is the operator's.
             guard let self, !self.adoptedSensorColors else { return }
             self.adoptedSensorColors = true
             self.pointCloudColorMode = .sensor
         }
-        live.start()
+        loadSamplePointCloud()
+
+        // Dev/testing: the same paths as the 3D view's buttons, without a click.
+        switch LiveLaunchAction.parse(CommandLine.arguments) {
+        case .snapshot: live.takeSnapshot()
+        case .live: live.startLive()
+        case nil: break
+        }
     }
-    
-    /// Load a sample PCD file for the 3D canvas when Spark is offline.
-    func loadSamplePointCloudIfNeeded() {
-        guard currentFrame == nil, !sampleLoadAttempted else { return }
-        sampleLoadAttempted = true
-        
+
+    /// Load the sample PCD that stands in on the 3D canvas while nothing is captured.
+    private func loadSamplePointCloud() {
         let fm = FileManager.default
         let filename = "mid360-frame.pcd"
         
@@ -170,7 +166,7 @@ final class AppState: ObservableObject {
         slowTimer = nil
         fastTimer = nil
         task?.cancel()
-        live.stop()
+        live.shutdown()
     }
 
     func restartTimer() {

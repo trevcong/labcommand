@@ -103,8 +103,9 @@ public struct DualPointCloudView: NSViewRepresentable {
     /// keep replacing the points without moving the camera.
     public var fitGeneration: Int?
     
-    /// Live clouds to pull on every draw. While set, `midFrame`/`jtFrame` are not
-    /// drawn and the camera fit for `fitGeneration` uses the live points.
+    /// Captured clouds (snapshot or live) to pull on every draw. While set,
+    /// `midFrame`/`jtFrame` are not drawn and the camera fit for `fitGeneration`
+    /// uses the captured points.
     var liveFeed: LiveFrameMailbox?
     
     init(
@@ -164,7 +165,7 @@ public struct DualPointCloudView: NSViewRepresentable {
         if liveFeed != nil {
             if fitPending, renderer.fitToLive() {
                 context.coordinator.lastFitGeneration = fitGeneration
-                FileHandle.standardError.write(Data("[PointCloudView] camera fit to live clouds, 2nd–98th percentile (fit generation \(fitGeneration ?? 0))\n".utf8))
+                FileHandle.standardError.write(Data("[PointCloudView] camera fit to captured clouds, 2nd–98th percentile (fit generation \(fitGeneration ?? 0))\n".utf8))
             }
             // Whatever static frames come back after live must load fresh.
             context.coordinator.lastRevision = -1

@@ -1,14 +1,16 @@
 import Foundation
 
-/// What the 3D view is showing: live clouds, or the sample PCD standing in. The
-/// two are never merged, and the badge and log say which one is on screen.
+/// What the 3D view is showing, for the badge and the `mode=` log line: nothing
+/// captured (the sample PCD may stand in), one held frame per sensor, or a live
+/// stream. Live and sample are never merged.
 public enum LiveViewMode: String, Sendable {
+    case off = "OFF"
+    case snapshot = "SNAPSHOT"
     case live = "LIVE"
-    case sample = "SAMPLE"
 
     public static let sampleBadge = "SAMPLE — not live data"
 
-    /// One sensor's share of the live view.
+    /// One sensor's share of the view.
     public struct Reading: Equatable, Sendable {
         public var label: String
         public var points: Int
@@ -21,15 +23,51 @@ public enum LiveViewMode: String, Sendable {
         }
     }
 
-    /// "LIVE · Mid-360 19.9k pts 10.0 Hz · JT128 60k pts 10.0 Hz". A rate not yet
-    /// measured is left out rather than shown as a guess.
-    public static func liveBadge(_ readings: [Reading]) -> String {
-        ([LiveViewMode.live.rawValue] + parts(readings)).joined(separator: " · ")
+    /// "OFF", or "OFF · SAMPLE — not live data" while the sample cloud is on screen.
+    public static func offBadge(sampleShown: Bool) -> String {
+        sampleShown ? "\(LiveViewMode.off.rawValue) · \(sampleBadge)" : LiveViewMode.off.rawValue
+    }
+
+    /// "SNAPSHOT · capturing… · Mid-360 19.9k pts" while the one-shot sockets are open.
+    public static func capturingBadge(_ readings: [Reading]) -> String {
+        ([LiveViewMode.snapshot.rawValue, "capturing…"] + parts(readings)).joined(separator: " · ")
+    }
+
+    /// "SNAPSHOT 10:42:13 · Mid-360 19.9k pts · JT128 no frame". Every sensor is
+    /// listed, so one that timed out reads as missing rather than silently absent.
+    public static func snapshotBadge(
+        capturedAt: Date,
+        points: [SensorID: Int],
+        timeZone: TimeZone = .current
+    ) -> String {
+        let sensors = SensorID.allCases.map { sensor in
+            points[sensor].map { "\(sensor.label) \(Self.points($0))" } ?? "\(sensor.label) no frame"
+        }
+        return (["\(LiveViewMode.snapshot.rawValue) \(clock(capturedAt, timeZone: timeZone))"] + sensors)
+            .joined(separator: " · ")
+    }
+
+    /// "LIVE · Mid-360 19.9k pts 10.0 Hz · JT128 60k pts 10.0 Hz · 1:42 left". A rate
+    /// not yet measured is left out rather than shown as a guess.
+    public static func liveBadge(_ readings: [Reading], remaining: TimeInterval? = nil) -> String {
+        var items = [LiveViewMode.live.rawValue]
+        items += readings.isEmpty ? ["connecting…"] : parts(readings)
+        if let remaining {
+            items.append("\(minutesSeconds(remaining)) left")
+        }
+        return items.joined(separator: " · ")
     }
 
     /// "Mid-360 19.9k pts 10.0 Hz, JT128 60k pts" — the badge's sensors, for logs.
     public static func summary(_ readings: [Reading]) -> String {
         parts(readings).joined(separator: ", ")
+    }
+
+    /// "Mid-360 19.9k pts, JT128 no frame" — a snapshot's sensors, for logs.
+    public static func snapshotSummary(_ points: [SensorID: Int]) -> String {
+        SensorID.allCases.map { sensor in
+            points[sensor].map { "\(sensor.label) \(Self.points($0))" } ?? "\(sensor.label) no frame"
+        }.joined(separator: ", ")
     }
 
     private static func parts(_ readings: [Reading]) -> [String] {
@@ -50,6 +88,21 @@ public enum LiveViewMode: String, Sendable {
             thousands.removeLast(2)
         }
         return "\(thousands)k pts"
+    }
+
+    /// "10:42:13", 24-hour, in `timeZone`.
+    public static func clock(_ date: Date, timeZone: TimeZone = .current) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: date)
+    }
+
+    /// "2:00", "0:07". Rounds up, so the badge never reads 0:00 while still live.
+    public static func minutesSeconds(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval.rounded(.up)))
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }
 

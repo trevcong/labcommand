@@ -171,6 +171,7 @@ struct CommandCenterView: View {
                     .font(LabTheme.t(LabTheme.titleSize, .semibold))
                     .foregroundStyle(LabTheme.text)
                 Spacer()
+                LiveStreamControls(live: state.live)
                 Picker("Color", selection: $state.pointCloudColorMode) {
                     ForEach(PointCloudColorMode.allCases, id: \.rawValue) { mode in
                         Text(mode.label).tag(mode)
@@ -367,29 +368,56 @@ struct CommandCenterView: View {
     }
 }
 
-/// The 3D canvas: live clouds while they stream, the sample cloud otherwise —
-/// never both, so a sensor that isn't live leaves its slot empty rather than
-/// backfilled by the sample. The badge says which one is on screen.
-/// The renderer pulls live clouds itself at draw time; this view only follows the
-/// live/sample state and the badge.
+/// Snapshot and Live, the only ways the 3D view touches the network.
+private struct LiveStreamControls: View {
+    @ObservedObject var live: FoxgloveLiveClient
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button("Snapshot") { live.takeSnapshot() }
+                .font(LabTheme.t(11, .medium))
+                .buttonStyle(QuietButton())
+                .disabled(!live.isAvailable || live.isCapturing || live.isLive)
+                .help("One frame per sensor, then the connection closes")
+            // Follows the session, so an auto-stop flips it back off.
+            Toggle("Live", isOn: Binding(
+                get: { live.isLive },
+                set: { $0 ? live.startLive() : live.stopLive() }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .font(LabTheme.t(11, .medium))
+            .foregroundStyle(LabTheme.dim)
+            .disabled(!live.isAvailable || live.isCapturing)
+            .help("Stream until switched off, for at most \(Int(LiveSession.liveMaxDuration / 60)) min, and only while the window is visible")
+        }
+    }
+}
+
+/// The 3D canvas: captured clouds (snapshot or live) once there are any, the
+/// sample cloud only while OFF — never both, so a sensor that didn't deliver
+/// leaves its slot empty rather than backfilled by the sample. The badge says
+/// which one is on screen. The renderer pulls captured clouds itself at draw
+/// time; this view only follows the mode and the badge.
 private struct LivePointCloudCanvas: View {
     @ObservedObject var live: FoxgloveLiveClient
     var sample: PointCloudFrame?
     var colorMode: PointCloudColorMode
 
     var body: some View {
+        let off = live.phase == .off
         DualPointCloudView(
-            midFrame: .constant(live.isLive ? nil : (sample?.sensor == .jt128 ? nil : sample)),
-            jtFrame: .constant(live.isLive ? nil : (sample?.sensor == .jt128 ? sample : nil)),
+            midFrame: .constant(off && sample?.sensor != .jt128 ? sample : nil),
+            jtFrame: .constant(off && sample?.sensor == .jt128 ? sample : nil),
             colorMode: colorMode,
             pointSize: 3.0,
-            fitGeneration: live.sourceGeneration,
-            liveFeed: live.isLive ? live.mailbox : nil
+            fitGeneration: live.fitGeneration,
+            liveFeed: off ? nil : live.mailbox
         )
         .overlay(alignment: .topLeading) {
             LiveModeBadge(
                 isLive: live.isLive,
-                text: live.isLive ? LiveViewMode.liveBadge(live.clouds.readings) : LiveViewMode.sampleBadge
+                text: off ? LiveViewMode.offBadge(sampleShown: sample != nil) : live.badge
             )
             .padding(10)
             // Camera drags start anywhere on the canvas, this corner included.
@@ -403,6 +431,7 @@ private struct LiveModeBadge: View {
     var text: String
 
     var body: some View {
+        // Green only for live data; anything held or standing in is amber.
         let tint = isLive ? LabTheme.good : LabTheme.warn
         HStack(spacing: 6) {
             Circle()
