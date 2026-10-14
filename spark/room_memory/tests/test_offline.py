@@ -8,12 +8,12 @@ import numpy as np
 import pytest
 
 from room_memory import offline
-from test_change_detection import CD_FIXTURES
+from test_change_detection import CD_FIXTURES, SNAPSHOTS
 
 
 @pytest.mark.parametrize("sensor", ["jt128", "mid360"])
 def test_cli_json_matches_swift_golden(sensor, capsys):
-    code = offline.main(["--evidence", "--json", str(CD_FIXTURES / f"a-{sensor}.bin"), str(CD_FIXTURES / f"b-{sensor}.bin")])
+    code = offline.main(["--evidence", "--json", str(SNAPSHOTS / "a" / f"{sensor}.bin"), str(SNAPSHOTS / "b" / f"{sensor}.bin")])
     assert code == 0
     assert capsys.readouterr().out.encode() == (CD_FIXTURES / f"{sensor}.json").read_bytes()
 
@@ -21,23 +21,23 @@ def test_cli_json_matches_swift_golden(sensor, capsys):
 @pytest.mark.parametrize("sensor", ["jt128", "mid360"])
 def test_bare_module_entry_point_prints_the_golden(sensor):
     result = subprocess.run(
-        [sys.executable, "-m", "room_memory.offline", str(CD_FIXTURES / f"a-{sensor}.bin"),
-         str(CD_FIXTURES / f"b-{sensor}.bin")],
+        [sys.executable, "-m", "room_memory.offline", str(SNAPSHOTS / "a" / f"{sensor}.bin"),
+         str(SNAPSHOTS / "b" / f"{sensor}.bin")],
         capture_output=True, check=True, cwd=pathlib.Path(offline.__file__).parents[1],
     )
     assert result.stdout == (CD_FIXTURES / f"{sensor}.json").read_bytes()
 
 
 def test_text_block(capsys):
-    code = offline.main(["--text", "--", str(CD_FIXTURES / "a-mid360.bin"), str(CD_FIXTURES / "b-mid360.bin")])
+    code = offline.main(["--text", "--", str(SNAPSHOTS / "a" / "mid360.bin"), str(SNAPSHOTS / "b" / "mid360.bin")])
     out = capsys.readouterr().out.splitlines()
     assert code == 0
-    assert out[0] == "before: a-mid360.bin  points=20064  voxels=7592  dropped=0"
+    assert out[0] == "before: mid360.bin  points=20064  voxels=7592  dropped=0"
     assert out[2] == "voxel_size_m=0.050  tolerance=1  min_points=1  min_voxels=6  min_extent=2  pair_moves=true"
     assert out[3] == "appeared_voxels=255  disappeared_voxels=104  unknown_voxels=1286"
     assert out[5:] == ["regions=0"]
-    assert offline.main(["--text", "--min-extent", "1", "--", str(CD_FIXTURES / "a-mid360.bin"),
-                         str(CD_FIXTURES / "b-mid360.bin")]) == 0
+    assert offline.main(["--text", "--min-extent", "1", "--", str(SNAPSHOTS / "a" / "mid360.bin"),
+                         str(SNAPSHOTS / "b" / "mid360.bin")]) == 0
     out = capsys.readouterr().out.splitlines()
     assert out[5] == "regions=1"
     assert out[6].startswith("region 0 appeared voxels=7 volume_m3=0.000875 centroid=-0.618,1.618,0.975")
@@ -56,12 +56,12 @@ def test_usage_errors(args, capsys):
 def test_input_and_config_errors(tmp_path, capsys):
     assert offline.main([str(tmp_path / "a.pcd"), str(tmp_path / "b.pcd")]) == 1
     assert "expected a .bin file" in capsys.readouterr().err
-    assert offline.main(["--tolerance", "9", str(CD_FIXTURES / "a-mid360.bin"), str(CD_FIXTURES / "b-mid360.bin")]) == 1
+    assert offline.main(["--tolerance", "9", str(SNAPSHOTS / "a" / "mid360.bin"), str(SNAPSHOTS / "b" / "mid360.bin")]) == 1
     assert "tolerance" in capsys.readouterr().err
 
 
 def test_opt_out_flags_select_the_swift_defaults(capsys):
-    args = [str(CD_FIXTURES / "a-mid360.bin"), str(CD_FIXTURES / "b-mid360.bin")]
+    args = [str(SNAPSHOTS / "a" / "mid360.bin"), str(SNAPSHOTS / "b" / "mid360.bin")]
     assert offline.main(["--no-evidence"] + args) == 0
     assert '"evidence":false' in capsys.readouterr().out
     assert offline.main(["--no-evidence", "--text"] + args) == 0

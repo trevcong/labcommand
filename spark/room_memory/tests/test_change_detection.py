@@ -26,6 +26,9 @@ from room_memory.offline import parse_args
 CD_FIXTURES = pathlib.Path(
     os.environ.get("ROOM_MEMORY_CD_FIXTURES", goldens.HERE.parents[2] / "Tests" / "Fixtures" / "change-detection")
 )
+SNAPSHOTS = pathlib.Path(
+    os.environ.get("ROOM_MEMORY_SNAPSHOTS", goldens.HERE.parents[2] / "Tests" / "Fixtures" / "room" / "snapshots")
+)
 
 CLEAR_LINE_GOLDEN = (
     '{"schema":"labcommand.change-detection.v2","evidence":true,"report_unobserved":false,'
@@ -78,8 +81,8 @@ def keys_of(points, config=Config()):
 
 @pytest.mark.parametrize("sensor", ["jt128", "mid360"])
 def test_snapshot_golden_bytes(sensor):
-    before = decode_pointcloud2((CD_FIXTURES / f"a-{sensor}.bin").read_bytes()).positions
-    after = decode_pointcloud2((CD_FIXTURES / f"b-{sensor}.bin").read_bytes()).positions
+    before = decode_pointcloud2((SNAPSHOTS / "a" / f"{sensor}.bin").read_bytes()).positions
+    after = decode_pointcloud2((SNAPSHOTS / "b" / f"{sensor}.bin").read_bytes()).positions
     _, text = record(before, after, Config(evidence_of_absence=True))
     assert (text + "\n").encode() == (CD_FIXTURES / f"{sensor}.json").read_bytes()
 
@@ -415,8 +418,8 @@ def test_shuffled_and_duplicated_input_keeps_the_bytes():
 
 
 def test_shuffled_snapshot_keeps_the_golden():
-    before = decode_pointcloud2((CD_FIXTURES / "a-mid360.bin").read_bytes()).positions
-    after = decode_pointcloud2((CD_FIXTURES / "b-mid360.bin").read_bytes()).positions
+    before = decode_pointcloud2((SNAPSHOTS / "a" / "mid360.bin").read_bytes()).positions
+    after = decode_pointcloud2((SNAPSHOTS / "b" / "mid360.bin").read_bytes()).positions
     rng = np.random.default_rng(7)
     _, text = record(before[rng.permutation(len(before))], after[rng.permutation(len(after))],
                      Config(evidence_of_absence=True))
