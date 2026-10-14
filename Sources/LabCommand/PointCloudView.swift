@@ -94,16 +94,29 @@ public struct DualPointCloudView: NSViewRepresentable {
     /// Point size in pixels.
     public var pointSize: Float
     
+    /// Bump to force a reload when the frames changed but their stamps and counts
+    /// might not have (live streams can repeat a header stamp).
+    public var revision: Int
+    
+    /// Nil refits the camera on every load. Otherwise the camera is fitted once per
+    /// distinct value, on the first load that has points — so a live stream can
+    /// keep replacing the points without moving the camera.
+    public var fitGeneration: Int?
+    
     public init(
         midFrame: Binding<PointCloudFrame?>,
         jtFrame: Binding<PointCloudFrame?>,
         colorMode: PointCloudColorMode = .sensor,
-        pointSize: Float = 4.0
+        pointSize: Float = 4.0,
+        revision: Int = 0,
+        fitGeneration: Int? = nil
     ) {
         self._midFrame = midFrame
         self._jtFrame = jtFrame
         self.colorMode = colorMode
         self.pointSize = pointSize
+        self.revision = revision
+        self.fitGeneration = fitGeneration
     }
     
     public func makeCoordinator() -> Coordinator {
@@ -145,7 +158,10 @@ public struct DualPointCloudView: NSViewRepresentable {
         let midChanged = context.coordinator.lastMidTimestamp != midTs || context.coordinator.lastMidCount != midFrame?.count
         let jtChanged = context.coordinator.lastJtTimestamp != jtTs || context.coordinator.lastJtCount != jtFrame?.count
         
-        if midChanged || jtChanged {
+        let revisionChanged = context.coordinator.lastRevision != revision
+        let fitPending = fitGeneration != nil && context.coordinator.lastFitGeneration != fitGeneration
+        
+        if midChanged || jtChanged || revisionChanged || fitPending {
             var frames: [PointCloudFrame] = []
             if let mid = midFrame {
                 var f = mid
@@ -157,7 +173,15 @@ public struct DualPointCloudView: NSViewRepresentable {
                 f.sensor = .jt128
                 frames.append(f)
             }
-            renderer.load(frames: frames)
+            var fitCamera = true
+            if let fitGeneration {
+                fitCamera = fitPending && frames.contains { !$0.isEmpty }
+                if fitCamera {
+                    context.coordinator.lastFitGeneration = fitGeneration
+                }
+            }
+            renderer.load(frames: frames, fitCamera: fitCamera)
+            context.coordinator.lastRevision = revision
             context.coordinator.lastMidTimestamp = midTs
             context.coordinator.lastJtTimestamp = jtTs
             context.coordinator.lastMidCount = midFrame?.count ?? 0
@@ -172,6 +196,8 @@ public struct DualPointCloudView: NSViewRepresentable {
         var lastJtTimestamp: Date?
         var lastMidCount: Int = 0
         var lastJtCount: Int = 0
+        var lastRevision: Int = 0
+        var lastFitGeneration: Int?
     }
 }
 

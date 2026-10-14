@@ -180,10 +180,10 @@ struct CommandCenterView: View {
                 .frame(width: 200)
             }
             
-            PointCloudView(
-                frame: $state.currentFrame,
-                colorMode: state.pointCloudColorMode,
-                pointSize: 3.0
+            LivePointCloudCanvas(
+                live: state.live,
+                sample: state.currentFrame,
+                colorMode: state.pointCloudColorMode
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(
@@ -367,3 +367,21 @@ struct CommandCenterView: View {
     }
 }
 
+/// The 3D canvas: live clouds while they stream, the sample cloud otherwise.
+/// Watches the live client directly so ~10 Hz cloud updates re-render only this.
+private struct LivePointCloudCanvas: View {
+    @ObservedObject var live: FoxgloveLiveClient
+    var sample: PointCloudFrame?
+    var colorMode: PointCloudColorMode
+
+    var body: some View {
+        DualPointCloudView(
+            midFrame: .constant(live.isLive ? live.clouds.mid : (sample?.sensor == .jt128 ? nil : sample)),
+            jtFrame: .constant(live.isLive ? live.clouds.jt : (sample?.sensor == .jt128 ? sample : nil)),
+            colorMode: colorMode,
+            pointSize: 3.0,
+            revision: live.clouds.revision,
+            fitGeneration: live.sourceGeneration
+        )
+    }
+}

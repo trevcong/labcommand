@@ -256,7 +256,11 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     }
     
     /// Load multiple frames with sensor coloring.
-    public func load(frames: [PointCloudFrame]) {
+    ///
+    /// - Parameter fitCamera: Refit the camera to the new bounds. Pass false for
+    ///   live updates so the points change under a camera that stays put; a fit
+    ///   still waiting on the first drawable size is left pending either way.
+    public func load(frames: [PointCloudFrame], fitCamera: Bool = true) {
         guard let device = device else {
             vertexBuffer = nil
             pointCount = 0
@@ -265,6 +269,7 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         }
         
         var allVertices: [PointVertex] = []
+        allVertices.reserveCapacity(frames.reduce(0) { $0 + $1.count })
         var bbMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
         var bbMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
         
@@ -325,8 +330,10 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         pointCount = allVertices.count
         
         // Schedule fit-to-bounds for when drawable size is known
-        needsInitialFit = true
-        hasFittedInitialBounds = false
+        if fitCamera {
+            needsInitialFit = true
+            hasFittedInitialBounds = false
+        }
         fitToBoundsIfReady()
     }
     
