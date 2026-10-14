@@ -72,6 +72,10 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     /// Current bounding box of loaded points.
     private var boundingBox: (min: SIMD3<Float>, max: SIMD3<Float>)?
     
+    /// True once we've received a real nonzero drawable size from MTKView.
+    /// Starts false; the default aspect (16:9) is just a placeholder.
+    private var hasValidDrawableSize: Bool = false
+    
     /// Tracks whether we've done the initial fit with valid drawable size.
     /// Prevents re-fitting on every resize while ensuring first fit uses real aspect.
     private var hasFittedInitialBounds: Bool = false
@@ -342,8 +346,8 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     /// Called from loadFrame, drawable size change, and resetCamera.
     private func fitToBoundsIfReady() {
         guard needsInitialFit,
-              boundingBox != nil,
-              aspect > 0 else {
+              hasValidDrawableSize,
+              boundingBox != nil else {
             return
         }
         fitToBounds(logOnce: !hasFittedInitialBounds)
@@ -387,6 +391,7 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     
     public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         guard size.width > 0, size.height > 0 else { return }
+        hasValidDrawableSize = true
         aspect = Float(size.width / size.height)
         projectionMatrix = Self.perspective(fovY: Self.fovY, aspect: aspect, near: 0.01, far: 1000)
         

@@ -234,7 +234,7 @@ func testFitToBoundsNarrowAspect() {
         "narrow aspect: max |NDC.y|=\(maxAbsY) should be > 0.3 (bbox uses vertical space)"
     )
     
-    // Concrete value check: center point should project to ~(0, 0)
+    // Concrete value check: center point should project to approximately (0, 0)
     let centerPoint = Point3D(
         x: (bboxMin.x + bboxMax.x) / 2,
         y: (bboxMin.y + bboxMax.y) / 2,
@@ -245,12 +245,12 @@ func testFitToBoundsNarrowAspect() {
         exit(1)
     }
     expect(
-        abs(centerNDC.x) < 0.1,
-        "narrow aspect: center NDC.x=\(centerNDC.x) should be ~0"
+        abs(centerNDC.x) < 0.05,
+        "narrow aspect: center NDC.x=\(centerNDC.x) should be ~0 (concrete check)"
     )
     expect(
-        abs(centerNDC.y) < 0.1,
-        "narrow aspect: center NDC.y=\(centerNDC.y) should be ~0"
+        abs(centerNDC.y) < 0.05,
+        "narrow aspect: center NDC.y=\(centerNDC.y) should be ~0 (concrete check)"
     )
 }
 
