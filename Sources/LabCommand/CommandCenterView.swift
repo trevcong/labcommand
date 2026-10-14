@@ -158,10 +158,45 @@ struct CommandCenterView: View {
     private var rigWorkspace: some View {
         HStack(alignment: .top, spacing: LabTheme.pad) {
             leftColumn
-            Spacer()
+            pointCloudCanvas
         }
         .padding(LabTheme.pad)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+    
+    private var pointCloudCanvas: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("3D View")
+                    .font(LabTheme.t(LabTheme.titleSize, .semibold))
+                    .foregroundStyle(LabTheme.text)
+                Spacer()
+                LiveStreamControls(live: state.live)
+                Picker("Color", selection: $state.pointCloudColorMode) {
+                    ForEach(PointCloudColorMode.allCases, id: \.rawValue) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 200)
+            }
+            
+            LivePointCloudCanvas(
+                live: state.live,
+                sample: state.currentFrame,
+                colorMode: state.pointCloudColorMode
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: LabTheme.radius, style: .continuous)
+                    .fill(LabTheme.surface)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: LabTheme.radius, style: .continuous)
+                    .stroke(LabTheme.line, lineWidth: 1)
+            )
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var leftColumn: some View {
@@ -333,3 +368,89 @@ struct CommandCenterView: View {
     }
 }
 
+/// Snapshot and Live, the only ways the 3D view touches the network.
+private struct LiveStreamControls: View {
+    @ObservedObject var live: FoxgloveLiveClient
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button("Snapshot") { live.takeSnapshot() }
+                .font(LabTheme.t(11, .medium))
+                .buttonStyle(QuietButton())
+                .disabled(!live.isAvailable || live.isCapturing || live.isLive)
+                .help("One frame per sensor, then the connection closes")
+            // Follows the session, so an auto-stop flips it back off.
+            Toggle("Live", isOn: Binding(
+                get: { live.isLive },
+                set: { $0 ? live.startLive() : live.stopLive() }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .font(LabTheme.t(11, .medium))
+            .foregroundStyle(LabTheme.dim)
+            .disabled(!live.isAvailable || live.isCapturing)
+            .help("Stream until switched off, for at most \(Int(LiveSession.liveMaxDuration / 60)) min, and only while the window is visible")
+        }
+    }
+}
+
+/// The 3D canvas: captured clouds (snapshot or live) once there are any, the
+/// sample cloud only while OFF — never both, so a sensor that didn't deliver
+/// leaves its slot empty rather than backfilled by the sample. The badge says
+/// which one is on screen. The renderer pulls captured clouds itself at draw
+/// time; this view only follows the mode and the badge.
+private struct LivePointCloudCanvas: View {
+    @ObservedObject var live: FoxgloveLiveClient
+    var sample: PointCloudFrame?
+    var colorMode: PointCloudColorMode
+
+    var body: some View {
+        let off = live.phase == .off
+        DualPointCloudView(
+            midFrame: .constant(off && sample?.sensor != .jt128 ? sample : nil),
+            jtFrame: .constant(off && sample?.sensor == .jt128 ? sample : nil),
+            colorMode: colorMode,
+            pointSize: 3.0,
+            fitGeneration: live.fitGeneration,
+            liveFeed: off ? nil : live.mailbox
+        )
+        .overlay(alignment: .topLeading) {
+            LiveModeBadge(
+                isLive: live.isLive,
+                text: off ? LiveViewMode.offBadge(sampleShown: sample != nil) : live.badge
+            )
+            .padding(10)
+            // Camera drags start anywhere on the canvas, this corner included.
+            .allowsHitTesting(false)
+        }
+    }
+}
+
+private struct LiveModeBadge: View {
+    var isLive: Bool
+    var text: String
+
+    var body: some View {
+        // Green only for live data; anything held or standing in is amber.
+        let tint = isLive ? LabTheme.good : LabTheme.warn
+        HStack(spacing: 6) {
+            Circle()
+                .fill(tint)
+                .frame(width: LabTheme.pip, height: LabTheme.pip)
+            Text(text)
+                .font(LabTheme.mono(11))
+                .foregroundStyle(tint)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: LabTheme.controlRadius, style: .continuous)
+                .fill(LabTheme.bg.opacity(0.85))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: LabTheme.controlRadius, style: .continuous)
+                .stroke(tint.opacity(0.6), lineWidth: 1)
+        )
+    }
+}

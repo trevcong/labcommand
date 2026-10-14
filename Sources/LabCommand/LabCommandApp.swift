@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let appState = AppState()
     private var statusItem: NSStatusItem?
     private var statusWatch: AnyCancellable?
+    private var visibilityObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMainMenu()
@@ -44,6 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         win.backgroundColor = NSColor(red: 0.043, green: 0.051, blue: 0.063, alpha: 1)
         win.makeKeyAndOrderFront(nil)
         window = win
+        watchVisibility(of: win)
 
         appState.start()
         installStatusItem()
@@ -51,6 +53,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             self?.rebuildStatusMenu()
         }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Live streams only while someone can see it: minimizing, hiding the app, or
+    /// covering the window stops it. Closing the window quits the app, which
+    /// closes everything anyway.
+    private func watchVisibility(of win: NSWindow) {
+        let center = NotificationCenter.default
+        let triggers: [(Notification.Name, AnyObject)] = [
+            (NSWindow.didChangeOcclusionStateNotification, win),
+            (NSWindow.didMiniaturizeNotification, win),
+            (NSApplication.didHideNotification, NSApp),
+        ]
+        visibilityObservers = triggers.map { name, object in
+            center.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.checkVisibility() }
+            }
+        }
+    }
+
+    private func checkVisibility() {
+        guard let window else { return }
+        let visible = window.isVisible
+            && !window.isMiniaturized
+            && !NSApp.isHidden
+            && window.occlusionState.contains(.visible)
+        if !visible {
+            appState.live.viewHidden()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

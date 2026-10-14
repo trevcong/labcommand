@@ -60,6 +60,13 @@ Menu bar extra: **LAB**. Capture menu: ⌘↩ start/restart rig, ⌘⇧R record,
 | Wake / Standby | API `wake`/`standby` → JT128 PTC 0x1C |
 | Arm at lock | API `arm` → collector fires at sustained clock lock |
 | Diagnose | Shows advice for the current rig state |
+| Snapshot (3D view) | Opens one socket per sensor to foxglove_bridge :8765, takes one frame each (`/livox/lidar`, `/lidar_points`; 10 s limit per sensor), unsubscribes and closes. The frames stay on screen |
+| Live (3D view) | Streams while on; stops itself after 120 s or when the window is hidden, minimized or covered. The last frames stay on screen |
+
+The 3D view opens no socket on its own: at launch it is **OFF** (the sample
+cloud may stand in, badged `OFF · SAMPLE — not live data`). For testing without a
+click, `--snapshot-on-launch` and `--live-on-launch` run the same paths as the
+buttons.
 
 The Spark side lives in `~/hesai_ws/` (`command_center.py`, `dual_up.sh`,
 `ptp_up.sh`, `watchdog.sh`); the rig write-up is

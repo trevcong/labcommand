@@ -50,6 +50,14 @@ final class AppState: ObservableObject {
     @Published var diagnosePresented = false
     @Published var diagnoseStage: RigStage?
     @Published private(set) var lastDiagnose: RigAdvice?
+    
+    /// Current point cloud frame for 3D canvas.
+    @Published var currentFrame: PointCloudFrame?
+    @Published var pointCloudColorMode: PointCloudColorMode = .height
+    /// Lidar clouds from Spark, on request only. Publishes on its own so live
+    /// updates don't invalidate everything that observes AppState. Mock mode is
+    /// for working without Spark — it doesn't reach for the real rig.
+    let live = FoxgloveLiveClient(isAvailable: MockMode.parseArgs() == nil)
 
     private let service: ConnectivityService
     private let rigIO: RigServiceProtocol
@@ -58,6 +66,7 @@ final class AppState: ObservableObject {
     private var fastTimer: Timer?
     /// Watchdog lines already forwarded into the mission log.
     private var seenWatchdogLines: Set<String> = []
+    private var adoptedSensorColors = false
 
     init(
         service: ConnectivityService = ConnectivityService(),
@@ -80,6 +89,75 @@ final class AppState: ObservableObject {
     func start() {
         refresh(manual: true)
         restartTimer()
+        setUpPointClouds()
+    }
+
+    /// The 3D canvas opens no socket on its own: the sample PCD stands in until
+    /// the operator takes a snapshot or goes live.
+    private func setUpPointClouds() {
+        live.onLog = { [weak self] text, kind in
+            self?.appendLog(text, kind: kind)
+        }
+        live.onCaptured = { [weak self] in
+            // Two sensors in one view read best by sensor color. Once only: after
+            // that the picker is the operator's.
+            guard let self, !self.adoptedSensorColors else { return }
+            self.adoptedSensorColors = true
+            self.pointCloudColorMode = .sensor
+        }
+        loadSamplePointCloud()
+
+        // Dev/testing: the same paths as the 3D view's buttons, without a click.
+        switch LiveLaunchAction.parse(CommandLine.arguments) {
+        case .snapshot: live.takeSnapshot()
+        case .live: live.startLive()
+        case nil: break
+        }
+    }
+
+    /// Load the sample PCD that stands in on the 3D canvas while nothing is captured.
+    private func loadSamplePointCloud() {
+        let fm = FileManager.default
+        let filename = "mid360-frame.pcd"
+        
+        // Try app bundle first
+        if let resourceURL = Bundle.main.resourceURL {
+            let bundlePath = resourceURL
+                .appendingPathComponent("fixtures/pointclouds")
+                .appendingPathComponent(filename)
+            if fm.fileExists(atPath: bundlePath.path) {
+                if loadPCDFile(at: bundlePath.path, name: filename) { return }
+            }
+        }
+        
+        // Fallback to relative paths from cwd (for swift run / development)
+        let cwd = fm.currentDirectoryPath
+        let searchPaths = [
+            "fixtures/pointclouds/\(filename)",
+            "../fixtures/pointclouds/\(filename)",
+            "../../fixtures/pointclouds/\(filename)",
+        ]
+        
+        for relativePath in searchPaths {
+            let url = URL(fileURLWithPath: cwd).appendingPathComponent(relativePath)
+            if fm.fileExists(atPath: url.path) {
+                if loadPCDFile(at: url.path, name: filename) { return }
+            }
+        }
+        
+        appendLog("fixture not found: \(filename) (3D canvas will be empty)", kind: .info)
+    }
+    
+    private func loadPCDFile(at path: String, name: String) -> Bool {
+        do {
+            let frame = try PointCloudDecoder.loadPCD(from: path)
+            currentFrame = frame
+            appendLog("loaded fixture: \(name) (\(frame.count) pts)", kind: .info)
+            return true
+        } catch {
+            appendLog("failed to load fixture: \(error)", kind: .error)
+            return false
+        }
     }
 
     func stop() {
@@ -88,6 +166,7 @@ final class AppState: ObservableObject {
         slowTimer = nil
         fastTimer = nil
         task?.cancel()
+        live.shutdown()
     }
 
     func restartTimer() {
