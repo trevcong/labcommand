@@ -94,7 +94,10 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     public let device: MTLDevice?
     private let commandQueue: MTLCommandQueue?
     private var pipelineState: MTLRenderPipelineState?
+    private var overlayPipelineState: MTLRenderPipelineState?
     private var depthState: MTLDepthStencilState?
+    private var overlayDepthState: MTLDepthStencilState?
+    private var overlayMarkDepthState: MTLDepthStencilState?
     
     /// True when Metal initialized successfully.
     public var isReady: Bool { pipelineState != nil }
@@ -174,6 +177,37 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
     }
     private var liveLayers: [SensorID: LiveLayer] = [:]
 
+    // MARK: - Change overlay
+
+    /// Tightly packed: float3 position, float3 color, float alpha. Stride 28.
+    private struct OverlayVertex {
+        var x: Float
+        var y: Float
+        var z: Float
+        var r: Float
+        var g: Float
+        var b: Float
+        var a: Float
+    }
+
+    private var overlayTriangles: MTLBuffer?
+    private var overlayTriangleCount = 0
+    private var overlayLines: MTLBuffer?
+    private var overlayLineCount = 0
+    private var overlayMarks: MTLBuffer?
+    private var overlayMarkCount = 0
+    private var overlayGeometry: ChangeOverlay.Geometry = .empty
+
+    /// Twelve triangles, two per face, indexing `Box.corners`.
+    private static let boxTriangles: [(Int, Int, Int)] = [
+        (0, 1, 2), (0, 2, 3),
+        (4, 6, 5), (4, 7, 6),
+        (0, 5, 1), (0, 4, 5),
+        (3, 2, 6), (3, 6, 7),
+        (0, 3, 7), (0, 7, 4),
+        (1, 5, 6), (1, 6, 2),
+    ]
+
     // MARK: - Init
     
     public override init() {
@@ -249,6 +283,44 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         } catch {
             print("PointCloudRenderer: Failed to create pipeline state: \(error)")
         }
+
+        guard let overlayVertex = lib.makeFunction(name: "overlayVertex"),
+              let overlayFragment = lib.makeFunction(name: "overlayFragment") else {
+            print("PointCloudRenderer: Failed to find overlay shader functions")
+            return
+        }
+
+        let overlayVertices = MTLVertexDescriptor()
+        overlayVertices.attributes[0].format = .float3
+        overlayVertices.attributes[0].offset = 0
+        overlayVertices.attributes[0].bufferIndex = 0
+        overlayVertices.attributes[1].format = .float3
+        overlayVertices.attributes[1].offset = MemoryLayout<Float>.stride * 3
+        overlayVertices.attributes[1].bufferIndex = 0
+        overlayVertices.attributes[2].format = .float
+        overlayVertices.attributes[2].offset = MemoryLayout<Float>.stride * 6
+        overlayVertices.attributes[2].bufferIndex = 0
+        overlayVertices.layouts[0].stride = MemoryLayout<OverlayVertex>.stride
+        overlayVertices.layouts[0].stepFunction = .perVertex
+
+        let overlayDescriptor = MTLRenderPipelineDescriptor()
+        overlayDescriptor.label = "ChangeOverlayPipeline"
+        overlayDescriptor.vertexFunction = overlayVertex
+        overlayDescriptor.fragmentFunction = overlayFragment
+        overlayDescriptor.vertexDescriptor = overlayVertices
+        overlayDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        overlayDescriptor.colorAttachments[0].isBlendingEnabled = true
+        overlayDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        overlayDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        overlayDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        overlayDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        overlayDescriptor.depthAttachmentPixelFormat = .depth32Float
+
+        do {
+            overlayPipelineState = try device.makeRenderPipelineState(descriptor: overlayDescriptor)
+        } catch {
+            print("PointCloudRenderer: Failed to create overlay pipeline: \(error)")
+        }
     }
     
     private func buildDepthState() {
@@ -257,6 +329,16 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
         depthDescriptor.depthCompareFunction = .less
         depthDescriptor.isDepthWriteEnabled = true
         depthState = device.makeDepthStencilState(descriptor: depthDescriptor)
+
+        let boxDepth = MTLDepthStencilDescriptor()
+        boxDepth.depthCompareFunction = .less
+        boxDepth.isDepthWriteEnabled = false
+        overlayDepthState = device.makeDepthStencilState(descriptor: boxDepth)
+
+        let markDepth = MTLDepthStencilDescriptor()
+        markDepth.depthCompareFunction = .always
+        markDepth.isDepthWriteEnabled = false
+        overlayMarkDepthState = device.makeDepthStencilState(descriptor: markDepth)
     }
     
     private func buildUniformBuffers() {
@@ -523,12 +605,100 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             encoder.setVertexBuffer(draw.buffer, offset: 0, index: 0)
             encoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: draw.count)
         }
+        drawOverlay(encoder: encoder, uniformBuffer: uniformBuffer)
         encoder.endEncoding()
         
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
     
+    /// Rebuilds the overlay buffers only when the geometry changes. Empty draws nothing.
+    func setOverlay(_ geometry: ChangeOverlay.Geometry) {
+        guard geometry != overlayGeometry else { return }
+        overlayGeometry = geometry
+        var triangles: [OverlayVertex] = []
+        var lines: [OverlayVertex] = []
+        var marks: [OverlayVertex] = []
+        triangles.reserveCapacity(geometry.boxes.count * 36)
+        lines.reserveCapacity(geometry.boxes.count * 24 + geometry.arrows.count * 6)
+        for box in geometry.boxes {
+            if box.filled, box.fillAlpha > 0, box.corners.count == 8 {
+                for tri in Self.boxTriangles {
+                    triangles.append(vertex(box.corners[tri.0], box, alpha: box.fillAlpha))
+                    triangles.append(vertex(box.corners[tri.1], box, alpha: box.fillAlpha))
+                    triangles.append(vertex(box.corners[tri.2], box, alpha: box.fillAlpha))
+                }
+            }
+            for edge in box.edges {
+                lines.append(vertex(edge.a, box, alpha: 1))
+                lines.append(vertex(edge.b, box, alpha: 1))
+            }
+            if box.markCentroid {
+                marks.append(vertex(box.centroid, box, alpha: 1))
+            }
+        }
+        let moved = ChangeOverlay.color(.moved)
+        for arrow in geometry.arrows {
+            lines.append(contentsOf: [
+                vertex(arrow.from, moved, alpha: 1),
+                vertex(arrow.to, moved, alpha: 1),
+                vertex(arrow.to, moved, alpha: 1),
+                vertex(arrow.left, moved, alpha: 1),
+                vertex(arrow.to, moved, alpha: 1),
+                vertex(arrow.right, moved, alpha: 1),
+            ])
+        }
+        overlayTriangles = upload(triangles)
+        overlayTriangleCount = triangles.count
+        overlayLines = upload(lines)
+        overlayLineCount = lines.count
+        overlayMarks = upload(marks)
+        overlayMarkCount = marks.count
+    }
+
+    private func drawOverlay(encoder: MTLRenderCommandEncoder, uniformBuffer: MTLBuffer) {
+        guard overlayTriangleCount > 0 || overlayLineCount > 0 || overlayMarkCount > 0,
+              let overlayPipelineState,
+              let overlayDepthState else {
+            return
+        }
+        encoder.setRenderPipelineState(overlayPipelineState)
+        encoder.setDepthStencilState(overlayDepthState)
+        encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+        if let overlayTriangles, overlayTriangleCount > 0 {
+            encoder.setVertexBuffer(overlayTriangles, offset: 0, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: overlayTriangleCount)
+        }
+        if let overlayLines, overlayLineCount > 0 {
+            encoder.setVertexBuffer(overlayLines, offset: 0, index: 0)
+            encoder.drawPrimitives(type: .line, vertexStart: 0, vertexCount: overlayLineCount)
+        }
+        if let overlayMarks, overlayMarkCount > 0, let overlayMarkDepthState {
+            encoder.setDepthStencilState(overlayMarkDepthState)
+            encoder.setVertexBuffer(overlayMarks, offset: 0, index: 0)
+            encoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: overlayMarkCount)
+        }
+    }
+
+    private func vertex(_ point: Point3D, _ box: ChangeOverlay.Box, alpha: Float) -> OverlayVertex {
+        vertex(point, box.color, alpha: alpha)
+    }
+
+    private func vertex(_ point: Point3D, _ color: ChangeOverlay.RGB, alpha: Float) -> OverlayVertex {
+        OverlayVertex(x: point.x, y: point.y, z: point.z, r: color.r, g: color.g, b: color.b, a: alpha)
+    }
+
+    private func upload(_ vertices: [OverlayVertex]) -> MTLBuffer? {
+        guard !vertices.isEmpty, let device else { return nil }
+        let bytes = vertices.count * MemoryLayout<OverlayVertex>.stride
+        guard let buffer = device.makeBuffer(length: bytes, options: .storageModeShared) else { return nil }
+        vertices.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            buffer.contents().copyMemory(from: base, byteCount: bytes)
+        }
+        return buffer
+    }
+
     private func updateUniforms(to buffer: MTLBuffer) {
         let mvp = projectionMatrix * viewMatrix
         var uniforms = Uniforms(
@@ -669,6 +839,33 @@ public final class PointCloudRenderer: NSObject, MTKViewDelegate {
             discard_fragment();
         }
         
+        return in.color;
+    }
+
+    struct OverlayIn {
+        float3 position [[attribute(0)]];
+        float3 color [[attribute(1)]];
+        float alpha [[attribute(2)]];
+    };
+
+    struct OverlayOut {
+        float4 position [[position]];
+        float pointSize [[point_size]];
+        float4 color;
+    };
+
+    vertex OverlayOut overlayVertex(
+        OverlayIn in [[stage_in]],
+        constant Uniforms& uniforms [[buffer(1)]]
+    ) {
+        OverlayOut out;
+        out.position = uniforms.modelViewProjection * float4(in.position, 1.0);
+        out.pointSize = 10.0;
+        out.color = float4(in.color, in.alpha);
+        return out;
+    }
+
+    fragment float4 overlayFragment(OverlayOut in [[stage_in]]) {
         return in.color;
     }
     """

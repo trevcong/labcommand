@@ -7,14 +7,19 @@ public struct ConnectivityService: Sendable {
     public var sparkPingHost: String
     public var connectTimeoutSeconds: Int
 
+    /// Snapshot launches refuse every process. The rig path spawns as before.
+    public var isolates: Bool
+
     public init(
         sparkSSHHost: String = "spark",
         sparkPingHost: String = CaptureRecipe.tailscaleIP,
-        connectTimeoutSeconds: Int = 2
+        connectTimeoutSeconds: Int = 2,
+        isolates: Bool = false
     ) {
         self.sparkSSHHost = sparkSSHHost
         self.sparkPingHost = sparkPingHost
         self.connectTimeoutSeconds = connectTimeoutSeconds
+        self.isolates = isolates
     }
 
     public func runAllChecks() -> [CheckOutcome] {
@@ -148,9 +153,26 @@ public struct ConnectivityService: Sendable {
     }
 
     private func runProcess(_ launchPath: String, args: [String]) -> ProcessResult {
+        let spawn = ProcessSpawn(executable: launchPath, arguments: args)
+        do {
+            let result = try ContactGate.runProcess(spawn, isolates: isolates) {
+                self.spawnProcess(spawn)
+            }
+            return ProcessResult(
+                exitCode: result.exitCode,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                spawnError: result.spawnError
+            )
+        } catch {
+            return ProcessResult(exitCode: -1, stdout: "", stderr: "", spawnError: "local session")
+        }
+    }
+
+    private func spawnProcess(_ spawn: ProcessSpawn) -> ContactProcessResult {
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: launchPath)
-        proc.arguments = args
+        proc.executableURL = URL(fileURLWithPath: spawn.executable)
+        proc.arguments = spawn.arguments
         let outPipe = Pipe()
         let errPipe = Pipe()
         proc.standardOutput = outPipe
@@ -160,14 +182,13 @@ public struct ConnectivityService: Sendable {
             proc.waitUntilExit()
             let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
             let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            return ProcessResult(
+            return ContactProcessResult(
                 exitCode: proc.terminationStatus,
                 stdout: String(data: outData, encoding: .utf8) ?? "",
-                stderr: String(data: errData, encoding: .utf8) ?? "",
-                spawnError: nil
+                stderr: String(data: errData, encoding: .utf8) ?? ""
             )
         } catch {
-            return ProcessResult(
+            return ContactProcessResult(
                 exitCode: -1,
                 stdout: "",
                 stderr: "",

@@ -6,15 +6,18 @@ import LabCommandCore
 /// spark-capture.sh probe path — the Spark-side collector is the one truth,
 /// shared with the web panel.
 public final class RigService: @unchecked Sendable {
-    public static let apiPort = 8766
-    public static let viewPort = CaptureRecipe.foxglovePort
+    public static let apiPort = TunnelGate.apiPort
+    public static let viewPort = TunnelGate.viewPort
 
     private let lock = NSLock()
     private var viewTunnel: Process?
     private var apiTunnel: Process?
     private let session: URLSession
+    /// Snapshot launches refuse SSH, the port probe, and the localhost API.
+    private let isolates: Bool
 
-    public init() {
+    public init(isolates: Bool = false) {
+        self.isolates = isolates
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 4
         cfg.timeoutIntervalForResource = 6
@@ -44,6 +47,16 @@ public final class RigService: @unchecked Sendable {
     /// Another process (the lidar CLI, a stray ssh) may already forward the
     /// port; that tunnel is as good as ours.
     private func portOpen(_ port: Int) -> Bool {
+        do {
+            return try ContactGate.attempt(.socket, isolates: isolates, detail: "127.0.0.1:\(port)") {
+                self.portOpenLive(port)
+            }
+        } catch {
+            return false
+        }
+    }
+
+    private func portOpenLive(_ port: Int) -> Bool {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(UInt16(port).bigEndian)
@@ -61,47 +74,66 @@ public final class RigService: @unchecked Sendable {
         return r == 0
     }
 
-    @discardableResult
-    private func startTunnel(port: Int, key: ReferenceWritableKeyPath<RigService, Process?>) -> String? {
-        if tunnelRunning(key) || portOpen(port) { return nil }
-        var lastError: String?
-        for host in hostOrder() {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-            proc.arguments = CaptureRecipe.viewTunnelArguments(host: host, port: port)
-            proc.standardOutput = Pipe()
-            proc.standardError = Pipe()
-            do {
-                try proc.run()
-            } catch {
-                lastError = error.localizedDescription
-                continue
-            }
-            Thread.sleep(forTimeInterval: 0.25)
-            if proc.isRunning {
-                lock.lock()
-                self[keyPath: key] = proc
-                lock.unlock()
-                if host.contains(".") { SparkHopCache.save(host) }
-                return nil
-            }
-            lastError = "tunnel to \(host) exited"
-        }
-        return lastError ?? "tunnel failed"
-    }
-
     /// Both tunnels. Returns the first error, or nil.
     public func ensureTunnels() -> String? {
-        let apiErr = startTunnel(port: Self.apiPort, key: \.apiTunnel)
-        let viewErr = startTunnel(port: Self.viewPort, key: \.viewTunnel)
-        return apiErr ?? viewErr
+        TunnelGate.ensureTunnels(isolates: isolates, factories: tunnelFactories())
     }
 
     public func ensureAPITunnel() -> String? {
-        startTunnel(port: Self.apiPort, key: \.apiTunnel)
+        TunnelGate.ensureAPITunnel(isolates: isolates, factories: tunnelFactories())
+    }
+
+    private func tunnelFactories() -> TunnelGate.Factories {
+        TunnelGate.Factories(
+            held: { port in
+                self.tunnelRunning(port == Self.apiPort ? \.apiTunnel : \.viewTunnel)
+            },
+            portOpen: { self.portOpen($0) },
+            hosts: { self.hostOrder() },
+            spawn: { port, command in
+                self.launchTunnel(port: port, command: command)
+            },
+            rememberHost: { SparkHopCache.save($0) }
+        )
+    }
+
+    private func launchTunnel(port: Int, command: ProcessSpawn) -> TunnelSpawnOutcome {
+        if isolates {
+            return TunnelSpawnOutcome(stayedUp: false, error: "local session")
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: command.executable)
+        proc.arguments = command.arguments
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
+            return TunnelSpawnOutcome(stayedUp: false, error: error.localizedDescription)
+        }
+        Thread.sleep(forTimeInterval: 0.25)
+        guard proc.isRunning else {
+            return TunnelSpawnOutcome(stayedUp: false)
+        }
+        let key: ReferenceWritableKeyPath<RigService, Process?> =
+            port == Self.apiPort ? \.apiTunnel : \.viewTunnel
+        lock.lock()
+        self[keyPath: key] = proc
+        lock.unlock()
+        return TunnelSpawnOutcome(stayedUp: true)
     }
 
     public func stopTunnels() {
+        do {
+            try ContactGate.attempt(.process, isolates: isolates, detail: "stop tunnels") {
+                self.stopTunnelProcesses()
+            }
+        } catch {
+            return
+        }
+    }
+
+    private func stopTunnelProcesses() {
         lock.lock()
         let procs = [viewTunnel, apiTunnel]
         viewTunnel = nil
@@ -118,6 +150,16 @@ public final class RigService: @unchecked Sendable {
     /// GET status.json. Failure returns an honest apiDown/offline snapshot
     /// using the caller's last knowledge of Spark reachability.
     public func fetchStatus(sparkWasReachable: Bool) -> RigSnapshot {
+        do {
+            return try ContactGate.attempt(.poll, isolates: isolates, detail: "fetchStatus") {
+                self.fetchStatusLive(sparkWasReachable: sparkWasReachable)
+            }
+        } catch {
+            return RigSnapshot.offline(reason: "local session")
+        }
+    }
+
+    private func fetchStatusLive(sparkWasReachable: Bool) -> RigSnapshot {
         _ = ensureAPITunnel()
         let viewUp = viewPathUp
         guard let url = URL(string: "http://localhost:\(Self.apiPort)/status.json") else {
@@ -151,6 +193,16 @@ public final class RigService: @unchecked Sendable {
     /// duration) straight through to the collector.
     public func postAction(_ name: String, arg: String? = nil,
                            extra: [String: Any] = [:]) -> (ok: Bool, message: String) {
+        do {
+            return try ContactGate.attempt(.action, isolates: isolates, detail: name) {
+                self.postActionLive(name, arg: arg, extra: extra)
+            }
+        } catch {
+            return (false, "local session")
+        }
+    }
+
+    private func postActionLive(_ name: String, arg: String?, extra: [String: Any]) -> (ok: Bool, message: String) {
         guard let url = URL(string: "http://localhost:\(Self.apiPort)/action") else {
             return (false, "bad URL")
         }
@@ -190,9 +242,21 @@ public final class RigService: @unchecked Sendable {
     }
 
     private func runProcess(_ path: String, args: [String]) -> ProcResult {
+        let spawn = ProcessSpawn(executable: path, arguments: args)
+        do {
+            let result = try ContactGate.runProcess(spawn, isolates: isolates) {
+                self.spawnProcess(spawn)
+            }
+            return ProcResult(exitCode: result.exitCode, stdout: result.stdout)
+        } catch {
+            return ProcResult(exitCode: -1, stdout: "")
+        }
+    }
+
+    private func spawnProcess(_ spawn: ProcessSpawn) -> ContactProcessResult {
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: path)
-        proc.arguments = args
+        proc.executableURL = URL(fileURLWithPath: spawn.executable)
+        proc.arguments = spawn.arguments
         let out = Pipe()
         proc.standardOutput = out
         proc.standardError = Pipe()
@@ -200,9 +264,9 @@ public final class RigService: @unchecked Sendable {
             try proc.run()
             proc.waitUntilExit()
             let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            return ProcResult(exitCode: proc.terminationStatus, stdout: stdout)
+            return ContactProcessResult(exitCode: proc.terminationStatus, stdout: stdout, stderr: "")
         } catch {
-            return ProcResult(exitCode: -1, stdout: "")
+            return ContactProcessResult(exitCode: -1, stdout: "", stderr: "", spawnError: error.localizedDescription)
         }
     }
 }

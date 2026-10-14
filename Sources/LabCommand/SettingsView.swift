@@ -30,6 +30,7 @@ struct SettingsView: View {
                         Toggle("", isOn: Binding(
                             get: { state.autoRefreshEnabled },
                             set: { newVal in
+                                guard !state.isolatesNetwork else { return }
                                 state.autoRefreshEnabled = newVal
                                 state.restartTimer()
                             }
@@ -37,6 +38,8 @@ struct SettingsView: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                         .controlSize(.small)
+                        .disabled(state.isolatesNetwork)
+                        .opacity(state.isolatesNetwork ? LabTheme.disabledOpacity : 1)
                     }
                     .padding(.vertical, 10)
 
@@ -57,6 +60,7 @@ struct SettingsView: View {
                         Picker("", selection: Binding(
                             get: { Int(state.probeIntervalSeconds) },
                             set: { newVal in
+                                guard !state.isolatesNetwork else { return }
                                 state.probeIntervalSeconds = Double(newVal)
                                 state.restartTimer()
                             }
@@ -69,8 +73,8 @@ struct SettingsView: View {
                         .pickerStyle(.segmented)
                         .controlSize(.small)
                         .frame(width: 240)
-                        .disabled(!state.autoRefreshEnabled)
-                        .opacity(state.autoRefreshEnabled ? 1 : LabTheme.disabledOpacity)
+                        .disabled(state.isolatesNetwork || !state.autoRefreshEnabled)
+                        .opacity(state.isolatesNetwork || !state.autoRefreshEnabled ? LabTheme.disabledOpacity : 1)
                         .accessibilityLabel("Probe interval seconds")
                     }
                     .padding(.vertical, 10)
@@ -115,6 +119,7 @@ struct SettingsView: View {
     /// intervals are not free. Say that here rather than letting the operator
     /// discover it as lag.
     private var intervalNote: String {
+        if state.isolatesNetwork { return "local snapshots — probes stay off" }
         if !state.autoRefreshEnabled { return "auto-refresh off — ⌘R to probe" }
         let s = Int(state.probeIntervalSeconds)
         if s <= 15 { return "measures rates every \(s)s — heavy while streaming" }
