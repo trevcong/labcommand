@@ -19,6 +19,7 @@ func passed() {
 print("Running LabCommandCore tests…")
 runFixtureTests()
 runPointCloudTests()
+runCameraMathTests()
 testDecoderLiveRig()
 print("  rig decoder: live JSON → streaming duo, locked clocks, containers, events"); passed()
 testDecoderParkedRigIsDarkNotBlocked()
