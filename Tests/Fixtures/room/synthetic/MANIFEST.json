@@ -1,0 +1,463 @@
+{
+  "format" : "sensor_msgs/PointCloud2 CDR little endian; x, y, z, intensity float32; point_step 16; frame_id synthetic_lidar",
+  "frame" : "points are in the sensor frame: room-frame hit minus that scene's sensor_m, no rotation",
+  "generator" : "swift run LabCommandCoreTestsRunner generate-room-fixtures",
+  "pairs" : [
+    {
+      "after" : "base_s2.bin",
+      "before" : "base_s1.bin",
+      "name" : "static",
+      "truth" : {
+        "kind" : "none",
+        "note" : "same room, different range-noise seed"
+      }
+    },
+    {
+      "after" : "box_a.bin",
+      "before" : "base_s1.bin",
+      "name" : "box_added",
+      "truth" : {
+        "aabb" : {
+          "room_m" : [
+            5.675,
+            3.875,
+            0,
+            5.925,
+            4.125,
+            0.25
+          ],
+          "sensor_frame_m" : [
+            1.675,
+            -0.125,
+            -1.2,
+            1.925,
+            0.125,
+            -0.95
+          ]
+        },
+        "kind" : "APPEARED"
+      }
+    },
+    {
+      "after" : "base_s2.bin",
+      "before" : "box_a.bin",
+      "name" : "box_removed",
+      "truth" : {
+        "aabb" : {
+          "room_m" : [
+            5.675,
+            3.875,
+            0,
+            5.925,
+            4.125,
+            0.25
+          ],
+          "sensor_frame_m" : [
+            1.675,
+            -0.125,
+            -1.2,
+            1.925,
+            0.125,
+            -0.95
+          ]
+        },
+        "kind" : "DISAPPEARED"
+      }
+    },
+    {
+      "after" : "box_b.bin",
+      "before" : "box_a.bin",
+      "name" : "box_moved",
+      "truth" : {
+        "from_aabb" : {
+          "room_m" : [
+            5.675,
+            3.875,
+            0,
+            5.925,
+            4.125,
+            0.25
+          ],
+          "sensor_frame_m" : [
+            1.675,
+            -0.125,
+            -1.2,
+            1.925,
+            0.125,
+            -0.95
+          ]
+        },
+        "kind" : "MOVED",
+        "move_m" : 1,
+        "to_aabb" : {
+          "room_m" : [
+            5.675,
+            4.875,
+            0,
+            5.925,
+            5.125,
+            0.25
+          ],
+          "sensor_frame_m" : [
+            1.675,
+            0.875,
+            -1.2,
+            1.925,
+            1.125,
+            -0.95
+          ]
+        }
+      }
+    },
+    {
+      "after_sequence" : [
+        "person_0.bin",
+        "person_1.bin",
+        "person_2.bin",
+        "person_3.bin",
+        "person_4.bin"
+      ],
+      "before" : "base_s1.bin",
+      "name" : "person_walkthrough",
+      "truth" : {
+        "kind" : "none (transient)",
+        "note" : "no CONFIRMED event: the person moves 0.3 m per 0.25 s frame",
+        "person_aabb_per_frame" : [
+          {
+            "room_m" : [
+              2.875,
+              2.65,
+              0,
+              3.325,
+              2.95,
+              1.75
+            ],
+            "sensor_frame_m" : [
+              -1.125,
+              -1.35,
+              -1.2,
+              -0.675,
+              -1.05,
+              0.55
+            ]
+          },
+          {
+            "room_m" : [
+              3.175,
+              2.65,
+              0,
+              3.625,
+              2.95,
+              1.75
+            ],
+            "sensor_frame_m" : [
+              -0.825,
+              -1.35,
+              -1.2,
+              -0.375,
+              -1.05,
+              0.55
+            ]
+          },
+          {
+            "room_m" : [
+              3.475,
+              2.65,
+              0,
+              3.925,
+              2.95,
+              1.75
+            ],
+            "sensor_frame_m" : [
+              -0.525,
+              -1.35,
+              -1.2,
+              -0.075,
+              -1.05,
+              0.55
+            ]
+          },
+          {
+            "room_m" : [
+              3.775,
+              2.65,
+              0,
+              4.225,
+              2.95,
+              1.75
+            ],
+            "sensor_frame_m" : [
+              -0.225,
+              -1.35,
+              -1.2,
+              0.225,
+              -1.05,
+              0.55
+            ]
+          },
+          {
+            "room_m" : [
+              4.075,
+              2.65,
+              0,
+              4.525,
+              2.95,
+              1.75
+            ],
+            "sensor_frame_m" : [
+              0.075,
+              -1.35,
+              -1.2,
+              0.525,
+              -1.05,
+              0.55
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "after" : "rig_shifted.bin",
+      "before" : "base_s1.bin",
+      "name" : "rig_shifted",
+      "truth" : {
+        "kind" : "RIG_MOVED",
+        "note" : "the whole room moves -5 cm in x in the sensor frame; no change events",
+        "shift_m" : [
+          0.05,
+          0,
+          0
+        ]
+      }
+    }
+  ],
+  "room" : {
+    "furniture_room_m" : [
+      [
+        0.3,
+        6.9,
+        0,
+        1.9,
+        7.7,
+        0.75
+      ],
+      [
+        7.5,
+        1,
+        0,
+        7.9,
+        3,
+        2
+      ],
+      [
+        0.2,
+        0.2,
+        0,
+        0.8,
+        1.4,
+        1.1
+      ],
+      [
+        3,
+        5.8,
+        0,
+        4.6,
+        6.6,
+        0.72
+      ],
+      [
+        5,
+        7.1,
+        0,
+        7,
+        7.9,
+        0.85
+      ]
+    ],
+    "size_m" : [
+      8,
+      8,
+      3
+    ]
+  },
+  "scanner" : {
+    "azimuth_step_deg" : 1.25,
+    "elevation_max_deg" : 50,
+    "elevation_min_deg" : -50,
+    "elevation_step_deg" : 1.25,
+    "range_noise_m" : 0.01,
+    "rays" : 23328
+  },
+  "scenes" : [
+    {
+      "file" : "base_s1.bin",
+      "objects" : [
+
+      ],
+      "points" : 23328,
+      "seed" : 1,
+      "sensor_m" : [
+        4,
+        4,
+        1.2
+      ],
+      "stamp" : {
+        "nanosec" : 0,
+        "sec" : 1760400000
+      }
+    },
+    {
+      "file" : "base_s2.bin",
+      "objects" : [
+
+      ],
+      "points" : 23328,
+      "seed" : 2,
+      "sensor_m" : [
+        4,
+        4,
+        1.2
+      ],
+      "stamp" : {
+        "nanosec" : 0,
+        "sec" : 1760400010
+      }
+    },
+    {
+      "file" : "box_a.bin",
+      "objects" : [
+        "box_a"
+      ],
+      "points" : 23328,
+      "seed" : 3,
+      "sensor_m" : [
+        4,
+        4,
+        1.2
+      ],
+      "stamp" : {
+        "nanosec" : 0,
+        "sec" : 1760400020
+      }
+    },
+    {
+      "file" : "box_b.bin",
+      "objects" : [
+        "box_b"
+      ],
+      "points" : 23328,
+      "seed" : 4,
+      "sensor_m" : [
+        4,
+        4,
+        1.2
+      ],
+      "stamp" : {
+        "nanosec" : 0,
+        "sec" : 1760400030
+      }
+    },
+    {
+      "file" : "rig_shifted.bin",
+      "objects" : [
+
+      ],
+      "points" : 23328,
+      "seed" : 1,
+      "sensor_m" : [
+        4.05,
+        4,
+        1.2
+      ],
+      "stamp" : {
+        "nanosec" : 0,
+        "sec" : 1760400040
+      }
+    },
+    {
+      "file" : "person_0.bin",
+      "objects" : [
+        "person"
+      ],
+      "points" : 23328,
+      "seed" : 10,
+      "sensor_m" : [
+        4,
+        4,
+        1.2
+      ],
+      "stamp" : {
+        "nanosec" : 0,
+        "sec" : 1760400050
+      }
+    },
+    {
+      "file" : "person_1.bin",
+      "objects" : [
+        "person"
+      ],
+      "points" : 23328,
+      "seed" : 11,
+      "sensor_m" : [
+        4,
+        4,
+        1.2
+      ],
+      "stamp" : {
+        "nanosec" : 250000000,
+        "sec" : 1760400050
+      }
+    },
+    {
+      "file" : "person_2.bin",
+      "objects" : [
+        "person"
+      ],
+      "points" : 23328,
+      "seed" : 12,
+      "sensor_m" : [
+        4,
+        4,
+        1.2
+      ],
+      "stamp" : {
+        "nanosec" : 500000000,
+        "sec" : 1760400050
+      }
+    },
+    {
+      "file" : "person_3.bin",
+      "objects" : [
+        "person"
+      ],
+      "points" : 23328,
+      "seed" : 13,
+      "sensor_m" : [
+        4,
+        4,
+        1.2
+      ],
+      "stamp" : {
+        "nanosec" : 750000000,
+        "sec" : 1760400050
+      }
+    },
+    {
+      "file" : "person_4.bin",
+      "objects" : [
+        "person"
+      ],
+      "points" : 23328,
+      "seed" : 14,
+      "sensor_m" : [
+        4,
+        4,
+        1.2
+      ],
+      "stamp" : {
+        "nanosec" : 1000000000,
+        "sec" : 1760400050
+      }
+    }
+  ]
+}

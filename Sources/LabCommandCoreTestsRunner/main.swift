@@ -16,6 +16,11 @@ func passed() {
     passCount += 1
 }
 
+if CommandLine.arguments.dropFirst().first == "generate-room-fixtures" {
+    generateRoomFixtures(arguments: Array(CommandLine.arguments.dropFirst(2)))
+    exit(0)
+}
+
 print("Running LabCommandCore tests…")
 runFixtureTests()
 runPointCloudTests()
@@ -89,4 +94,6 @@ runRigTransformsTests()
 runFoxgloveProtocolTests()
 runLiveSessionTests()
 runRobustBoundsTests()
+runRoomMemoryCDRTests()
+runRoomFixtureTests()
 print("PASS LabCommandCoreTestsRunner (\(passCount) groups)")

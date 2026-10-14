@@ -1,0 +1,35 @@
+# labcommand_msgs/MapBricks KIND_DELTA, CDR little endian. Derived by hand; see memory_status_le.hex.
+# Covers: uint8 -> uint64 pad (7 bytes); negative int16 brick coords; int16[] -> uint8[] pad (2 bytes);
+# bit order (voxel (0,0,0) = byte 0 bit 0, voxel (7,7,7) = byte 63 bit 7); a free voxel
+# (known, not occupied); uint32[] removed indices.
+# Brick (-1, 2, -3): voxel (0,0,0) occupied, (1,0,0) free, (7,7,7) occupied, the rest unknown.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+04 00 00 00                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   "lab\0"
+2b 00 00 00 00 00 00 00     # pos 8   map_epoch 43 (after the delta)
+0c 00 00 00 00 00 00 00     # pos 16  seq 12
+8a 92 ed 68                 # pos 24  stamp.sec 1760400010
+80 b2 e6 0e                 # pos 28  stamp.nanosec 250000000
+01                          # pos 32  kind KIND_DELTA
+00 00 00 00 00 00 00        # pos 33  pad to 8
+2a 00 00 00 00 00 00 00     # pos 40  base_epoch 42
+cd cc 4c 3d                 # pos 48  voxel_size 0.05
+08                          # pos 52  brick_dim 8
+00 00 00                    # pos 53  pad to 4
+03 00 00 00                 # pos 56  brick_ijk length 3 (one brick)
+ff ff 02 00 fd ff           # pos 60  brick_ijk (-1, 2, -3)
+00 00                       # pos 66  pad to 4
+40 00 00 00                 # pos 68  occ_bits length 64
+01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 72  occ bytes 0-15: voxel (0,0,0)
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 88  occ bytes 16-31
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 104 occ bytes 32-47
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80   # pos 120 occ bytes 48-63: voxel (7,7,7)
+40 00 00 00                 # pos 136 known_bits length 64
+03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 140 known bytes 0-15: voxels (0,0,0), (1,0,0)
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 156 known bytes 16-31
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 172 known bytes 32-47
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80   # pos 188 known bytes 48-63: voxel (7,7,7)
+02 00 00 00                 # pos 204 removed_bricks_idx length 2
+00 00 00 00                 # pos 208 removed_bricks_idx[0] 0
+05 00 00 00                 # pos 212 removed_bricks_idx[1] 5
+00                          # pos 216 compression COMPRESSION_NONE
