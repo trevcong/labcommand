@@ -34,8 +34,9 @@ What's new:
 
 ## Build and run
 
+From the repository root:
+
 ```bash
-cd ~/Developer/labcommand-grunt
 ./build.sh --no-install
 open ./build/LabCommand.app
 ```
