@@ -23,6 +23,25 @@ public enum CameraMath {
             self.columns = (c0, c1, c2, c3)
         }
         
+        public static func == (lhs: Matrix4x4, rhs: Matrix4x4) -> Bool {
+            lhs.columns.0.0 == rhs.columns.0.0 &&
+            lhs.columns.0.1 == rhs.columns.0.1 &&
+            lhs.columns.0.2 == rhs.columns.0.2 &&
+            lhs.columns.0.3 == rhs.columns.0.3 &&
+            lhs.columns.1.0 == rhs.columns.1.0 &&
+            lhs.columns.1.1 == rhs.columns.1.1 &&
+            lhs.columns.1.2 == rhs.columns.1.2 &&
+            lhs.columns.1.3 == rhs.columns.1.3 &&
+            lhs.columns.2.0 == rhs.columns.2.0 &&
+            lhs.columns.2.1 == rhs.columns.2.1 &&
+            lhs.columns.2.2 == rhs.columns.2.2 &&
+            lhs.columns.2.3 == rhs.columns.2.3 &&
+            lhs.columns.3.0 == rhs.columns.3.0 &&
+            lhs.columns.3.1 == rhs.columns.3.1 &&
+            lhs.columns.3.2 == rhs.columns.3.2 &&
+            lhs.columns.3.3 == rhs.columns.3.3
+        }
+        
         public static let identity = Matrix4x4(
             (1, 0, 0, 0),
             (0, 1, 0, 0),
@@ -149,10 +168,12 @@ public enum CameraMath {
     
     /// Compute camera parameters to fit a bounding box.
     /// Returns (eye position, center, distance).
+    /// Accounts for aspect ratio to ensure bbox fits in both horizontal and vertical directions.
     public static func fitToBounds(
         min: Point3D,
         max: Point3D,
         fovY: Float = defaultFovY,
+        aspect: Float = 1.0,
         margin: Float = 1.2
     ) -> (eye: Point3D, center: Point3D, distance: Float) {
         let center = Point3D(
@@ -166,8 +187,10 @@ public enum CameraMath {
         let dz = max.z - min.z
         let radius = sqrt(dx * dx + dy * dy + dz * dz) * 0.5
         
-        let halfFov = fovY * 0.5
-        let distance = Swift.max(radius / sin(halfFov) * margin, 0.1)
+        // Account for aspect ratio: compute horizontal FOV and use the smaller
+        let fovX = 2 * atan(tan(fovY / 2) * aspect)
+        let effectiveFov = Swift.min(fovX, fovY)
+        let distance = Swift.max(radius / sin(effectiveFov / 2) * margin, 0.1)
         
         // Position camera looking from Y-negative toward center
         let eye = Point3D(
