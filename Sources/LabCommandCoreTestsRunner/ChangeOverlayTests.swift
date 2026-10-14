@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import LabCommandCore
 
@@ -53,9 +54,8 @@ func testChangeOverlayConfig() {
     let config = ChangeOverlay.snapshotConfig()
     var expected = ChangeDetection.Config()
     expected.evidenceOfAbsence = true
-    expected.minVoxels = 1
-    expected.minExtent = 1
-    expect(config == expected, "snapshot config changes evidence, minVoxels, and minExtent only")
+    expect(config == expected, "snapshot config turns evidence on and keeps every other library field")
+    expect(config.minVoxels == 6 && config.minExtent == 2, "library cuts stay at 6 and 2")
     do {
         let report = try ChangeDetection.compare(PointCloudFrame(), PointCloudFrame(), config: config)
         expect(report.regions.isEmpty, "empty clouds stay empty")
@@ -74,24 +74,41 @@ func testChangeOverlayMovedThroughViewerConfig() {
         expect(false, "compare threw: \(error)")
         return
     }
-    expect(report.regions.count == 1, "one region, got \(report.regions.count)")
-    expect(report.regions.first?.kind == .moved, "the pair is a move")
-    let timeline = ChangeOverlay.timeline(
-        sensor: .jt128,
-        report: report,
-        beforeStamp: nil,
-        afterStamp: nil
+    expect(report.regions.isEmpty, "a one-voxel pair is below the library cuts, got \(report.regions.count)")
+
+    let from = Point3D(x: 0, y: 0, z: 0)
+    let to = Point3D(x: 1, y: 0, z: 0)
+    let timeline = oneTimeline(regions: [draft(
+        .moved,
+        voxels: 4,
+        centroid: to,
+        boundsMin: Point3D(x: 0.9, y: -0.05, z: -0.05),
+        boundsMax: Point3D(x: 1.1, y: 0.05, z: 0.05),
+        fromCentroid: from,
+        fromBoundsMin: Point3D(x: -0.05, y: -0.05, z: -0.05),
+        fromBoundsMax: Point3D(x: 0.05, y: 0.05, z: 0.05),
+        fromVoxelCount: 4
+    )])
+    expect(timeline.events.count == 1 && timeline.events[0].region.voxelCount > 1, "the draft is one multi-voxel move")
+    let chips = ChangeOverlay.chips(timeline)
+    expect(
+        chips.map(\.title) == ["appeared · 0", "disappeared · 0", "moved · 1"],
+        "one moved event is one chip, not marks or voxels: \(chips.map(\.title))"
     )
+    expect(!chips.contains { $0.kind == .unobserved }, "a lone move does not add an unobserved chip")
     let revealed = ChangeOverlay.revealed(timeline: timeline, filter: ChangeOverlay.Filter(), count: timeline.events.count)
-    expect(revealed.count == 1, "full count reveals the move")
+    expect(revealed.count == 1, "full count reveals the drafted move")
     let geometry = ChangeOverlay.geometry(events: revealed, transform: { _ in .identity }, emphasizedIndex: 0)
     expect(geometry.boxes.count == 2, "a move draws the from box and the to box")
+    expect(geometry.boxes.filter(\.markCentroid).count == 2, "a move marks both centroids")
     expect(geometry.arrows.count == 1, "a separated move draws one arrow")
-    guard let region = revealed.first?.region, let from = region.fromCentroid, let arrow = geometry.arrows.first else {
+    guard let region = revealed.first?.region, let fromCentroid = region.fromCentroid, let arrow = geometry.arrows.first else {
         expect(false, "move is missing a from centroid or an arrow")
         return
     }
-    expect(arrow.from == from, "arrow from is the from centroid")
+    expect(chips.first { $0.kind == .moved }?.count != geometry.boxes.filter(\.markCentroid).count, "the chip is not the mark count")
+    expect(chips.first { $0.kind == .moved }?.count != region.voxelCount, "the chip is not the voxel count")
+    expect(arrow.from == fromCentroid, "arrow from is the from centroid")
     expect(arrow.to == region.centroid, "arrow to is the appeared centroid")
     expect(geometry.boxes[0].filled && geometry.boxes[0].fillAlpha == ChangeOverlay.emphasizedFillAlpha, "playhead fill is emphasized")
     expect(!geometry.boxes[1].filled, "the from box is edges only")
@@ -192,6 +209,16 @@ func testChangeOverlayBoxesArrowsColors() {
         fromVoxelCount: 4
     )])
     let arrowGeometry = ChangeOverlay.geometry(events: moved.events, transform: { _ in .identity }, emphasizedIndex: 0)
+    let movedChips = ChangeOverlay.chips(moved)
+    expect(
+        movedChips.map(\.title) == ["appeared · 0", "disappeared · 0", "moved · 1"],
+        "a drafted move is one chip: \(movedChips.map(\.title))"
+    )
+    expect(moved.events[0].region.voxelCount > 1, "the drafted move is more than one voxel")
+    expect(arrowGeometry.boxes.count == 2, "a move draws two boxes")
+    expect(arrowGeometry.boxes.filter(\.markCentroid).count == 2, "a move marks both centroids")
+    expect(arrowGeometry.arrows.count == 1, "a separated move draws one arrow")
+    expect(movedChips.first { $0.kind == .moved }?.count == 1, "the chip counts the region")
     guard let arrow = arrowGeometry.arrows.first else {
         expect(false, "horizontal move has no arrow")
         return
@@ -666,17 +693,157 @@ func testSnapshotIsolation() {
     expect(ran == ["refresh", "timer", "poll", "action"], "rig mode enters refresh, timer, poll, and action")
 }
 
+func testChangeOverlayChipsMatchSnapshotGoldens() {
+    let files = [
+        ("a", "jt128", "e42f40b225109884a2e16dd9ddbdcf362eb91003"),
+        ("a", "mid360", "7e91c7c457a025741d52e37fa63368d6ca145195"),
+        ("b", "jt128", "c11460da9b697e19d6b95be718b563df0f0b8988"),
+        ("b", "mid360", "bd90b789cf9c393137bd8a5f0fae741fe5fc2140"),
+    ]
+    let homeRoot = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        .appendingPathComponent("Developer/lc-tasks/snapshots", isDirectory: true)
+    var homeIsDirectory: ObjCBool = false
+    let homePresent = FileManager.default.fileExists(atPath: homeRoot.path, isDirectory: &homeIsDirectory)
+    if homePresent {
+        expect(homeIsDirectory.boolValue, "home snapshots path is not a directory")
+    }
+    var vendored: [String: Data] = [:]
+    for (side, sensor, hash) in files {
+        let relative = "\(side)/\(sensor).bin"
+        let path = "Tests/Fixtures/room/snapshots/\(relative)"
+        guard let data = FileManager.default.contents(atPath: path) else {
+            expect(false, "missing \(path)")
+            return
+        }
+        let digest = Insecure.SHA1.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        expect(digest == hash, "\(relative) sha1 \(digest)")
+        if homePresent {
+            let homePath = homeRoot.appendingPathComponent(relative).path
+            guard let home = FileManager.default.contents(atPath: homePath) else {
+                expect(false, "home snapshot missing \(homePath)")
+                return
+            }
+            expect(home == data, "home \(relative) is not the vendored snapshot")
+        }
+        vendored[relative] = data
+    }
+
+    let loaded = SnapshotFiles.load(
+        directoryA: "Tests/Fixtures/room/snapshots/a",
+        directoryB: "Tests/Fixtures/room/snapshots/b"
+    )
+    guard case .ready(let clouds) = loaded else {
+        expect(false, "snapshot load failed: \(loaded.caption)")
+        return
+    }
+
+    var live: [ChangeDetection.Kind: Int] = [.appeared: 0, .disappeared: 0, .moved: 0, .unobserved: 0]
+    for sensor in ["jt128", "mid360"] {
+        guard let beforeData = vendored["a/\(sensor).bin"], let afterData = vendored["b/\(sensor).bin"] else {
+            expect(false, "decoded pair missing for \(sensor)")
+            return
+        }
+        do {
+            let before = try PointCloud2CDR.decode(beforeData)
+            let after = try PointCloud2CDR.decode(afterData)
+            let report = try ChangeDetection.compare(before, after, config: ChangeOverlay.snapshotConfig())
+            for region in report.regions {
+                live[region.kind, default: 0] += 1
+            }
+        } catch {
+            expect(false, "\(sensor) compare failed: \(error)")
+            return
+        }
+    }
+
+    var goldenKinds: [ChangeDetection.Kind: Int] = [.appeared: 0, .disappeared: 0, .moved: 0, .unobserved: 0]
+    var appearedVoxels = 0
+    var disappearedVoxels = 0
+    var unknownVoxels = 0
+    for sensor in ["jt128", "mid360"] {
+        let path = "Tests/Fixtures/change-detection/\(sensor).json"
+        guard let data = FileManager.default.contents(atPath: path),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let regions = object["regions"] as? [[String: Any]],
+              let appeared = (object["appeared_voxels"] as? NSNumber)?.intValue,
+              let disappeared = (object["disappeared_voxels"] as? NSNumber)?.intValue,
+              let unknown = (object["unknown_voxels"] as? NSNumber)?.intValue else {
+            expect(false, "could not parse \(path)")
+            return
+        }
+        appearedVoxels += appeared
+        disappearedVoxels += disappeared
+        unknownVoxels += unknown
+        for region in regions {
+            guard let name = region["kind"] as? String, let kind = ChangeDetection.Kind(rawValue: name) else {
+                expect(false, "\(sensor) region kind missing")
+                return
+            }
+            goldenKinds[kind, default: 0] += 1
+        }
+    }
+
+    var eventKinds: [ChangeDetection.Kind: Int] = [.appeared: 0, .disappeared: 0, .moved: 0, .unobserved: 0]
+    for event in clouds.timeline.events {
+        eventKinds[event.region.kind, default: 0] += 1
+    }
+    let chips = ChangeOverlay.chips(clouds.timeline)
+    func chipCount(_ kind: ChangeDetection.Kind) -> Int {
+        chips.first { $0.kind == kind }?.count ?? -1
+    }
+    for kind in [ChangeDetection.Kind.appeared, .disappeared, .moved] {
+        let chip = chipCount(kind)
+        let events = eventKinds[kind, default: 0]
+        let compared = live[kind, default: 0]
+        let golden = goldenKinds[kind, default: 0]
+        expect(
+            chip == events && events == compared && compared == golden && golden == 0,
+            "\(kind.rawValue) chip \(chip), events \(events), compare \(compared), golden \(golden)"
+        )
+    }
+    expect(goldenKinds[.unobserved, default: 0] == 0 && live[.unobserved, default: 0] == 0, "goldens and live reports have no unobserved region")
+    expect(chips.map(\.title) == ["appeared · 0", "disappeared · 0", "moved · 0"], "chip titles \(chips.map(\.title))")
+    expect(chips.allSatisfy { !$0.title.contains("voxel") }, "chip titles do not say voxel")
+    expect(!chips.contains { $0.kind == .unobserved }, "no unobserved chip")
+
+    let filter = ChangeOverlay.Filter()
+    expect(!filter.showUnobserved, "default filter still hides unobserved")
+    let matched = ChangeOverlay.filtered(clouds.timeline, filter)
+    let revealed = ChangeOverlay.revealed(timeline: clouds.timeline, filter: filter, count: matched.count)
+    expect(revealed.isEmpty, "full filtered count reveals nothing")
+    var shown = filter
+    shown.showUnobserved = true
+    expect(
+        ChangeOverlay.revealed(timeline: clouds.timeline, filter: shown, count: 1).isEmpty,
+        "showing unobserved still reveals nothing when the timeline is empty"
+    )
+    let geometry = ChangeOverlay.geometry(events: revealed, transform: RigTransforms.toWorld, emphasizedIndex: nil)
+    expect(geometry.boxes.isEmpty && geometry.arrows.isEmpty, "zero regions draw no boxes and no arrows")
+    let slider = ChangeOverlay.slider(filteredCount: matched.count, count: matched.count)
+    expect(!slider.enabled && slider.value == 0 && slider.lower == 0 && slider.upper == 1, "no regions disables the slider on 0...1")
+
+    let rejected = appearedVoxels + disappearedVoxels
+    let caption = "0 regions · \(appearedVoxels) appeared voxels, \(disappearedVoxels) disappeared voxels, \(unknownVoxels) unknown voxels, \(rejected) rejected voxels"
+    expect(
+        caption == "0 regions · 301 appeared voxels, 118 disappeared voxels, 2140 unknown voxels, 419 rejected voxels",
+        "golden voxel sums were \(caption)"
+    )
+    expect(clouds.caption == caption, "load caption was \(clouds.caption)")
+}
+
 func runChangeOverlayTests() {
     testChangeOverlayConfig()
-    print("  change overlay: viewer config is evidence on, minVoxels 1, minExtent 1"); passed()
+    print("  change overlay: viewer config is evidence on, library cuts"); passed()
     testChangeOverlayMovedThroughViewerConfig()
-    print("  change overlay: one moved region, two boxes, arrow on the centroids"); passed()
+    print("  change overlay: a one-voxel pair is zero regions; a drafted move is one chip"); passed()
     testChangeOverlayOrderAndFilter()
     print("  change overlay: merge order and kind filter"); passed()
     testChangeOverlayBoxesArrowsColors()
     print("  change overlay: corners, rig transform, arrow head, colors"); passed()
     testChangeOverlayCaptions()
     print("  change overlay: captions, disabled slider, clocks, snapshot dirs"); passed()
+    testChangeOverlayChipsMatchSnapshotGoldens()
+    print("  change overlay: snapshot chips match the golden region counts"); passed()
     testTunnelGateBoundary()
     print("  change overlay: isolated tunnel methods invoke zero factories; rig mode spawns"); passed()
     testSnapshotIsolation()

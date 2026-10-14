@@ -25,12 +25,11 @@ public enum ChangeOverlay: Sendable {
         public var b: Float
     }
 
-    /// Viewer config. Library defaults stay on `ChangeDetection.Config()`.
+    /// Golden viewer config. `ChangeDetection.Config()` with evidence on.
+    /// Library cuts stay at `minVoxels` 6 and `minExtent` 2.
     public static func snapshotConfig() -> ChangeDetection.Config {
         var config = ChangeDetection.Config()
         config.evidenceOfAbsence = true
-        config.minVoxels = 1
-        config.minExtent = 1
         return config
     }
 
