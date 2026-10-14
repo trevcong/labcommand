@@ -12,6 +12,8 @@ public final class RigService: @unchecked Sendable {
     private let lock = NSLock()
     private var viewTunnel: Process?
     private var apiTunnel: Process?
+    private var isStartingViewTunnel = false
+    private var isStartingAPITunnel = false
     private let session: URLSession
 
     public init() {
@@ -62,8 +64,18 @@ public final class RigService: @unchecked Sendable {
     }
 
     @discardableResult
-    private func startTunnel(port: Int, key: ReferenceWritableKeyPath<RigService, Process?>) -> String? {
-        if tunnelRunning(key) || portOpen(port) { return nil }
+    private func startTunnel(port: Int, key: ReferenceWritableKeyPath<RigService, Process?>, startingKey: ReferenceWritableKeyPath<RigService, Bool>) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        // Already have a tunnel running, starting, or port is open
+        if self[keyPath: key]?.isRunning == true || self[keyPath: startingKey] || portOpen(port) {
+            return nil
+        }
+        
+        self[keyPath: startingKey] = true
+        defer { self[keyPath: startingKey] = false }
+        
         var lastError: String?
         for host in hostOrder() {
             let proc = Process()
@@ -77,13 +89,24 @@ public final class RigService: @unchecked Sendable {
                 lastError = error.localizedDescription
                 continue
             }
+            
+            self[keyPath: key] = proc
+            
+            // Poll portOpen for up to 2 seconds (20 × 100ms)
+            for _ in 0..<20 {
+                if portOpen(port) {
+                    if host.contains(".") { SparkHopCache.save(host) }
+                    return nil
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            
+            // Port didn't open in time, but process may still be starting
             if proc.isRunning {
-                lock.lock()
-                self[keyPath: key] = proc
-                lock.unlock()
                 if host.contains(".") { SparkHopCache.save(host) }
                 return nil
             }
+            
             lastError = "tunnel to \(host) exited"
         }
         return lastError ?? "tunnel failed"
@@ -91,13 +114,13 @@ public final class RigService: @unchecked Sendable {
 
     /// Both tunnels. Returns the first error, or nil.
     public func ensureTunnels() -> String? {
-        let apiErr = startTunnel(port: Self.apiPort, key: \.apiTunnel)
-        let viewErr = startTunnel(port: Self.viewPort, key: \.viewTunnel)
+        let apiErr = startTunnel(port: Self.apiPort, key: \.apiTunnel, startingKey: \.isStartingAPITunnel)
+        let viewErr = startTunnel(port: Self.viewPort, key: \.viewTunnel, startingKey: \.isStartingViewTunnel)
         return apiErr ?? viewErr
     }
 
     public func ensureAPITunnel() -> String? {
-        startTunnel(port: Self.apiPort, key: \.apiTunnel)
+        startTunnel(port: Self.apiPort, key: \.apiTunnel, startingKey: \.isStartingAPITunnel)
     }
 
     public func stopTunnels() {
