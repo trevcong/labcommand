@@ -6,7 +6,7 @@ import LabCommandCore
 private let cdrFloat32: UInt8 = 7
 private let cdrFloat64: UInt8 = 8
 
-private struct CDRTestField {
+struct CDRTestField {
     var name: String
     var offset: UInt32
     var datatype: UInt8
@@ -60,7 +60,7 @@ private struct CDRTestPoints {
     }
 }
 
-private struct CDRTestCloud {
+struct CDRTestCloud {
     var sec: Int32 = 0
     var nanosec: UInt32 = 0
     var frameId = "lidar"
@@ -105,7 +105,7 @@ private let cdrXYZIFields = [
 ]
 
 /// Unorganized float32 x/y/z/intensity cloud, 16 bytes per point.
-private func cdrXYZICloud(
+func cdrXYZICloud(
     _ points: [(Float, Float, Float, Float)],
     dataIsBigEndian: Bool = false
 ) -> CDRTestCloud {
