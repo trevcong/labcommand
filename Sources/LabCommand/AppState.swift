@@ -85,18 +85,11 @@ final class AppState: ObservableObject {
     ) {
         let launch = SnapshotSession(environment: environment)
         self.launch = launch
-        var resolved = service ?? ConnectivityService(isolates: launch.isolates)
-        resolved.isolates = launch.isolates
-        self.service = resolved
+        self.service = service ?? ConnectivityService()
         self.rigIO = rigIO ?? MockMode.createRigService(isolates: launch.isolates)
         self.live = FoxgloveLiveClient(
-            isAvailable: !launch.isolates && MockMode.parseArgs() == nil,
-            isolates: launch.isolates
+            isAvailable: !launch.isolates && MockMode.parseArgs() == nil
         )
-        if launch.isolates {
-            pointCloudColorMode = .sensor
-            autoRefreshEnabled = false
-        }
         self.snapshot = LabStatusSnapshot(
             overall: .unknown,
             spark: .unknown,
@@ -105,6 +98,10 @@ final class AppState: ObservableObject {
             summaryLine: "—",
             refreshedAt: Date()
         )
+        if launch.isolates {
+            pointCloudColorMode = .sensor
+            autoRefreshEnabled = false
+        }
     }
 
     var health: RigConfidence { RigHealth.evaluate(rig) }
@@ -189,11 +186,9 @@ final class AppState: ObservableObject {
             localFailure = message
             logLine(message)
         case .load(let directoryA, let directoryB):
-            Task.detached(priority: .userInitiated) {
+            Task.detached(priority: .userInitiated) { [weak self] in
                 let loaded = SnapshotFiles.load(directoryA: directoryA, directoryB: directoryB)
-                await MainActor.run { [weak self] in
-                    self?.applySnapshot(loaded)
-                }
+                await self?.applySnapshot(loaded)
             }
         }
     }

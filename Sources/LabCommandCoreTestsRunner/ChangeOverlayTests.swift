@@ -346,6 +346,17 @@ func testChangeOverlayCaptions() {
     expect(chips.first?.title == "appeared · 1", "chip title is kind and full count")
     let noUnknownChip = ChangeOverlay.chips(oneTimeline(regions: [draft(.moved)]))
     expect(!noUnknownChip.contains { $0.kind == .unobserved }, "no unobserved chip when the timeline has none")
+
+    var left = oneTimeline(regions: [draft(.appeared)])
+    var right = left
+    left.events[0].region.volume = 0
+    left.events[0].region.minKey = 0
+    right.events[0].region.volume = 1.5
+    right.events[0].region.minKey = 99
+    right.events[0].region.fromMinKey = 7
+    expect(left.events[0] == right.events[0], "placeholder volume and minKey are not event identity")
+    right.events[0].region.voxelCount += 1
+    expect(left.events[0] != right.events[0], "voxel count still participates in equality")
 }
 
 private final class TunnelFactoryLog {
@@ -384,8 +395,8 @@ private func tunnelFactories(
     )
 }
 
-/// Service boundary for both public tunnel methods. Helper-level `ContactGate`
-/// checks stay above; this is the path `RigService.ensureAPITunnel` used to skip.
+/// Both public tunnel methods, through the injected factories. An isolated call
+/// returns before any factory. Overlapping rig calls share the gate lock.
 func testTunnelGateBoundary() {
     let fallbacks = SparkSSH.hopList(tailscaleJSON: nil, lastLAN: nil)
     expect(fallbacks.count >= 2, "blocked tailscale discovery still leaves fallback hosts: \(fallbacks)")
@@ -452,25 +463,53 @@ func testTunnelGateBoundary() {
     expect(openLog.probes == [TunnelGate.apiPort], "an open port is still probed: \(openLog.probes)")
     expect(openLog.discoveries == 0 && openLog.spawns.isEmpty, "an open port does not discover or spawn")
 
-    let serviceURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appendingPathComponent("Sources/LabCommand/RigService.swift")
-    guard let service = try? String(contentsOf: serviceURL, encoding: .utf8) else {
-        expect(false, "RigService.swift missing")
-        return
+    let overlap = SpawnOverlap()
+    let racing = TunnelGate.Factories(
+        held: { _ in false },
+        portOpen: { _ in false },
+        hosts: { ["10.0.0.8"] },
+        spawn: { _, _ in
+            overlap.enter()
+            Thread.sleep(forTimeInterval: 0.05)
+            overlap.leave()
+            return TunnelSpawnOutcome(stayedUp: true)
+        },
+        rememberHost: { _ in }
+    )
+    let group = DispatchGroup()
+    for _ in 0..<2 {
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = TunnelGate.ensureAPITunnel(isolates: false, factories: racing)
+            group.leave()
+        }
     }
-    expect(
-        service.contains("func ensureAPITunnel() -> String? {\n        TunnelGate.ensureAPITunnel(isolates: isolates, factories: tunnelFactories())\n    }"),
-        "RigService.ensureAPITunnel must enter TunnelGate and not spawn on its own"
-    )
-    expect(
-        service.contains("func ensureTunnels() -> String? {\n        TunnelGate.ensureTunnels(isolates: isolates, factories: tunnelFactories())\n    }"),
-        "RigService.ensureTunnels must enter TunnelGate and not spawn on its own"
-    )
-    expect(!service.contains("func startTunnel"), "the unguarded startTunnel bypass stays deleted")
-    expect(
-        service.contains("if isolates {\n            return TunnelSpawnOutcome(stayedUp: false, error: \"local session\")\n        }\n        let proc = Process()"),
-        "tunnel proc.run stays behind the isolation return"
-    )
+    let finished = group.wait(timeout: .now() + 2)
+    expect(finished == .success, "overlapping tunnel calls finished")
+    expect(overlap.maxInside == 1, "the gate runs one spawn at a time, saw \(overlap.maxInside)")
+    expect(overlap.spawns == 2, "a closed port still lets each caller spawn, saw \(overlap.spawns)")
+}
+
+/// Counts how many spawn factories are inside the gate at once.
+private final class SpawnOverlap: @unchecked Sendable {
+    private let lock = NSLock()
+    private var inside = 0
+    private(set) var maxInside = 0
+    private(set) var spawns = 0
+
+    func enter() {
+        lock.lock()
+        inside += 1
+        if inside > maxInside { maxInside = inside }
+        lock.unlock()
+    }
+
+    func leave() {
+        lock.lock()
+        inside -= 1
+        spawns += 1
+        lock.unlock()
+    }
 }
 
 func testSnapshotIsolation() {

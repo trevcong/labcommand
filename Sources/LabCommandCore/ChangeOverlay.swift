@@ -125,6 +125,23 @@ public enum ChangeOverlay: Sendable {
         public var region: ChangeDetection.Region
         public var beforeStamp: Date?
         public var afterStamp: Date?
+
+        /// `region(_:)` fills `volume`, `minKey`, and `fromMinKey` with placeholders.
+        /// Those fields are not event identity.
+        public static func == (lhs: Event, rhs: Event) -> Bool {
+            lhs.sensor == rhs.sensor
+                && lhs.beforeStamp == rhs.beforeStamp
+                && lhs.afterStamp == rhs.afterStamp
+                && lhs.region.kind == rhs.region.kind
+                && lhs.region.voxelCount == rhs.region.voxelCount
+                && lhs.region.centroid == rhs.region.centroid
+                && lhs.region.boundsMin == rhs.region.boundsMin
+                && lhs.region.boundsMax == rhs.region.boundsMax
+                && lhs.region.fromVoxelCount == rhs.region.fromVoxelCount
+                && lhs.region.fromCentroid == rhs.region.fromCentroid
+                && lhs.region.fromBoundsMin == rhs.region.fromBoundsMin
+                && lhs.region.fromBoundsMax == rhs.region.fromBoundsMax
+        }
     }
 
     public struct Timeline: Equatable, Sendable {

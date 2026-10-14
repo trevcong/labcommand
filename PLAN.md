@@ -168,11 +168,11 @@ The caption, the chip labels, the empty-state sentences, `readingLine`, `localSe
 
 `ChangeOverlay.snapshotDirs` returns the two paths only for `.snapshots`. It returns nil for `.rig` and for `.configurationError`. Nil is not permission to probe. The app branches on `LaunchMode`, not on that optional.
 
-Isolation does not stop at `start()`. `SnapshotSession` is the boundary `AppState` calls, and `ContactGate` is the branch those calls share with the services:
+Isolation does not stop at `start()`. `SnapshotSession` is the boundary `AppState` calls:
 
 - `begin(rig:)` runs the rig closure only for `.rig`. Snapshot mode returns the two directories and does not call it. A configuration error returns the sentence and does not call it or the loader.
 - `refresh`, `restartTimer`, `pollRig`, and `runAction` take the network work as a closure. `ContactGate.attempt` throws `ContactForbidden` before that closure when `isolates` is true, so the closure does not run. `AppState.refresh`, `AppState.restartTimer`, `AppState.pollRig`, and `AppState.runAction` (every action, including `stopView`) are that call. `restartTimer` may invalidate a local `Timer` first. It does not schedule one.
-- `ContactGate.runProcess` and `ContactGate.openSocket` are the process and socket factories. `ConnectivityService.runProcess`, `RigService` (SSH, the localhost port probe, tunnel start, `fetchStatus`, `postAction`, `stopTunnels`), and `FoxgloveLiveClient`’s web socket open go through them. The factory closure is the real `Process` or `URLSessionWebSocketTask`. In snapshot mode it is not entered. `isAvailable: false` on the live client is a second return in `takeSnapshot` and `startLive`, not the only one.
+- Tunnel start is the other entry. `RigService.ensureTunnels` and `ensureAPITunnel` call `TunnelGate`, which holds a lock across the held-port check, host discovery, and spawn. `startTunnel` is the ssh spawn that factory calls. An isolated `TunnelGate` returns before discovery and before `startTunnel`. Status GET, action POST, the localhost port probe, `stopTunnels`, connectivity probes, and the Foxglove socket stay on the rig path. Snapshot mode does not reach them: those calls sit inside the closures above, and the live client is created with `isAvailable: false`.
 
 The same flag disables the controls that would reach those methods. Disabled is not the fence. The fence is the gate. The controls are:
 
@@ -217,9 +217,8 @@ Edit:
 | `Sources/LabCommand/CommandCenterView.swift` | Scrubber under the canvas. Snapshot mode hides live controls, disables Refresh and the recording deck, swaps the Spark chip and the rig headline |
 | `Sources/LabCommand/LabCommandApp.swift` | Menu and status-item actions stay disabled in snapshot mode. Arrow keys step the playhead |
 | `Sources/LabCommand/SettingsView.swift` | Auto-refresh and the interval picker disabled in snapshot mode |
-| `Sources/LabCommand/ConnectivityService.swift` | `runProcess` goes through `ContactGate.runProcess` |
-| `Sources/LabCommand/RigService.swift` | SSH, port probe, status GET, and action POST go through `ContactGate` |
-| `Sources/LabCommand/FoxgloveLiveClient.swift` | The web socket is opened through `ContactGate.openSocket` |
+| `Sources/LabCommand/RigService.swift` | `ensureTunnels` and `ensureAPITunnel` enter locked `TunnelGate`. `startTunnel` still spawns ssh. |
+| `Sources/LabCommand/MockRigService.swift` | Passes the snapshot flag through to `RigService` |
 
 Do not edit: `ChangeDetection.swift`, `ChangeDetect/main.swift`, `Package.swift` (both targets compile every `.swift` file in their directory), `RoomMemory*`, `RigHealth.swift`, `Info.plist`, `build.sh`.
 
@@ -259,7 +258,7 @@ No commit and no push.
 - **Oriented Mid-360 boxes.** Corners are transformed as points. The box matches the transformed cloud. It will not line up with world axes. An axis-aligned world box would be the wrong shape.
 - **AABB is not a voxel mask.** A multi-voxel region draws its bounds, including empty cells inside the box. Per-voxel cubes would need the key set, which `Region` does not have.
 - **Disabled recording controls.** Snapshot mode leaves the deck on screen so the shell does not fork. The controls are disabled because the session is isolated, and `RigGate` would also refuse an unprobed rig. `runAction` itself does not consult `RigGate`, so the contact gate is what refuses a caller that skips the button. The headline and the Spark chip must use the local-session copy, or the shot looks like a failed SSH probe.
-- **The gate is every contact method, not only `start()`.** `refresh`, a restarted probe timer, `pollRig`, and every action can SSH or open a socket after launch. Refresh lives on the workspace button, the View menu, and the status path that a timer would call. Settings can restart the timer. A partial environment is an error, not a reason to start those paths. `ContactGate` is the branch in front of `Process` and the web socket. A new call from `applicationDidFinishLaunching` has to go through `SnapshotSession.begin`.
+- **The gate is the session boundary, plus the tunnel entry.** `refresh`, a restarted probe timer, `pollRig`, and every action can SSH or open a socket after launch. Those four go through `SnapshotSession` before any of that work. Refresh lives on the workspace button, the View menu, and the status path that a timer would call. Settings can restart the timer. A partial environment is an error, not a reason to start those paths. A new call from `applicationDidFinishLaunching` has to go through `SnapshotSession.begin`. Tunnel spawn is the other entry: `TunnelGate` locks it and returns before `startTunnel` when the launch is isolated.
 - **Camera does not orbit.** The overlay is checked against the fitted view only. Adding orbit is out of scope. `setViewMatrix` already exists for a later pass. The overlay uses the same MVP, so it will follow that matrix when something sets it.
 - **Stale fit.** `fitGeneration` is 1 and is not bumped when the overlay arrives. The camera fits the B cloud once. Overlay bounds must not schedule another fit.
 - **Process kill.** `shot.sh` kills the app PID. A child `ssh` started by `refresh` would be the failure mode this plan avoids by not starting one. Quit is that `kill`. No `Cmd-Q` and no AppleEvent.

@@ -56,13 +56,9 @@ struct ChangeScrubberView: View {
                 .foregroundStyle(on ? tint : LabTheme.dim)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
-                .background(
-                    RoundedRectangle(cornerRadius: 100, style: .continuous)
-                        .fill(LabTheme.well)
-                )
+                .background(Capsule().fill(LabTheme.well))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 100, style: .continuous)
-                        .stroke(on ? tint : LabTheme.line, lineWidth: 1)
+                    Capsule().stroke(on ? tint : LabTheme.line, lineWidth: 1)
                 )
         }
         .buttonStyle(.plain)

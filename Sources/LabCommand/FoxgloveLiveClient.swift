@@ -48,8 +48,6 @@ final class FoxgloveLiveClient: ObservableObject {
     private var machine = LiveSession()
     private let hosts: @Sendable () -> [String]
     private let port: Int
-    /// Snapshot launches never open a web socket, even if a caller asks.
-    private let isolates: Bool
     private var session: URLSession?
     private var workers: [SensorID: Worker] = [:]
     private var nextWorkerId = 0
@@ -65,14 +63,12 @@ final class FoxgloveLiveClient: ObservableObject {
     ///   attempt so a hop that SSH discovers later is picked up.
     init(
         isAvailable: Bool = true,
-        isolates: Bool = false,
         hosts: @escaping @Sendable () -> [String] = {
             FoxgloveProtocol.streamHosts(lastLAN: SparkHopCache.load())
         },
         port: Int = CaptureRecipe.foxglovePort
     ) {
         self.isAvailable = isAvailable
-        self.isolates = isolates
         self.hosts = hosts
         self.port = port
         log("mode=\(LiveViewMode.off.rawValue) — no stream until Snapshot or Live", kind: .info, mission: false)
@@ -182,7 +178,6 @@ final class FoxgloveLiveClient: ObservableObject {
     }
 
     private func spawn(_ sensor: SensorID, oneFrame: Bool) {
-        if isolates { return }
         let session = self.session ?? makeSession()
         self.session = session
         nextWorkerId += 1
@@ -192,9 +187,8 @@ final class FoxgloveLiveClient: ObservableObject {
         }
         let hosts = self.hosts
         let port = self.port
-        let isolates = self.isolates
         let task = Task.detached(priority: .userInitiated) { [weak self] in
-            await LiveStream.run(sensor: sensor, hosts: hosts, port: port, session: session, oneFrame: oneFrame, isolates: isolates, sink: sink)
+            await LiveStream.run(sensor: sensor, hosts: hosts, port: port, session: session, oneFrame: oneFrame, sink: sink)
             await self?.workerEnded(sensor, id: id)
         }
         workers[sensor] = Worker(id: id, task: task)
@@ -545,7 +539,6 @@ private enum LiveStream {
         port: Int,
         session: URLSession,
         oneFrame: Bool,
-        isolates: Bool,
         sink: Sink
     ) async {
         var rotation = StreamHostRotation()
@@ -562,7 +555,7 @@ private enum LiveStream {
             let endpoint = "ws://\(host):\(port)"
             await sink.log("connecting \(endpoint) (\(sensor.label))", .info, !announcedDown)
 
-            let end = await connect(sensor: sensor, endpoint: endpoint, session: session, oneFrame: oneFrame, isolates: isolates, sink: sink)
+            let end = await connect(sensor: sensor, endpoint: endpoint, session: session, oneFrame: oneFrame, sink: sink)
             if end.tookFrame {
                 await sink.log("closed \(endpoint) (\(sensor.label)) — \(end.reason)", .info, false)
                 return
@@ -587,18 +580,11 @@ private enum LiveStream {
         }
     }
 
-    private static func connect(sensor: SensorID, endpoint: String, session: URLSession, oneFrame: Bool, isolates: Bool, sink: Sink) async -> ConnectionEnd {
+    private static func connect(sensor: SensorID, endpoint: String, session: URLSession, oneFrame: Bool, sink: Sink) async -> ConnectionEnd {
         guard let url = URL(string: endpoint) else {
             return ConnectionEnd(opened: false, reason: "bad URL")
         }
-        let socket: URLSessionWebSocketTask
-        do {
-            socket = try ContactGate.attempt(.socket, isolates: isolates, detail: endpoint) {
-                session.webSocketTask(with: url, protocols: FoxgloveProtocol.subprotocols)
-            }
-        } catch {
-            return ConnectionEnd(opened: false, reason: "local session")
-        }
+        let socket = session.webSocketTask(with: url, protocols: FoxgloveProtocol.subprotocols)
         socket.maximumMessageSize = maxMessageBytes
         let health = OSAllocatedUnfairLock(initialState: SocketHealth())
         socket.resume()

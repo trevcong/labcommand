@@ -156,14 +156,8 @@ struct CommandCenterView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 100, style: .continuous)
-                .fill(LabTheme.well)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 100, style: .continuous)
-                .stroke(LabTheme.line, lineWidth: 1)
-        )
+        .background(Capsule().fill(LabTheme.well))
+        .overlay(Capsule().stroke(LabTheme.line, lineWidth: 1))
         .help(ChangeOverlay.localSessionLine)
     }
 

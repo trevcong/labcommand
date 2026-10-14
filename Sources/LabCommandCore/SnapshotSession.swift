@@ -168,6 +168,9 @@ public enum TunnelGate {
         }
     }
 
+    /// One check-then-spawn at a time. Two callers otherwise both see a closed port and both spawn.
+    private static let lock = NSLock()
+
     public static func ensureTunnels(isolates: Bool, factories: Factories) -> String? {
         let apiErr = open(port: apiPort, isolates: isolates, factories: factories)
         let viewErr = open(port: viewPort, isolates: isolates, factories: factories)
@@ -179,6 +182,8 @@ public enum TunnelGate {
     }
 
     private static func open(port: Int, isolates: Bool, factories: Factories) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
         do {
             return try ContactGate.attempt(.process, isolates: isolates, detail: "tunnel \(port)") {
                 var lastError: String?
