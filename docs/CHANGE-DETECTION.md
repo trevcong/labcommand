@@ -722,10 +722,10 @@ The runner's extent group builds a 7-voxel 5×3×1 sheet and expects no region a
 
 | Before | After | Golden |
 |---|---|---|
-| `snapshots/a/jt128.bin` | `snapshots/b/jt128.bin` | `Tests/Fixtures/change-detection/jt128.json` |
-| `snapshots/a/mid360.bin` | `snapshots/b/mid360.bin` | `Tests/Fixtures/change-detection/mid360.json` |
+| `Tests/Fixtures/room/snapshots/a/jt128.bin` | `Tests/Fixtures/room/snapshots/b/jt128.bin` | `Tests/Fixtures/change-detection/jt128.json` |
+| `Tests/Fixtures/room/snapshots/a/mid360.bin` | `Tests/Fixtures/room/snapshots/b/mid360.bin` | `Tests/Fixtures/change-detection/mid360.json` |
 
-The four inputs are copied beside the goldens as `a-jt128.bin`, `b-jt128.bin`, `a-mid360.bin`, and `b-mid360.bin`. A golden file is the `json` string plus one `\n`. The test decodes those copies, runs `compare`, and checks byte-identical JSON. No network.
+The inputs are the shared snapshots in `Tests/Fixtures/room/snapshots/{a,b}/` (from the room-memory fixtures; not duplicated here). A golden file is the `json` string plus one `\n`. The test decodes those snapshots, runs `compare`, and checks byte-identical JSON. No network.
 
 ### Tests
 
@@ -757,6 +757,6 @@ Not part of the contract the port matches. This change touches these files and n
 | `Sources/LabCommandCoreTestsRunner/ChangeDetectionTests.swift` | Groups above |
 | `Sources/ChangeDetect/main.swift` | Flags, `unknown_voxels` text token, `--json` |
 | `README.md` | One clause for `--json` and `--evidence` on the existing CLI line |
-| `Tests/Fixtures/change-detection/` | Copied `a`/`b` bins and the two JSON goldens |
+| `Tests/Fixtures/change-detection/` | The two JSON goldens (inputs live in `Tests/Fixtures/room/snapshots/`) |
 
 No app, Metal, or live-session files. The occupied structure stays `Set<Int64>`. The free-set is the bit grid or the open-addressed table in the budget section. When evidence is on, the after map keeps one representative point per occupied voxel so `diff` can cast the specified rays. That storage is not in the JSON. The representative is the accepted point in the voxel that is minimum under the binary32 order key.

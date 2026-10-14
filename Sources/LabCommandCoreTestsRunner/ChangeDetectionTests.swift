@@ -1055,9 +1055,17 @@ func testChangeDetectionSnapshotGoldens() -> (jt128: ChangeDetection.Report, mid
         }
         return data
     }
+    func loadSnapshot(_ side: String, _ sensor: String) -> Data {
+        let path = "Tests/Fixtures/room/snapshots/\(side)/\(sensor).bin"
+        guard let data = FileManager.default.contents(atPath: path) else {
+            expect(false, "missing \(path)")
+            return Data()
+        }
+        return data
+    }
     func check(_ sensor: String) -> (ChangeDetection.Report, Double) {
-        let beforeData = load("a-\(sensor).bin")
-        let afterData = load("b-\(sensor).bin")
+        let beforeData = loadSnapshot("a", sensor)
+        let afterData = loadSnapshot("b", sensor)
         let golden = load("\(sensor).json")
         let before = must({ try PointCloud2CDR.decode(beforeData) }, "\(sensor) before")
         let after = must({ try PointCloud2CDR.decode(afterData) }, "\(sensor) after")
