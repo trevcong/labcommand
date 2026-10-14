@@ -367,7 +367,9 @@ struct CommandCenterView: View {
     }
 }
 
-/// The 3D canvas: live clouds while they stream, the sample cloud otherwise.
+/// The 3D canvas: live clouds while they stream, the sample cloud otherwise —
+/// never both, so a sensor that isn't live leaves its slot empty rather than
+/// backfilled by the sample. The badge says which one is on screen.
 /// Watches the live client directly so ~10 Hz cloud updates re-render only this.
 private struct LivePointCloudCanvas: View {
     @ObservedObject var live: FoxgloveLiveClient
@@ -382,6 +384,43 @@ private struct LivePointCloudCanvas: View {
             pointSize: 3.0,
             revision: live.clouds.revision,
             fitGeneration: live.sourceGeneration
+        )
+        .overlay(alignment: .topLeading) {
+            LiveModeBadge(
+                isLive: live.isLive,
+                text: live.isLive ? LiveViewMode.liveBadge(live.clouds.readings) : LiveViewMode.sampleBadge
+            )
+            .padding(10)
+            // Camera drags start anywhere on the canvas, this corner included.
+            .allowsHitTesting(false)
+        }
+    }
+}
+
+private struct LiveModeBadge: View {
+    var isLive: Bool
+    var text: String
+
+    var body: some View {
+        let tint = isLive ? LabTheme.good : LabTheme.warn
+        HStack(spacing: 6) {
+            Circle()
+                .fill(tint)
+                .frame(width: LabTheme.pip, height: LabTheme.pip)
+            Text(text)
+                .font(LabTheme.mono(11))
+                .foregroundStyle(tint)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: LabTheme.controlRadius, style: .continuous)
+                .fill(LabTheme.bg.opacity(0.85))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: LabTheme.controlRadius, style: .continuous)
+                .stroke(tint.opacity(0.6), lineWidth: 1)
         )
     }
 }

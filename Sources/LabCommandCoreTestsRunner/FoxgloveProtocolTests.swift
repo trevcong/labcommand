@@ -175,6 +175,39 @@ func testFoxgloveReconnectBackoff() {
     expect(FoxgloveProtocol.reconnectDelay(afterFailures: -3) == 1, "nonsense input still waits a second")
 }
 
+func testLiveViewBadge() {
+    expect(LiveViewMode.points(850) == "850 pts", "under 1k is exact")
+    expect(LiveViewMode.points(19_912) == "19.9k pts", "thousands get one decimal, got \(LiveViewMode.points(19_912))")
+    expect(LiveViewMode.points(60_000) == "60k pts", "a whole thousand drops .0, got \(LiveViewMode.points(60_000))")
+
+    let both = LiveViewMode.liveBadge([
+        .init(label: "Mid-360", points: 19_912, hz: 10),
+        .init(label: "JT128", points: 60_000, hz: 9.96),
+    ])
+    expect(both == "LIVE · Mid-360 19.9k pts 10.0 Hz · JT128 60k pts 10.0 Hz", "both sensors, got \(both)")
+    let summary = LiveViewMode.summary([
+        .init(label: "Mid-360", points: 19_912, hz: 10),
+        .init(label: "JT128", points: 60_000, hz: nil),
+    ])
+    expect(summary == "Mid-360 19.9k pts 10.0 Hz, JT128 60k pts", "log summary, got \(summary)")
+    let unmeasured = LiveViewMode.liveBadge([.init(label: "JT128", points: 60_000, hz: nil)])
+    expect(unmeasured == "LIVE · JT128 60k pts", "an unmeasured rate is omitted, got \(unmeasured)")
+    expect(LiveViewMode.sampleBadge == "SAMPLE — not live data", "sample badge wording")
+}
+
+func testArrivalRate() {
+    var rate = ArrivalRate()
+    expect(rate.hz(now: 0) == nil, "no arrivals, no rate")
+    rate.note(0)
+    expect(rate.hz(now: 0) == nil, "one arrival is not a rate")
+    for i in 1...20 {
+        rate.note(Double(i) * 0.1)
+    }
+    let hz = rate.hz(now: 2.0) ?? 0
+    expect(abs(hz - 10) < 0.01, "10 Hz arrivals read 10 Hz, got \(hz)")
+    expect(rate.hz(now: 10) == nil, "a stream quiet past the window has no rate")
+}
+
 func runFoxgloveProtocolTests() {
     testFoxgloveServerMessages()
     print("  Foxglove: serverInfo / advertise / unadvertise / status parse; junk is nil"); passed()
@@ -192,4 +225,8 @@ func runFoxgloveProtocolTests() {
     print("  Foxglove: stream hosts are IPv4 literals, Tailscale IP first"); passed()
     testFoxgloveReconnectBackoff()
     print("  Foxglove: reconnect backoff 1 s → 30 s"); passed()
+    testLiveViewBadge()
+    print("  live view: LIVE badge counts + Hz, SAMPLE badge wording"); passed()
+    testArrivalRate()
+    print("  live view: arrival rate over a 2 s window; quiet stream has none"); passed()
 }

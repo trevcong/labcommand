@@ -178,6 +178,8 @@ public struct DualPointCloudView: NSViewRepresentable {
                 fitCamera = fitPending && frames.contains { !$0.isEmpty }
                 if fitCamera {
                     context.coordinator.lastFitGeneration = fitGeneration
+                    let points = frames.reduce(0) { $0 + $1.count }
+                    FileHandle.standardError.write(Data("[PointCloudView] camera fit to \(points) pts (fit generation \(fitGeneration))\n".utf8))
                 }
             }
             renderer.load(frames: frames, fitCamera: fitCamera)

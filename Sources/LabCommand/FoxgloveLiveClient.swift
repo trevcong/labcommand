@@ -7,8 +7,28 @@ import LabCommandCore
 struct LiveClouds {
     var mid: PointCloudFrame?
     var jt: PointCloudFrame?
+    /// Message rate per sensor as published by the bridge, before any throttling.
+    var hz: [SensorID: Double] = [:]
     /// Changes whenever either cloud does — header stamps alone can repeat.
     var revision = 0
+
+    func frame(_ sensor: SensorID) -> PointCloudFrame? {
+        switch sensor {
+        case .mid360: return mid
+        case .jt128: return jt
+        }
+    }
+
+    var sensors: Set<SensorID> {
+        Set(SensorID.allCases.filter { frame($0) != nil })
+    }
+
+    /// What the badge reports: shown points and rate, per sensor on screen.
+    var readings: [LiveViewMode.Reading] {
+        SensorID.allCases.compactMap { sensor in
+            frame(sensor).map { LiveViewMode.Reading(label: sensor.label, points: $0.count, hz: hz[sensor]) }
+        }
+    }
 }
 
 /// Live lidar clouds for the 3D view, straight from foxglove_bridge on Spark
@@ -44,6 +64,8 @@ final class FoxgloveLiveClient: ObservableObject {
     private var startedAt: TimeInterval = 0
     private var fallbackRequested = false
     private var hasBeenLive = false
+    /// Sensors the last `mode=LIVE` line named.
+    private var loggedLiveSensors: Set<SensorID> = []
 
     /// - Parameter hosts: Candidates for `ws://<host>:<port>`, re-read before every
     ///   attempt so a hop that SSH discovers later is picked up.
@@ -107,7 +129,7 @@ final class FoxgloveLiveClient: ObservableObject {
                 leaveLive(latest.connectionEnded ? "connection lost" : "stream stopped")
             } else if latest.revision != clouds.revision {
                 show(latest)
-            }
+                logLiveMode()            }
         } else if let first = latest.firstFrameAt, !latest.frames.isEmpty,
                   latest.expected.isSubset(of: latest.frames.keys) || now - first >= LiveStream.settle {
             // Going live waits a beat for the second sensor so the one camera fit
@@ -115,7 +137,8 @@ final class FoxgloveLiveClient: ObservableObject {
             enterLive(latest)
         } else if latest.connectionEnded {
             requestFallback("no connection")
-        } else if now - startedAt >= LiveStream.fallbackAfter {
+        } else if latest.frames.isEmpty, now - startedAt >= LiveStream.fallbackAfter {
+            // Frames already arriving are settling into live, not missing.
             requestFallback("no live data after \(Int(LiveStream.fallbackAfter)) s")
         }
     }
@@ -124,8 +147,18 @@ final class FoxgloveLiveClient: ObservableObject {
         clouds = LiveClouds(
             mid: latest.frames[.mid360],
             jt: latest.frames[.jt128],
+            hz: latest.hz,
             revision: latest.revision
         )
+    }
+
+    /// `mode=LIVE` on entry, and again when a sensor joins or leaves the view —
+    /// going live can beat the second sensor by the settle time.
+    private func logLiveMode() {
+        let sensors = clouds.sensors
+        guard sensors != loggedLiveSensors else { return }
+        loggedLiveSensors = sensors
+        log("mode=\(LiveViewMode.live.rawValue) — \(LiveViewMode.summary(clouds.readings))", kind: .info, mission: false)
     }
 
     private func enterLive(_ latest: LiveFrameMailbox.Snapshot) {
@@ -140,12 +173,14 @@ final class FoxgloveLiveClient: ObservableObject {
             .compactMap { sensor in latest.frames[sensor].map { "\(sensor.label) \($0.count) pts" } }
             .joined(separator: ", ")
         log("streaming live clouds — \(summary)", kind: .info, mission: true)
+        logLiveMode()
         onLive?()
     }
 
     private func leaveLive(_ reason: String) {
         isLive = false
         clouds = LiveClouds()
+        loggedLiveSensors = []
         // Count the fallback window again from here.
         startedAt = ProcessInfo.processInfo.systemUptime
         requestFallback(reason)
@@ -155,6 +190,7 @@ final class FoxgloveLiveClient: ObservableObject {
         guard !fallbackRequested else { return }
         fallbackRequested = true
         log("\(reason) — showing sample cloud", kind: .info, mission: true)
+        log("mode=\(LiveViewMode.sample.rawValue)", kind: .info, mission: false)
         onFallback?()
     }
 
@@ -176,6 +212,8 @@ final class FoxgloveLiveClient: ObservableObject {
 private final class LiveFrameMailbox: Sendable {
     struct Snapshot: Sendable {
         var frames: [SensorID: PointCloudFrame] = [:]
+        /// Message rate for each sensor in `frames` that has one yet.
+        var hz: [SensorID: Double] = [:]
         var revision = 0
         /// Sensors the socket is subscribed to right now.
         var expected: Set<SensorID> = []
@@ -188,6 +226,7 @@ private final class LiveFrameMailbox: Sendable {
     private struct State: Sendable {
         var snapshot = Snapshot()
         var receivedAt: [SensorID: TimeInterval] = [:]
+        var rates: [SensorID: ArrivalRate] = [:]
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -201,6 +240,11 @@ private final class LiveFrameMailbox: Sendable {
             state.snapshot.revision += 1
             state.receivedAt[sensor] = now
         }
+    }
+
+    /// Every message for the sensor, including ones throttled before decoding.
+    func noteArrival(_ sensor: SensorID, at now: TimeInterval) {
+        state.withLock { $0.rates[sensor, default: ArrivalRate()].note(now) }
     }
 
     func setExpected(_ sensors: Set<SensorID>) {
@@ -228,13 +272,18 @@ private final class LiveFrameMailbox: Sendable {
             for (sensor, at) in state.receivedAt where now - at > staleAfter {
                 Self.remove(sensor, from: &state)
             }
-            let snapshot = state.snapshot
+            var snapshot = state.snapshot
+            snapshot.hz = [:]
+            for sensor in snapshot.frames.keys {
+                snapshot.hz[sensor] = state.rates[sensor]?.hz(now: now)
+            }
             state.snapshot.connectionEnded = false
             return snapshot
         }
     }
 
     private static func remove(_ sensor: SensorID, from state: inout State) {
+        state.rates[sensor] = nil
         guard state.snapshot.frames.removeValue(forKey: sensor) != nil else { return }
         state.receivedAt[sensor] = nil
         state.snapshot.revision += 1
@@ -255,7 +304,10 @@ private enum LiveStream {
     static let minFrameInterval: TimeInterval = 0.08
     static let fallbackAfter: TimeInterval = 3
     static let staleAfter: TimeInterval = 3
-    static let settle: TimeInterval = 0.5
+    /// How long going live waits for a subscribed sensor that hasn't sent yet. A
+    /// JT128 frame is ~3 MB and over Tailscale lands up to ~0.7 s after the first
+    /// Mid-360 one; the one camera fit should frame both.
+    static let settle: TimeInterval = 2
     static let handshakeTimeout: TimeInterval = 5
     static let pingInterval: TimeInterval = 10
     /// URLSession's default cap is 1 MiB; one JT128 PointCloud2 is several.
@@ -541,6 +593,7 @@ private enum LiveStream {
 
         // Throttle on the raw payload: a frame the UI would never show isn't decoded.
         let now = ProcessInfo.processInfo.systemUptime
+        sink.mailbox.noteArrival(sensor, at: now)
         if let last = link.lastAccepted[sensor], now - last < minFrameInterval {
             return
         }
