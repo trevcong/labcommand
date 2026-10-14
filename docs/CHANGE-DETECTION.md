@@ -586,19 +586,35 @@ cap = |di| + |dj| + |dk|          # end index minus start index, at the start
 steps = 0
 while steps < cap:
     if current == end: return     # do not mark the endpoint voxel
-    if pack(current) fails: return
-    mark current free
+    if current is outside the origin–end index AABB: skip the mark
+    else if pack(current) fails: return
+    else: mark current free       # bit grid: also skip unless the word index is inside the allocated words
+    # Clamp. An axis that has reached its endpoint index stops stepping.
+    # +infinity drops it from tNext, so a tie cannot drag it past the end cell.
+    # Along +step the test is index >= endIndex; along −step it is index <= endIndex.
+    if stepX > 0 and x >= endI: tMaxX = +infinity
+    else if stepX < 0 and x <= endI: tMaxX = +infinity
+    if stepY > 0 and y >= endJ: tMaxY = +infinity
+    else if stepY < 0 and y <= endJ: tMaxY = +infinity
+    if stepZ > 0 and z >= endK: tMaxZ = +infinity
+    else if stepZ < 0 and z <= endK: tMaxZ = +infinity
     tNext = min(tMaxX, tMaxY, tMaxZ)    # binary32 <, left to right
     # capture tNext first; then test all three axes against it
-    if tMaxX == tNext: x += stepX; tMaxX = tMaxX + tDeltaX
-    if tMaxY == tNext: y += stepY; tMaxY = tMaxY + tDeltaY
-    if tMaxZ == tNext: z += stepZ; tMaxZ = tMaxZ + tDeltaZ
+    # short of the end: step > 0 and index < endIndex, or step < 0 and index > endIndex
+    if tMaxX == tNext and stepX > 0 and x < endI: x += stepX; tMaxX = tMaxX + tDeltaX
+    if tMaxX == tNext and stepX < 0 and x > endI: x += stepX; tMaxX = tMaxX + tDeltaX
+    if tMaxY == tNext and stepY > 0 and y < endJ: y += stepY; tMaxY = tMaxY + tDeltaY
+    if tMaxY == tNext and stepY < 0 and y > endJ: y += stepY; tMaxY = tMaxY + tDeltaY
+    if tMaxZ == tNext and stepZ > 0 and z < endK: z += stepZ; tMaxZ = tMaxZ + tDeltaZ
+    if tMaxZ == tNext and stepZ < 0 and z > endK: z += stepZ; tMaxZ = tMaxZ + tDeltaZ
     steps += 1
 ```
 
-`tMax + tDelta` is one binary32 add, accumulated. Do not recompute `tMax` from the plane each step. Equality is binary32 `==`. When all three `tMax` values compare equal, all three axes advance and the walk moves to the diagonal neighbor. The start voxel is marked when it differs from the end voxel, so the sensor cell is free unless some return occupies it. The endpoint voxel is never marked free by that ray. After every ray, free is the union of the marks minus the after occupied set. Ray order does not change the union.
+`tMax + tDelta` is one binary32 add, accumulated. Do not recompute `tMax` from the plane each step. Equality is binary32 `==`. When all three `tMax` values compare equal, all three axes that are still short of their endpoint indices advance, and the walk moves to the diagonal neighbor. An axis already sitting on its endpoint index stays there. The start voxel is marked when it differs from the end voxel, so the sensor cell is free unless some return occupies it. The endpoint voxel is never marked free by that ray. After every ray, free is the union of the marks minus the after occupied set. Ray order does not change the union.
 
-The loop count is at most `|di| + |dj| + |dk|`. Reaching the cap without landing on the end voxel ends the ray. Both languages share that cutoff.
+A return on a voxel face can tie two `tMax` values while another axis still has cells left. Stepping every tied axis then leaves the origin–end AABB. Voxel size 1, origin `(0.5, 0.5, 0.5)`, return `(16, -15, 0.5)` ties `x` and `y`: the unclamped walk reaches `(16, -16, 0)` instead of the end cell `(16, -15, 0)`, then runs to the Manhattan cap. Those steps write past the allocated words, and earlier out-of-grid indices alias unrelated cells inside the buffer. The clamp holds `y` at `-15`. The next `x` step lands on `(16, -15, 0)` and the walk returns. The open-addressed fallback uses this same clamp, the same end-cell return, and the same AABB skip before it marks a key. The bit-grid write also requires the word index to fall inside the allocated `words`.
+
+The loop count is at most `|di| + |dj| + |dk|`. The clamp puts a finite in-range segment on the end cell with steps to spare. Hitting the cap without landing on that cell still ends the ray. Both languages share the clamp and the cutoff.
 
 ### Canonical JSON
 

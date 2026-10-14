@@ -869,29 +869,33 @@ public enum ChangeDetection: Sendable {
                         continue
                     }
                     let cap = abs(endI - startI) + abs(endJ - startJ) + abs(endK - startK)
+                    let iLo = min(startI, endI)
+                    let iHi = max(startI, endI)
+                    let jLo = min(startJ, endJ)
+                    let jHi = max(startJ, endJ)
+                    let kLo = min(startK, endK)
+                    let kHi = max(startK, endK)
+                    let wordCount = buffer.count
                     var x = startI
                     var y = startJ
                     var z = startK
                     var steps = 0
                     while steps < cap {
                         if x == endI, y == endJ, z == endK { break }
-                        let idx = ((x - i0) * nj + (y - j0)) * nk + (z - k0)
-                        base[idx >> 6] |= UInt64(1) << UInt64(idx & 63)
-                        var tNext = tMaxX
-                        if tMaxY < tNext { tNext = tMaxY }
-                        if tMaxZ < tNext { tNext = tMaxZ }
-                        if tMaxX == tNext {
-                            x += stepX
-                            tMaxX += tDeltaX
+                        if x >= iLo, x <= iHi, y >= jLo, y <= jHi, z >= kLo, z <= kHi {
+                            let idx = ((x - i0) * nj + (y - j0)) * nk + (z - k0)
+                            let word = idx >> 6
+                            if word >= 0, word < wordCount {
+                                base[word] |= UInt64(1) << UInt64(idx & 63)
+                            }
                         }
-                        if tMaxY == tNext {
-                            y += stepY
-                            tMaxY += tDeltaY
-                        }
-                        if tMaxZ == tNext {
-                            z += stepZ
-                            tMaxZ += tDeltaZ
-                        }
+                        stepClamped(
+                            x: &x, y: &y, z: &z,
+                            tMaxX: &tMaxX, tMaxY: &tMaxY, tMaxZ: &tMaxZ,
+                            tDeltaX: tDeltaX, tDeltaY: tDeltaY, tDeltaZ: tDeltaZ,
+                            stepX: stepX, stepY: stepY, stepZ: stepZ,
+                            endI: endI, endJ: endJ, endK: endK
+                        )
                         steps += 1
                     }
                 }
@@ -956,9 +960,62 @@ public enum ChangeDetection: Sendable {
         }
     }
 
-    /// Amanatides–Woo traversal. On a tie every tied axis steps. The endpoint voxel
-    /// is not marked. Indices stay inside the AABB of the origin and the end, which
-    /// is the bit grid, so the mark does not bounds-check.
+    /// Steps every axis tied for the nearest plane, except an axis that has reached
+    /// its endpoint index. That axis is clamped: `tMax` becomes +infinity so a later
+    /// tie cannot drag it past the end cell.
+    @inline(__always)
+    private static func stepClamped(
+        x: inout Int, y: inout Int, z: inout Int,
+        tMaxX: inout Float, tMaxY: inout Float, tMaxZ: inout Float,
+        tDeltaX: Float, tDeltaY: Float, tDeltaZ: Float,
+        stepX: Int, stepY: Int, stepZ: Int,
+        endI: Int, endJ: Int, endK: Int
+    ) {
+        let inf = Float.infinity
+        if stepX > 0 {
+            if x >= endI { tMaxX = inf }
+        } else if stepX < 0 {
+            if x <= endI { tMaxX = inf }
+        }
+        if stepY > 0 {
+            if y >= endJ { tMaxY = inf }
+        } else if stepY < 0 {
+            if y <= endJ { tMaxY = inf }
+        }
+        if stepZ > 0 {
+            if z >= endK { tMaxZ = inf }
+        } else if stepZ < 0 {
+            if z <= endK { tMaxZ = inf }
+        }
+        var tNext = tMaxX
+        if tMaxY < tNext { tNext = tMaxY }
+        if tMaxZ < tNext { tNext = tMaxZ }
+        if tMaxX == tNext {
+            let open = stepX > 0 ? x < endI : (stepX < 0 && x > endI)
+            if open {
+                x += stepX
+                tMaxX += tDeltaX
+            }
+        }
+        if tMaxY == tNext {
+            let open = stepY > 0 ? y < endJ : (stepY < 0 && y > endJ)
+            if open {
+                y += stepY
+                tMaxY += tDeltaY
+            }
+        }
+        if tMaxZ == tNext {
+            let open = stepZ > 0 ? z < endK : (stepZ < 0 && z > endK)
+            if open {
+                z += stepZ
+                tMaxZ += tDeltaZ
+            }
+        }
+    }
+
+    /// Amanatides–Woo traversal. On a tie every tied axis steps unless that axis
+    /// has reached its endpoint index. The walk returns on the end cell and does
+    /// not mark it. A cell outside the origin–end index AABB is not marked.
     @inline(__always)
     private static func walk(
         origin: (x: Float, y: Float, z: Float),
@@ -1021,28 +1078,28 @@ public enum ChangeDetection: Sendable {
         }
 
         let cap = abs(endI - startI) + abs(endJ - startJ) + abs(endK - startK)
+        let iLo = min(startI, endI)
+        let iHi = max(startI, endI)
+        let jLo = min(startJ, endJ)
+        let jHi = max(startJ, endJ)
+        let kLo = min(startK, endK)
+        let kHi = max(startK, endK)
         var x = startI
         var y = startJ
         var z = startK
         var steps = 0
         while steps < cap {
             if x == endI, y == endJ, z == endK { return }
-            mark(x, y, z)
-            var tNext = tMaxX
-            if tMaxY < tNext { tNext = tMaxY }
-            if tMaxZ < tNext { tNext = tMaxZ }
-            if tMaxX == tNext {
-                x += stepX
-                tMaxX += tDeltaX
+            if x >= iLo, x <= iHi, y >= jLo, y <= jHi, z >= kLo, z <= kHi {
+                mark(x, y, z)
             }
-            if tMaxY == tNext {
-                y += stepY
-                tMaxY += tDeltaY
-            }
-            if tMaxZ == tNext {
-                z += stepZ
-                tMaxZ += tDeltaZ
-            }
+            stepClamped(
+                x: &x, y: &y, z: &z,
+                tMaxX: &tMaxX, tMaxY: &tMaxY, tMaxZ: &tMaxZ,
+                tDeltaX: tDeltaX, tDeltaY: tDeltaY, tDeltaZ: tDeltaZ,
+                stepX: stepX, stepY: stepY, stepZ: stepZ,
+                endI: endI, endJ: endJ, endK: endK
+            )
             steps += 1
         }
     }

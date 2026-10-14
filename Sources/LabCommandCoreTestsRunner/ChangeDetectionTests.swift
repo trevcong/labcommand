@@ -754,6 +754,175 @@ func testChangeDetectionDeterminism() {
     expect(movedShuffle.json == moved.json, "shuffled move JSON matches")
 }
 
+/// Voxel size 1. Origin center `(0.5, 0.5, 0.5)` is cell `(0, 0, 0)`.
+private func unitCenter(_ i: Int, _ j: Int, _ k: Int) -> Point3D {
+    Point3D(x: Float(i) + 0.5, y: Float(j) + 0.5, z: Float(k) + 0.5)
+}
+
+private func unitEvidenceConfig(
+    origin: Point3D,
+    reportUnobserved: Bool = false
+) -> ChangeDetection.Config {
+    var config = evidenceConfig(
+        tolerance: 0,
+        minVoxels: 1,
+        reportUnobserved: reportUnobserved,
+        origin: origin,
+        minExtent: 1
+    )
+    config.voxelSize = 1
+    config.pairMoves = false
+    return config
+}
+
+/// The tied walk from `(0.5, 0.5, 0.5)` to `(16, -15, 0.5)` used to leave the
+/// grid at `(16, -16, 0)`. `fallback` adds a far return so the ray uses the
+/// open-addressed walker instead of the bit grid.
+private func boundaryEndpointReport(fallback: Bool) -> ChangeDetection.Report {
+    let origin = Point3D(x: 0.5, y: 0.5, z: 0.5)
+    let endpoint = Point3D(x: 16, y: -15, z: 0.5)
+    var before: [Point3D] = []
+    for i in 0...15 {
+        before.append(unitCenter(i, -i, 0))
+    }
+    // Cells the unclamped tie aliases into the allocated words, plus two cells
+    // past the grid where the old loop indexed off the end of `words`.
+    before.append(unitCenter(15, 0, 0))
+    before.append(unitCenter(16, -1, 0))
+    before.append(unitCenter(16, -16, 0))
+    before.append(unitCenter(21, -21, 0))
+    before.append(endpoint)
+    var after = [endpoint]
+    if fallback {
+        let far = unitCenter(700, 700, 700)
+        before.append(far)
+        after.append(far)
+    }
+    return diffRecord(before, after, unitEvidenceConfig(origin: origin), "boundary endpoint").report
+}
+
+private func expectBoundaryEndpoint(_ report: ChangeDetection.Report, _ label: String) {
+    expect(report.appearedVoxels == 0, "\(label) endpoint stays occupied, appeared \(report.appearedVoxels)")
+    expect(report.disappearedVoxels == 16, "\(label) diagonal has 16 cells, disappeared \(report.disappearedVoxels)")
+    expect(report.unknownVoxels == 4, "\(label) alias and overshoot cells stay unknown \(report.unknownVoxels)")
+    expect(report.regions.count == 1, "\(label) one disappeared region, got \(report.regions.count)")
+    guard let region = report.regions.first else { return }
+    expect(region.kind == .disappeared && region.voxelCount == 16, "\(label) region \(region.kind) \(region.voxelCount)")
+    guard let originKey = VoxelKey.pack(i: 0, j: 0, k: 0) else {
+        expect(false, "\(label) origin key")
+        return
+    }
+    expect(region.minKey == originKey, "\(label) walk starts at the origin cell")
+    expect(region.boundsMin.x == 0 && region.boundsMin.y == -15 && region.boundsMin.z == 0,
+           "\(label) boundsMin \(region.boundsMin)")
+    expect(region.boundsMax.x == 16 && region.boundsMax.y == 1 && region.boundsMax.z == 1,
+           "\(label) boundsMax \(region.boundsMax)")
+}
+
+func testChangeDetectionBoundaryEndpoint() {
+    expectBoundaryEndpoint(boundaryEndpointReport(fallback: false), "bit grid")
+    expectBoundaryEndpoint(boundaryEndpointReport(fallback: true), "open-addressed")
+}
+
+private func indexEdge(_ value: Float, exclusive: Bool) -> Int {
+    let truncated = Int(value)
+    return exclusive ? truncated - 1 : truncated
+}
+
+private func chebyshevToBox(
+    i: Int, j: Int, k: Int,
+    iLo: Int, iHi: Int, jLo: Int, jHi: Int, kLo: Int, kHi: Int
+) -> Int {
+    func axis(_ value: Int, _ lo: Int, _ hi: Int) -> Int {
+        if value < lo { return lo - value }
+        if value > hi { return value - hi }
+        return 0
+    }
+    return max(axis(i, iLo, iHi), max(axis(j, jLo, jHi), axis(k, kLo, kHi)))
+}
+
+func testChangeDetectionBoundaryOctants() {
+    let origin = Point3D(x: 0.5, y: 0.5, z: 0.5)
+    let inverse: Float = 1
+    let originI = VoxelKey.index(origin.x, inverseVoxelSize: inverse)
+    let originJ = VoxelKey.index(origin.y, inverseVoxelSize: inverse)
+    let originK = VoxelKey.index(origin.z, inverseVoxelSize: inverse)
+    var rng = SplitMix(state: 0xB0A1_DDA5)
+    var samples = 0
+    for sx in [-1, 1] {
+        for sy in [-1, 1] {
+            for sz in [-1, 1] {
+                // Bits 0/1/2 place x/y/z on a voxel face. Every non-empty mask is a boundary endpoint.
+                for mask in 1...7 {
+                    let magX = Int(rng.next() % 8) + 1
+                    let magY = Int(rng.next() % 8) + 1
+                    let magZ = Int(rng.next() % 8) + 1
+                    let endI = sx * magX
+                    let endJ = sy * magY
+                    let endK = sz * magZ
+                    let point = Point3D(
+                        x: mask & 1 != 0 ? Float(endI) : Float(endI) + 0.5,
+                        y: mask & 2 != 0 ? Float(endJ) : Float(endJ) + 0.5,
+                        z: mask & 4 != 0 ? Float(endK) : Float(endK) + 0.5
+                    )
+                    let ei = VoxelKey.index(point.x, inverseVoxelSize: inverse)
+                    let ej = VoxelKey.index(point.y, inverseVoxelSize: inverse)
+                    let ek = VoxelKey.index(point.z, inverseVoxelSize: inverse)
+                    expect(ei == endI && ej == endJ && ek == endK,
+                           "octant (\(sx),\(sy),\(sz)) mask \(mask) quantizer \(ei),\(ej),\(ek)")
+                    let iLo = min(originI, ei)
+                    let iHi = max(originI, ei)
+                    let jLo = min(originJ, ej)
+                    let jHi = max(originJ, ej)
+                    let kLo = min(originK, ek)
+                    let kHi = max(originK, ek)
+                    var before: [Point3D] = []
+                    before.reserveCapacity((iHi - iLo + 3) * (jHi - jLo + 3) * (kHi - kLo + 3))
+                    for i in (iLo - 1)...(iHi + 1) {
+                        for j in (jLo - 1)...(jHi + 1) {
+                            for k in (kLo - 1)...(kHi + 1) {
+                                before.append(unitCenter(i, j, k))
+                            }
+                        }
+                    }
+                    let report = diffRecord(
+                        before,
+                        [point],
+                        unitEvidenceConfig(origin: origin),
+                        "octant (\(sx),\(sy),\(sz)) mask \(mask)"
+                    ).report
+                    let span = max(abs(ei - originI), max(abs(ej - originJ), abs(ek - originK)))
+                    let aabbCount = (iHi - iLo + 1) * (jHi - jLo + 1) * (kHi - kLo + 1)
+                    expect(report.disappearedVoxels >= span,
+                           "octant (\(sx),\(sy),\(sz)) mask \(mask) marked \(report.disappearedVoxels), long axis \(span)")
+                    expect(report.disappearedVoxels <= aabbCount - 1,
+                           "octant (\(sx),\(sy),\(sz)) mask \(mask) left the AABB or marked the end, count \(report.disappearedVoxels)")
+                    expect(!report.regions.isEmpty, "octant (\(sx),\(sy),\(sz)) mask \(mask) produced no region")
+                    var nearest = Int.max
+                    for region in report.regions where region.kind == .disappeared {
+                        let riLo = indexEdge(region.boundsMin.x, exclusive: false)
+                        let rjLo = indexEdge(region.boundsMin.y, exclusive: false)
+                        let rkLo = indexEdge(region.boundsMin.z, exclusive: false)
+                        let riHi = indexEdge(region.boundsMax.x, exclusive: true)
+                        let rjHi = indexEdge(region.boundsMax.y, exclusive: true)
+                        let rkHi = indexEdge(region.boundsMax.z, exclusive: true)
+                        expect(riLo >= iLo && riHi <= iHi && rjLo >= jLo && rjHi <= jHi && rkLo >= kLo && rkHi <= kHi,
+                               "octant (\(sx),\(sy),\(sz)) mask \(mask) visited \(riLo)...\(riHi), \(rjLo)...\(rjHi), \(rkLo)...\(rkHi) outside \(iLo)...\(iHi), \(jLo)...\(jHi), \(kLo)...\(kHi)")
+                        nearest = min(nearest, chebyshevToBox(
+                            i: ei, j: ej, k: ek,
+                            iLo: riLo, iHi: riHi, jLo: rjLo, jHi: rjHi, kLo: rkLo, kHi: rkHi
+                        ))
+                    }
+                    expect(nearest <= 1,
+                           "octant (\(sx),\(sy),\(sz)) mask \(mask) stopped \(nearest) cells short of the end")
+                    samples += 1
+                }
+            }
+        }
+    }
+    expect(samples == 56, "sweep covered \(samples) boundary endpoints")
+}
+
 func testChangeDetectionWideGridFallback() {
     let before = [cellPoint(10, 10, 10), cellPoint(700, 700, 700)]
     let after = [cellPoint(700, 700, 700)]
@@ -936,6 +1105,10 @@ func runChangeDetectionTests() {
     print("  ChangeDetection: a clear line of sight is the v2 JSON golden"); passed()
     testChangeDetectionDiagonalTie()
     print("  ChangeDetection: a corner tie steps the diagonal and leaves the face neighbor unknown"); passed()
+    testChangeDetectionBoundaryEndpoint()
+    print("  ChangeDetection: a tied boundary return stays in the grid and stops on the end cell"); passed()
+    testChangeDetectionBoundaryOctants()
+    print("  ChangeDetection: boundary endpoints in every octant stay inside the origin–end box"); passed()
     testChangeDetectionSlide()
     print("  ChangeDetection: a slide toward the sensor stays unknown; a slide away is suppressed"); passed()
     testChangeDetectionEvidenceOrder()
