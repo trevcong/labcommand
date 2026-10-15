@@ -680,6 +680,30 @@ func testLiveRoomGenerationsAndPartialHistory() {
     _ = map.receive(topic: .syncMapBricks, payload: snapshot(epoch: 1, seq: 0, [brick(6)]), at: 112)
     expect(map.mapState == .current && map.mapEpoch == 1 && map.bricks.count == 1, "new generation's sync snapshot at seq 0 is current")
 
+    // Status ran ahead of the map. A replayed snapshot that is still behind that epoch must not
+    // clear the request: the delta after it is the rest of the answer.
+    var behind = currentMirror()
+    _ = behind.receive(topic: .mapBricks, payload: snapshot(epoch: 8, seq: 10, [brick(8)]), at: 110)
+    _ = behind.receive(topic: .status, payload: status(epoch: 10, seq: 2), at: 111)
+    let ahead = behind.receive(topic: .status, payload: status(epoch: 10, seq: 3), at: 112)
+    expect(behind.mapState == .stale(.epochMismatch) && request(ahead, .mapBricks, "status epoch") != nil,
+           "status epoch 10 vs mirror 8: stale and requesting")
+    _ = behind.receive(topic: .syncMapBricks, payload: snapshot(epoch: 9, seq: 11, [brick(9)]), at: 113)
+    expect(behind.mapState != .current && behind.mapEpoch == 9, "replayed snapshot at epoch 9 is behind status epoch 10")
+    _ = behind.receive(topic: .syncMapBricks, payload: delta(epoch: 10, seq: 12, base: 9, [brick(10)]), at: 114)
+    expect(behind.mapState == .current && behind.mapEpoch == 10 && behind.mapSeq == 12 && behind.bricks.count == 2,
+           "the delta after that snapshot reaches the status epoch and is applied")
+
+    // Connect already requested events. A second status that still names events, with none held,
+    // is an incomplete history. The outstanding request must not hide that.
+    var waiting = Mirror(roomId: "lab")
+    _ = waiting.connectionOpened(at: 0, canRequest: true)
+    _ = waiting.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 12), at: 0)
+    expect(waiting.eventsState == .complete, "the first status may still be racing the first event")
+    _ = waiting.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 12), at: 1)
+    expect(waiting.eventsState != .complete, "events advertised twice and none held: incomplete while the connect request is out")
+    expect(waiting.activity.gaps == 0, "the connect request is not a second gap")
+
     // An unreadable map payload: bricks kept, map stale, resync requested.
     var bad = currentMirror()
     let good = delta(epoch: 6, seq: 11, base: 5, [])
@@ -710,7 +734,7 @@ func runLiveRoomTests() {
     testLiveRoomReplayAndFallbackEdges()
     print("  LiveRoom: replayed snapshot behind live stays stale until chained; initial + bounded fallbacks settle; lost first event"); passed()
     testLiveRoomGenerationsAndPartialHistory()
-    print("  LiveRoom: partial first history, SINCE_NONE retries, node restart generations, unreadable map → resync"); passed()
+    print("  LiveRoom: partial first history, replay behind the status epoch, incomplete while a connect request is out, unreadable map → resync"); passed()
 }
 
 /// `swift run LabCommandCoreTestsRunner live-room-probe [seconds] [ws://host:port]`: connects a read-only

@@ -335,13 +335,17 @@ public struct RoomMemoryMirror: Sendable, Equatable {
                 // The live topic is in order: its snapshot is the newest there is, even after a restart.
                 highestLiveMapSeq = seq
             }
-            if seq >= (highestLiveMapSeq ?? seq) {
+            // A live snapshot is the newest on that topic. A replay is current only once its seq
+            // has caught the live topic and its epoch has reached the latest status: an older
+            // snapshot must leave the request open, or the deltas after it are ignored.
+            let seqCaughtUp = seq >= (highestLiveMapSeq ?? seq)
+            let epochCaughtUp = !fromSync || (status.map { message.header.mapEpoch >= $0.mapEpoch } ?? true)
+            if seqCaughtUp && epochCaughtUp {
                 mapState = .current
                 replayChained = false
                 needs[.mapBricks] = nil
             } else {
-                // A replayed snapshot behind the live topic: the replay's deltas must chain on before it is current.
-                mapState = .stale(.seqGap)
+                mapState = .stale(seqCaughtUp ? .epochMismatch : .seqGap)
                 replayChained = true
             }
 
@@ -692,14 +696,18 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         // events_seq gap: a high-water mark the baseline still has not reached one status later.
         if eventsSeq == nil, let mark = message.eventsSeq {
             // Events exist but none is held (the first was lost, or none has arrived yet).
-            if eventsMark != nil, needs[.events] == nil {
+            // The connect request is already outstanding in that case: incompleteness is separate
+            // from opening another request, or the list stays complete for as long as the replay lags.
+            if eventsMark != nil {
                 if canRequest {
-                    activity.gaps += 1
                     if eventsState == .complete {
                         eventsState = .incomplete(since: lastGoodEventStamp)
                     }
-                    eventsInitialSync = true
-                    needEvents()
+                    if needs[.events] == nil {
+                        activity.gaps += 1
+                        eventsInitialSync = true
+                        needEvents()
+                    }
                 } else if eventsState == .complete {
                     activity.gaps += 1
                     loseEventsHistory()

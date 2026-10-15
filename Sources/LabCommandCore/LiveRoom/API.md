@@ -126,11 +126,14 @@ but only while `isStatusFresh`. Otherwise "STALE · age".
   list goes incomplete and requests `RequestSync{events, since: (epoch, eventsSeq)}`. So does an
   **events_seq gap**: a status `events_seq` above the baseline that the next status still finds
   unreached. An event's state changes only on a message with a higher seq than the last one applied to it.
-- **Answers.** A replayed snapshot behind the newest live seq stays stale until the replay's
-  deltas chain up to it. An events answer settles once its sync topic has been quiet for 2 s.
+- **Answers.** A replayed snapshot stays stale until its seq reaches the newest live seq and its
+  epoch is at least the latest status epoch; the request stays open so the deltas after an older
+  snapshot still apply. An events answer settles once its sync topic has been quiet for 2 s.
   A `SINCE_NONE` answer, not the first live event, settles what exists. Seqs an answer could
   not fill (the bounded fallback) are skipped: the baseline jumps to the highest replayed seq and
-  the history stays incomplete. A status `events_seq` with no events held triggers `SINCE_NONE`.
+  the history stays incomplete. A status `events_seq` with no events held, seen again on the next
+  status, marks the list incomplete even when the connect request is already outstanding, and
+  triggers `SINCE_NONE` when nothing is outstanding.
 - **Node restart.** A status `seq` lower than the last one, or `events_seq` below the events
   baseline on 2 consecutive statuses, starts a new generation. The events baseline is dropped
   (history incomplete) and refetched with `SINCE_NONE`; the map's live high-water mark resets.

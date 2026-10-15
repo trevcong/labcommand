@@ -84,11 +84,8 @@ final class RoomMapRenderer: NSObject, MTKViewDelegate {
     func update(mirror: RoomMemoryMirror, markers: [LiveRoomMarker], opacity: Float, drawMap: Bool) {
         guard drawMap else {
             clearGeometry()
-            uploaded = true
-            uploadedRevision = mirror.mapRevision
-            uploadedVoxel = mirror.voxelSize
-            uploadedMarkers = []
-            uploadedOpacity = opacity
+            // Same revision coming back must rebuild. Recording this as uploaded leaves the canvas blank.
+            uploaded = false
             content = []
             return
         }
