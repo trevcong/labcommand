@@ -271,6 +271,7 @@ Small messages pay 2–3× their size in headers, which is why §3.2 counts wire
 ### 3.3 Spark-side shaping (PR 2.4)
 
 - **Delta coalescing.** Deltas are capped at 0.2 Hz (protocol §2). Reference changes within one 5 s slot merge into one delta. That is legal: a delta's `map_epoch` must only exceed its `base_epoch` (D8), so epochs may skip.
+- **Byte bucket on `events` answers (P4).** One bucket covers `sync/events` and `sync/events_fallback`, not live `events`, which stays under 1/min. It refills at 3 KB/s up to 48 KB, one full fallback (≤ 120 messages × 396 B). An answer is admitted whole at a balance ≥ 0 and debits its full size, so it never waits for its own size and is never split. Answers wait in arrival order. Without it, ten Macs each requesting a 99-event replay every 30 s would send about 13 KB/s on the shared sync topic (Codex, PR #13).
 - **Byte bucket on `map_bricks` (P15).** One bucket covers the live topic and `sync/map_bricks`. It refills at 3 KB/s up to 180 KB.
   - **Admission.** A message may go out whenever the balance is ≥ 0 and its other limits allow (0.2 Hz for deltas, P4 for snapshot answers). It debits its full size, even if that takes the balance negative.
   - **Debt is bounded.** P15 makes protocol §7's 2 MB snapshot cap a node rule: the node never publishes a `MapBricks` larger than 2 MB on the wire. The protocol's own validity limit is D22's 16 MiB uncompressed payload, which is larger, so this rule is P15's, not the protocol's.
@@ -402,8 +403,8 @@ This is symmetric with the Mac's validation (D16).
 
 **Rate limits.**
 - **Mac (P3).** At most one request per topic per 5 s (protocol §5). While consecutive requests end without CURRENT, the interval backs off 5 → 10 → 20 → 30 s.
-- **Spark (P4).** At most one *snapshot* answer per topic per 15 s across all clients. A request inside the window is served in the next slot. Replays (≤ 9 deltas, or ≤ 100 events) are not capped.
-- **Together** these bound a storm at 65 KB + 48 KB per 15 s, about 7.5 KB/s. Once its 180 KB burst is spent, the `map_bricks` bucket (§3.3) holds the map share to 3 KB/s, so a long storm runs at about 6 KB/s. For larger maps the bucket, not P4, is the binding limit.
+- **Spark (P4).** At most one *snapshot* answer per topic per 15 s across all clients. A request inside the window is served in the next slot. Map replays (≤ 9 deltas) are not capped by P4; the `map_bricks` bucket (§3.3) covers them. Every `events` answer, replay or fallback with its header, goes through the events bucket (§3.3), shared by all clients. A request repeated with the same `since` while its answer still waits is answered once.
+- **Together** these bound a storm at 65 KB + 48 KB per 15 s, about 7.5 KB/s. Once their bursts are spent, the `map_bricks` bucket and the events bucket (§3.3) hold the two shares to 3 KB/s each, so a long storm runs at about 6 KB/s, however many Macs request. For larger maps the map bucket, not P4, is the binding limit.
   - That is still over 5 KB/s while the storm lasts.
   - The hourly mean stays in budget unless there are more than ~40 storms an hour.
   - The soak (§7.5) reports both figures.
@@ -442,7 +443,7 @@ This is symmetric with the Mac's validation (D16).
 | Wi-Fi blip shorter than the TCP timeout | late messages, nothing lost | none | no |
 | Socket drop and reconnect; node did not restart | the mirror goes STALE, greyed, on close; the first live `map_bricks` may be a delta | per-topic requests with the saved `since = (epoch, seq)` (§4.3): map replay if 1–9 deltas behind, else a snapshot (including when none were missed); events replay, so the history stays COMPLETE if the baseline is among the 100 kept | no |
 | Dedicated bridge restarts; node keeps running | close; on return `seq` continues | as above; replay usually succeeds | no |
-| Node restarts; bridge keeps running | `seq` starts again at 0: case 1 or 2 of protocol §5's `seq` rule | new generation (protocol §5's `seq` rule): baselines cleared, map STALE, both requests with `SINCE_NONE`; snapshot answer | no |
+| Node restarts; bridge keeps running | `seq` starts again at 0: case 1 or 2 of protocol §5's `seq` rule | new generation (protocol §5's `seq` rule): baselines cleared, the generation fence drops the old node's in-flight messages, map STALE, both requests with `SINCE_NONE`; snapshot answer | no |
 | Node restarted while the Mac was away | `node_started_at` on `:8766` differs from the baseline's | both requests use `SINCE_NONE` (§4.3): the snapshot, applied on the cleared baseline, and the events fallback; the greyed mirror stays until the snapshot | no |
 | Bridge backlog overflow (> 1024 queued messages for this client) | the oldest messages are dropped → `seq` gap | replay or snapshot; overflow counted (§7.5) | no |
 | Mac sleep/wake | TCP looks open; nothing arrives | status stale at 3 s; socket closed and redialled after 10 s of silence | no |
@@ -773,7 +774,7 @@ None of these is in effect until accepted. Each would change `ROOM-MEMORY-PROTOC
 | P1 | Fallback only: when no request path exists, a live `map_bricks` snapshot every 60 s | protocol §2, §5 | a connecting Mac otherwise gets no map; ~1.1 KB/s, and only while the relay is unavailable |
 | P2 | `status` and `epoch` durability transient_local, depth 1; every other topic explicitly volatile. **Written into protocol §2 by PR #13 (D24).** Node change: §2.5 | protocol §2 (D18, D24) | memory state on connect; duplicates are harmless on full-state topics |
 | P3 | Mac: memory-socket reconnect floor 5 s, failure count not reset by connections under 60 s; request backoff 5 → 30 s | protocol §5 | bounds reconnect and request storms (§3.2) |
-| P4 | Spark: ≤ 1 snapshot answer per topic per 15 s across clients; request inputs rate-limited | protocol §5 | the sync topics are shared, so answers multiply with clients |
+| P4 | Spark: ≤ 1 snapshot answer per topic per 15 s across clients; `events` answers through a shared 3 KB/s bucket with a 48 KB burst, repeats of a waiting `since` answered once; request inputs rate-limited | protocol §5 | the sync topics are shared, so answers multiply with clients |
 | P5 | No `mask` on CANDIDATE transitions | protocol §3.2 (allowed; this makes it the rule) | walk-throughs would otherwise cost 2–3 KB/s |
 | P6 | New `OperatorAction` message and `/room_memory/operator` topic (§4.11). **Written into protocol §3.6 and `OperatorAction.msg` by PR #13 (D25).** Codecs, goldens and the node handler remain (S5) | protocol §2, §3.6 (D25) | acknowledge, accept, dismiss, label, ground truth, pause, resume, re-reference |
 | P7 | A snapshot instead of a delta whose payload would exceed half a snapshot's | protocol §3.1 | a large delta costs more than a snapshot and cannot be replayed cheaply |
