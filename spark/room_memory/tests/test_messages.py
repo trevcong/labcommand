@@ -43,7 +43,7 @@ def snapshot_zlib():
 
 def memory_status():
     return m.MemoryStatus(
-        head("lab-a", 42, 7, m.Time(1760400000, 500000000)), m.MemoryState.TRACKING, 3200, 2, 0.75, None, 1.0, 10, None, 3,
+        head("lab-a", 42, 7, m.Time(1760400000, 500000000)), m.MemoryState.TRACKING, 3200, 2, 0.75, None, 1.0, 10, None, 3, 12,
     )
 
 
@@ -251,10 +251,26 @@ def test_change_event_partial_nan_from_centroid_is_invalid():
     lambda s: replace(s, window_s=0.0),
     lambda s: replace(s, mid360_hz=m.HZ_UNAVAILABLE),
     lambda s: replace(s, state=9),
+    lambda s: replace(s, events_seq=m.EVENTS_SEQ_NONE),
+    lambda s: replace(s, events_seq=-1),
 ])
 def test_memory_status_rejections(change):
     with pytest.raises(m.Invalid):
         change(memory_status()).to_cdr()
+
+
+def test_memory_status_events_seq():
+    none = replace(memory_status(), events_seq=None)
+    data = none.to_cdr()
+    assert data == hexfile("memory_status_le.hex")[:-8] + b"\xff" * 8
+    assert m.MemoryStatus.from_cdr(data) == none
+    zero = replace(memory_status(), events_seq=0)
+    assert m.MemoryStatus.from_cdr(zero.to_cdr()).events_seq == 0
+    top = replace(memory_status(), events_seq=m.EVENTS_SEQ_NONE - 1)
+    assert m.MemoryStatus.from_cdr(top.to_cdr()) == top
+    # Protocol §3.3 wire size, encapsulation header included.
+    for room, size in (("lab", 76), ("lab-a", 84)):
+        assert len(replace(memory_status(), header=head(room, 42, 7)).to_cdr()) == size, room
 
 
 def test_request_sync_rules():

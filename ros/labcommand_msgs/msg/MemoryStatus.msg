@@ -8,6 +8,7 @@ uint8 STATE_DEGRADED=3
 uint8 STATE_PAUSED=4
 
 uint16 HZ_UNAVAILABLE=65535       # per_sensor_hz value when the rate was not measured
+uint64 EVENTS_SEQ_NONE=18446744073709551615  # events_seq before the first event is published
 
 # Common fields, first in every labcommand_msgs message.
 string room_id
@@ -23,3 +24,4 @@ float32 pose_residual_m           # m, last rig-pose guard residual; NaN = guard
 float32 window_s                  # s, accumulation window length; NaN = not reported
 uint16[2] per_sensor_hz           # Hz, sensor frames received per second, rounded: [0] Mid-360, [1] JT128; HZ_UNAVAILABLE = not measured
 uint32 dropped_windows            # windows dropped since the node started
+uint64 events_seq                 # seq of the newest live events message (high-water mark, section 5), or EVENTS_SEQ_NONE

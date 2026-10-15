@@ -3,8 +3,8 @@
 Subscribes to each configured lidar with the sensor-data QoS and ``raw=True``, so frames go
 through the tested ``decode_pointcloud2`` rather than rclpy's deserializer. Publishes the
 codec's CDR bytes on ``/room_memory/status`` (1 Hz) and ``/room_memory/events``; the
-``labcommand_msgs`` classes only provide the type support. A rejected frame logs one warning
-per sensor per 10 s.
+``labcommand_msgs`` classes only provide the type support. Status carries the ``seq`` of the
+last event published (``events_seq``). A rejected frame logs one warning per sensor per 10 s.
 """
 
 import time
@@ -59,6 +59,7 @@ class RoomMemoryNode(Node):
         self.events = self.create_publisher(ChangeEventMsg, EVENTS_TOPIC, reliable)
         self.status = self.create_publisher(MemoryStatusMsg, STATUS_TOPIC, QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
         self._rejections = RejectionLog()
+        self._events_seq = None
         for name in self.config.sensors:
             sensor = SENSORS[name]
             self.create_subscription(
@@ -87,6 +88,7 @@ class RoomMemoryNode(Node):
         events = self.memory.close_window(_time(self))
         for event in events:
             self.events.publish(event.to_cdr())
+            self._events_seq = event.header.seq
         elapsed_ms = (time.perf_counter() - start) * 1000
         cpu_ms = (time.process_time() - cpu) * 1000
         self.get_logger().info(
@@ -98,7 +100,7 @@ class RoomMemoryNode(Node):
 
     def _publish_status(self):
         now = time.monotonic()
-        message = self.memory.status(_time(self), now - self._last_status)
+        message = self.memory.status(_time(self), now - self._last_status, self._events_seq)
         self._last_status = now
         self.status.publish(message.to_cdr())
 

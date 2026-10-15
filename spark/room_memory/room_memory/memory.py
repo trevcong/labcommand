@@ -445,12 +445,13 @@ class RoomMemory:
             mask=mask,
         )
 
-    def status(self, stamp, period_s):
+    def status(self, stamp, period_s, events_seq=None):
         """``MemoryStatus`` for the last ``period_s`` seconds; resets the per-sensor frame counts.
 
         DEGRADED while a configured sensor measured 0 Hz or the last window was dropped.
         ``pose_residual_m`` and ``coverage_known_frac`` are NaN: no rig-pose guard and no
-        configured room volume yet.
+        configured room volume yet. ``events_seq`` is the ``seq`` of the newest published
+        ``ChangeEvent``, which only the publisher knows; ``None`` before the first one.
         """
         hz = [None, None]
         for channel in self.channels.values():
@@ -471,6 +472,7 @@ class RoomMemory:
             mid360_hz=hz[0],
             jt128_hz=hz[1],
             dropped_windows=self.dropped_windows,
+            events_seq=events_seq,
         )
         self.status_seq += 1
         return message

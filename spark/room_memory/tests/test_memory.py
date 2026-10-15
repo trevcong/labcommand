@@ -104,6 +104,7 @@ def test_reference_build_then_tracking_with_unknown_back_face(tmp_path):
     status = memory.status(stamp(0), 1.0)
     assert status.state == MemoryState.DEGRADED and status.header.map_epoch == 0 and status.mid360_hz == 0
     assert status.jt128_hz is None and status.pose_residual_m is None and status.coverage_known_frac is None
+    assert status.events_seq is None
     memory.add_points("mid360", before)
     assert memory.status(stamp(0), 1.0).state == MemoryState.BUILDING
     second = build_reference(memory, before)
@@ -131,8 +132,9 @@ def test_reference_build_then_tracking_with_unknown_back_face(tmp_path):
 
     memory.add_points("mid360", after)
     assert memory.close_window(stamp(second + 1)) == []
-    status = memory.status(stamp(second + 1), 2.0)
+    status = memory.status(stamp(second + 1), 2.0, events[-1].header.seq)
     assert status.state == MemoryState.TRACKING and status.n_open_events == 3 and status.mid360_hz == 1
+    assert status.events_seq == 2
     assert status.n_bricks == len(memory.channels["mid360"].reference.to_bricks())
     assert MemoryStatus.from_cdr(status.to_cdr()) == status
 

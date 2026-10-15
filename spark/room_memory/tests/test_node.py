@@ -1,5 +1,7 @@
 """rclpy wiring. Runs only where ROS 2 Jazzy and a built labcommand_msgs are on the path."""
 
+from dataclasses import replace
+
 import pytest
 
 rclpy = pytest.importorskip("rclpy")
@@ -10,8 +12,9 @@ from rclpy.parameter import Parameter  # noqa: E402
 from rclpy.qos import QoSProfile, ReliabilityPolicy  # noqa: E402
 
 from room_memory.memory import SENSORS  # noqa: E402
-from room_memory.messages import MemoryState, MemoryStatus  # noqa: E402
+from room_memory.messages import Header, MemoryState, MemoryStatus  # noqa: E402
 from room_memory.node import EVENTS_TOPIC, STATUS_TOPIC, RoomMemoryNode  # noqa: E402
+from test_messages import T10, appeared_event  # noqa: E402
 
 
 @pytest.fixture
@@ -46,3 +49,18 @@ def test_status_bytes_reach_a_raw_subscriber(node):
             break
     status = MemoryStatus.from_cdr(received[0])
     assert status.header.room_id == "lab" and status.state == MemoryState.DEGRADED and status.jt128_hz is None
+    assert status.events_seq is None
+
+
+def test_status_reports_the_last_published_event_seq(node, monkeypatch):
+    events = [replace(appeared_event(), header=Header("lab", 0, seq, T10)) for seq in (0, 1)]
+    monkeypatch.setattr(node.memory, "close_window", lambda stamp: events)
+    published = []
+    monkeypatch.setattr(node.events, "publish", published.append)
+    statuses = []
+    monkeypatch.setattr(node.status, "publish", statuses.append)
+    node._publish_status()
+    node._close_window()
+    node._publish_status()
+    assert len(published) == 2
+    assert [MemoryStatus.from_cdr(data).events_seq for data in statuses] == [None, 1]
