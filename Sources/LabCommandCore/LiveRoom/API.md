@@ -37,7 +37,7 @@ so time-based staleness re-renders without help from the view.
 
 | member | type | meaning |
 |---|---|---|
-| `init(url: URL = LiveRoomClient.defaultURL, roomId: String? = nil)` | | `roomId` nil = adopt the first room seen |
+| `init(url: URL = LiveRoomClient.defaultURL, roomId: String? = nil, publishRequests: Bool = true)` | | `roomId` nil = adopt the first room seen; `publishRequests: false` = read-only, never advertises or sends |
 | `connection` | `LiveRoomConnection` | socket state, below |
 | `mirror` | `RoomMemoryMirror` | the mirrored state |
 | `log` | `[String]` | last 200 diagnostic lines, newest last |

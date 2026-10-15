@@ -16,6 +16,10 @@ func passed() {
     passCount += 1
 }
 
+if CommandLine.arguments.dropFirst().first == "live-room-probe" {
+    exit(MainActor.assumeIsolated { runLiveRoomProbe(arguments: Array(CommandLine.arguments.dropFirst(2))) })
+}
+
 if CommandLine.arguments.dropFirst().first == "generate-room-fixtures" {
     generateRoomFixtures(arguments: Array(CommandLine.arguments.dropFirst(2)))
     exit(0)
@@ -97,4 +101,5 @@ runRobustBoundsTests()
 runRoomMemoryCDRTests()
 runRoomFixtureTests()
 runChangeDetectionTests()
+runLiveRoomTests()
 print("PASS LabCommandCoreTestsRunner (\(passCount) groups)")
