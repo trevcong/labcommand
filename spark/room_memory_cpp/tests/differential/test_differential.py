@@ -300,6 +300,38 @@ def test_sync_cursor_across_restarts(tmp_path):
     assert out[-2:] == ["sync 1", f"data {events[1].to_cdr().hex()}"]
 
 
+def test_sensor_subset_restarts(tmp_path):
+    """Codex P2: a restart with sensors=mid360 saved only reference-mid360.cdr at the next epoch,
+    so the saved references disagreed and a restart with both sensors refused the room. The room
+    epoch file keeps every start one past the room's last epoch, whichever sensors ran."""
+    room = scenes.room_shell()
+    partial = floats(tmp_path, "partial", room[room[:, 0] < 1.5])
+    full = floats(tmp_path, "room", room)
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360,jt128 max_range=none reference_windows=3 state_dir={{state}}",
+             "start 1760400000 0"]
+    for second in range(3):
+        lines += [f"points mid360 {partial}", f"points jt128 {partial}", f"close {1760400000 + second} 0"]
+    # The mid360-only run learns the far wall, so its reference moves ahead of jt128's.
+    lines += ["config sensors=mid360 delta_period_s=1", "start 1760400100 0", "map 1760400110 0",
+              f"points mid360 {full}", "close 1760400111 0", "map 1760400111 0",
+              "config sensors=mid360,jt128", "start 1760400200 0", "start 1760400300 0"]
+    # A room with only a jt128 reference: the mid360-only build continues the room epoch.
+    lines += ["config room_id=lab-2 sensors=jt128", "start 1760400400 0"]
+    for second in range(3):
+        lines += [f"points jt128 {full}", f"close {1760400400 + second} 0"]
+    lines += ["config sensors=mid360", "start 1760400500 0"]
+    for second in range(3):
+        lines += [f"points mid360 {full}", f"close {1760400500 + second} 0"]
+    lines += ["config sensors=mid360,jt128", "start 1760400600 0"]
+    out = run_both(tmp_path, "\n".join(lines)).splitlines()
+    assert [line for line in out if line.startswith("init ")] == [
+        "init BUILDING 0", "init TRACKING 2", "init TRACKING 4", "init TRACKING 5",
+        "init BUILDING 0", "init BUILDING 1", "init TRACKING 3"]
+    maps = [MapBricks.from_cdr(bytes.fromhex(line.split()[1])) for line in out if line.startswith("map ")]
+    assert [m.header.map_epoch for m in maps] == [2, 3]
+    assert [line for line in out if line.startswith("close ")][-1] == "close 0 TRACKING 2"
+
+
 def test_degraded_and_dropped(tmp_path):
     room = scenes.room_shell()
     cdr = tmp_path / "room.bin"

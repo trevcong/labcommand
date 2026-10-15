@@ -315,22 +315,17 @@ MapDelta map_delta(std::span<const msg::Brick> before, std::span<const msg::Bric
 
 // MARK: Persistence
 
-std::filesystem::path reference_path(const std::string& state_dir, const std::string& room_id, const std::string& sensor) {
+namespace {
+
+std::filesystem::path room_dir(const std::string& state_dir, const std::string& room_id) {
     if (!plain_name(room_id)) {
         throw std::invalid_argument("room_id '" + room_id + "' is not a plain file name ([A-Za-z0-9._-], no leading dot)");
     }
-    return expand_user(state_dir) / room_id / ("reference-" + sensor + ".cdr");
+    return expand_user(state_dir) / room_id;
 }
 
-void save_reference(const std::filesystem::path& path, const VoxelLayer& layer, const msg::Header& header,
-                    float voxel_size) {
-    msg::MapBricks message;
-    message.header = header;
-    message.compression = msg::Compression::zlib;
-    message.kind = msg::MapKind::snapshot;
-    message.voxel_size = voxel_size;
-    message.bricks = layer.to_bricks();
-    const msg::Bytes data = message.to_cdr();
+// Temp file, fsync, rename.
+void write_atomic(const std::filesystem::path& path, std::span<const std::uint8_t> data) {
     std::filesystem::create_directories(path.parent_path());
     const std::filesystem::path scratch = path.string() + ".tmp";
     const int fd = ::open(scratch.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -348,6 +343,50 @@ void save_reference(const std::filesystem::path& path, const VoxelLayer& layer, 
     ::close(fd);
     if (!synced) throw std::runtime_error("cannot sync " + scratch.string());
     std::filesystem::rename(scratch, path);
+}
+
+}  // namespace
+
+std::filesystem::path reference_path(const std::string& state_dir, const std::string& room_id, const std::string& sensor) {
+    return room_dir(state_dir, room_id) / ("reference-" + sensor + ".cdr");
+}
+
+std::filesystem::path epoch_path(const std::string& state_dir, const std::string& room_id) {
+    return room_dir(state_dir, room_id) / "map_epoch";
+}
+
+void save_reference(const std::filesystem::path& path, const VoxelLayer& layer, const msg::Header& header,
+                    float voxel_size) {
+    msg::MapBricks message;
+    message.header = header;
+    message.compression = msg::Compression::zlib;
+    message.kind = msg::MapKind::snapshot;
+    message.voxel_size = voxel_size;
+    message.bricks = layer.to_bricks();
+    write_atomic(path, message.to_cdr());
+}
+
+void save_epoch(const std::filesystem::path& path, std::uint64_t epoch) {
+    const std::string text = std::to_string(epoch) + "\n";
+    write_atomic(path, std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
+}
+
+std::optional<std::uint64_t> load_epoch(const std::filesystem::path& path) {
+    if (!std::filesystem::exists(path)) return std::nullopt;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot read " + path.string());
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto malformed = [&] { return std::invalid_argument(path.string() + " does not hold one map_epoch"); };
+    if (text.size() < 2 || text.size() > 21 || text.back() != '\n') throw malformed();
+    std::uint64_t epoch = 0;
+    for (std::size_t n = 0; n + 1 < text.size(); ++n) {
+        const char c = text[n];
+        if (c < '0' || c > '9') throw malformed();
+        const auto digit = static_cast<std::uint64_t>(c - '0');
+        if (epoch > (UINT64_MAX - digit) / 10) throw malformed();
+        epoch = epoch * 10 + digit;
+    }
+    return epoch;
 }
 
 std::pair<msg::MapBricks, VoxelLayer> load_reference(const std::filesystem::path& path) {
@@ -461,6 +500,9 @@ std::vector<std::filesystem::path> RoomMemory::paths() const {
 
 void RoomMemory::load(const msg::Time& start) {
     if (!config_.state_dir) return;
+    // The room's last epoch, whichever sensors that run had: a subset run moves it on and saves
+    // only its own references, so the others' saved epochs may lag behind it.
+    const std::optional<std::uint64_t> room_epoch = load_epoch(epoch_path(*config_.state_dir, config_.room_id));
     const std::vector<std::filesystem::path> all = paths();
     std::vector<std::string> missing;
     std::size_t present = 0;
@@ -471,13 +513,17 @@ void RoomMemory::load(const msg::Time& start) {
             missing.push_back(channels_[n].sensor.name);
         }
     }
-    if (present == 0) return;
+    if (present == 0) {
+        // BUILDING publishes no map or events; TRACKING takes the next epoch.
+        map_epoch_ = room_epoch.value_or(0);
+        return;
+    }
     if (!missing.empty()) {
         std::sort(missing.begin(), missing.end());
         throw std::invalid_argument("saved references are incomplete for room '" + config_.room_id + "': missing " +
                                     sensor_list(missing));
     }
-    std::vector<std::uint64_t> epochs;
+    std::uint64_t epoch = room_epoch.value_or(0);
     for (std::size_t n = 0; n < all.size(); ++n) {
         auto [message, layer] = load_reference(all[n]);
         if (message.header.room_id != config_.room_id) {
@@ -487,16 +533,13 @@ void RoomMemory::load(const msg::Time& start) {
         if (message.voxel_size != static_cast<float>(config_.voxel_size)) {
             throw std::invalid_argument(all[n].string() + " uses a different voxel_size");
         }
-        if (std::find(epochs.begin(), epochs.end(), message.header.map_epoch) == epochs.end()) {
-            epochs.push_back(message.header.map_epoch);
-        }
+        epoch = std::max(epoch, message.header.map_epoch);
         set_reference(channels_[n], std::move(layer));
         channels_[n].reference_windows = config_.reference_windows;
     }
-    if (epochs.size() != 1) throw std::invalid_argument("saved references disagree on map_epoch");
     // seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
     // before it names a message after it. Saved at once, so the next restart moves on again.
-    map_epoch_ = epochs.front() + 1;
+    map_epoch_ = epoch + 1;
     save(start);
     state_ = msg::MemoryState::tracking;
 }
@@ -508,6 +551,7 @@ void RoomMemory::save(const msg::Time& stamp) {
     for (std::size_t n = 0; n < all.size(); ++n) {
         save_reference(all[n], channels_[n].reference, header, static_cast<float>(config_.voxel_size));
     }
+    save_epoch(epoch_path(*config_.state_dir, config_.room_id), map_epoch_);
 }
 
 void RoomMemory::add_points(const std::string& sensor, std::span<const float> xyz) {

@@ -1,5 +1,7 @@
 """Voxel layers, bricks, reference persistence, and the window engine (PR 2.1 / 2.2)."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -14,6 +16,7 @@ from room_memory.memory import (
     SettleRule,
     VoxelLayer,
     VoxelStats,
+    epoch_path,
     load_reference,
     map_delta,
     pose_offset,
@@ -232,6 +235,49 @@ def test_sync_cursor_from_before_a_restart_names_nothing_after_it(tmp_path):
     assert restarted.sync(since, stamp(302)) == [new.to_cdr()]
 
 
+def test_a_sensor_subset_run_keeps_the_room_loadable(tmp_path):
+    """Codex P2: a restart with sensors=['mid360'] saved only reference-mid360.cdr at the next
+    epoch, so the saved references disagreed and a restart with both sensors refused the room."""
+    room, partial = partial_room()
+    both = MemoryConfig(sensors=("mid360", "jt128"), max_range=None, reference_windows=3, state_dir=str(tmp_path),
+                        **SINGLE_WINDOW)
+    memory = RoomMemory(both, START)
+    for second in range(3):
+        memory.add_points("mid360", partial)
+        memory.add_points("jt128", partial)
+        memory.close_window(stamp(second))
+    assert memory.state == MemoryState.TRACKING and memory.map_epoch == 1
+    subset = mid360_memory(tmp_path, delta_period_s=1.0)
+    assert subset.state == MemoryState.TRACKING and subset.map_epoch == 2
+    assert MapBricks.from_cdr(subset.map_update(stamp(10))).header.map_epoch == 2
+    # The subset run learns the far wall, so reference-mid360.cdr moves ahead of reference-jt128.cdr.
+    subset.add_points("mid360", room)
+    subset.close_window(stamp(11))
+    assert MapBricks.from_cdr(subset.map_update(stamp(11))).header.map_epoch == subset.map_epoch == 3
+    epochs = {name: load_reference(reference_path(tmp_path, "lab", name))[0].header.map_epoch
+              for name in ("mid360", "jt128")}
+    assert epochs == {"mid360": 3, "jt128": 1}
+    restarted = RoomMemory(both, stamp(20))
+    assert restarted.state == MemoryState.TRACKING and restarted.map_epoch == 4
+    assert restarted.channels["mid360"].reference.to_bricks() == subset.channels["mid360"].reference.to_bricks()
+    assert RoomMemory(both, stamp(30)).map_epoch == 5 and epoch_path(tmp_path, "lab").read_bytes() == b"5\n"
+
+
+def test_a_sensor_subset_build_continues_the_room_epoch(tmp_path):
+    """A sensor the room has no reference for builds one from the room's epoch, not from 0."""
+    jt128 = mid360_memory(tmp_path, sensors=("jt128",))
+    for second in range(3):
+        jt128.add_points("jt128", scenes.room_shell())
+        jt128.close_window(stamp(second))
+    assert jt128.state == MemoryState.TRACKING and jt128.map_epoch == 1
+    assert RoomMemory(jt128.config, stamp(10)).map_epoch == 2
+    mid360 = mid360_memory(tmp_path)
+    assert mid360.state == MemoryState.BUILDING and mid360.map_epoch == 2
+    build_reference(mid360, scenes.room_shell())
+    assert mid360.state == MemoryState.TRACKING and mid360.map_epoch == 3
+    assert RoomMemory(replace(mid360.config, sensors=("mid360", "jt128")), stamp(20)).map_epoch == 4
+
+
 def test_inconsistent_saved_state_is_refused(tmp_path):
     memory = mid360_memory(tmp_path)
     build_reference(memory, scenes.room_shell())
@@ -239,6 +285,10 @@ def test_inconsistent_saved_state_is_refused(tmp_path):
         RoomMemory(MemoryConfig(sensors=("mid360", "jt128"), state_dir=str(tmp_path)), START)
     with pytest.raises(ValueError, match="voxel_size"):
         mid360_memory(tmp_path, voxel_size=0.1)
+    for data in (b"", b"3", b"-3\n", b" 3\n", b"18446744073709551616\n"):
+        epoch_path(tmp_path, "lab").write_bytes(data)
+        with pytest.raises(ValueError, match="map_epoch"):
+            mid360_memory(tmp_path)
 
 
 def test_degraded_and_dropped_windows(tmp_path):

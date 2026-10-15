@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <random>
@@ -308,6 +309,66 @@ TEST(sync_cursor_from_before_a_restart_names_nothing_after_it) {
     CHECK((restarted.sync(since, stamp(302)) == std::vector<msg::Bytes>{fresh[0].to_cdr()}));
 }
 
+// Codex P2: a restart with sensors=['mid360'] saved only reference-mid360.cdr at the next
+// epoch, so the saved references disagreed and a restart with both sensors refused the room.
+TEST(a_sensor_subset_run_keeps_the_room_loadable) {
+    TempDir dir;
+    const Cloud room = scenes::room_shell();
+    Cloud partial;
+    for (std::size_t n = 0; n < room.size(); n += 3) {
+        if (room[n] < 1.5f) partial.insert(partial.end(), room.begin() + static_cast<std::ptrdiff_t>(n), room.begin() + static_cast<std::ptrdiff_t>(n) + 3);
+    }
+    MemoryConfig both = mid360_config(dir.path.string());
+    both.sensors = {"mid360", "jt128"};
+    RoomMemory memory(both, kStart);
+    for (std::int64_t second = 0; second < 3; ++second) {
+        memory.add_points("mid360", partial);
+        memory.add_points("jt128", partial);
+        memory.close_window(stamp(second));
+    }
+    CHECK(memory.state() == MemoryState::tracking && memory.map_epoch() == 1);
+    MemoryConfig mid360 = mid360_config(dir.path.string());
+    mid360.delta_period_s = 1.0;
+    RoomMemory subset(mid360, kStart);
+    CHECK(subset.state() == MemoryState::tracking && subset.map_epoch() == 2);
+    CHECK_EQ(msg::MapBricks::from_cdr(*subset.map_update(stamp(10))).header.map_epoch, std::uint64_t{2});
+    // The subset run learns the far wall, so reference-mid360.cdr moves ahead of reference-jt128.cdr.
+    subset.add_points("mid360", room);
+    subset.close_window(stamp(11));
+    CHECK_EQ(msg::MapBricks::from_cdr(*subset.map_update(stamp(11))).header.map_epoch, std::uint64_t{3});
+    CHECK_EQ(subset.map_epoch(), std::uint64_t{3});
+    CHECK_EQ(load_reference(reference_path(dir.path.string(), "lab", "mid360")).first.header.map_epoch, std::uint64_t{3});
+    CHECK_EQ(load_reference(reference_path(dir.path.string(), "lab", "jt128")).first.header.map_epoch, std::uint64_t{1});
+    RoomMemory restarted(both, stamp(20));
+    CHECK(restarted.state() == MemoryState::tracking && restarted.map_epoch() == 4);
+    CHECK(restarted.channel("mid360").reference.to_bricks() == subset.channel("mid360").reference.to_bricks());
+    CHECK_EQ(RoomMemory(both, stamp(30)).map_epoch(), std::uint64_t{5});
+    CHECK(load_epoch(epoch_path(dir.path.string(), "lab")) == std::optional<std::uint64_t>{5});
+    std::ifstream in(epoch_path(dir.path.string(), "lab"), std::ios::binary);
+    CHECK_EQ(std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()), std::string("5\n"));
+}
+
+// A sensor the room has no reference for builds one from the room's epoch, not from 0.
+TEST(a_sensor_subset_build_continues_the_room_epoch) {
+    TempDir dir;
+    MemoryConfig jt128_only = mid360_config(dir.path.string());
+    jt128_only.sensors = {"jt128"};
+    RoomMemory jt128(jt128_only, kStart);
+    for (std::int64_t second = 0; second < 3; ++second) {
+        jt128.add_points("jt128", scenes::room_shell());
+        jt128.close_window(stamp(second));
+    }
+    CHECK(jt128.state() == MemoryState::tracking && jt128.map_epoch() == 1);
+    CHECK_EQ(RoomMemory(jt128_only, stamp(10)).map_epoch(), std::uint64_t{2});
+    RoomMemory mid360(mid360_config(dir.path.string()), kStart);
+    CHECK(mid360.state() == MemoryState::building && mid360.map_epoch() == 2);
+    build_reference(mid360, scenes::room_shell());
+    CHECK(mid360.state() == MemoryState::tracking && mid360.map_epoch() == 3);
+    MemoryConfig both = mid360_config(dir.path.string());
+    both.sensors = {"mid360", "jt128"};
+    CHECK_EQ(RoomMemory(both, stamp(20)).map_epoch(), std::uint64_t{4});
+}
+
 TEST(inconsistent_saved_state_is_refused) {
     TempDir dir;
     RoomMemory memory(mid360_config(dir.path.string()), kStart);
@@ -318,6 +379,10 @@ TEST(inconsistent_saved_state_is_refused) {
     MemoryConfig coarse = mid360_config(dir.path.string());
     coarse.voxel_size = 0.1;
     CHECK_THROWS(std::invalid_argument, RoomMemory(coarse, kStart));
+    for (const std::string data : {"", "3", "-3\n", " 3\n", "18446744073709551616\n"}) {
+        std::ofstream(epoch_path(dir.path.string(), "lab"), std::ios::binary | std::ios::trunc) << data;
+        CHECK_THROWS(std::invalid_argument, RoomMemory(mid360_config(dir.path.string()), kStart));
+    }
 }
 
 // Codex P2: row_step 0 falls back to point_step x width = 2^42, and 2^42 x height (2^22)

@@ -268,17 +268,47 @@ def pose_offset(recent, reference_occupied, voxel_size):
 # MARK: Persistence
 
 
-def reference_path(state_dir, room_id, sensor):
-    """``<state_dir>/<room_id>/reference-<sensor>.cdr``. ``room_id`` must be a plain name."""
+def _room_dir(state_dir, room_id):
     if not _ROOM_ID.fullmatch(room_id):
         raise ValueError(f"room_id '{room_id}' is not a plain file name ([A-Za-z0-9._-], no leading dot)")
-    return pathlib.Path(state_dir).expanduser() / room_id / f"reference-{sensor}.cdr"
+    return pathlib.Path(state_dir).expanduser() / room_id
+
+
+def reference_path(state_dir, room_id, sensor):
+    """``<state_dir>/<room_id>/reference-<sensor>.cdr``. ``room_id`` must be a plain name."""
+    return _room_dir(state_dir, room_id) / f"reference-{sensor}.cdr"
+
+
+def epoch_path(state_dir, room_id):
+    """``<state_dir>/<room_id>/map_epoch``: the room's last ``map_epoch``, whichever sensors the
+    node ran, as decimal ASCII and a newline. Same ``room_id`` rule as ``reference_path``."""
+    return _room_dir(state_dir, room_id) / "map_epoch"
 
 
 def save_reference(path, layer, header, voxel_size):
     """Writes ``layer`` as one zlib ``MapBricks`` snapshot, atomically (temp file, then rename)."""
     message = MapBricks(header, Compression.ZLIB, MapKind.SNAPSHOT, 0, voxel_size, layer.to_bricks())
-    data = message.to_cdr()
+    _write_atomic(path, message.to_cdr())
+
+
+def save_epoch(path, epoch):
+    """Writes the epoch file, atomically (temp file, then rename)."""
+    _write_atomic(path, f"{epoch}\n".encode("ascii"))
+
+
+def load_epoch(path):
+    """Reads the epoch file: ``None`` if it does not exist. Raises ``ValueError`` if it does not
+    hold one uint64 as digits and a newline."""
+    path = pathlib.Path(path)
+    if not path.exists():
+        return None
+    data = path.read_bytes()
+    if not re.fullmatch(rb"[0-9]{1,20}\n", data) or int(data) >= 1 << 64:
+        raise ValueError(f"{path} does not hold one map_epoch")
+    return int(data)
+
+
+def _write_atomic(path, data):
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     scratch = path.with_suffix(path.suffix + ".tmp")
@@ -568,39 +598,44 @@ class RoomMemory:
     def _load(self, start):
         if self.config.state_dir is None:
             return
+        # The room's last epoch, whichever sensors that run had: a subset run moves it on and saves
+        # only its own references, so the others' saved epochs may lag behind it.
+        room_epoch = load_epoch(epoch_path(self.config.state_dir, self.config.room_id))
         paths = self._paths()
         present = {name: path for name, path in paths.items() if path.exists()}
         if not present:
+            # BUILDING publishes no map or events; TRACKING takes the next epoch.
+            self.map_epoch = room_epoch or 0
             return
         if len(present) != len(paths):
             missing = sorted(set(paths) - set(present))
             raise ValueError(f"saved references are incomplete for room '{self.config.room_id}': missing {missing}")
-        epochs = set()
+        epoch = room_epoch or 0
         for name, path in present.items():
             message, layer = load_reference(path)
             if message.header.room_id != self.config.room_id:
                 raise ValueError(f"{path} holds room '{message.header.room_id}', not '{self.config.room_id}'")
             if message.voxel_size != float(np.float32(self.config.voxel_size)):
                 raise ValueError(f"{path} uses voxel_size {message.voxel_size} m, not {self.config.voxel_size} m")
-            epochs.add(message.header.map_epoch)
+            epoch = max(epoch, message.header.map_epoch)
             channel = self.channels[name]
             self._set_reference(channel, layer)
             channel.reference_windows = self.config.reference_windows
-        if len(epochs) != 1:
-            raise ValueError(f"saved references disagree on map_epoch: {sorted(epochs)}")
         # seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
         # before it names a message after it. Saved at once, so the next restart moves on again.
-        self.map_epoch = epochs.pop() + 1
+        self.map_epoch = epoch + 1
         self.save(start)
         self.state = MemoryState.TRACKING
 
     def save(self, stamp):
-        """Writes every sensor's reference with the current ``map_epoch``. No-op without ``state_dir``."""
+        """Writes every sensor's reference and the room's epoch file with the current ``map_epoch``.
+        No-op without ``state_dir``."""
         if self.config.state_dir is None:
             return
         header = Header(self.config.room_id, self.map_epoch, 0, stamp)
         for name, path in self._paths().items():
             save_reference(path, self.channels[name].reference, header, self.config.voxel_size)
+        save_epoch(epoch_path(self.config.state_dir, self.config.room_id), self.map_epoch)
 
     def add_points(self, sensor, positions):
         """Queues decoded ``(n, 3)`` positions (meters, sensor frame) for the current window."""

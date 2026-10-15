@@ -102,6 +102,14 @@ void save_reference(const std::filesystem::path& path, const VoxelLayer& layer, 
                     float voxel_size);
 // Reads a saved reference. Throws msg::CDRError or std::runtime_error.
 std::pair<msg::MapBricks, VoxelLayer> load_reference(const std::filesystem::path& path);
+// <state_dir>/<room_id>/map_epoch: the room's last map_epoch, whichever sensors the node ran,
+// as decimal ASCII and a newline. Same room_id rule as reference_path.
+std::filesystem::path epoch_path(const std::string& state_dir, const std::string& room_id);
+// Writes the epoch file, atomically (temp file, fsync, rename).
+void save_epoch(const std::filesystem::path& path, std::uint64_t epoch);
+// Reads the epoch file: nullopt if it does not exist. Throws std::invalid_argument if it does not
+// hold one uint64 as digits and a newline.
+std::optional<std::uint64_t> load_epoch(const std::filesystem::path& path);
 
 // One change region followed across windows: pending until it has persisted, then an open
 // candidate (CANDIDATE sent, no terminal transition yet).
@@ -270,7 +278,8 @@ public:
     // topic of request.topic. Empty for another room_id, and for a map request before the
     // first live map message.
     std::vector<msg::Bytes> sync(const msg::RequestSync& request, const msg::Time& stamp);
-    // Writes every sensor's reference with the current map_epoch. No-op without state_dir.
+    // Writes every sensor's reference and the room's epoch file with the current map_epoch.
+    // No-op without state_dir.
     void save(const msg::Time& stamp);
 
     const MemoryConfig& config() const { return config_; }
