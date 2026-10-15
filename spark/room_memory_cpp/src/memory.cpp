@@ -603,14 +603,19 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         options.scope = scope_;
         options.backend = backend_;
         const Report report = diff(channel.reference.as_occupancy(change_.voxel_size), recent, change_, options);
-        // The recent layer carries a return for recent_windows windows, so only this window's
-        // own returns count toward the persistence gate: an appeared or moved region is fresh
-        // when this window occupies one of its (new-pose) voxels. A disappearance in the
-        // recent layer is one in this window too, so it is always fresh.
+        // The recent layer carries a return and its ray for recent_windows windows, so only this
+        // window's own evidence counts toward the persistence gate: an appeared or moved region
+        // is fresh when this window occupies one of its (new-pose) voxels, a disappeared one
+        // when this window's rays traverse one of its voxels.
+        Keys gone;
+        for (const Region& region : report.regions) {
+            if (region.kind == Region::Kind::disappeared) gone = set_union(gone, region.keys);
+        }
+        const Keys free = gone.empty() ? Keys{} : cast_rays(window, change_, &gone, backend_);
         std::vector<bool> fresh(report.regions.size());
         for (std::size_t n = 0; n < fresh.size(); ++n) {
             const Region& region = report.regions[n];
-            fresh[n] = region.kind == Region::Kind::disappeared || intersects(window.occupied, region.keys);
+            fresh[n] = intersects(region.kind == Region::Kind::disappeared ? free : window.occupied, region.keys);
         }
         for (const auto& [state, candidate] :
              channel.tracker.update(report.regions, stamp, [this] { return next_id(); }, fresh)) {

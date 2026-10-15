@@ -662,11 +662,13 @@ class RoomMemory:
                 channel.stats.add(np.setdiff1d(observed.occupied, reference.known, assume_unique=True),
                                   np.setdiff1d(observed.known, reference.known, assume_unique=True))
             report = diff(reference.as_occupancy(self.config.voxel_size), recent, self.change, reference.known)
-            # The recent layer carries a return for recent_windows windows, so only this window's
-            # own returns count toward the persistence gate: an appeared or moved region is fresh
-            # when this window occupies one of its (new-pose) voxels. A disappearance in the
-            # recent layer is one in this window too, so it is always fresh.
-            fresh = [region.kind == "disappeared" or bool(contains(window.occupied, region.keys).any())
+            # The recent layer carries a return and its ray for recent_windows windows, so only
+            # this window's own evidence counts toward the persistence gate: an appeared or moved
+            # region is fresh when this window occupies one of its (new-pose) voxels, a disappeared
+            # one when this window's rays traverse one of its voxels.
+            gone = [region.keys for region in report.regions if region.kind == "disappeared"]
+            free = cast_rays(window, self.change, np.unique(np.concatenate(gone))) if gone else _EMPTY_KEYS
+            fresh = [bool(contains(free if region.kind == "disappeared" else window.occupied, region.keys).any())
                      for region in report.regions]
             for state, candidate in channel.tracker.update(report.regions, stamp, self._next_id, fresh):
                 events.append(self._event(channel, state, candidate, stamp))

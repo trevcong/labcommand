@@ -3,6 +3,7 @@ room_memory_bag's timer schedule. No recording needed; the bag test needs ROOM_M
 
 import os
 import pathlib
+import shutil
 import struct
 import subprocess
 import sys
@@ -10,10 +11,36 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+TOOLS = pathlib.Path(__file__).resolve().parents[2] / "tools"
+sys.path.insert(0, str(TOOLS))
 import bag_stream  # noqa: E402
 
 BAG = os.environ.get("ROOM_MEMORY_BAG")
+
+
+def test_bag_stream_finds_the_oracle_outside_the_repository(tmp_path):
+    """Codex P1: the image copies the oracle to /oracle/room_memory, not next to
+    /ws/src/room_memory_cpp, and bag_stream.py only looked next to itself. It takes the package
+    from ROOM_MEMORY_PYTHON_PACKAGE (CTest sets it), in the tests and in their subprocesses."""
+    tools = tmp_path / "src" / "room_memory_cpp" / "tools"
+    tools.mkdir(parents=True)
+    shutil.copy(TOOLS / "bag_stream.py", tools)
+    package = os.environ.get("ROOM_MEMORY_PYTHON_PACKAGE", str(TOOLS.parents[1] / "room_memory"))
+    env = {**os.environ, "ROOM_MEMORY_PYTHON_PACKAGE": package}
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, str(tools / "bag_stream.py"), "--help"], env=env, cwd=tmp_path,
+                            capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+def test_split_bags_replay_in_segment_order(tmp_path):
+    """Codex P2: segments sorted by name put _10.mcap between _1 and _2, and the replay's timers
+    then ran across a jump back in time."""
+    for n in (2, 10, 0, 11, 1, 9):
+        (tmp_path / f"static5m_{n}.mcap").touch()
+    (tmp_path / "metadata.yaml").touch()
+    assert [f.name for f in bag_stream.segments(tmp_path)] == [f"static5m_{n}.mcap" for n in (0, 1, 2, 9, 10, 11)]
+    assert bag_stream.segments(tmp_path / "static5m_10.mcap") == [tmp_path / "static5m_10.mcap"]
 
 
 @pytest.mark.parametrize("background_m", [10.0, 4.0])

@@ -321,6 +321,33 @@ def test_a_return_kept_in_the_recent_layer_is_not_fresh_evidence():
     assert [(e.kind, e.state, e.first_seen) for e in events[2]] == [(EventKind.APPEARED, EventState.CANDIDATE, stamp(second))]
 
 
+def test_free_space_kept_in_the_recent_layer_is_not_fresh_evidence():
+    """Codex P2: with recent_windows=3 one window's rays through a removed box kept it disappeared
+    in three consecutive reports, each counted fresh, so it passed the 3-window gate alone. Only
+    windows whose own rays traverse it count now."""
+    room = scenes.room_shell()
+    boxed = np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))])
+    # The other half of the room: no ray from the origin to it comes near the box.
+    other_half = room[room[:, 1] < 0]
+    gate = dict(recent_windows=3, candidate_windows=3, expire_windows=3)
+    memory = mid360_memory(None, state_dir=None, **gate)
+    second = build_reference(memory, boxed)
+    for points in (room, other_half, other_half, other_half):
+        memory.add_points("mid360", points)
+        assert memory.close_window(stamp(second)) == []
+        second += 1
+    # The box missing from three windows in a row is a candidate on the third.
+    memory = mid360_memory(None, state_dir=None, **gate)
+    second = build_reference(memory, boxed)
+    events = []
+    for n in range(3):
+        memory.add_points("mid360", room)
+        events.append(memory.close_window(stamp(second + n)))
+    assert events[:2] == [[], []]
+    assert [(e.kind, e.state, e.first_seen) for e in events[2]] == [
+        (EventKind.DISAPPEARED, EventState.CANDIDATE, stamp(second))]
+
+
 def test_a_stale_region_keeps_its_match_but_neither_counts_nor_starts():
     tracker = CandidateTracker(2, 1)
     ids = iter(range(100, 200))

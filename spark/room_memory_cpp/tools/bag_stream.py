@@ -19,13 +19,18 @@ is gone the real returns behind it come back as free-space evidence.
 """
 
 import argparse
+import os
 import pathlib
+import re
 import struct
 import sys
 
 import numpy as np
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "room_memory"))
+# The oracle's PointCloud2 decoder: ROOM_MEMORY_PYTHON_PACKAGE when set (CTest sets it; the image keeps
+# the oracle in /oracle/room_memory), else spark/room_memory next to this package.
+ORACLE = pathlib.Path(__file__).resolve().parents[2] / "room_memory"
+sys.path.insert(0, os.environ.get("ROOM_MEMORY_PYTHON_PACKAGE", str(ORACLE)))
 from room_memory.core.pointcloud2 import decode_pointcloud2  # noqa: E402
 
 SENSORS = {"/livox/lidar": 0, "/lidar_points": 1}
@@ -86,9 +91,18 @@ def messages(files):
                     yield topics[record.channel_id], record.log_time, record.data
 
 
-def records(path, injections, seed=0):
+def segments(path):
+    """The mcap files of a bag directory in recording order (rosbag2 splits number them
+    ``<name>_<n>.mcap``, so ``_10`` comes after ``_9``), or the one file given."""
     path = pathlib.Path(path)
-    files = sorted(path.glob("*.mcap")) if path.is_dir() else [path]
+    if not path.is_dir():
+        return [path]
+    index = lambda file: int(match[1]) if (match := re.search(r"_(\d+)\.mcap$", file.name)) else -1
+    return sorted(path.glob("*.mcap"), key=lambda file: (index(file), file.name))
+
+
+def records(path, injections, seed=0):
+    files = segments(path)
     rng = np.random.default_rng(seed)
     first = None
     for topic, log_time, data in messages(files):

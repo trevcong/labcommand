@@ -382,6 +382,22 @@ def test_codex_candidates_need_fresh_windows(tmp_path):
     assert events == [0] * 10 + [1, 0]
 
 
+def test_codex_disappearances_need_fresh_rays(tmp_path):
+    """Codex P2: free space seen in one window stays in the 3-window recent layer, but only windows
+    whose own rays cross the removed box count; three such windows make a candidate, in both engines."""
+    room = scenes.room_shell()
+    r = floats(tmp_path, "room", room)
+    half = floats(tmp_path, "half", room[room[:, 1] < 0])
+    boxed = floats(tmp_path, "boxed", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))]))
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360 max_range=none reference_windows=3 recent_windows=3 "
+             "candidate_windows=3 expire_windows=3 state_dir=none", "start 1760400000 0"]
+    for second, path in enumerate([boxed, boxed, boxed, r, half, half, half, r, r, r, half]):
+        lines += [f"points mid360 {path}", f"close {1760400000 + second} 0"]
+    out = run_both(tmp_path, "\n".join(lines))
+    events = [int(line.split()[1]) for line in out.splitlines() if line.startswith("close ")]
+    assert events == [0] * 9 + [1, 0]
+
+
 def test_a_move_seen_as_its_halves_stays_one_move(tmp_path):
     """A corner of the moved box is too small for the move-count gate (48 vs 148 voxels), so the diff
     reports an APPEARED and a DISAPPEARED region; both engines keep the open MOVED alive on them,

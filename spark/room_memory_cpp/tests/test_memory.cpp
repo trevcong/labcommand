@@ -451,6 +451,43 @@ TEST(a_return_kept_in_the_recent_layer_is_not_fresh_evidence) {
     CHECK(events[2][0].first_seen == stamp(second));
 }
 
+// Codex P2: with recent_windows=3 one window's rays through a removed box kept it disappeared
+// in three consecutive reports, each counted fresh, so it passed the 3-window gate alone. Only
+// windows whose own rays traverse it count now.
+TEST(free_space_kept_in_the_recent_layer_is_not_fresh_evidence) {
+    const Cloud room = scenes::room_shell();
+    const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
+    const Cloud boxed = scenes::concat({&room, &box});
+    // The other half of the room: no ray from the origin to it comes near the box.
+    Cloud other_half;
+    for (std::size_t n = 0; n < room.size(); n += 3) {
+        if (room[n + 1] < 0) other_half.insert(other_half.end(), room.begin() + n, room.begin() + n + 3);
+    }
+    MemoryConfig config = mid360_config(std::nullopt);
+    config.recent_windows = 3;
+    config.candidate_windows = 3;
+    config.expire_windows = 3;
+    {
+        RoomMemory memory(config, kStart);
+        std::int64_t second = build_reference(memory, boxed);
+        for (const Cloud* points : std::initializer_list<const Cloud*>{&room, &other_half, &other_half, &other_half}) {
+            memory.add_points("mid360", *points);
+            CHECK(memory.close_window(stamp(second++)).empty());
+        }
+    }
+    // The box missing from three windows in a row is a candidate on the third.
+    RoomMemory memory(config, kStart);
+    const std::int64_t second = build_reference(memory, boxed);
+    std::vector<std::vector<msg::ChangeEvent>> events;
+    for (int n = 0; n < 3; ++n) {
+        memory.add_points("mid360", room);
+        events.push_back(memory.close_window(stamp(second + n)));
+    }
+    CHECK(events[0].empty() && events[1].empty());
+    CHECK((transitions(events[2]) == std::vector<std::pair<EventKind, EventState>>{{EventKind::disappeared, EventState::candidate}}));
+    CHECK(events[2][0].first_seen == stamp(second));
+}
+
 TEST(a_stale_region_keeps_its_match_but_neither_counts_nor_starts) {
     CandidateTracker tracker(2, 1);
     std::uint64_t ids = 100;

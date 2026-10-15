@@ -7,11 +7,12 @@ This is how tests/fixtures/static5m-mid360-excerpt.mcap was made from the static
 """
 
 import argparse
-import pathlib
 
 from mcap.records import Channel, Message, Schema
 from mcap.stream_reader import StreamReader
 from mcap.writer import CompressionType, Writer
+
+from bag_stream import segments
 
 
 def main(argv=None):
@@ -22,8 +23,7 @@ def main(argv=None):
     parser.add_argument("--count", type=int, required=True, help="messages per topic")
     parser.add_argument("--from-s", type=float, default=0.0, help="skip messages before this time from the start")
     args = parser.parse_args(argv)
-    source = pathlib.Path(args.bag)
-    files = sorted(source.glob("*.mcap")) if source.is_dir() else [source]
+    files = segments(args.bag)
     with open(args.out, "wb") as handle:
         writer = Writer(handle, compression=CompressionType.ZSTD)
         writer.start(profile="ros2", library="room_memory bag_excerpt")
