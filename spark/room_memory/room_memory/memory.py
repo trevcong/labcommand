@@ -265,6 +265,12 @@ def pose_offset(recent, reference_occupied, voxel_size):
     return math.sqrt(squared)
 
 
+def _near_field(keys, voxel_size, range_m):
+    """Whether a voxel center of ``keys`` lies within ``range_m`` meters of the sensor origin."""
+    x, y, z = ((lane.astype(np.float64) + 0.5) * voxel_size for lane in unpack(keys))
+    return bool(np.any(x * x + y * y + z * z < range_m * range_m))
+
+
 # MARK: Persistence
 
 
@@ -471,11 +477,13 @@ class MemoryConfig:
     sensors: Tuple[str, ...] = ("mid360", "jt128")
     voxel_size: float = 0.05
     max_range: Optional[float] = 15.0
-    tolerance: int = 1
-    min_voxels: int = 6
+    # tolerance, min_voxels and near_range_m, like the defaults below, were measured on the static
+    # recordings (room_memory_cpp/PLAN.md, "False change events").
+    tolerance: int = 2
+    min_voxels: int = 8
     min_extent: int = 2
     window_s: float = 1.0
-    # Defaults measured on the static recording (room_memory_cpp/PLAN.md, "False change events").
+    # Defaults measured on the static recordings (room_memory_cpp/PLAN.md, "False change events").
     reference_windows: int = 30
     recent_windows: int = 3
     state_dir: Optional[str] = "~/room-memory"
@@ -491,6 +499,9 @@ class MemoryConfig:
     # A tracking window adds to the counts of unsettled voxels only while its pose offset is at
     # most this (meters), so a moved rig never teaches the reference its new view.
     learn_max_offset_m: float = 0.02
+    # A change region with a voxel center within this distance (meters) of the sensor is not
+    # reported: the near field next to the rig, where people work (0: every region is).
+    near_range_m: float = 2.0
     # Map stream: the sensor whose reference is published ("" = jt128 when configured, else the
     # first configured), the
     # minimum time between map messages, the maximum time between snapshots, and the share of
@@ -558,6 +569,8 @@ class RoomMemory:
             raise ValueError("candidate_windows and expire_windows must be >= 1")
         if not 0 <= config.learn_max_offset_m < 1e9:
             raise ValueError("learn_max_offset_m must be in [0, 1e9) m")
+        if not 0 <= config.near_range_m < 1e9:
+            raise ValueError("near_range_m must be in [0, 1e9) m")
         if not (0 < config.delta_period_s < 1e9 and 0 < config.keyframe_period_s < 1e9
                 and 0 <= config.keyframe_delta_ratio < 1e9):
             raise ValueError("delta_period_s and keyframe_period_s must be in (0, 1e9) s, keyframe_delta_ratio in [0, 1e9)")
@@ -718,15 +731,18 @@ class RoomMemory:
                 channel.stats.add(np.setdiff1d(observed.occupied, reference.known, assume_unique=True),
                                   np.setdiff1d(observed.known, reference.known, assume_unique=True))
             report = diff(reference.as_occupancy(self.config.voxel_size), recent, self.change, reference.known)
+            # Regions reaching into the near field are not reported, either pose of a move.
+            regions = [region for region in report.regions
+                       if not _near_field(region_keys(region), self.config.voxel_size, self.config.near_range_m)]
             # The recent layer carries a return and its ray for recent_windows windows, so only
             # this window's own evidence counts toward the persistence gate: an appeared or moved
             # region is fresh when this window occupies one of its (new-pose) voxels, a disappeared
             # one when this window's rays traverse one of its voxels.
-            gone = [region.keys for region in report.regions if region.kind == "disappeared"]
+            gone = [region.keys for region in regions if region.kind == "disappeared"]
             free = cast_rays(window, self.change, np.unique(np.concatenate(gone))) if gone else _EMPTY_KEYS
             fresh = [bool(contains(free if region.kind == "disappeared" else window.occupied, region.keys).any())
-                     for region in report.regions]
-            for state, candidate in channel.tracker.update(report.regions, stamp, self._next_id, fresh):
+                     for region in regions]
+            for state, candidate in channel.tracker.update(regions, stamp, self._next_id, fresh):
                 events.append(self._event(channel, state, candidate, stamp))
                 self._log_event(events[-1])
         if dropped:

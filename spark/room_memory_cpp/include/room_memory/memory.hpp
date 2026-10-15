@@ -164,11 +164,13 @@ struct MemoryConfig {
     std::vector<std::string> sensors{"mid360", "jt128"};
     double voxel_size = 0.05;
     std::optional<double> max_range = 15.0;
-    std::int64_t tolerance = 1;
-    std::int64_t min_voxels = 6;
+    // tolerance, min_voxels and near_range_m, like the defaults below, were measured on the static
+    // recordings (PLAN.md, "False change events").
+    std::int64_t tolerance = 2;
+    std::int64_t min_voxels = 8;
     std::int64_t min_extent = 2;
     double window_s = 1.0;
-    // Defaults measured on the static recording (PLAN.md, "False change events").
+    // Defaults measured on the static recordings (PLAN.md, "False change events").
     std::int64_t reference_windows = 30;
     std::int64_t recent_windows = 3;
     std::optional<std::string> state_dir = std::string("~/room-memory");
@@ -184,6 +186,9 @@ struct MemoryConfig {
     // A tracking window adds to the counts of unsettled voxels only while its pose offset is
     // at most this (meters), so a moved rig never teaches the reference its new view.
     double learn_max_offset_m = 0.02;
+    // A change region with a voxel center within this distance (meters) of the sensor is not
+    // reported: the near field next to the rig, where people work (0: every region is).
+    double near_range_m = 2.0;
     // Map stream: the sensor whose reference is published (empty: jt128 when configured,
     // else the first configured sensor),
     // the minimum time between map messages, the maximum time between snapshots, and the

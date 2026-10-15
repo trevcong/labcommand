@@ -67,6 +67,8 @@ inline void configure(MemoryConfig& config, const std::string& key, const std::s
         config.expire_windows = integer(value);
     } else if (key == "learn_max_offset_m") {
         config.learn_max_offset_m = real(value);
+    } else if (key == "near_range_m") {
+        config.near_range_m = real(value);
     } else if (key == "map_sensor") {
         config.map_sensor = value;
     } else if (key == "delta_period_s") {

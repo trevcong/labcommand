@@ -16,6 +16,10 @@ A present cube is drawn by ray casting: every point whose ray from the sensor or
 the cube before its own return is moved to the entry point, plus N(0, 1 cm) range noise. So
 the cube occludes what is behind it and is sampled at the sensor's own density, and once it
 is gone the real returns behind it come back as free-space evidence.
+
+--loop N plays the recording N times back to back, each pass shifted by the length of the
+ones before it plus one frame period, for long runs of a static recording (injection times
+count from the first record of the first pass).
 """
 
 import argparse
@@ -101,13 +105,26 @@ def segments(path):
     return sorted(path.glob("*.mcap"), key=lambda file: (index(file), file.name))
 
 
-def records(path, injections, seed=0):
+def passes(files, loop):
+    """(topic, log_time, data) of the sensor messages of ``loop`` passes over the recording, each
+    pass shifted to start one frame period (0.1 s) after the previous one ended."""
+    shift, end, last = 0, None, None
+    for _ in range(loop):
+        for topic, log_time, data in messages(files):
+            if topic not in SENSORS:
+                continue
+            if end is not None:
+                shift, end = end + 100_000_000 - log_time, None
+            yield topic, log_time + shift, data
+            last = log_time + shift
+        end = last
+
+
+def records(path, injections, seed=0, loop=1):
     files = segments(path)
     rng = np.random.default_rng(seed)
     first = None
-    for topic, log_time, data in messages(files):
-        if topic not in SENSORS:
-            continue
+    for topic, log_time, data in passes(files, loop):
         sensor = SENSORS[topic]
         first = log_time if first is None else first
         t = (log_time - first) / 1e9
@@ -126,10 +143,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("bag")
     parser.add_argument("--inject", action="append", default=[], type=Injection)
+    parser.add_argument("--loop", type=int, default=1, help="passes over the recording (default 1)")
     args = parser.parse_args(argv)
     out = sys.stdout.buffer
     try:
-        for kind, sensor, stamp, data in records(args.bag, args.inject):
+        for kind, sensor, stamp, data in records(args.bag, args.inject, loop=args.loop):
             out.write(struct.pack("<BBQI", kind, sensor, stamp, len(data)))
             out.write(data)
     except BrokenPipeError:

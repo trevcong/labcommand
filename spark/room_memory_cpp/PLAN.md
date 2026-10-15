@@ -172,13 +172,52 @@ The count rule above, with the gate and a 3-window recent layer. Each knob was s
 
 ### After
 
-The node defaults on the same recording: **0 events in 30–86 s and 0 false events in the whole 269 s of TRACKING (0 per minute)**. The 49 messages that remain (25 CANDIDATE, 24 EXPIRED, first at 89 s) all lie within 0.69 m of one spot in each sensor's frame: (0.35, 1.1, 0) for the JT128 and (−1.2, −0.7, 0) for the Mid-360, about 1.2 m and 1.4 m from the sensors. That is a real change: something low moves next to the rig from 86 s on.
+The node defaults on the same recording: **0 events in 30–86 s and 0 false events in the whole 269 s of TRACKING (0 per minute)**. The 49 messages that remain (25 CANDIDATE, 24 EXPIRED, first at 89 s) all lie within 0.69 m of one spot in each sensor's frame: (0.35, 1.1, 0) for the JT128 and (−1.2, −0.7, 0) for the Mid-360, about 1.2 m and 1.4 m from the sensors. That is a real change: something low moves next to the rig from 86 s on. (The second round below finds the same spot active in a second recording and live, so it is not a one-off: it is where someone works next to the rig.)
 - **Raw returns.** Without any reference involved, the returns in a 0.9 × 0.9 m column (z −0.06 … 0.3 m) at each spot are flat for 80 s (Mid-360 1,524–1,536/s; JT128 5,533–5,642/s). Then both rise together, peak at 130–140 s (Mid-360 1,743/s, +14 %; JT128 7,143/s, +27 %), and ease back by 290 s.
 - **JT128 at (0.25, 1.0).** It sees only floor returns at z −0.078 m (2–8 per s) until 85 s. From 86 s it sees returns up to z +0.15 m, 12 to 846 per second.
 - **New occupancy.** Voxels occupied now that the 30-window reference holds as free, at the JT128 spot: exactly 0 in every window from 30 to 85 s, then 12, 132, 73 … with bursts at 87–90, 133–136 and 202–206 s. The Mid-360's events cluster in the same seconds (88–90, 127–138, 204–216 s).
 - **The rig did not move.** The pose estimate stays at 2.8–3.4 mm throughout.
 
-The regression test treats exactly that region and time as the real change (`REAL_CHANGE_*` in `tests/recording/test_static_recording.py`) and requires 0 events anywhere else.
+The regression test then treated exactly that region and time as the real change and required 0 events anywhere else. It no longer does (next section).
+
+### Second round: the near field
+
+**Live, at 2ed75e1 with these defaults**, the node sent false events at a rate that rose from ~2 per minute right after the reference was built to ~18 per minute 35 minutes later. A 150 s capture of `/room_memory/events`: 45 events (APPEARED 39, DISAPPEARED 28, MOVED 13 messages), mostly CANDIDATE then EXPIRED, 6–24 voxels, 0.9–1.9 m from the rig, z −0.1 … 0.7 m, around (−1, −1) and (−1, 0) for the Mid-360 and (0, 1) for the JT128. That is the "real change" spot above. A second 5-minute recording of the static room (`static5m-b`, 2026-10-14 21:44 CT, 304.7 s, 6,085 frames) reproduces it: **103 event messages, rising from 10 to 16, 21, 21 and 29 per minute**, 96 of them within 2.0 m horizontally of the sensor and the other 7 (2.0–2.6 m) on the same bearing in the same seconds.
+
+The cause is that spot, not the reference:
+- **Raw returns.** In a 0.8 × 0.8 m column at the Mid-360 spot (`static5m-b`): 2,120/s for the first 25 s, 2,650/s at 30–45 s, 842/s at 50 s, ~1,600/s at 70–130 s, 1,260/s at 160–170 s, 1,800/s at 180–240 s and 1,400/s after 250 s. The 90th-percentile height moves between 0.27 and 0.72 m. At the JT128 spot, 2,700–3,000/s fall to 750/s from 250 s on. In half-second JT128 slices a low object (z ≤ 0.25 m) at (0.3–0.6, 1.1–1.7) m holds one shape for seconds to minutes, then takes another. Both lidars change in the same seconds. That is a physical object, most likely someone working there, not range noise.
+- **Not aging or learning.** `static5m-b` played back to back for 30 minutes: 97, 130, 121, 113, 116 and 118 events per 5 minutes, flat after the first pass, and the same with learning off (`learn_max_offset_m` 0: 100, 108, 111, 114, 108, 104). `static5m` for 35 minutes: 49, 42, 42, 42, 44, 40, 44. The rise within a run is the object wandering away from where it was during the 30 BUILDING windows. The `map_epoch` steps every ~5 s are new coverage joining the reference (48 deltas in the first 5 minutes, 15 in the last); they do not cause the events.
+- **Learning does widen it slowly.** Settled voxels are never revised. A voxel occluded by the object during BUILDING settles as free once the object moves off it, and is then reportable when it comes back: one 6–7-voxel JT128 fragment 2.4 m out fired in passes 3–5 of the 30-minute loop and not in the first.
+
+What each knob does on `static5m-b` (events per recording, previous defaults plus the change):
+
+| change | static5m | static5m-b |
+|---|---|---|
+| none (previous defaults) | 49 | 103 |
+| `learn_max_offset_m` 0 (no learning) | | 101 |
+| `free_min_seen` 30 | | 93 |
+| `occupied_min_hits` 5, `free_min_seen` 5 | | 106 |
+| `recent_windows` 6 | | 113 |
+| `min_voxels` 30 | | 46 |
+| `candidate_windows` 6 | | 43 |
+| `tolerance` 2 | | 43 |
+| `near_range_m` 2.0 | 0 | 6 |
+| `near_range_m` 2.0, `min_voxels` 8 | | 6 |
+| `near_range_m` 2.0, `candidate_windows` 5 | 0 | 0 (but the Mid-360 move cube takes 13 s) |
+| `near_range_m` 1.6, `tolerance` 2, `min_voxels` 8 | 2 | 4 |
+| `near_range_m` 1.7 or 1.8, `tolerance` 2 | 0 | 0 |
+| `near_range_m` 2.0, `tolerance` 2 | 0 | 0; 6 over 30 minutes (the fragment above) |
+| **`near_range_m` 2.0, `tolerance` 2, `min_voxels` 8 (the defaults)** | **0; 0 over 35 minutes** | **0; 0 over 30 minutes** |
+
+Region size, persistence and evidence thresholds alone do not get there: the object's regions (6–168 voxels, alive 2–90 s) overlap the cubes' (80–157 voxels, persistent). Hence:
+- **`near_range_m` 2.0.** A change region with any voxel center within 2.0 m of its sensor (3-D, either pose of a move) is dropped before the gate. It covers the spot in both frames with margin (1.7 m already clears both recordings), and stays under the 2.05 m near face of the closest cube. **This is a blind zone, not noise removal:** anything that really changes within 2 m of either lidar is not reported.
+- **`tolerance` 2** (10 cm) removes the far fragments of the same motion (2.0–2.6 m, on the object's bearing, in its seconds). A real change within 10 cm of a reference surface now has to reach beyond it.
+- **`min_voxels` 8** (1 L) removes the learned 6–7-voxel fragment.
+The core `Config` defaults (and so every golden) are unchanged; these are `MemoryConfig` defaults only.
+
+The live JT128 events at (0.87, 2.64), 2.8 m out, were not in either recording, so nothing here shows that the live rate goes to 0, only that both recordings do.
+
+The regression test (`tests/recording/test_static_recording.py`) now runs on both recordings (`ROOM_MEMORY_RECORDING`, `ROOM_MEMORY_RECORDING_B`, each skipped when absent) and requires **no event at all**, over each recording, over each one played back to back for at least 30 minutes (`bag_stream.py --loop`), and from a saved union reference. The seven cube cases run on both and must find their cube and nothing else. Their latencies and sizes are the ones below, on both recordings.
 
 ### Synthetic changes in the real recording
 
@@ -306,10 +345,11 @@ On the Spark itself the GB10's cores differ from the M5's; the code has no Apple
 ## Node
 
 `room_memory_node` (node name `room_memory`) declares the Python node's parameters with the same defaults, which are `MemoryConfig`'s (a pytest checks both launch files against it):
-- the earlier ones: `room_id`, `sensors`, `voxel_size`, `max_range` (≤ 0: none), `tolerance`, `min_voxels`, `min_extent`, `window_s`, `reference_windows` (now 30), `recent_windows` (now 3), `state_dir` (empty: none, `~` expanded);
+- the earlier ones: `room_id`, `sensors`, `voxel_size`, `max_range` (≤ 0: none), `tolerance` (now 2), `min_voxels` (now 8), `min_extent`, `window_s`, `reference_windows` (now 30), `recent_windows` (now 3), `state_dir` (empty: none, `~` expanded);
 - the count rule: `occupied_min_hits` 2, `occupied_min_ratio` 0.3, `free_min_seen` 2, `free_max_ratio` 0;
 - the gate: `candidate_windows` 3, `expire_windows` 3;
 - learning: `learn_max_offset_m` 0.02;
+- the near field: `near_range_m` 2.0 (0: none);
 - the map stream: `map_sensor` (empty: the JT128 when configured), `delta_period_s` 5, `keyframe_period_s` 60, `keyframe_delta_ratio` 0.5.
 
 It subscribes to `/livox/lidar` and `/lidar_points` as generic (serialized) subscriptions with the sensor-data QoS, so the raw CDR goes through `decode_pointcloud2`. It publishes the codec bytes with generic publishers:

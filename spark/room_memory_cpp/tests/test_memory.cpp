@@ -71,12 +71,16 @@ struct TempDir {
 };
 
 // Single-window mechanics: every voxel a window sees settles, the recent layer is the last
-// window, and every region is sent and expired at once. The node's defaults are measured on
-// the static recording (tests/recording).
+// window, every region near the sensor or not is sent and expired at once, and the diff keeps
+// its tolerance 1 and 6-voxel minimum. The node's defaults are measured on the static
+// recordings (tests/recording).
 MemoryConfig mid360_config(const std::optional<std::string>& state_dir) {
     MemoryConfig config;
     config.sensors = {"mid360"};
     config.max_range = std::nullopt;
+    config.tolerance = 1;
+    config.min_voxels = 6;
+    config.near_range_m = 0.0;
     config.reference_windows = 3;
     config.recent_windows = 1;
     config.occupied_min_hits = 1;
@@ -254,6 +258,22 @@ TEST(new_coverage_is_not_an_appearance) {
     const std::array<float, 3> center = {0.3f, 1.2f, 0.3f};
     for (int a = 0; a < 3; ++a) CHECK(std::fabs(events[0].centroid[a] - center[a]) <= 0.025f);
     CHECK(events[0].evidence == 1.0f);
+}
+
+TEST(regions_reaching_into_the_near_field_are_not_reported) {
+    const Cloud room = scenes::room_shell();
+    MemoryConfig config = mid360_config(std::nullopt);
+    config.near_range_m = 1.5;
+    RoomMemory memory(config, kStart);
+    const std::int64_t second = build_reference(memory, room);
+    // 1.3 m and 2.3 m from the sensor: only the far box is reported.
+    const Cloud near = scenes::box_shell({0.3, 1.2, 0.3});
+    const Cloud far = scenes::box_shell({1.6, 1.6, 0.3});
+    memory.add_points("mid360", scenes::concat({&room, &near, &far}));
+    const auto events = memory.close_window(stamp(second));
+    CHECK((transitions(events) == std::vector<std::pair<EventKind, EventState>>{{EventKind::appeared, EventState::candidate}}));
+    const std::array<float, 3> center = {1.6f, 1.6f, 0.3f};
+    for (int a = 0; a < 3; ++a) CHECK(std::fabs(events[0].centroid[a] - center[a]) <= 0.025f);
 }
 
 TEST(moved_box_is_one_moved_candidate) {
@@ -550,6 +570,7 @@ TEST(tracking_waits_for_settled_reference_occupancy) {
     config.state_dir = std::nullopt;
     config.max_range = std::nullopt;
     config.reference_windows = 1;
+    config.near_range_m = 0.0;  // the box below is 1.3 m from the sensor, inside the default near field
     RoomMemory memory(config, kStart);
     memory.add_points("mid360", room);
     memory.close_window(stamp(0));
@@ -1008,7 +1029,7 @@ TEST(stream_config_rejections) {
              [](MemoryConfig& c) { c.candidate_windows = 0; }, [](MemoryConfig& c) { c.expire_windows = 0; },
              [](MemoryConfig& c) { c.delta_period_s = 0; }, [](MemoryConfig& c) { c.keyframe_period_s = NAN; },
              [](MemoryConfig& c) { c.keyframe_delta_ratio = -1; }, [](MemoryConfig& c) { c.map_sensor = "jt128"; },
-             [](MemoryConfig& c) { c.learn_max_offset_m = -0.1; }}) {
+             [](MemoryConfig& c) { c.learn_max_offset_m = -0.1; }, [](MemoryConfig& c) { c.near_range_m = -0.1; }}) {
         MemoryConfig config = mid360_config(std::nullopt);
         edit(config);
         CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart));

@@ -102,10 +102,11 @@ def test_save_and_load_reference(tmp_path):
 
 
 # Single-window mechanics: every voxel a window sees settles, the recent layer is the last window,
-# and every region is sent and expired at once. The node's defaults are measured on the static
-# recording (room_memory_cpp/tests/recording).
+# every region near the sensor or not is sent and expired at once, and the diff keeps its tolerance
+# 1 and 6-voxel minimum. The node's defaults are measured on the static recordings
+# (room_memory_cpp/tests/recording).
 SINGLE_WINDOW = dict(recent_windows=1, occupied_min_hits=1, occupied_min_ratio=0.0, free_min_seen=1,
-                     candidate_windows=1, expire_windows=1)
+                     candidate_windows=1, expire_windows=1, tolerance=1, min_voxels=6, near_range_m=0.0)
 
 
 def mid360_memory(tmp_path, **changes):
@@ -191,6 +192,18 @@ def test_new_coverage_is_not_an_appearance(tmp_path):
     assert [(e.kind, e.state) for e in events] == [(EventKind.APPEARED, EventState.CANDIDATE)]
     assert np.all(np.abs(np.array(events[0].centroid) - [0.3, 1.2, 0.3]) <= 0.025)
     assert events[0].evidence == 1.0
+
+
+def test_regions_reaching_into_the_near_field_are_not_reported(tmp_path):
+    room = scenes.room_shell()
+    memory = mid360_memory(tmp_path, state_dir=None, near_range_m=1.5)
+    second = build_reference(memory, room)
+    # 1.3 m and 2.3 m from the sensor: only the far box is reported.
+    near, far = scenes.box_shell((0.3, 1.2, 0.3)), scenes.box_shell((1.6, 1.6, 0.3))
+    memory.add_points("mid360", np.concatenate([room, near, far]))
+    events = memory.close_window(stamp(second))
+    assert [(e.kind, e.state) for e in events] == [(EventKind.APPEARED, EventState.CANDIDATE)]
+    assert np.all(np.abs(np.array(events[0].centroid) - [1.6, 1.6, 0.3]) <= 0.025)
 
 
 def test_moved_box_is_one_moved_candidate(tmp_path):
@@ -355,7 +368,9 @@ def test_tracking_waits_for_settled_reference_occupancy():
     so TRACKING began on an empty reference that pose_offset could never register on, and that no
     window could ever teach. The reference keeps building until it has occupancy."""
     room = scenes.room_shell()
-    memory = RoomMemory(MemoryConfig(sensors=("mid360",), state_dir=None, max_range=None, reference_windows=1), START)
+    # The box below is 1.3 m from the sensor, inside the default near field.
+    memory = RoomMemory(MemoryConfig(sensors=("mid360",), state_dir=None, max_range=None, reference_windows=1,
+                                     near_range_m=0.0), START)
     memory.add_points("mid360", room)
     memory.close_window(stamp(0))
     assert memory.state == MemoryState.BUILDING and memory.map_epoch == 0
@@ -694,7 +709,7 @@ def test_pose_offset_is_binary64():
 @pytest.mark.parametrize("changes", [
     dict(occupied_min_hits=0), dict(free_min_seen=0), dict(occupied_min_ratio=1.5), dict(free_max_ratio=-0.1),
     dict(candidate_windows=0), dict(expire_windows=0), dict(delta_period_s=0), dict(keyframe_period_s=float("nan")),
-    dict(keyframe_delta_ratio=-1), dict(map_sensor="jt128"), dict(learn_max_offset_m=-0.1),
+    dict(keyframe_delta_ratio=-1), dict(map_sensor="jt128"), dict(learn_max_offset_m=-0.1), dict(near_range_m=-0.1),
 ])
 def test_stream_config_rejections(changes):
     with pytest.raises(ValueError):

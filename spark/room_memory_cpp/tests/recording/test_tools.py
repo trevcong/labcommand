@@ -43,6 +43,19 @@ def test_split_bags_replay_in_segment_order(tmp_path):
     assert bag_stream.segments(tmp_path / "static5m_10.mcap") == [tmp_path / "static5m_10.mcap"]
 
 
+def test_loop_plays_the_recording_back_to_back(monkeypatch):
+    """--loop: each pass starts one frame period after the previous one's last lidar message, and
+    other topics neither play nor stretch a pass."""
+    second = 10**9
+    recorded = [("/tf", 5 * second, b"t"), ("/livox/lidar", 7 * second, b"a"), ("/lidar_points", 8 * second, b"b"),
+                ("/livox/lidar", 9 * second, b"c"), ("/tf", 12 * second, b"t")]
+    monkeypatch.setattr(bag_stream, "messages", lambda files: iter(recorded))
+    played = [(topic, t / second, data) for topic, t, data in bag_stream.passes([], 3)]
+    assert played == [("/livox/lidar", 7.0, b"a"), ("/lidar_points", 8.0, b"b"), ("/livox/lidar", 9.0, b"c"),
+                      ("/livox/lidar", 9.1, b"a"), ("/lidar_points", 10.1, b"b"), ("/livox/lidar", 11.1, b"c"),
+                      ("/livox/lidar", 11.2, b"a"), ("/lidar_points", 12.2, b"b"), ("/livox/lidar", 13.2, b"c")]
+
+
 @pytest.mark.parametrize("background_m", [10.0, 4.0])
 def test_injected_returns_get_the_documented_range_noise(monkeypatch, background_m):
     """Codex P2: the noise term was scaled by the intersection fraction, so a return 10 m out whose

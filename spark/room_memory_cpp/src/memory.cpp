@@ -458,6 +458,9 @@ RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, const RayBac
     if (!(config_.learn_max_offset_m >= 0 && config_.learn_max_offset_m < 1e9)) {
         throw std::invalid_argument("learn_max_offset_m must be in [0, 1e9) m");
     }
+    if (!(config_.near_range_m >= 0 && config_.near_range_m < 1e9)) {
+        throw std::invalid_argument("near_range_m must be in [0, 1e9) m");
+    }
     if (!(config_.delta_period_s > 0 && config_.delta_period_s < 1e9) ||
         !(config_.keyframe_period_s > 0 && config_.keyframe_period_s < 1e9) ||
         !(config_.keyframe_delta_ratio >= 0 && config_.keyframe_delta_ratio < 1e9)) {
@@ -598,6 +601,23 @@ bool RoomMemory::reference_ready(const Channel& channel) const {
     return channel.reference_windows >= config_.reference_windows && !channel.reference.occupied.empty();
 }
 
+namespace {
+
+// Whether a voxel center of `keys` lies within `range` meters of the sensor origin.
+bool near_field(const Keys& keys, double voxel_size, double range) {
+    const double limit = range * range;
+    for (const Key key : keys) {
+        const Index3 v = unpack(key);
+        const double x = (static_cast<double>(v.i) + 0.5) * voxel_size;
+        const double y = (static_cast<double>(v.j) + 0.5) * voxel_size;
+        const double z = (static_cast<double>(v.k) + 0.5) * voxel_size;
+        if (x * x + y * y + z * z < limit) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
 std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
     std::vector<msg::ChangeEvent> events;
     bool dropped = false;
@@ -660,7 +680,12 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         options.before_known = &channel.reference.known;
         options.scope = scope_;
         options.backend = backend_;
-        const Report report = diff(channel.reference.as_occupancy(change_.voxel_size), recent, change_, options);
+        Report report = diff(channel.reference.as_occupancy(change_.voxel_size), recent, change_, options);
+        // Regions reaching into the near field are not reported, either pose of a move.
+        std::erase_if(report.regions, [&](const Region& region) {
+            return near_field(region.keys, config_.voxel_size, config_.near_range_m) ||
+                   near_field(region.from_keys, config_.voxel_size, config_.near_range_m);
+        });
         // The recent layer carries a return and its ray for recent_windows windows, so only this
         // window's own evidence counts toward the persistence gate: an appeared or moved region
         // is fresh when this window occupies one of its (new-pose) voxels, a disappeared one

@@ -6,7 +6,7 @@ Mac. Every parameter can be overridden on the command line:
 ``max_range`` <= 0 disables the range clip; an empty ``state_dir`` disables saving and loading;
 an empty ``map_sensor`` publishes the JT128's reference when it is configured, else the first
 sensor's. Same node parameters and defaults as ``room_memory.launch.py`` (the Python node), which
-are ``MemoryConfig``'s, measured on the static recording.
+are ``MemoryConfig``'s, measured on the static recordings.
 
 The sidecar (``foxglove_bridge:=false`` turns it off) listens on ``foxglove_port`` (8767) and
 relays only topics matching ``^/room_memory/.*``, so the raw clouds never leave through it; the
@@ -30,8 +30,8 @@ ARGUMENTS = {
     "sensors": ("['mid360', 'jt128']", None),
     "voxel_size": ("0.05", float),
     "max_range": ("15.0", float),
-    "tolerance": ("1", int),
-    "min_voxels": ("6", int),
+    "tolerance": ("2", int),
+    "min_voxels": ("8", int),
     "min_extent": ("2", int),
     "window_s": ("1.0", float),
     "reference_windows": ("30", int),
@@ -44,6 +44,7 @@ ARGUMENTS = {
     "candidate_windows": ("3", int),
     "expire_windows": ("3", int),
     "learn_max_offset_m": ("0.02", float),
+    "near_range_m": ("2.0", float),
     "map_sensor": ("", str),
     "delta_period_s": ("5.0", float),
     "keyframe_period_s": ("60.0", float),

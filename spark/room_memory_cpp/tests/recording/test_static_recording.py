@@ -1,19 +1,23 @@
-"""Regression on the real 5-minute static recording of both lidars (rosbag2 mcap, zstd), replayed
-through room_memory_bag at its own timestamps with the node's default parameters.
+"""Regression on the real 5-minute static recordings of both lidars (rosbag2 mcap, zstd), replayed
+through room_memory_bag at their own timestamps with the node's default parameters.
 
-The recording is not in git. It is read from ROOM_MEMORY_RECORDING, by default
-~/Developer/lc-tasks/recordings/static5m, and every test here skips when it is absent.
+The recordings are not in git. They are read from ROOM_MEMORY_RECORDING (by default
+~/Developer/lc-tasks/recordings/static5m) and ROOM_MEMORY_RECORDING_B (by default
+~/Developer/lc-tasks/recordings/static5m-b), and each one's tests skip when it is absent.
 
-- The unmodified recording: no change event outside the one real change it contains (from 86 s
-  on, something low moves about 1.2 m from the JT128 and 1.4 m from the Mid-360, seen by both;
-  spark/room_memory_cpp/PLAN.md has the evidence), and every output within the protocol's
-  5 KB/s budget.
+Nothing in the room moves in either, except next to the rig: about 1.3 m from both sensors
+something low (z up to ~0.8 m) shifts every few seconds to minutes in both recordings and live,
+which the node does not report (near_range_m; spark/room_memory_cpp/PLAN.md has the evidence).
+
+- Each recording: no change event at all, also over 30 minutes of it played back to back, and
+  every output within the protocol's 5 KB/s budget.
 - Boxes injected into one sensor's frames by ray casting (tools/bag_stream.py): an appearance,
   a disappearance and a move must each be detected, as a CANDIDATE of the right kind near the
-  box, within the latency bound.
+  box, within the latency bound, and nothing else.
 """
 
 import json
+import math
 import os
 import pathlib
 import subprocess
@@ -24,30 +28,36 @@ import pytest
 HERE = pathlib.Path(__file__).resolve().parent
 STREAM = HERE.parents[1] / "tools" / "bag_stream.py"
 BAG = os.environ.get("ROOM_MEMORY_BAG")
-RECORDING = pathlib.Path(os.environ.get("ROOM_MEMORY_RECORDING", "~/Developer/lc-tasks/recordings/static5m")).expanduser()
+RECORDINGS = {
+    "static5m": pathlib.Path(os.environ.get("ROOM_MEMORY_RECORDING",
+                                            "~/Developer/lc-tasks/recordings/static5m")).expanduser(),
+    "static5m-b": pathlib.Path(os.environ.get("ROOM_MEMORY_RECORDING_B",
+                                              "~/Developer/lc-tasks/recordings/static5m-b")).expanduser(),
+}
 
 pytest.importorskip("mcap", reason="the mcap package reads the recording (pip install mcap zstandard)")
 
-pytestmark = [
-    pytest.mark.skipif(not BAG, reason="ROOM_MEMORY_BAG (the room_memory_bag binary) not set"),
-    pytest.mark.skipif(not list(RECORDING.glob("*.mcap")),
-                       reason=f"static recording not found at {RECORDING} (set ROOM_MEMORY_RECORDING)"),
-]
+pytestmark = pytest.mark.skipif(not BAG, reason="ROOM_MEMORY_BAG (the room_memory_bag binary) not set")
 
-# The real change (module docstring): from REAL_CHANGE_FROM_S on, within REAL_CHANGE_RADIUS_M of
-# a center in each sensor's frame (sensor bit -> center).
-REAL_CHANGE_FROM_S = 86.0
-REAL_CHANGE_RADIUS_M = 0.8
-REAL_CHANGE_AT = {1: (-1.2, -0.7, 0.0), 2: (0.35, 1.1, 0.0)}
 INJECT_AT = 180.0
 LATENCY_BOUND_S = 8.0
 BUDGET_BYTES_PER_S = 5000
+LONG_RUN_S = 1800.0
 
 
-def replay(*injections, config=()):
+@pytest.fixture(scope="module", params=sorted(RECORDINGS))
+def recording(request):
+    path = RECORDINGS[request.param]
+    if not list(path.glob("*.mcap")):
+        variable = "ROOM_MEMORY_RECORDING" + ("_B" if request.param.endswith("-b") else "")
+        pytest.skip(f"static recording not found at {path} (set {variable})")
+    return path
+
+
+def replay(recording, *injections, config=(), loop=1):
     """(events, summary) of one replay with the node defaults plus `config` (key=value words)."""
-    stream = subprocess.Popen([sys.executable, str(STREAM), str(RECORDING), *[f"--inject={j}" for j in injections]],
-                              stdout=subprocess.PIPE)
+    stream = subprocess.Popen([sys.executable, str(STREAM), str(recording), f"--loop={loop}",
+                               *[f"--inject={j}" for j in injections]], stdout=subprocess.PIPE)
     result = subprocess.run([BAG, *config], stdin=stream.stdout, capture_output=True, check=True)
     stream.stdout.close()
     assert stream.wait() == 0
@@ -63,35 +73,38 @@ def replay(*injections, config=()):
 
 
 @pytest.fixture(scope="module")
-def unmodified():
-    return replay()
+def unmodified(recording):
+    return replay(recording)
 
 
 def distance(a, b):
     return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
 
 
-def real_change(event):
-    return (event["t"] >= REAL_CHANGE_FROM_S
-            and distance(event["centroid"], REAL_CHANGE_AT[event["sensors"]]) <= REAL_CHANGE_RADIUS_M)
-
-
-def test_no_false_events_after_the_reference(unmodified):
+def test_no_events_on_the_static_room(unmodified):
     events, summary = unmodified
     assert summary["tracking_from_s"] > 0 and summary["tracked_s"] > 200
-    false = [e for e in events if not real_change(e)]
-    assert false == [], f"{len(false)} events outside the real change: {false[:5]}"
-    assert any(real_change(e) for e in events), "the real change was not detected"
+    assert events == [], f"{len(events)} events: {events[:5]}"
 
 
-def test_a_saved_union_reference_still_gives_no_false_events(tmp_path):
-    """The deployed node saved union-of-5-window references; the new defaults load them as they are."""
+def test_no_events_over_half_an_hour(recording, unmodified):
+    """The recording played back to back for at least LONG_RUN_S: the reference keeps learning the
+    whole time, and every pass starts again from the room as the first one found it."""
+    _, once = unmodified
+    loop = math.ceil(LONG_RUN_S / once["duration_s"])
+    events, summary = replay(recording, loop=loop)
+    assert summary["duration_s"] >= LONG_RUN_S
+    assert events == [], f"{len(events)} events: {events[:5]}"
+
+
+def test_a_saved_union_reference_still_gives_no_events(recording, tmp_path):
+    """The first deployed node saved union-of-5-window references; the defaults load them as they are."""
     legacy = ("reference_windows=5", "occupied_min_hits=1", "occupied_min_ratio=0", "free_min_seen=1",
               "recent_windows=1", "candidate_windows=1", "expire_windows=1")
-    replay(config=(*legacy, f"state_dir={tmp_path}"))
-    events, summary = replay(config=(f"state_dir={tmp_path}",))
+    replay(recording, config=(*legacy, f"state_dir={tmp_path}"))
+    events, summary = replay(recording, config=(f"state_dir={tmp_path}",))
     assert summary["tracking_from_s"] <= 1.0
-    assert [e for e in events if not real_change(e)] == []
+    assert events == [], f"{len(events)} events: {events[:5]}"
 
 
 def test_output_within_the_byte_budget(unmodified):
@@ -124,12 +137,12 @@ def detection(events, sensor, kind, center):
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
-def test_injected_change_is_detected(name):
+def test_injected_change_is_detected(recording, name):
     spec, sensor, kind, center = CASES[name]
-    events, _ = replay(spec)
+    events, _ = replay(recording, spec)
     found = detection(events, sensor, kind, center)
     assert found is not None, f"{name}: no {kind} candidate near {center}"
     latency = found["t"] - INJECT_AT
     assert 0 < latency <= LATENCY_BOUND_S, f"{name}: latency {latency} s"
-    others = [e for e in events if e is not found and not real_change(e)]
+    others = [e for e in events if e is not found]
     assert others == [], f"{name}: other events {others[:5]}"

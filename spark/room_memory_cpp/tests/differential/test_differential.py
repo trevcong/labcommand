@@ -36,10 +36,11 @@ OVERFLOWING_CLOUD = (
     "01"
 )
 
-# The memory tests' single-window mechanics (every voxel a window sees settles, every region is
-# sent and expired at once); scenarios written for them prepend it to their config line.
+# The memory tests' single-window mechanics (every voxel a window sees settles, every region, near
+# the sensor or not, is sent and expired at once, the diff keeps tolerance 1 and 6 voxels);
+# scenarios written for them prepend it to their config line.
 SINGLE_WINDOW = ("recent_windows=1 occupied_min_hits=1 occupied_min_ratio=0 free_min_seen=1 candidate_windows=1 "
-                 "expire_windows=1")
+                 "expire_windows=1 tolerance=1 min_voxels=6 near_range_m=0")
 
 pytestmark = pytest.mark.skipif(not (OFFLINE and REPLAY), reason="ROOM_MEMORY_OFFLINE / ROOM_MEMORY_REPLAY not set")
 
@@ -239,7 +240,9 @@ def test_new_coverage_and_moves(tmp_path):
         "moved": floats(tmp_path, "moved", np.concatenate([room, scenes.shifted(box, 1)])),
         "added": floats(tmp_path, "added", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))])),
     }
-    lines = ["config sensors=mid360 max_range=none reference_windows=3 state_dir=none", "start 1760400000 0"]
+    # The boxes sit within 1.3 m of the sensor: no near field, and the diff's tolerance 1 and 6 voxels.
+    lines = ["config sensors=mid360 max_range=none reference_windows=3 state_dir=none near_range_m=0 tolerance=1 "
+             "min_voxels=6", "start 1760400000 0"]
     # The gate needs 3 fresh windows: the box added at the end stays for three.
     sequence = ["partial", "partial", "partial", "room", "added", "box", "moved", "moved", "room", "added", "added",
                 "added"]
@@ -415,7 +418,8 @@ def test_codex_tracking_waits_for_reference_occupancy(tmp_path):
     room = scenes.room_shell()
     r = floats(tmp_path, "room", room)
     boxed = floats(tmp_path, "boxed", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))]))
-    lines = ["config sensors=mid360 state_dir={state} max_range=none reference_windows=1", "start 1760400000 0"]
+    lines = ["config sensors=mid360 state_dir={state} max_range=none reference_windows=1 near_range_m=0",
+             "start 1760400000 0"]
     for second, path in enumerate([r, r, boxed, boxed, boxed]):
         lines += [f"points mid360 {path}", f"close {1760400000 + second} 0", f"status {1760400000 + second} 0 1.0"]
     out = run_both(tmp_path, "\n".join(lines))
@@ -491,10 +495,12 @@ def test_codex_a_lone_half_keeps_no_move_alive(tmp_path):
 
 
 @pytest.mark.parametrize("variant", [
-    "tolerance=1 recent_windows=2",
-    "tolerance=0 recent_windows=1 min_extent=1",
-    "tolerance=2 recent_windows=3 voxel_size=0.1",
-    "tolerance=1 recent_windows=1 max_range=2.5 min_voxels=3",
+    "tolerance=1 recent_windows=2 near_range_m=0",
+    "tolerance=0 recent_windows=1 min_extent=1 near_range_m=0",
+    "tolerance=2 recent_windows=3 voxel_size=0.1 near_range_m=0",
+    "tolerance=1 recent_windows=1 max_range=2.5 min_voxels=3 near_range_m=0",
+    # box_a and its move lie in the near field, box_b (1.9 m at its closest) does not.
+    "tolerance=1 recent_windows=2 min_voxels=6 near_range_m=1.0",
 ])
 def test_two_sensor_sequences(tmp_path, variant):
     rng = np.random.default_rng(42)
@@ -554,7 +560,7 @@ def test_settled_reference_map_stream_and_sync(tmp_path, variant):
     clouds = {"partial": room[room[:, 0] < 1.5], "room": room, "box": np.concatenate([room, box])}
     lines = [f"config sensors=mid360,jt128 max_range=none reference_windows=4 occupied_min_hits=2 "
              f"occupied_min_ratio=0.3 free_min_seen=2 free_max_ratio=0.2 map_sensor=jt128 delta_period_s=2 "
-             f"room_id=lab state_dir={{state}} {variant}", "start 1760400000 0"]
+             f"room_id=lab state_dir={{state}} near_range_m=0 {variant}", "start 1760400000 0"]
     sequence = ["partial"] * 4 + ["room"] * 5 + ["box"] * 4 + ["room"] * 4 + ["box", "room", "box"] + ["room"] * 3
     syncs = {6: [(None, SyncTopic.MAP_BRICKS)], 12: [("map", SyncTopic.MAP_BRICKS), (None, SyncTopic.EVENTS)],
              18: [("event", SyncTopic.EVENTS), ("last event", SyncTopic.EVENTS), ((1, 99), SyncTopic.MAP_BRICKS)]}
