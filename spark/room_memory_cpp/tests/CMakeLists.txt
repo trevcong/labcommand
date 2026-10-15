@@ -62,6 +62,39 @@ foreach(sensor jt128 mid360)
                    -P ${CMAKE_CURRENT_SOURCE_DIR}/compare_cli.cmake)
 endforeach()
 
+# 30+ minutes of a looped static recording. The mcap is not in git; the binary skips (exit 77)
+# when it is absent. libzstd is only for this reader, not the core.
+set(ROOM_MEMORY_ZSTD_INCLUDE "")
+set(ROOM_MEMORY_ZSTD_LIBRARY "")
+find_path(ROOM_MEMORY_ZSTD_INCLUDE zstd.h)
+find_library(ROOM_MEMORY_ZSTD_LIBRARY zstd)
+if(NOT ROOM_MEMORY_ZSTD_INCLUDE OR NOT ROOM_MEMORY_ZSTD_LIBRARY)
+  execute_process(COMMAND brew --prefix zstd OUTPUT_VARIABLE ROOM_MEMORY_ZSTD_PREFIX
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(ROOM_MEMORY_ZSTD_PREFIX
+     AND EXISTS "${ROOM_MEMORY_ZSTD_PREFIX}/include/zstd.h"
+     AND EXISTS "${ROOM_MEMORY_ZSTD_PREFIX}/lib/libzstd.dylib")
+    set(ROOM_MEMORY_ZSTD_INCLUDE "${ROOM_MEMORY_ZSTD_PREFIX}/include")
+    set(ROOM_MEMORY_ZSTD_LIBRARY "${ROOM_MEMORY_ZSTD_PREFIX}/lib/libzstd.dylib")
+  endif()
+endif()
+add_executable(test_static_longrun test_static_longrun.cpp)
+target_link_libraries(test_static_longrun PRIVATE room_memory_core)
+if(ROOM_MEMORY_OPENMP)
+  target_link_libraries(test_static_longrun PRIVATE OpenMP::OpenMP_CXX)
+endif()
+target_compile_options(test_static_longrun PRIVATE -Wall -Wextra -Wpedantic)
+if(ROOM_MEMORY_ZSTD_INCLUDE AND ROOM_MEMORY_ZSTD_LIBRARY)
+  target_include_directories(test_static_longrun PRIVATE ${ROOM_MEMORY_ZSTD_INCLUDE})
+  target_link_libraries(test_static_longrun PRIVATE ${ROOM_MEMORY_ZSTD_LIBRARY})
+  target_compile_definitions(test_static_longrun PRIVATE ROOM_MEMORY_HAS_ZSTD=1)
+endif()
+add_test(NAME static_longrun COMMAND test_static_longrun)
+set_tests_properties(static_longrun PROPERTIES
+  SKIP_RETURN_CODE 77
+  TIMEOUT 300
+  ENVIRONMENT "OMP_NUM_THREADS=${HOST_CORES}")
+
 # Differential tests against the Python oracle (pytest), when a Python with numpy is given.
 if(ROOM_MEMORY_PYTHON)
   foreach(threads 1 ${HOST_CORES})
