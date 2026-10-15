@@ -720,6 +720,45 @@ func testLiveRoomGenerationsAndPartialHistory() {
     _ = early.tick(at: 4.6)
     expect(early.eventsSeq == 101 && early.eventsState == .complete, "the replay covers 0–100: complete, got \(early.eventsState)")
 
+    // Live 101 before the replay, then a reconnect: the baseline exists, but 0–100 still have to come.
+    var rejoin = Mirror(roomId: "lab")
+    _ = rejoin.connectionOpened(at: 0, canRequest: true)
+    _ = rejoin.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 100), at: 0)
+    _ = rejoin.receive(topic: .events, payload: event(id: 101, seq: 101), at: 1)
+    rejoin.connectionClosed(at: 2)
+    let reopened = rejoin.connectionOpened(at: 10, canRequest: true)
+    expect(request(reopened, .events, "reconnect before replay")?.since == nil, "reconnect keeps asking for events since NONE")
+    _ = rejoin.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 101), at: 11)
+    _ = rejoin.tick(at: 11.5)
+    expect(rejoin.eventsState != .complete, "after a reconnect a status matching 101 does not vouch for 0–100")
+    for seq in UInt64(0)...100 {
+        _ = rejoin.receive(topic: .syncEvents, payload: event(id: seq, seq: seq, state: .reverted), at: 12)
+    }
+    _ = rejoin.receive(topic: .status, payload: status(epoch: 5, seq: 3, eventsSeq: 101), at: 13)
+    _ = rejoin.tick(at: 14.5)
+    expect(rejoin.eventsState == .complete, "the replay after the reconnect covers 0–100: complete, got \(rejoin.eventsState)")
+    var rejoinBlind = Mirror(roomId: "lab")
+    _ = rejoinBlind.connectionOpened(at: 0, canRequest: true)
+    _ = rejoinBlind.receive(topic: .events, payload: event(id: 101, seq: 101), at: 1)
+    rejoinBlind.connectionClosed(at: 2)
+    _ = rejoinBlind.connectionOpened(at: 10, canRequest: false)
+    _ = rejoinBlind.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 101), at: 11)
+    expect(rejoinBlind.eventsState != .complete, "reconnect with no request path: 0–100 are lost, incomplete")
+
+    // Live 101 before the replay, which settles after only 0–50: 51–100 are still missing.
+    var partial = Mirror(roomId: "lab")
+    _ = partial.connectionOpened(at: 0, canRequest: true)
+    _ = partial.receive(topic: .events, payload: event(id: 101, seq: 101), at: 1)
+    _ = partial.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 101), at: 1)
+    for seq in UInt64(0)...50 {
+        _ = partial.receive(topic: .syncEvents, payload: event(id: seq, seq: seq, state: .reverted), at: 2)
+    }
+    _ = partial.tick(at: 4.5)
+    expect(partial.eventsState != .complete, "a gapless replay of 0–50 does not cover 0–100: incomplete, got \(partial.eventsState)")
+    _ = partial.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 101), at: 5)
+    _ = partial.tick(at: 7.5)
+    expect(partial.eventsState != .complete, "a later status matching 101 does not complete it either")
+
     // An unreadable map payload: bricks kept, map stale, resync requested.
     var bad = currentMirror()
     let good = delta(epoch: 6, seq: 11, base: 5, [])

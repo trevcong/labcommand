@@ -186,6 +186,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     private var eventsInitialSync = false
     /// Seqs the initial answer brought, to tell a full history from a bounded fallback.
     private var initialSyncSeqs: Set<UInt64> = []
+    /// A live event started the baseline at this seq: the initial answer must replay every seq below it.
+    private var initialHistoryBelow: UInt64?
     /// Newest message on the events sync topic, for the settle window.
     private var lastSyncEventAt: TimeInterval?
     /// Bumped when the node restarts; per-event seq order holds only within one generation.
@@ -223,7 +225,13 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         needs = [:]
         lastSyncEventAt = nil
         initialSyncSeqs = []
-        eventsInitialSync = canRequest && eventsSeq == nil
+        // A live event may have set the baseline before the initial answer came: that answer is still owed.
+        if eventsInitialSync, !canRequest {
+            eventsInitialSync = false
+            initialHistoryBelow = nil
+            loseEventsHistory()
+        }
+        eventsInitialSync = canRequest && (eventsSeq == nil || eventsInitialSync)
         if canRequest {
             needs[.mapBricks] = Need()
             needs[.events] = Need()
@@ -476,6 +484,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
                     if eventsState == .complete {
                         eventsState = .incomplete(since: nil)
                     }
+                    initialHistoryBelow = seq
                     if !eventsInitialSync {
                         eventsInitialSync = true
                         needEvents()
@@ -594,12 +603,15 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         }
         if eventsInitialSync {
             eventsInitialSync = false
-            // A full history runs 0, 1, 2, … with no hole; anything else is the bounded fallback.
-            if let low = initialSyncSeqs.min(), let high = initialSyncSeqs.max(),
-               !(low == 0 && UInt64(initialSyncSeqs.count) == high - low + 1) {
+            // A full history runs 0, 1, 2, … with no hole, up to the first live event that set the
+            // baseline; anything else is the bounded fallback.
+            let seqs = initialSyncSeqs
+            let gapless = seqs.isEmpty || (seqs.min() == 0 && UInt64(seqs.count) == seqs.max()! + 1)
+            if !gapless || UInt64(seqs.count) < (initialHistoryBelow ?? 0) {
                 loseEventsHistory()
             }
             initialSyncSeqs = []
+            initialHistoryBelow = nil
         }
         resolveEventsIfDone()
     }
@@ -768,6 +780,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         highestLiveEventsSeq = nil
         eventsMark = nil
         eventsLowMark = nil
+        initialHistoryBelow = nil
         if canRequest {
             eventsInitialSync = true
             needEvents()
