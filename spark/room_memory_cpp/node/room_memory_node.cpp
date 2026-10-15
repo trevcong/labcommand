@@ -1,7 +1,8 @@
 // Thin rclcpp node around RoomMemory: raw CDR in, codec bytes out. The C++ twin of
 // spark/room_memory/room_memory/node.py, with the same topics, QoS and parameters: status at
 // 1 Hz, events per transition, map_bricks after each window when RoomMemory::map_update has
-// one, and RequestSync answers on the two sync topics (protocol sections 2 and 5).
+// one, and RequestSync answers on the two sync topics (protocol sections 2 and 5). A rejected
+// frame logs one warning per sensor per 10 s (RejectionLog), with the decoder's error.
 //
 // Subscriptions and publishers are generic (serialized), so frames go through the tested
 // decode_pointcloud2 and outputs are the codec's CDR bytes; sensor_msgs and labcommand_msgs
@@ -21,6 +22,7 @@
 #include <rclcpp/serialized_message.hpp>
 
 #include "room_memory/memory.hpp"
+#include "room_memory/rejectlog.hpp"
 
 namespace {
 
@@ -100,10 +102,7 @@ public:
             const room_memory::Sensor& sensor = memory_->channel(name).sensor;
             subscriptions_.push_back(create_generic_subscription(
                 sensor.topic, "sensor_msgs/msg/PointCloud2", rclcpp::SensorDataQoS(),
-                [this, name](std::shared_ptr<const rclcpp::SerializedMessage> message) {
-                    const rcl_serialized_message_t& raw = message->get_rcl_serialized_message();
-                    memory_->add_cdr(name, std::span<const std::uint8_t>(raw.buffer, raw.buffer_length));
-                }));
+                [this, name](std::shared_ptr<const rclcpp::SerializedMessage> message) { on_cloud(name, *message); }));
         }
         last_status_ = std::chrono::steady_clock::now();
         window_timer_ = rclcpp::create_timer(this, get_clock(), rclcpp::Duration::from_seconds(config.window_s),
@@ -120,6 +119,15 @@ private:
         const std::int64_t ns = now().nanoseconds();
         const std::int64_t sec = ns >= 0 ? ns / 1'000'000'000 : -((-ns + 999'999'999) / 1'000'000'000);
         return msg::Time{sec, ns - sec * 1'000'000'000};
+    }
+
+    void on_cloud(const std::string& name, const rclcpp::SerializedMessage& message) {
+        const rcl_serialized_message_t& raw = message.get_rcl_serialized_message();
+        if (memory_->add_cdr(name, std::span<const std::uint8_t>(raw.buffer, raw.buffer_length))) return;
+        const room_memory::RejectedFrame& error = *memory_->channel(name).last_error;
+        if (const auto line = rejections_.observe(name, error.type_name, error.message)) {
+            RCLCPP_WARN(get_logger(), "%s", line->c_str());
+        }
     }
 
     void close_window() {
@@ -163,6 +171,7 @@ private:
     }
 
     std::unique_ptr<RoomMemory> memory_;
+    room_memory::RejectionLog rejections_;
     std::shared_ptr<rclcpp::GenericPublisher> events_;
     std::shared_ptr<rclcpp::GenericPublisher> status_;
     std::shared_ptr<rclcpp::GenericPublisher> map_;

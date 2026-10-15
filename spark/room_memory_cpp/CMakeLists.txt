@@ -66,6 +66,7 @@ add_library(room_memory_core
   src/pointcloud2.cpp
   src/messages.cpp
   src/memory.cpp
+  src/rejectlog.cpp
 )
 set_target_properties(room_memory_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(room_memory_core PUBLIC

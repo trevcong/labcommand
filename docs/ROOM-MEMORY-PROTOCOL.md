@@ -49,7 +49,7 @@ Every message starts with these four fields, in the order the brief lists them:
 | field | type | unit | valid | if missing or invalid |
 |---|---|---|---|---|
 | `room_id` | `string` | — | non-empty UTF-8, no NUL | message rejected |
-| `map_epoch` | `uint64` | epoch | bumped on every reference-map change; in `RequestSync`, repeats `since_epoch` | always present; a stale message renders "—" |
+| `map_epoch` | `uint64` | epoch | bumped on every reference-map change and on every node start that loads saved references; in `RequestSync`, repeats `since_epoch` | always present; a stale message renders "—" |
 | `seq` | `uint64` | count | +1 per message on that topic, starts at 0 per publisher; `0` inside `ChangeEvent.mask`; in `RequestSync`, +1 per request from that client | gaps follow §5 |
 | `stamp` | `builtin_interfaces/Time` | s, ns | `nanosec` < 10⁹ | `{0, 0}` renders "time —" |
 
@@ -394,7 +394,7 @@ The Spark keeps its last 10 `map_bricks` messages. It answers a `TOPIC_MAP_BRICK
 2. **Snapshot** otherwise. That covers no `since`, a `since_seq` older than the kept messages, a `since_seq` newer than the latest (the node restarted), an epoch that does not match, and nothing missed. The Spark publishes a new snapshot of the current map. Its `seq` is the latest `seq` published on the live topic, so the next live delta chains from it.
 3. **No answer** before the first live map message (BUILDING): there is no map yet, and the live snapshot that starts TRACKING ends the Mac's STALE state.
 
-A request whose `room_id` is not the node's room gets no answer, and one that does not decode is dropped and logged.
+A request whose `room_id` is not the node's room gets no answer, and one that does not decode is dropped and logged. `seq` restarts at 0 with the node, so a node that loads saved references takes the next `map_epoch` (and saves it at once): a `since` from before a restart never names a message after it.
 
 **`events`.** A message with `seq` ≤ the last applied, for an `event_id` the Mac already holds in that `state`, is a duplicate: ignored and counted. Any other `seq` ≠ previous + 1 is a gap, including a reset after a node restart. A gap marks the event list "incomplete since \<stamp of the last good message\>". Open events show "may be outdated". Missed transitions are never invented. The Mac sends `RequestSync{TOPIC_EVENTS, since = (map_epoch, seq) of the last event message applied}`, or `SINCE_NONE` when it holds none. It does the same on every (re)connect, and it repeats the request after 5 s like the map request.
 

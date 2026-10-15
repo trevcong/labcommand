@@ -270,10 +270,34 @@ config sensors=mid360 voxel_size=0.1
 start 1760400100 0
 config sensors=mid360 voxel_size=0.05 room_id=other
 start 1760400100 0
+config sensors=mid360,jt128 room_id=lab-7
+start 1760400200 0
 """
     run_both(tmp_path, build)
-    out = run_both(tmp_path, reload)
-    assert out.splitlines()[0] == "init TRACKING 1" and out.splitlines()[2] == "init error"
+    out = run_both(tmp_path, reload).splitlines()
+    # Each load takes the next epoch and saves it; a refused load saves nothing.
+    assert out[0] == "init TRACKING 2" and out[2] == "init error" and out[4] == "init TRACKING 3"
+
+
+def test_sync_cursor_across_restarts(tmp_path):
+    """Codex P2: seq restarts at 0, so a restart must not reissue an old (map_epoch, seq)
+    cursor; the pre-restart cursor gets the post-restart event."""
+    room = scenes.room_shell()
+    plain = floats(tmp_path, "room", room)
+    boxed = floats(tmp_path, "boxed", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))]))
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360 max_range=none reference_windows=3 state_dir={{state}}",
+             "start 1760400000 0"]
+    for second in range(3):
+        lines += [f"points mid360 {plain}", f"close {1760400000 + second} 0"]
+    lines += [f"points mid360 {boxed}", "close 1760400003 0", "start 1760400100 0", "start 1760400200 0",
+              f"points mid360 {boxed}", "close 1760400201 0",
+              f"sync 1760400202 0 {request('lab', (1, 0), SyncTopic.EVENTS)}"]
+    out = run_both(tmp_path, "\n".join(lines)).splitlines()
+    events = [ChangeEvent.from_cdr(bytes.fromhex(line.split()[1])) for line in out if line.startswith("event ")]
+    assert [(e.header.map_epoch, e.header.seq) for e in events] == [(1, 0), (3, 0)]
+    assert events[0].event_id != events[1].event_id
+    assert [line for line in out if line.startswith("init ")] == ["init BUILDING 0", "init TRACKING 2", "init TRACKING 3"]
+    assert out[-2:] == ["sync 1", f"data {events[1].to_cdr().hex()}"]
 
 
 def test_degraded_and_dropped(tmp_path):

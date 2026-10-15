@@ -212,6 +212,13 @@ inline constexpr std::int64_t kPoseSearchVoxels = 4;
 // Binary64 like the Python oracle, so the learning gate decides alike; status rounds to float.
 std::optional<double> pose_offset(const Keys& recent, const Membership& reference, double voxel_size);
 
+// Why add_cdr rejected a frame: the error's type name and message.
+struct RejectedFrame {
+    std::string type_name;
+    std::string message;
+    friend bool operator==(const RejectedFrame&, const RejectedFrame&) = default;
+};
+
 // Accumulation windows, reference/recent layers, candidates and status for one room. The
 // caller feeds frames with add_cdr or add_points, calls close_window every window_s and
 // status at 1 Hz, and publishes the returned messages.
@@ -223,6 +230,8 @@ public:
         std::vector<float> points;  // the current window's frames, 3 floats per point
         std::int64_t received = 0;
         std::int64_t failed = 0;
+        // The last rejected frame's error, cleared by an accepted one. Never the frame.
+        std::optional<RejectedFrame> last_error;
         VoxelLayer reference;
         VoxelStats stats;  // every voxel while BUILDING; the not yet settled ones while TRACKING
         std::int64_t reference_windows = 0;  // windows with usable points counted into the reference
@@ -242,7 +251,8 @@ public:
     // Queues positions (3 floats per point, meters, sensor frame) for the current window.
     void add_points(const std::string& sensor, std::span<const float> xyz);
     // Decodes one CDR PointCloud2 and queues it. Returns false when the frame is rejected:
-    // any exception from the decoder counts as a failed frame, never escapes.
+    // any exception from the decoder counts as a failed frame, never escapes, and is kept as
+    // the channel's last_error.
     bool add_cdr(const std::string& sensor, std::span<const std::uint8_t> data);
     // Integrates the queued frames. Returns the ChangeEvent messages to publish, in order.
     std::vector<msg::ChangeEvent> close_window(const msg::Time& stamp);
@@ -276,7 +286,7 @@ private:
     // (pose_offset registers on it, and without it no window may teach the reference).
     bool reference_ready(const Channel& channel) const;
     std::vector<std::filesystem::path> paths() const;
-    void load();
+    void load(const msg::Time& start);
     std::uint64_t next_id();
     msg::ChangeEvent event(const Channel& channel, msg::EventState state, const Candidate& candidate,
                            const msg::Time& stamp);

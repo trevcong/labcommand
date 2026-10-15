@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <new>
 #include <stdexcept>
 
 #include "parallel.hpp"
@@ -436,7 +437,7 @@ RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, const RayBac
     validate(change_);
     const std::int64_t millis = start.sec * 1000 + start.nanosec / 1'000'000;
     next_event_id_ = static_cast<std::uint64_t>(millis) << 20;
-    load();
+    load(start);
 }
 
 RoomMemory::Channel& RoomMemory::find(const std::string& sensor) {
@@ -458,7 +459,7 @@ std::vector<std::filesystem::path> RoomMemory::paths() const {
     return out;
 }
 
-void RoomMemory::load() {
+void RoomMemory::load(const msg::Time& start) {
     if (!config_.state_dir) return;
     const std::vector<std::filesystem::path> all = paths();
     std::vector<std::string> missing;
@@ -493,7 +494,10 @@ void RoomMemory::load() {
         channels_[n].reference_windows = config_.reference_windows;
     }
     if (epochs.size() != 1) throw std::invalid_argument("saved references disagree on map_epoch");
-    map_epoch_ = epochs.front();
+    // seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
+    // before it names a message after it. Saved at once, so the next restart moves on again.
+    map_epoch_ = epochs.front() + 1;
+    save(start);
     state_ = msg::MemoryState::tracking;
 }
 
@@ -517,14 +521,23 @@ void RoomMemory::add_points(const std::string& sensor, std::span<const float> xy
 bool RoomMemory::add_cdr(const std::string& sensor, std::span<const std::uint8_t> data) {
     Channel& channel = find(sensor);
     PointCloud cloud;
-    try {
-        cloud = decode_pointcloud2(data);
-    } catch (const std::exception&) {  // PointCloudError, or any other decode failure (e.g. bad_alloc)
+    const auto reject = [&](const char* type_name, const std::exception& error) {
         ++channel.received;
         ++channel.failed;
+        channel.last_error = RejectedFrame{type_name, error.what()};
         return false;
+    };
+    try {
+        cloud = decode_pointcloud2(data);
+    } catch (const PointCloudError& error) {
+        return reject("PointCloudError", error);
+    } catch (const std::bad_alloc& error) {
+        return reject("bad_alloc", error);
+    } catch (const std::exception& error) {  // any other decode failure
+        return reject("exception", error);
     }
     add_points(sensor, cloud.positions);
+    channel.last_error.reset();
     return true;
 }
 

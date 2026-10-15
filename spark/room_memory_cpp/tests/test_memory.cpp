@@ -1,5 +1,6 @@
 // Voxel layers, bricks, reference persistence and the window engine, ported from
-// spark/room_memory/tests/test_memory.py (including the three Codex regressions of 289afb6).
+// spark/room_memory/tests/test_memory.py (including the three Codex regressions of 289afb6),
+// and the rejected-frame throttle of test_rejectlog.py.
 #include <unistd.h>
 
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include "harness.hpp"
 #include "room_memory/memory.hpp"
 #include "room_memory/pointcloud2.hpp"
+#include "room_memory/rejectlog.hpp"
 #include "scenes.hpp"
 
 using namespace room_memory;
@@ -275,9 +277,35 @@ TEST(reload_restores_epoch_and_bricks) {
     build_reference(memory, scenes::concat({&room, &box}));
     const auto bricks = memory.channel("mid360").reference.to_bricks();
     RoomMemory restarted(mid360_config(dir.path.string()), kStart);
-    CHECK(restarted.state() == MemoryState::tracking && restarted.map_epoch() == 1 && memory.map_epoch() == 1);
+    CHECK(restarted.state() == MemoryState::tracking && memory.map_epoch() == 1 && restarted.map_epoch() == 2);
     CHECK(restarted.channel("mid360").reference.to_bricks() == bricks);
     CHECK_EQ(restarted.status(stamp(9), 1.0).n_bricks, static_cast<std::int64_t>(bricks.size()));
+}
+
+// Codex P2: seq restarts at 0, so a restart that kept map_epoch reissued (map_epoch, seq)
+// cursors, and an old client's cursor matched a new, unrelated event: an empty answer.
+TEST(sync_cursor_from_before_a_restart_names_nothing_after_it) {
+    TempDir dir;
+    const Cloud room = scenes::room_shell();
+    const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
+    const Cloud boxed = scenes::concat({&room, &box});
+    const MemoryConfig config = mid360_config(dir.path.string());
+    RoomMemory memory(config, kStart);
+    const std::int64_t second = build_reference(memory, room);
+    memory.add_points("mid360", boxed);
+    const auto old = memory.close_window(stamp(second));
+    CHECK(old.size() == 1 && old[0].header.map_epoch == 1 && old[0].header.seq == 0);
+    CHECK(RoomMemory(config, stamp(100)).map_epoch() == 2 && RoomMemory(config, stamp(200)).map_epoch() == 3);
+    RoomMemory restarted(config, stamp(300));
+    restarted.add_points("mid360", boxed);
+    const auto fresh = restarted.close_window(stamp(301));
+    CHECK(fresh.size() == 1 && fresh[0].event_id != old[0].event_id);
+    CHECK(fresh[0].header.map_epoch == 4 && fresh[0].header.seq == 0);
+    msg::RequestSync since;
+    since.header = msg::Header{"lab", old[0].header.map_epoch, 0, kStart};
+    since.since = msg::RequestSync::Since{old[0].header.map_epoch, old[0].header.seq};
+    since.topic = msg::SyncTopic::events;
+    CHECK((restarted.sync(since, stamp(302)) == std::vector<msg::Bytes>{fresh[0].to_cdr()}));
 }
 
 TEST(inconsistent_saved_state_is_refused) {
@@ -339,6 +367,61 @@ TEST(degraded_and_dropped_windows) {
     CHECK(memory.state() == MemoryState::tracking && status.state == MemoryState::tracking && memory.map_epoch() == 1);
     status = memory.status(stamp(3), 1.0);
     CHECK(status.state == MemoryState::degraded && status.mid360_hz == 0 && status.jt128_hz == 0);
+}
+
+// Codex P2 (round 6): the node warns with the decoder's error, so add_cdr keeps it. Ported
+// from spark/room_memory/tests/test_rejectlog.py.
+TEST(rejected_cdr_keeps_type_name_and_message) {
+    MemoryConfig config;
+    config.state_dir = std::nullopt;
+    RoomMemory memory(config, kStart);
+    CHECK(!memory.channel("mid360").last_error);
+    CHECK(!memory.add_cdr("mid360", msg::Bytes{0x00, 0x01, 0x00, 0x00}));
+    const RejectedFrame truncated{"PointCloudError", "PointCloud2 CDR: truncated header.stamp.sec at byte 4 (need 4, have 0)"};
+    CHECK(memory.channel("mid360").last_error == truncated && !memory.channel("jt128").last_error);
+    CHECK(memory.channel("mid360").received == 1 && memory.channel("mid360").failed == 1);
+    RejectionLog log(kRejectionIntervalS, [] { return 0.0; });
+    CHECK(log.observe("mid360", truncated.type_name, truncated.message) ==
+          "mid360 rejected frame: PointCloudError: " + truncated.message);
+    memory.close_window(stamp(0));
+    CHECK(memory.channel("mid360").last_error == truncated && memory.channel("mid360").failed == 0);
+    CHECK(!memory.add_cdr("mid360", msg::Bytes{0x00, 0x01, 0x00, 0x00}));
+    CHECK(memory.add_cdr("mid360", encode_pointcloud2(scenes::room_shell())));
+    // An accepted frame clears last_error; failed is close_window's to clear.
+    CHECK(!memory.channel("mid360").last_error && memory.channel("mid360").failed == 1);
+}
+
+TEST(rejection_log_throttles_per_sensor) {
+    double t = 0;
+    RejectionLog log(kRejectionIntervalS, [&] { return t; });
+    const auto line = [&](const std::string& sensor, const std::string& message) {
+        return log.observe(sensor, "PointCloudError", message);
+    };
+    using Line = std::optional<std::string>;
+    CHECK(kRejectionIntervalS == 10.0);
+    CHECK(line("mid360", "bad mid") == Line("mid360 rejected frame: PointCloudError: bad mid"));
+    CHECK(line("jt128", "bad jt") == Line("jt128 rejected frame: PointCloudError: bad jt"));
+    t = 1.0;
+    CHECK(!line("mid360", "bad mid"));
+    t = 9.999;
+    CHECK(!line("mid360", "bad mid"));
+    t = 4.0;  // a clock step back stays inside the window
+    CHECK(!line("jt128", "bad jt"));
+    t = 10.0;
+    CHECK(line("mid360", "bad mid") == Line("mid360 rejected frame: PointCloudError: bad mid (2 suppressed)"));
+    CHECK(line("jt128", "bad jt") == Line("jt128 rejected frame: PointCloudError: bad jt (1 suppressed)"));
+    t = 11.0;
+    CHECK(!line("mid360", "bad mid"));
+    t = 20.0;
+    // jt128 emits first; that must not clear mid360's suppressed call from t = 11, and the
+    // count restarts after each emission.
+    CHECK(line("jt128", "bad jt") == Line("jt128 rejected frame: PointCloudError: bad jt"));
+    CHECK(line("mid360", "still bad") == Line("mid360 rejected frame: PointCloudError: still bad (1 suppressed)"));
+    // The interval restarts at the last emission, not on a grid from t = 0.
+    t = 29.0;
+    CHECK(!line("mid360", "still bad"));
+    t = 30.0;
+    CHECK(line("mid360", "still bad") == Line("mid360 rejected frame: PointCloudError: still bad (1 suppressed)"));
 }
 
 // Codex fix 1: a reference window needs at least one occupied voxel.

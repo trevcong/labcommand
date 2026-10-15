@@ -560,12 +560,12 @@ class RoomMemory:
         self._map_log = deque(maxlen=MAP_LOG_DEPTH)
         self._event_log = deque(maxlen=EVENT_LOG_DEPTH)
         self._open_latest = {}  # event_id -> latest Logged message, open events only
-        self._load()
+        self._load(start)
 
     def _paths(self):
         return {name: reference_path(self.config.state_dir, self.config.room_id, name) for name in self.channels}
 
-    def _load(self):
+    def _load(self, start):
         if self.config.state_dir is None:
             return
         paths = self._paths()
@@ -588,7 +588,10 @@ class RoomMemory:
             channel.reference_windows = self.config.reference_windows
         if len(epochs) != 1:
             raise ValueError(f"saved references disagree on map_epoch: {sorted(epochs)}")
-        self.map_epoch = epochs.pop()
+        # seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
+        # before it names a message after it. Saved at once, so the next restart moves on again.
+        self.map_epoch = epochs.pop() + 1
+        self.save(start)
         self.state = MemoryState.TRACKING
 
     def save(self, stamp):

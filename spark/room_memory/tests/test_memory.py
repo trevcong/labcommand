@@ -206,9 +206,30 @@ def test_reload_restores_epoch_and_bricks(tmp_path):
     build_reference(memory, np.concatenate([scenes.room_shell(), scenes.box_shell((1.0, 0.5, 0.3))]))
     bricks = memory.channels["mid360"].reference.to_bricks()
     restarted = mid360_memory(tmp_path)
-    assert restarted.state == MemoryState.TRACKING and restarted.map_epoch == memory.map_epoch == 1
+    assert restarted.state == MemoryState.TRACKING and memory.map_epoch == 1 and restarted.map_epoch == 2
     assert restarted.channels["mid360"].reference.to_bricks() == bricks
     assert restarted.status(stamp(9), 1.0).n_bricks == len(bricks)
+
+
+def test_sync_cursor_from_before_a_restart_names_nothing_after_it(tmp_path):
+    """Codex P2: seq restarts at 0, so a restart that kept map_epoch reissued (map_epoch, seq)
+    cursors, and an old client's cursor matched a new, unrelated event: an empty answer."""
+    room, box = scenes.room_shell(), scenes.box_shell((0.3, 1.2, 0.3))
+    memory = mid360_memory(tmp_path)
+    second = build_reference(memory, room)
+    memory.add_points("mid360", np.concatenate([room, box]))
+    (old,) = memory.close_window(stamp(second))
+    assert (old.header.map_epoch, old.header.seq) == (1, 0)
+    config = memory.config
+    restarted = RoomMemory(config, stamp(100))
+    assert restarted.map_epoch == 2 and RoomMemory(config, stamp(200)).map_epoch == 3
+    restarted = RoomMemory(config, stamp(300))
+    restarted.add_points("mid360", np.concatenate([room, box]))
+    (new,) = restarted.close_window(stamp(301))
+    assert new.event_id != old.event_id and (new.header.map_epoch, new.header.seq) == (4, 0)
+    since = RequestSync(Header("lab", old.header.map_epoch, 0, START), (old.header.map_epoch, old.header.seq),
+                        SyncTopic.EVENTS)
+    assert restarted.sync(since, stamp(302)) == [new.to_cdr()]
 
 
 def test_inconsistent_saved_state_is_refused(tmp_path):
