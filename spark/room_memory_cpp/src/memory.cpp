@@ -424,6 +424,61 @@ bool same_shape(const Keys& keys, const Keys& anchor, std::int64_t tolerance, do
            static_cast<double>(count_within(anchor, keys, tolerance)) >= fraction * static_cast<double>(anchor.size());
 }
 
+Region region_from_poses(Region::Kind kind, const Keys& keys, const Keys& from_keys, double voxel_size) {
+    const float voxel = static_cast<float>(voxel_size);
+    const double size = static_cast<double>(voxel);
+    struct Geometry {
+        std::int64_t count;
+        Vec3 centroid, low, high;
+        float volume;
+        Key first;
+    };
+    // The diff's cluster geometry: exact index sums in binary64, rounded once to binary32.
+    const auto geometry = [&](const Keys& members) {
+        std::int64_t sum[3] = {0, 0, 0};
+        std::int64_t low[3] = {kLimit, kLimit, kLimit};
+        std::int64_t high[3] = {-kLimit - 1, -kLimit - 1, -kLimit - 1};
+        for (const Key key : members) {
+            const Index3 v = unpack(key);
+            const std::int64_t lanes[3] = {v.i, v.j, v.k};
+            for (int a = 0; a < 3; ++a) {
+                sum[a] += lanes[a];
+                low[a] = std::min(low[a], lanes[a]);
+                high[a] = std::max(high[a], lanes[a]);
+            }
+        }
+        Geometry g{static_cast<std::int64_t>(members.size()), {}, {}, {}, 0.0f, members.front()};
+        const double n = static_cast<double>(members.size());
+        for (int a = 0; a < 3; ++a) {
+            g.centroid[a] = static_cast<float>(((static_cast<double>(sum[a]) / n) + 0.5) * size);
+            g.low[a] = static_cast<float>(low[a]) * voxel;
+            g.high[a] = static_cast<float>(high[a] + 1) * voxel;
+        }
+        g.volume = ((static_cast<float>(members.size()) * voxel) * voxel) * voxel;
+        return g;
+    };
+    Region region;
+    region.kind = kind;
+    const Geometry g = geometry(keys);
+    region.voxel_count = g.count;
+    region.centroid = g.centroid;
+    region.bounds_min = g.low;
+    region.bounds_max = g.high;
+    region.volume = g.volume;
+    region.min_key = g.first;
+    region.keys = keys;
+    if (kind == Region::Kind::moved) {
+        const Geometry f = geometry(from_keys);
+        region.from_voxel_count = f.count;
+        region.from_min_key = f.first;
+        region.from_centroid = f.centroid;
+        region.from_bounds_min = f.low;
+        region.from_bounds_max = f.high;
+        region.from_keys = from_keys;
+    }
+    return region;
+}
+
 std::int64_t box_gap(const Box& a, const Box& b) {
     std::int64_t gap = 0;
     for (int n = 0; n < 3; ++n) gap = std::max({gap, b.low[n] - a.high[n], a.low[n] - b.high[n]});
@@ -517,7 +572,7 @@ RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, const RayBac
             : std::nullopt;
     for (Channel& channel : channels_) {
         channel.tracker = CandidateTracker(config_.candidate_windows, config_.expire_windows, config_.tolerance, radius,
-                                           config_.stable_min_fraction);
+                                           config_.stable_min_fraction, config_.voxel_size);
     }
     const std::int64_t millis = start.sec * 1000 + start.nanosec / 1'000'000;
     next_event_id_ = static_cast<std::uint64_t>(millis) << 20;

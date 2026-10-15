@@ -20,7 +20,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from .core import Config, OccupancyMap, cast_rays, decode_pointcloud2, diff, occupancy_map
+from .core import Config, OccupancyMap, Region, cast_rays, decode_pointcloud2, diff, occupancy_map
 from .core.change_detection import contains, in_range, pack, unpack, validate
 from .messages import (
     Activity,
@@ -367,6 +367,34 @@ def region_fresh(region, occupied, free, min_voxels, min_fraction):
     return supported(occupied, region.keys) and (region.kind != "moved" or supported(free, region.from_keys))
 
 
+def region_from_poses(kind, keys, from_keys, voxel_size):
+    """A region of ``kind`` ("appeared", "disappeared", "moved") over exactly these voxels (the
+    old pose in ``from_keys``, moved only), with the geometry the diff's clusters give."""
+    voxel = np.float32(voxel_size)
+    size = float(voxel)
+
+    def geometry(members):
+        i, j, k = unpack(members)
+        n = float(len(members))
+        centroid = np.array([((float(int(axis.sum())) / n) + 0.5) * size for axis in (i, j, k)]).astype(np.float32)
+        low = np.array([i.min(), j.min(), k.min()])
+        high = np.array([i.max(), j.max(), k.max()]) + 1
+        volume = ((np.float32(len(members)) * voxel) * voxel) * voxel
+        return len(members), centroid, low.astype(np.float32) * voxel, high.astype(np.float32) * voxel, volume, int(members[0])
+
+    count, centroid, low, high, volume, first = geometry(keys)
+    out = Region(kind=kind, voxel_count=count, centroid=centroid, bounds_min=low, bounds_max=high, volume=volume,
+                 min_key=first, keys=keys)
+    if kind == "moved":
+        count, centroid, low, high, _, first = geometry(from_keys)
+        out.from_voxel_count, out.from_min_key, out.from_centroid = count, first, centroid
+        out.from_bounds_min, out.from_bounds_max, out.from_keys = low, high, from_keys
+    return out
+
+
+_REGION_KINDS = {EventKind.APPEARED: "appeared", EventKind.DISAPPEARED: "disappeared", EventKind.MOVED: "moved"}
+
+
 def _poses(region):
     """(new-pose or only voxels, old-pose voxels) of a region; the second is empty unless moved."""
     return region.keys, (_EMPTY_KEYS if region.from_keys is None else region.from_keys)
@@ -446,12 +474,14 @@ class CandidateTracker:
     becomes a CANDIDATE (and gets its event id), in region order.
     """
 
-    def __init__(self, candidate_windows=1, expire_windows=1, tolerance=None, radius=None, stable_fraction=1.0):
+    def __init__(self, candidate_windows=1, expire_windows=1, tolerance=None, radius=None, stable_fraction=1.0,
+                 voxel_size=None):
         self.candidate_windows = candidate_windows
         self.expire_windows = expire_windows
         self.tolerance = tolerance
         self.radius = radius
         self.stable_fraction = stable_fraction
+        self.voxel_size = voxel_size  # rebuilds the region of halves and fragments (None: keeps the last one)
         self.open = []
         self.pending = []
         self.activity = []  # indices into the last update's regions that were activity
@@ -595,7 +625,9 @@ class CandidateTracker:
         activity = set()
         for entry, indices, region, new, old, fragments in steps:
             entry.keys = np.union1d(new, old) if len(old) else new
-            if region is not None:
+            if (region is None or fragments) and self.voxel_size is not None:
+                entry.region = region_from_poses(_REGION_KINDS[entry.kind], new, old, self.voxel_size)
+            elif region is not None:
                 entry.region = region
             entry.last_seen = stamp
             if not all(is_fresh(index) for index in indices):
@@ -736,7 +768,7 @@ class _Channel:
         self.recent = deque(maxlen=config.recent_windows)  # one entry per closed window, empty when it had none
         radius = math.floor(config.activity_radius_m / config.voxel_size + 0.5) if config.activity_radius_m > 0 else None
         self.tracker = CandidateTracker(config.candidate_windows, config.expire_windows, config.tolerance, radius,
-                                        config.stable_min_fraction)
+                                        config.stable_min_fraction, config.voxel_size)
         self.hz = None
         self.residual = None  # pose_offset of the last tracking window with points
 

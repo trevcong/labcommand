@@ -138,6 +138,9 @@ bool same_shape(const Keys& keys, const Keys& anchor, std::int64_t tolerance, do
 // (`free`: disappeared, the old pose of a move), each pose of a move.
 bool region_fresh(const Region& region, const Keys& occupied, const Keys& free, std::int64_t min_voxels,
                   double min_fraction);
+// A region of `kind` over exactly these voxels (the old pose in `from_keys`, moved only), with the
+// geometry the diff's clusters give.
+Region region_from_poses(Region::Kind kind, const Keys& keys, const Keys& from_keys, double voxel_size);
 // Voxels between two boxes along the axis that separates them most (0 when they touch).
 std::int64_t box_gap(const Box& a, const Box& b);
 
@@ -173,12 +176,13 @@ class CandidateTracker {
 public:
     CandidateTracker(std::int64_t candidate_windows = 1, std::int64_t expire_windows = 1,
                      std::optional<std::int64_t> tolerance = std::nullopt, std::optional<std::int64_t> radius = std::nullopt,
-                     double stable_fraction = 1.0)
+                     double stable_fraction = 1.0, std::optional<double> voxel_size = std::nullopt)
         : candidate_windows_(candidate_windows),
           expire_windows_(expire_windows),
           tolerance_(tolerance),
           radius_(radius),
-          stable_fraction_(stable_fraction) {}
+          stable_fraction_(stable_fraction),
+          voxel_size_(voxel_size) {}
     // (state, candidate) in a fixed order: new candidates in region order, then expiries by
     // event id. `fresh` holds one flag per region, empty when every region is fresh.
     template <typename NextId>
@@ -200,6 +204,7 @@ private:
     std::optional<std::int64_t> tolerance_;
     std::optional<std::int64_t> radius_;
     double stable_fraction_;
+    std::optional<double> voxel_size_;  // rebuilds the region of halves and fragments (empty: keeps the last one)
     std::vector<Candidate> open_;
     std::vector<Candidate> pending_;
     std::vector<std::size_t> activity_;
@@ -598,7 +603,14 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
     for (Step& step : steps) {
         Candidate& entry = *step.entry;
         entry.keys = step.from_pose.empty() ? step.pose : set_union(step.pose, step.from_pose);
-        if (step.region) entry.region = *step.region;
+        if ((!step.region || !step.fragments.empty()) && voxel_size_) {
+            const Region::Kind kind = entry.kind == msg::EventKind::appeared      ? Region::Kind::appeared
+                                      : entry.kind == msg::EventKind::disappeared ? Region::Kind::disappeared
+                                                                                   : Region::Kind::moved;
+            entry.region = region_from_poses(kind, step.pose, step.from_pose, *voxel_size_);
+        } else if (step.region) {
+            entry.region = *step.region;
+        }
         entry.last_seen = stamp;
         if (!is_fresh(step.a) || (step.b && !is_fresh(*step.b))) {
             entry.windows = 0;

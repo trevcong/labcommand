@@ -977,6 +977,21 @@ def test_a_move_seen_as_its_halves_keeps_its_run():
     assert tracker.pending[0].windows == 2
 
 
+def test_a_move_promoted_through_its_halves_reports_their_geometry():
+    """Codex P2: a pending move matched by its halves kept the last whole move's geometry, so a
+    half that reshaped and then settled was reported at its old place next to its new mask."""
+    tracker = CandidateTracker(3, 1, 1, None, 0.9, 0.05)
+    whole = region("moved", block(10), block(0))
+    halves = [region("appeared", block(12)), region("disappeared", block(0))]
+    ids = iter(range(100, 200))
+    transitions = [tracker.update(regions, stamp(n), lambda: next(ids)) for n, regions in enumerate([[whole], halves, halves, halves])]
+    ((state, moved),) = transitions[3]
+    assert state == EventState.CANDIDATE and moved.kind == EventKind.MOVED
+    assert moved.region.centroid.tolist() == pytest.approx([0.675, 0.075, 0.075]) and moved.region.voxel_count == 27
+    assert moved.region.from_centroid.tolist() == pytest.approx([0.075, 0.075, 0.075])
+    assert moved.region.bounds_min.tolist() == pytest.approx([0.6, 0.0, 0.0]) and np.array_equal(moved.region.keys, keys_of(block(12)))
+
+
 def test_a_move_takes_over_its_pending_halves():
     """Halves first (2 and 1 settled windows), then the whole move: one pending move whose run is
     the shorter of theirs plus this window, both halves consumed. (No activity check: the new

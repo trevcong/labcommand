@@ -1364,6 +1364,26 @@ TEST(a_move_seen_as_its_halves_keeps_its_run) {
     CHECK(tracker.pending()[0].windows == 2);
 }
 
+// Codex P2: a pending move matched by its halves kept the last whole move's geometry, so a half
+// that reshaped and then settled was reported at its old place next to its new mask.
+TEST(a_move_promoted_through_its_halves_reports_their_geometry) {
+    CandidateTracker tracker(3, 1, 1, std::nullopt, 0.9, 0.05);
+    const Region whole = region_of(Region::Kind::moved, block(10), block(0));
+    const std::vector<Region> halves{region_of(Region::Kind::appeared, block(12)), region_of(Region::Kind::disappeared, block(0))};
+    std::uint64_t ids = 100;
+    const auto next = [&] { return ids++; };
+    CHECK(tracker.update({whole}, stamp(0), next).empty());
+    CHECK(tracker.update(halves, stamp(1), next).empty());
+    CHECK(tracker.update(halves, stamp(2), next).empty());
+    const auto out = tracker.update(halves, stamp(3), next);
+    CHECK(out.size() == 1 && out[0].first == EventState::candidate && out[0].second.kind == EventKind::moved);
+    const Region& r = out[0].second.region;
+    CHECK(r.centroid == (Vec3{static_cast<float>(13.5 * static_cast<double>(0.05f)), static_cast<float>(1.5 * static_cast<double>(0.05f)),
+                              static_cast<float>(1.5 * static_cast<double>(0.05f))}));
+    CHECK(r.voxel_count == 27 && r.keys == keys(block(12)) && r.bounds_min[0] == 12.0f * 0.05f);
+    CHECK(r.from_centroid[0] == static_cast<float>(1.5 * static_cast<double>(0.05f)));
+}
+
 // Halves first (2 and 1 settled windows), then the whole move: one pending move whose run is the
 // shorter of theirs plus this window, both halves consumed. (No activity check: the new
 // disappeared half would hold the appeared one back.)

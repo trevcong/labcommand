@@ -64,8 +64,6 @@ endforeach()
 
 # 30+ minutes of each looped static recording. The mcaps are not in git; the binary skips (exit 77)
 # when one is absent. libzstd is only for this reader, not the core.
-set(ROOM_MEMORY_ZSTD_INCLUDE "")
-set(ROOM_MEMORY_ZSTD_LIBRARY "")
 find_path(ROOM_MEMORY_ZSTD_INCLUDE zstd.h)
 find_library(ROOM_MEMORY_ZSTD_LIBRARY zstd)
 if(NOT ROOM_MEMORY_ZSTD_INCLUDE OR NOT ROOM_MEMORY_ZSTD_LIBRARY)
