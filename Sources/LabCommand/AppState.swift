@@ -50,14 +50,24 @@ final class AppState: ObservableObject {
     @Published var diagnosePresented = false
     @Published var diagnoseStage: RigStage?
     @Published private(set) var lastDiagnose: RigAdvice?
-    
+
     /// Current point cloud frame for 3D canvas.
     @Published var currentFrame: PointCloudFrame?
     @Published var pointCloudColorMode: PointCloudColorMode = .height
+    /// Snapshot B in world, once a local pair has loaded.
+    @Published private(set) var snapshotMid: PointCloudFrame?
+    @Published private(set) var snapshotJT: PointCloudFrame?
+    @Published private(set) var overlayTimeline: ChangeOverlay.Timeline?
+    @Published var overlayFilter = ChangeOverlay.Filter()
+    @Published private(set) var overlayCount = 0
+    /// Configuration error or load failure. Nil while a snapshot pair is fine.
+    @Published private(set) var localFailure: String?
     /// Lidar clouds from Spark, on request only. Publishes on its own so live
     /// updates don't invalidate everything that observes AppState. Mock mode is
     /// for working without Spark — it doesn't reach for the real rig.
-    let live = FoxgloveLiveClient(isAvailable: MockMode.parseArgs() == nil)
+    let live: FoxgloveLiveClient
+    /// Launch mode. Named apart from `session`, which is the capture spec.
+    let launch: SnapshotSession
 
     private let service: ConnectivityService
     private let rigIO: RigServiceProtocol
@@ -69,11 +79,17 @@ final class AppState: ObservableObject {
     private var adoptedSensorColors = false
 
     init(
-        service: ConnectivityService = ConnectivityService(),
-        rigIO: RigServiceProtocol = MockMode.createRigService()
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        service: ConnectivityService? = nil,
+        rigIO: RigServiceProtocol? = nil
     ) {
-        self.service = service
-        self.rigIO = rigIO
+        let launch = SnapshotSession(environment: environment)
+        self.launch = launch
+        self.service = service ?? ConnectivityService()
+        self.rigIO = rigIO ?? MockMode.createRigService(isolates: launch.isolates)
+        self.live = FoxgloveLiveClient(
+            isAvailable: !launch.isolates && MockMode.parseArgs() == nil
+        )
         self.snapshot = LabStatusSnapshot(
             overall: .unknown,
             spark: .unknown,
@@ -82,14 +98,129 @@ final class AppState: ObservableObject {
             summaryLine: "—",
             refreshedAt: Date()
         )
+        if launch.isolates {
+            pointCloudColorMode = .sensor
+            autoRefreshEnabled = false
+        }
     }
 
     var health: RigConfidence { RigHealth.evaluate(rig) }
 
+    var isolatesNetwork: Bool { launch.isolates }
+
+    var localHeadline: String? {
+        guard launch.isolates else { return nil }
+        if let localFailure { return localFailure }
+        if overlayTimeline == nil { return ChangeOverlay.readingLine }
+        return ChangeOverlay.localSessionLine
+    }
+
+    var scrubberCaption: String {
+        if let localFailure { return localFailure }
+        guard let overlayTimeline else {
+            return launch.isolates ? ChangeOverlay.readingLine : ""
+        }
+        return ChangeOverlay.caption(timeline: overlayTimeline, filter: overlayFilter, count: overlayCount)
+    }
+
+    var scrubberSlider: ChangeOverlay.SliderState {
+        guard localFailure == nil, let overlayTimeline else {
+            return ChangeOverlay.slider(filteredCount: 0, count: 0)
+        }
+        let matched = ChangeOverlay.filtered(overlayTimeline, overlayFilter).count
+        return ChangeOverlay.slider(filteredCount: matched, count: overlayCount)
+    }
+
+    var scrubberChips: [ChangeOverlay.Chip] {
+        guard localFailure == nil, let overlayTimeline else { return [] }
+        return ChangeOverlay.chips(overlayTimeline)
+    }
+
+    var scrubberBefore: String {
+        ChangeOverlay.clock(overlayTimeline?.beforeStamp, missing: "A")
+    }
+
+    var scrubberAfter: String {
+        ChangeOverlay.clock(overlayTimeline?.afterStamp, missing: "B")
+    }
+
+    func overlayShows(_ kind: ChangeDetection.Kind) -> Bool {
+        overlayFilter.allows(kind)
+    }
+
+    var overlayGeometry: ChangeOverlay.Geometry {
+        guard localFailure == nil, let overlayTimeline else { return .empty }
+        let events = ChangeOverlay.revealed(timeline: overlayTimeline, filter: overlayFilter, count: overlayCount)
+        let emphasized = events.isEmpty ? nil : events.count - 1
+        return ChangeOverlay.geometry(
+            events: events,
+            transform: RigTransforms.toWorld,
+            emphasizedIndex: emphasized
+        )
+    }
+
+    func setOverlayCount(_ count: Int) {
+        guard let overlayTimeline, localFailure == nil else { return }
+        let matched = ChangeOverlay.filtered(overlayTimeline, overlayFilter).count
+        overlayCount = ChangeOverlay.clampedCount(count, filteredCount: matched)
+    }
+
+    func stepOverlay(_ delta: Int) {
+        guard launch.isolates else { return }
+        setOverlayCount(overlayCount + delta)
+    }
+
+    func setOverlayKind(_ kind: ChangeDetection.Kind, shown: Bool) {
+        overlayFilter.set(kind, shown: shown)
+        setOverlayCount(overlayCount)
+    }
+
     func start() {
+        if launch.isolates {
+            logLine(ChangeOverlay.localSessionLine)
+        }
+        switch launch.begin(rig: { [weak self] in self?.beginRig() }) {
+        case .rig:
+            break
+        case .failed(let message):
+            localFailure = message
+            logLine(message)
+        case .load(let directoryA, let directoryB):
+            Task.detached(priority: .userInitiated) { [weak self] in
+                let loaded = SnapshotFiles.load(directoryA: directoryA, directoryB: directoryB)
+                await self?.applySnapshot(loaded)
+            }
+        }
+    }
+
+    private func beginRig() {
         refresh(manual: true)
         restartTimer()
         setUpPointClouds()
+    }
+
+    private func applySnapshot(_ loaded: SnapshotLoad) {
+        switch loaded {
+        case .failure(let message):
+            localFailure = message
+            overlayTimeline = nil
+            snapshotMid = nil
+            snapshotJT = nil
+            overlayCount = 0
+            logLine(message)
+        case .ready(let clouds):
+            localFailure = nil
+            overlayTimeline = clouds.timeline
+            snapshotMid = clouds.mid
+            snapshotJT = clouds.jt
+            let matched = ChangeOverlay.filtered(clouds.timeline, overlayFilter).count
+            overlayCount = matched
+            logLine(clouds.caption)
+        }
+    }
+
+    private func logLine(_ text: String) {
+        FileHandle.standardError.write(Data((text + "\n").utf8))
     }
 
     /// The 3D canvas opens no socket on its own: the sample PCD stands in until
@@ -174,6 +305,12 @@ final class AppState: ObservableObject {
         fastTimer?.invalidate()
         slowTimer = nil
         fastTimer = nil
+        launch.restartTimer { [weak self] in
+            self?.installTimers()
+        }
+    }
+
+    private func installTimers() {
         guard autoRefreshEnabled else { return }
         slowTimer = Timer.scheduledTimer(withTimeInterval: probeIntervalSeconds, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
@@ -186,7 +323,14 @@ final class AppState: ObservableObject {
     func refresh() { refresh(manual: false) }
 
     /// Full probe: connectivity checks (slow) + a rig poll.
+    /// Snapshot mode returns before any of that.
     func refresh(manual: Bool) {
+        launch.refresh(manual: manual) { [weak self] in
+            self?.refreshOverNetwork(manual: manual)
+        }
+    }
+
+    private func refreshOverNetwork(manual: Bool) {
         task?.cancel()
         isRefreshing = true
         let svc = service
@@ -207,7 +351,14 @@ final class AppState: ObservableObject {
     }
 
     /// Fast path: just the API. Never blocks the UI on SSH.
+    /// Snapshot mode returns before the request.
     func pollRig() {
+        launch.pollRig { [weak self] in
+            self?.pollOverNetwork()
+        }
+    }
+
+    private func pollOverNetwork() {
         guard !isActing else { return }
         let io = rigIO
         let sparkWasUp = snapshot.spark == .connected || rig.sparkReachable
@@ -346,11 +497,14 @@ final class AppState: ObservableObject {
     }
 
     func stopView() {
-        rigIO.stopTunnels()
-        var next = rig
-        next.viewTunnelUp = false
-        rig = next
-        appendLog("view tunnel closed")
+        launch.runAction("stop view") { [weak self] in
+            guard let self else { return }
+            self.rigIO.stopTunnels()
+            var next = self.rig
+            next.viewTunnelUp = false
+            self.rig = next
+            self.appendLog("view tunnel closed")
+        }
     }
 
     private func runAction(
@@ -358,6 +512,17 @@ final class AppState: ObservableObject {
         kind: MissionEventKind = .info,
         work: @escaping @Sendable (RigServiceProtocol, CaptureSessionSpec) -> String?,
         after: ((Bool) -> Void)? = nil
+    ) {
+        launch.runAction(name) { [weak self] in
+            self?.runActionNow(name, kind: kind, work: work, after: after)
+        }
+    }
+
+    private func runActionNow(
+        _ name: String,
+        kind: MissionEventKind,
+        work: @escaping @Sendable (RigServiceProtocol, CaptureSessionSpec) -> String?,
+        after: ((Bool) -> Void)?
     ) {
         guard !isActing else { return }
         isActing = true
@@ -368,7 +533,7 @@ final class AppState: ObservableObject {
         let sparkWasUp = rig.sparkReachable
         Task.detached(priority: .userInitiated) {
             let err = work(io, spec)
-            Thread.sleep(forTimeInterval: 3.5)
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
             let rig = io.fetchStatus(sparkWasReachable: sparkWasUp)
             await MainActor.run {
                 self.applyRig(rig)

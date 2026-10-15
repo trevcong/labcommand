@@ -1046,6 +1046,115 @@ private func expectSameBytes(_ got: Data, _ want: Data, _ label: String) {
     expect(false, "\(label) JSON differs at byte \(index) (got \(got.count), file \(want.count))")
 }
 
+func testChangeDetectionEmptyClouds() {
+    let empty = frame([])
+    let report = must({ try ChangeDetection.compare(empty, empty) }, "empty vs empty")
+    expect(report.regions.isEmpty, "two empty clouds produce no regions")
+    expect(report.appearedVoxels == 0 && report.disappearedVoxels == 0, "no voxels changed")
+    expect(report.beforeVoxels == 0 && report.afterVoxels == 0, "both maps are empty")
+}
+
+func testChangeDetectionIdenticalClouds() {
+    let cloud = roomShell() + boxShell(center: Point3D(x: 1, y: 0.5, z: 0.30))
+    let report = must({ try ChangeDetection.compare(frame(cloud), frame(cloud)) }, "identical")
+    expect(report.regions.isEmpty, "a cloud against itself is empty")
+    expect(report.appearedVoxels == 0 && report.disappearedVoxels == 0, "no voxels changed")
+    expect(report.beforeVoxels > 0 && report.afterVoxels == report.beforeVoxels, "voxel counts match")
+}
+
+func testChangeDetectionSinglePoint() {
+    let single = [cellPoint(5, 10, 3)]
+    let added = must({ try ChangeDetection.compare(frame([]), frame(single)) }, "single point added")
+    expect(added.appearedVoxels == 1, "one voxel appeared")
+    // Default minVoxels=6 and minExtent=2 drop a single voxel.
+    expect(added.regions.isEmpty, "single point is below minVoxels 6")
+
+    var loose = ChangeDetection.Config()
+    loose.minVoxels = 1
+    loose.minExtent = 1
+    let kept = must({ try ChangeDetection.compare(frame([]), frame(single), config: loose) }, "single point kept")
+    expect(kept.regions.count == 1, "one region with loose gates")
+    expect(kept.regions[0].kind == .appeared, "it is an appearance")
+    expect(kept.regions[0].voxelCount == 1, "one voxel")
+}
+
+func testChangeDetectionNaNInfPoints() {
+    let cloud = frame([
+        Point3D(x: .nan, y: 0.1, z: 0.2),
+        Point3D(x: 0.1, y: .infinity, z: 0.2),
+        Point3D(x: 0.1, y: 0.2, z: -.infinity),
+        Point3D(x: .nan, y: .infinity, z: 0.2),
+        Point3D(x: 0.1, y: 0.2, z: 0.3),
+    ])
+    let map = must({ try ChangeDetection.occupancyMap(cloud) }, "nan/inf occupancy")
+    expect(map.droppedPoints == 4, "non-finite points drop, got \(map.droppedPoints)")
+    expect(map.acceptedPoints == 1, "one finite point accepted")
+
+    let report = must({ try ChangeDetection.compare(frame([]), cloud) }, "nan/inf compare")
+    expect(report.appearedVoxels == 1, "one voxel from the finite point")
+    expect(report.regions.isEmpty, "single voxel below minVoxels 6")
+}
+
+func testChangeDetectionAllPointsRemoved() {
+    let room = roomShell() + boxShell(center: Point3D(x: 1, y: 0.5, z: 0.30))
+    let report = must({ try ChangeDetection.compare(frame(room), frame([])) }, "all removed")
+    expect(report.appearedVoxels == 0, "nothing appeared when everything is removed")
+    expect(report.disappearedVoxels > 0, "many voxels disappeared")
+    // The room shell and box together form multiple clusters. With default minVoxels=6
+    // and minExtent=2, the room walls form one large disappeared region.
+    expect(report.regions.count >= 1, "at least one disappeared region")
+    for region in report.regions {
+        expect(region.kind == .disappeared, "all regions are disappeared")
+    }
+}
+
+func testChangeDetectionOutOfBounds() {
+    let far = Point3D(x: 60_000, y: 60_000, z: 60_000)
+    let near = Point3D(x: 1, y: 2, z: 3)
+    let cloud = frame([far, near])
+    let map = must({ try ChangeDetection.occupancyMap(cloud) }, "out-of-bounds occupancy")
+    expect(map.droppedPoints == 1, "the far point drops for exceeding VoxelKey limits")
+    expect(map.acceptedPoints == 1, "the near point is accepted")
+
+    let report = must({ try ChangeDetection.compare(frame([]), cloud) }, "out-of-bounds compare")
+    expect(report.appearedVoxels == 1, "only the near point occupies a voxel")
+    expect(report.regions.isEmpty, "single voxel below minVoxels 6")
+}
+
+func testChangeDetectionTinyUnderMinExtent() {
+    // A 2×1×1 line: two voxels in a row. minExtent=2 on the default config drops it
+    // because two axes have extent 1. Use minVoxels=1 to isolate the extent gate.
+    let tiny = [cellPoint(0, 0, 0), cellPoint(1, 0, 0)]
+    var isolate = ChangeDetection.Config()
+    isolate.minVoxels = 1
+    isolate.minExtent = 2
+    let droppedByExtent = must({ try ChangeDetection.compare(frame([]), frame(tiny), config: isolate) }, "tiny line minExtent 2")
+    expect(droppedByExtent.appearedVoxels == 2, "two voxels before the cut")
+    expect(droppedByExtent.regions.isEmpty, "a 2×1×1 line is below minExtent 2")
+
+    // With minExtent=1 the same two-voxel line is kept.
+    isolate.minExtent = 1
+    let keptByExtent = must({ try ChangeDetection.compare(frame([]), frame(tiny), config: isolate) }, "tiny line minExtent 1")
+    expect(keptByExtent.regions.count == 1, "one region with minExtent 1")
+    expect(keptByExtent.regions[0].kind == .appeared, "it is an appearance")
+    expect(keptByExtent.regions[0].voxelCount == 2, "two voxels kept")
+
+    // A 3×2×2 block: clears both minVoxels=6 and minExtent=2.
+    var block = [Point3D]()
+    for i in 0..<3 {
+        for j in 0..<2 {
+            for k in 0..<2 {
+                block.append(cellPoint(i, j, k))
+            }
+        }
+    }
+    let blockReport = must({ try ChangeDetection.compare(frame([]), frame(block)) }, "3×2×2 block")
+    expect(blockReport.appearedVoxels == 12, "twelve voxels")
+    expect(blockReport.regions.count == 1, "one region clears the gates")
+    expect(blockReport.regions[0].kind == .appeared, "it is an appearance")
+    expect(blockReport.regions[0].voxelCount == 12, "all twelve voxels kept")
+}
+
 func testChangeDetectionSnapshotGoldens() -> (jt128: ChangeDetection.Report, mid360: ChangeDetection.Report, jt128ms: Double, mid360ms: Double) {
     func load(_ name: String) -> Data {
         let path = "Tests/Fixtures/change-detection/\(name)"
@@ -1089,6 +1198,20 @@ func testChangeDetectionSnapshotGoldens() -> (jt128: ChangeDetection.Report, mid
 func runChangeDetectionTests() {
     testChangeDetectionKeyMath()
     print("  ChangeDetection: pack/unpack round-trips; floor quantization; non-finite points drop"); passed()
+    testChangeDetectionEmptyClouds()
+    print("  ChangeDetection: two empty clouds produce no regions"); passed()
+    testChangeDetectionIdenticalClouds()
+    print("  ChangeDetection: a cloud against itself is empty"); passed()
+    testChangeDetectionSinglePoint()
+    print("  ChangeDetection: a single point is below minVoxels, kept with loose gates"); passed()
+    testChangeDetectionNaNInfPoints()
+    print("  ChangeDetection: NaN and infinity points drop, finite point accepted"); passed()
+    testChangeDetectionAllPointsRemoved()
+    print("  ChangeDetection: removing everything produces disappeared regions"); passed()
+    testChangeDetectionOutOfBounds()
+    print("  ChangeDetection: out-of-limit points drop for exceeding VoxelKey limits"); passed()
+    testChangeDetectionTinyUnderMinExtent()
+    print("  ChangeDetection: a 2×1×1 line drops; a 3×2×2 block clears the gates"); passed()
     testChangeDetectionVoxelSize()
     print("  ChangeDetection: a coarser voxel occupies fewer keys, and a rebuild matches"); passed()
     testChangeDetectionRangeAndMinPoints()
