@@ -762,8 +762,8 @@ Each stage has an owner, go/no-go criteria and a rollback.
 | **S6** soak and product bar | 7-day soak; PR 3.2 scripted sessions | Trevor, Claude Code | §7.5 passes all week; PR 3.2 bar met (Q2, Q3) | stay at S5 and fix; memory mode stays opt-in |
 
 **Spark data rollback.**
-- Before a re-reference, the node renames the current `reference-*.cdr` to `reference-*.<epoch>.cdr`, keeping the last 5.
-- Restoring one is a rename and a node restart. The restart is a new generation, so every Mac resyncs (protocol §5's `seq` rule).
+- Before a re-reference, the node renames the current `reference.cdr` (§2.3) to `reference.<epoch>.cdr`, keeping the last 5. Until the migration of §2.3, the per-sensor `reference-<sensor>.cdr` files are renamed together, to `reference-<sensor>.<epoch>.cdr`.
+- Restoring one is a rename and a node restart. The room's `map_epoch` file is not rolled back, so the restored reference loads under the next epoch (protocol §5). The restart is a new generation, so every Mac resyncs (protocol §5's `seq` rule).
 
 ## 10. Proposed amendments (for Trevor and Codex)
 
