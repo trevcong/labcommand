@@ -71,6 +71,8 @@ public struct LiveRoomActivity: Sendable, Equatable {
     public var rejected = 0
     public var duplicates = 0
     public var gaps = 0
+    /// Event histories cut off by a publisher restart, which only status evidence signals.
+    public var historyCuts = 0
     /// Messages for another `room_id`, ignored.
     public var foreignRoom = 0
     public var requestsSent = 0
@@ -199,7 +201,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         var topStamp: RoomMemory.Time
     }
 
-    /// What each received seq carried, to tell a late copy from a restart reusing the seq.
+    /// What each received seq carried, to tell a late copy from out-of-order delivery.
     private struct Transition: Sendable, Equatable {
         var eventId: UInt64
         var state: RoomMemory.ChangeEvent.State
@@ -226,7 +228,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     private var eventsInitialSync = false
     /// Newest message on the events sync topic, for the settle window.
     private var lastSyncEventAt: TimeInterval?
-    /// Bumped when the node restarts; per-event seq order holds only within one generation.
+    /// Bumped when status evidence shows the node restarted; per-event seq order holds only within
+    /// one generation.
     private var eventsGeneration = 0
     private var eventGeneration: [UInt64: Int] = [:]
 
@@ -524,43 +527,22 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             return
         }
         if seq <= base || eventsAhead[seq] != nil {
-            // A seq this generation already carried, with the same transition, is a late copy (a
-            // replay overtook the live topic): never roll the event back. The same seq with another
-            // transition is a publisher restart reusing it.
-            let duplicate: Bool
-            if let seen = transitions[seq] {
-                duplicate = seen == Transition(eventId: message.eventId, state: message.state)
-            } else if let held = eventsById[message.eventId], eventGeneration[message.eventId] == eventsGeneration {
-                if held.seq > seq {
-                    // Older than the event's latest transition (a partial replay delivered the later
-                    // one first): out-of-order delivery. It fills the coverage, never rolls the event
-                    // back, and proves no restart.
-                    record(message, at: now, fromSync: false)
-                    noteReceived(message)
-                    return
-                }
-                duplicate = held.seq == seq && held.event.state == message.state
-            } else {
-                duplicate = false
-            }
-            if duplicate {
+            // Already passed or held: out-of-order delivery (a replay overtook the live topic), never
+            // a restart, whatever its event. A seq already carrying this transition is a late copy;
+            // any other fills the coverage. Neither moves the baseline or rolls an event back. Only
+            // status evidence starts a new generation.
+            if transitions[seq] == Transition(eventId: message.eventId, state: message.state) {
                 activity.duplicates += 1
                 return
             }
+            record(message, at: now, fromSync: false)
+            noteReceived(message)
+            return
         }
         activity.gaps += 1
-        if seq <= base {
-            // A lower seq that is no late copy: the node restarted. A new generation starts here.
-            eventsGeneration += 1
-            cutHistory()
-        }
         record(message, at: now, fromSync: false)
         noteReceived(message)
-        if seq <= base {
-            highestLiveEventsSeq = seq
-            eventsAhead = [:]
-            moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
-        } else if canRequest {
+        if canRequest {
             // Hold the baseline so the replay can fill the gap; remember what is already here.
             holdAhead(seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
         } else {
@@ -636,9 +618,11 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         receivedSpans.remove(at: receivedSpans.first?.low == 0 ? 1 : 0)
     }
 
-    /// A new publisher generation: coverage starts again at nothing. If the old one held or named
-    /// any event, its unseen tail is lost for good.
+    /// A new publisher generation, reached only from status evidence (a status seq reset, or
+    /// `events_seq` below the baseline twice): coverage starts again at nothing. If the old one held
+    /// or named any event, its unseen tail is lost for good.
     private mutating func cutHistory() {
+        activity.historyCuts += 1
         if !receivedSpans.isEmpty || eventsHighWater != nil, !historyCut {
             if case .incomplete(let since) = eventsState {
                 historyCutSince = since

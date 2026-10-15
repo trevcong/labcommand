@@ -507,10 +507,17 @@ func testLiveRoomEvents() {
     expect(mirror.eventsById[3]?.event.state == .expired, "older replayed transition does not overwrite a newer one")
     expect(mirror.eventsSeq == 7 && mirror.eventsState == .complete, "gap 6 replayed: complete")
 
-    // Node restart: seq drops. New generation, history incomplete for good.
+    // A live seq drop alone is out-of-order delivery, not a restart: nothing rolls back or is cut.
     _ = mirror.receive(topic: .events, payload: event(id: 3, seq: 0, state: .candidate), at: 210)
-    expect(mirror.eventsSeq == 0 && mirror.eventsById[3]?.event.state == .candidate, "restart: new generation applies")
-    expect(mirror.eventsState != .complete, "restart leaves the history incomplete")
+    expect(mirror.eventsSeq == 7 && mirror.eventsById[3]?.event.state == .expired, "live seq drop: no rollback, baseline stays")
+    expect(mirror.eventsState == .complete && mirror.activity.historyCuts == 0, "live seq drop: no cut")
+
+    // Node restart: the status seq drops. New generation, history incomplete for good.
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 9, eventsSeq: 7), at: 211)
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 0, eventsSeq: 0), at: 212)
+    _ = mirror.receive(topic: .events, payload: event(id: 3, seq: 1, state: .candidate), at: 213)
+    expect(mirror.eventsSeq == 1 && mirror.eventsById[3]?.event.state == .candidate, "restart: new generation applies")
+    expect(mirror.eventsState != .complete && mirror.activity.historyCuts == 1, "restart leaves the history incomplete")
 
     // The ring is bounded.
     var ring = currentMirror(canRequest: false)
@@ -867,11 +874,11 @@ func testLiveRoomDelayedLiveTransitionIsDuplicate() {
     expect(mirror.eventsSeq == 3 && mirror.eventsById[1]?.event.state == .expired && mirror.eventsState == .complete,
            "live seq 3 chains on: complete")
 
-    // A seen seq with another transition is still a restart reusing it.
-    var restart = mirror
-    _ = restart.receive(topic: .events, payload: event(id: 1, seq: 1, state: .reverted), at: 202)
-    expect(restart.eventsSeq == 1 && restart.eventsById[1]?.event.state == .reverted, "another transition at seq 1: new generation applies")
-    expect(restart.eventsState != .complete, "restart at a reused seq leaves the history incomplete")
+    // A seen seq with another transition is no restart either: only status evidence is.
+    var reused = mirror
+    _ = reused.receive(topic: .events, payload: event(id: 1, seq: 1, state: .reverted), at: 202)
+    expect(reused.eventsSeq == 3 && reused.eventsById[1]?.event.state == .expired, "another transition at seq 1: no rollback, baseline stays")
+    expect(reused.eventsState == .complete && reused.activity.historyCuts == 0, "another transition at seq 1: no cut")
 
     // And a status seq reset still starts a new generation.
     var reset = mirror
@@ -1046,6 +1053,147 @@ func testLiveRoomHistoryInvariantProperty() {
     expect(runsCompleteMidway >= 25, "the property is not vacuous: \(runsCompleteMidway) runs read complete midway")
 }
 
+/// Codex P2: a partial replay delivers event 2 at seq 1; the live topic then delivers event 1 at
+/// seq 0, late. A lower seq from another event is out-of-order delivery, never a restart: only
+/// status evidence cuts the history.
+func testLiveRoomLowerSeqFromAnotherEventIsNoRestart() {
+    var mirror = Mirror(roomId: "lab")
+    let opened = mirror.connectionOpened(at: 100, canRequest: true)
+    expect(request(opened, .events, "other event connect")?.since == nil, "connect asks for events since NONE")
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 2, seq: 1, state: .candidate), at: 101)
+    expect(mirror.eventsSeq == 1 && mirror.eventsById[2]?.event.state == .candidate, "partial replay: event 2 at 1")
+
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 0, state: .candidate), at: 101.5)
+    expect(mirror.activity.historyCuts == 0, "a lower seq from another event cuts nothing, got \(mirror.activity.historyCuts) cuts")
+    expect(mirror.eventsSeq == 1 && mirror.eventsById[1]?.event.state == .candidate && mirror.eventsById[2]?.event.state == .candidate,
+           "delayed live event 1 at seq 0 applies; event 2 and the baseline stay")
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 1), at: 102)
+    expect(mirror.eventsState == .complete, "0–1 held, status 1: complete, got \(mirror.eventsState)")
+    _ = mirror.tick(at: 101 + Mirror.syncSettle + 1)
+    expect(request(mirror.tick(at: 200), .events, "other event resolved") == nil, "events request resolved")
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 2, state: .confirmed), at: 201)
+    expect(mirror.eventsSeq == 2 && mirror.eventsById[1]?.event.state == .confirmed && mirror.eventsState == .complete,
+           "live seq 2 chains on: complete")
+
+    // A status seq reset still starts a new generation.
+    var reset = mirror
+    _ = reset.receive(topic: .status, payload: status(epoch: 5, seq: 0, eventsSeq: 0), at: 202)
+    expect(reset.activity.historyCuts == 1 && reset.eventsState != .complete && reset.eventsSeq == nil,
+           "status seq reset: one cut, new generation, incomplete")
+}
+
+/// Random interleavings of live, sync and duplicate deliveries over several events, with statuses
+/// between them: the history is cut only on a status step that resets the status seq. No event
+/// message, at any seq or from any event id, cuts it or rolls an event back.
+func testLiveRoomOnlyStatusCutsHistoryProperty() {
+    let lifecycle: [R.ChangeEvent.State] = [.candidate, .confirmed, .accepted]
+    var lowerFromOtherEvent = 0
+    var restartRuns = 0
+    for seed in UInt64(1)...300 {
+        var rng = SplitMix64(seed: seed &* 0xD1B5_4A32)
+        func below(_ n: Int) -> Int { Int(rng.next() % UInt64(n)) }
+        func chance(_ p: Double) -> Bool { rng.unit() < p }
+
+        // What the publisher sends, one transition per seq, across a few events at once.
+        var plan: [(id: UInt64, state: R.ChangeEvent.State)] = []
+        var progress: [UInt64: Int] = [:]
+        var nextId: UInt64 = 1
+        for _ in 0..<(6 + below(14)) {
+            let open = progress.filter { $0.value < lifecycle.count }.keys.sorted()
+            let id: UInt64
+            if open.count < 2 || chance(0.25) {
+                id = nextId
+                nextId += 1
+            } else {
+                id = open[below(open.count)]
+            }
+            plan.append((id, lifecycle[progress[id, default: 0]]))
+            progress[id, default: 0] += 1
+        }
+
+        // Every seq arrives live at least once; some also on sync or twice, each displaced in time.
+        let spread = Double(1 + below(6))
+        var deliveries: [(at: Double, seq: UInt64, sync: Bool)] = []
+        for seq in plan.indices {
+            deliveries.append((Double(seq) + rng.unit() * spread, UInt64(seq), false))
+            if chance(0.6) { deliveries.append((Double(seq) + rng.unit() * spread, UInt64(seq), true)) }
+            if chance(0.15) { deliveries.append((Double(seq) + rng.unit() * spread, UInt64(seq), false)) }
+        }
+        deliveries.sort { $0.at < $1.at }
+        let restartAt = chance(0.3) ? below(deliveries.count) : nil
+
+        var mirror = Mirror(roomId: "lab")
+        var now: TimeInterval = 0
+        _ = mirror.connectionOpened(at: now, canRequest: true)
+        var statusSeq: UInt64 = 0
+        var restarted = false
+        // The restart cut off a history that held or named an event: it never reads complete again.
+        var cutHeldSomething = false
+        var topDelivered: UInt64?
+        var heldSeq: [UInt64: UInt64] = [:]
+        var trace: [String] = []
+
+        func sendStatus(reset: Bool) {
+            statusSeq = reset ? 0 : statusSeq + 1
+            let cuts = mirror.activity.historyCuts
+            _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: statusSeq, eventsSeq: topDelivered), at: now)
+            trace.append(reset ? "RESET" : "st\(topDelivered.map(String.init) ?? "-")")
+            let expected = cuts + (reset ? 1 : 0)
+            expect(mirror.activity.historyCuts == expected,
+                   "seed \(seed): status \(reset ? "reset" : "step") made \(mirror.activity.historyCuts - cuts) cuts; trace \(trace.suffix(25).joined(separator: " "))")
+        }
+
+        for (index, delivery) in deliveries.enumerated() {
+            now += 0.05
+            if index == restartAt {
+                if statusSeq == 0 { sendStatus(reset: false) }
+                cutHeldSomething = topDelivered != nil
+                sendStatus(reset: true)
+                restarted = true
+                restartRuns += 1
+            } else if chance(0.3) {
+                sendStatus(reset: false)
+            }
+            let seq = delivery.seq
+            let (id, state) = plan[Int(seq)]
+            if !delivery.sync, let top = topDelivered, seq < top, plan[Int(top)].id != id {
+                lowerFromOtherEvent += 1
+            }
+            let cuts = mirror.activity.historyCuts
+            _ = mirror.receive(topic: delivery.sync ? .syncEvents : .events, payload: event(id: id, seq: seq, state: state), at: now)
+            trace.append("\(delivery.sync ? "sy" : "lv")\(seq)#\(id)")
+            topDelivered = max(topDelivered ?? seq, seq)
+            expect(mirror.activity.historyCuts == cuts,
+                   "seed \(seed): an event message made \(mirror.activity.historyCuts - cuts) cuts; trace \(trace.suffix(25).joined(separator: " "))")
+            guard !restarted else { continue }
+            // Never rolled back: each event holds a seq at least as new as before and as its newest live one.
+            for (heldId, held) in mirror.eventsById {
+                let floor = max(heldSeq[heldId] ?? 0, delivery.sync || heldId != id ? 0 : seq)
+                expect(held.seq >= floor && held.event.state == plan[Int(held.seq)].state,
+                       "seed \(seed): event \(heldId) at seq \(held.seq) \(held.event.state), floor \(floor); trace \(trace.suffix(25).joined(separator: " "))")
+                heldSeq[heldId] = held.seq
+            }
+        }
+        now += 0.05
+        sendStatus(reset: false)
+
+        if restarted {
+            expect(mirror.activity.historyCuts == 1 && (mirror.eventsState != .complete) == cutHeldSomething,
+                   "seed \(seed): one status reset: \(mirror.activity.historyCuts) cuts, \(mirror.eventsState)")
+        } else {
+            expect(mirror.activity.historyCuts == 0 && mirror.eventsState == .complete,
+                   "seed \(seed): no restart evidence: \(mirror.activity.historyCuts) cuts, \(mirror.eventsState); trace \(trace.suffix(25).joined(separator: " "))")
+            for (id, _) in progress {
+                let last = plan.lastIndex { $0.id == id }!
+                expect(mirror.eventsById[id]?.seq == UInt64(last) && mirror.eventsById[id]?.event.state == plan[last].state,
+                       "seed \(seed): event \(id) ends at its newest transition (seq \(last))")
+            }
+        }
+    }
+    expect(lowerFromOtherEvent >= 200, "the property is not vacuous: \(lowerFromOtherEvent) lower live seqs from another event")
+    expect(restartRuns >= 40, "restart runs exercised: \(restartRuns)")
+}
+
 func runLiveRoomTests() {
     testLiveRoomFoxgloveClientFrames()
     print("  LiveRoom: serverInfo capabilities, client advertise + message data, topic/schema match"); passed()
@@ -1062,7 +1210,7 @@ func runLiveRoomTests() {
     testLiveRoomReconnect()
     print("  LiveRoom: close → STALE, reconnect requests both topics, delta-first stays stale, 3 s status freshness"); passed()
     testLiveRoomEvents()
-    print("  LiveRoom: events ring, duplicates, gap → incomplete + RequestSync, replay closes it, restart generation"); passed()
+    print("  LiveRoom: events ring, duplicates, gap → incomplete + RequestSync, replay closes it, live seq drop is no restart, status reset is"); passed()
     testLiveRoomEventsSeqGap()
     print("  LiveRoom: status events_seq unreached on the next status → RequestSync(events); replay to the mark"); passed()
     testLiveRoomReplayAndFallbackEdges()
@@ -1072,11 +1220,15 @@ func runLiveRoomTests() {
     testLiveRoomOutstandingSyncHidesNothing()
     print("  LiveRoom: an outstanding events request hides no missing seq; settle and retry stay incomplete until 1–2 arrive"); passed()
     testLiveRoomDelayedLiveTransitionIsDuplicate()
-    print("  LiveRoom: a replay overtaking live delivery: delayed live transitions are duplicates, never roll back; reused seq or status reset still restarts"); passed()
+    print("  LiveRoom: a replay overtaking live delivery: delayed live transitions are duplicates, never roll back; a reused seq cuts nothing, a status reset still restarts"); passed()
     testLiveRoomOlderTransitionIsOutOfOrder()
     print("  LiveRoom: a partial replay then an older live transition: out-of-order, no rollback, no cut; status reset still restarts"); passed()
     testLiveRoomHistoryInvariantProperty()
     print("  LiveRoom: random live/sync/status/reconnect/settle runs never read complete with a seq missing; full replay converges"); passed()
+    testLiveRoomLowerSeqFromAnotherEventIsNoRestart()
+    print("  LiveRoom: a partial replay then a lower live seq from another event: out-of-order, no cut; complete once a status confirms"); passed()
+    testLiveRoomOnlyStatusCutsHistoryProperty()
+    print("  LiveRoom: random multi-event live/sync/duplicate interleavings: only a status reset cuts the history, no event rolls back"); passed()
 }
 
 /// `swift run LabCommandCoreTestsRunner live-room-probe [seconds] [ws://host:port]`: connects a read-only

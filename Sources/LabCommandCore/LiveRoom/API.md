@@ -108,6 +108,7 @@ Nil means not measured. Never render a nil as 0.
 - `topics: [String: TopicActivity]`, with `TopicActivity { count: Int, lastAt: TimeInterval }` per topic
 - `rejected`: undecodable or invalid messages, dropped whole
 - `duplicates`, `gaps`, `foreignRoom`: counts
+- `historyCuts`: events histories cut by a publisher restart (status evidence only)
 - `requestsSent`, `requestsUnsent`: unsent means no request path
 - `lastRequest: RoomMemory.RequestSync?`
 
@@ -123,12 +124,11 @@ but only while `isStatusFresh`. Otherwise "STALE · age".
   So does **epoch change**: `status.map_epoch ≠ mapEpoch` on 2 consecutive statuses with no map
   applied between them (D20). A duplicate (`seq ≤ mapSeq` and `epoch ≤ mapEpoch`) is counted and ignored.
 - **Events.** `seq == eventsSeq + 1` applies. A duplicate is counted: a seq already received in this
-  generation with the same `event_id` and state (a live copy a replay overtook) never rolls the
-  event back. A live seq older than its event's latest seq in this generation is out-of-order
-  delivery (a partial replay delivered the later one first): it fills the coverage, never rolls the
-  event back, and never cuts the history. A live seq at or below the baseline that carries another
-  transition is a restart.
-  Any other seq is a gap: the list goes incomplete and requests
+  generation with the same `event_id` and state (a live copy a replay overtook). Any other live seq
+  at or below the baseline, from any event, is out-of-order delivery: it fills the coverage, never
+  moves the baseline, never rolls an event back, and never cuts the history. No event message
+  signals a restart; only status evidence does (see **Node restart**).
+  Any other seq above the baseline is a gap: the list goes incomplete and requests
   `RequestSync{events, since: (epoch, eventsSeq)}`. So does an
   **events_seq gap**: a status `events_seq` above the baseline that the next status still finds
   unreached. An event's state changes only on a message with a higher seq than the last one applied to it.
