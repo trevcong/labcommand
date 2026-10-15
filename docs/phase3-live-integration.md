@@ -656,7 +656,7 @@ When several conditions hold at once, the banner shows the first that applies:
   - ACCEPT while the bucket holds a delta: the event stays CONFIRMED with its overlay until the delta arrives, then ACCEPTED removes the overlay. An ACCEPTED that arrives before its delta keeps the region outlined "accepted · map updating".
 - **Fault-injection property test.**
   - Take a session trace.
-  - Apply a seeded random schedule of: drop; duplicate; reorder within 10; truncate one message; reconnect with `seq` continuing; node restart (`seq` reset, same epoch); epoch jump; wrong `room_id`; fallback answers; lost, late or foreign fallback headers; snapshot answers meant for another Mac; a relay that fails.
+  - Apply a seeded random schedule of: drop; duplicate; reorder within 10; truncate one message; reconnect with `seq` continuing; node restart (`seq` reset, `map_epoch` + 1, as the node does with its state directory, protocol §5); an old snapshot answer arriving after a restart was recognized (the new snapshot must replace it, epoch first); an old `status` or live message arriving after the reset (one more, spurious, new generation that recovers); epoch jump; wrong `room_id`; fallback answers; lost, late or foreign fallback headers; snapshot answers meant for another Mac; a relay that fails.
   - Run 10,000 schedules, and assert §5.5's invariants 1–6 after every step.
   - Once faults stop, assert the mirror reaches CURRENT within a bounded number of requests.
   - The oracle is the trace's own state at each `seq`.
