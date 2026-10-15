@@ -936,6 +936,17 @@ def test_a_still_residue_beyond_the_gate_is_reported():
     assert run_tracker(tracker, [[region("disappeared", block(0))]] * 41) == [39]
 
 
+def test_a_run_restarted_after_a_stale_window_takes_a_new_anchor():
+    """Codex P2 (round 2): a fresh window after a stale one counted on from the last run's anchor,
+    so blocks alternating at x=0 and x=2 (each within 1 voxel of the old x=1 block, not of each
+    other) promoted after 40 windows without being activity. The restart now anchors on its own window."""
+    tracker = CandidateTracker(40, 1, 1, 20, 0.9)
+    windows = [[region("appeared", block(1))]] * 2 + [[region("appeared", block(2 * (n % 2)))] for n in range(50)]
+    fresh = [[True], [False]] + [[True]] * 50
+    assert run_tracker(tracker, windows, fresh) == []
+    assert tracker.activity == [0] and tracker.pending[0].windows == 1
+
+
 def test_an_edge_that_flickers_keeps_the_shape():
     """Sparse returns at range: a voxel or two of the boundary comes and goes (at least 90 %
     within tolerance), and a small fragment off its edge joins it instead of being motion."""

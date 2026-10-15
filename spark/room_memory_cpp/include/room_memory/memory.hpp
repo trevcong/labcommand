@@ -166,8 +166,8 @@ std::int64_t box_gap(const Box& a, const Box& b);
 // A pending entry's run counts the windows since it last settled. A window whose own evidence
 // does not support it (`fresh`) sets the run to 0. A fresh window whose voxels keep the run's
 // shape (each pose against its own anchor: at least `stable_fraction` of the voxels of each within
-// `tolerance` voxels of the other) adds 1; one that does not (or a new entry) starts a new run at
-// 1 with itself as anchor, and its regions are activity. Then, with `radius`, an entry that has an activity region other than its own within
+// `tolerance` voxels of the other) adds 1 (from 0, it becomes the anchor of the new run); one that
+// does not (or a new entry) starts a new run at 1 with itself as anchor, and its regions are activity. Then, with `radius`, an entry that has an activity region other than its own within
 // `radius` voxels (box gap, either pose) sets its run to 0: a change next to motion only counts
 // once the motion has settled. No `tolerance` skips the shape check, no `radius` the activity
 // check. Last, every entry whose run reached `candidate_windows` becomes a CANDIDATE (and gets its
@@ -617,6 +617,10 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
         } else if (!step.started && (!tolerance_ || (same_shape(step.pose, entry.anchor, *tolerance_, stable_fraction_) &&
                                                       same_shape(step.from_pose, entry.anchor_from, *tolerance_,
                                                                  stable_fraction_)))) {
+            if (entry.windows == 0) {  // the run restarts here: anchor it to this window, not the last run
+                entry.anchor = step.pose;
+                entry.anchor_from = step.from_pose;
+            }
             ++entry.windows;
         } else {
             entry.windows = 1;

@@ -466,8 +466,9 @@ class CandidateTracker:
     A pending entry's *run* counts the windows since it last settled. A window whose own evidence
     does not support it (``fresh``) sets the run to 0. A fresh window whose voxels keep the run's
     shape (each pose against its own anchor: at least ``stable_fraction`` of the voxels of each
-    within ``tolerance`` voxels of the other) adds 1; one that does not (or a new entry) starts a
-    new run at 1 with itself as anchor, and its regions are *activity*. Then, with ``radius``, an entry that has an activity region other than
+    within ``tolerance`` voxels of the other) adds 1 (from 0, it becomes the anchor of the new run);
+    one that does not (or a new entry) starts a new run at 1 with itself as anchor, and its regions
+    are *activity*. Then, with ``radius``, an entry that has an activity region other than
     its own within ``radius`` voxels (box gap, either pose) sets its run to 0: a change next to
     motion only counts once the motion has settled. ``tolerance`` None skips the shape check,
     ``radius`` None the activity check. Last, every entry whose run reached ``candidate_windows``
@@ -635,6 +636,8 @@ class CandidateTracker:
             elif id(entry) not in new_entries and (
                     self.tolerance is None or (_same_shape(new, entry.anchor, self.tolerance, self.stable_fraction)
                                                and _same_shape(old, entry.anchor_from, self.tolerance, self.stable_fraction))):
+                if entry.windows == 0:  # the run restarts here: anchor it to this window, not the last run
+                    entry.anchor, entry.anchor_from = new, old
                 entry.windows += 1
             else:
                 entry.windows, entry.anchor, entry.anchor_from = 1, new, old

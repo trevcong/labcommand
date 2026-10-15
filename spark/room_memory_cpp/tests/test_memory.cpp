@@ -1317,6 +1317,22 @@ TEST(a_still_residue_beyond_the_gate_is_reported) {
     CHECK((run_tracker(tracker, windows) == std::vector<int>{39}));
 }
 
+// Codex P2 (round 2): a fresh window after a stale one counted on from the last run's anchor, so
+// blocks alternating at x=0 and x=2 (each within 1 voxel of the old x=1 block, not of each other)
+// promoted after 40 windows without being activity. The restart now anchors on its own window.
+TEST(a_run_restarted_after_a_stale_window_takes_a_new_anchor) {
+    CandidateTracker tracker(40, 1, 1, 20, 0.9);
+    Windows windows = {std::vector<Region>{region_of(Region::Kind::appeared, block(1))},
+                       std::vector<Region>{region_of(Region::Kind::appeared, block(1))}};
+    std::vector<std::vector<bool>> fresh = {{true}, {false}};
+    for (int n = 0; n < 50; ++n) {
+        windows.push_back(std::vector<Region>{region_of(Region::Kind::appeared, block(2 * (n % 2)))});
+        fresh.push_back({true});
+    }
+    CHECK(run_tracker(tracker, windows, fresh).empty());
+    CHECK((tracker.activity() == std::vector<std::size_t>{0}) && tracker.pending()[0].windows == 1);
+}
+
 // Sparse returns at range: a voxel or two of the boundary comes and goes, and a small fragment off
 // its edge joins it instead of being motion.
 TEST(an_edge_that_flickers_keeps_the_shape) {
