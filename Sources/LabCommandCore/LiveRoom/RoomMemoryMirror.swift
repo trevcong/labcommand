@@ -186,7 +186,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     private var eventsInitialSync = false
     /// Seqs the initial answer brought, to tell a full history from a bounded fallback.
     private var initialSyncSeqs: Set<UInt64> = []
-    /// A live event started the baseline at this seq: the initial answer must replay every seq below it.
+    /// The baseline started at this seq while the initial answer was owed: that answer must replay every seq below it.
     private var initialHistoryBelow: UInt64?
     /// Newest message on the events sync topic, for the settle window.
     private var lastSyncEventAt: TimeInterval?
@@ -481,10 +481,6 @@ public struct RoomMemoryMirror: Sendable, Equatable {
                 // Seqs start at 0 per publisher: events before this one exist and are not held.
                 // That holds whether or not the connect request is already out; its answer clears it.
                 if canRequest {
-                    if eventsState == .complete {
-                        eventsState = .incomplete(since: nil)
-                    }
-                    initialHistoryBelow = seq
                     if !eventsInitialSync {
                         eventsInitialSync = true
                         needEvents()
@@ -493,6 +489,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
                     loseEventsHistory()
                 }
             }
+            requireHistory(below: seq)
             resolveEventsIfDone()
             return
         }
@@ -544,6 +541,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         guard let base = eventsSeq else {
             record(message, at: now, fromSync: true)
             moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
+            requireHistory(below: seq)
             return
         }
         if seq <= base {
@@ -561,6 +559,18 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             holdAhead(seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
         }
         resolveEventsIfDone()
+    }
+
+    /// The baseline just started at `seq`. While the initial answer is owed, that answer must
+    /// replay every seq below it, whichever topic (or the status that opened the request) led here,
+    /// and until it does the history is incomplete. The bound outlives a reconnect: the seqs
+    /// counted before it are forgotten, the baseline is not.
+    private mutating func requireHistory(below seq: UInt64) {
+        guard eventsInitialSync else { return }
+        initialHistoryBelow = seq
+        if seq != 0, eventsState == .complete {
+            eventsState = .incomplete(since: nil)
+        }
     }
 
     private mutating func moveBaseline(to seq: UInt64, epoch: UInt64, stamp: RoomMemory.Time) {

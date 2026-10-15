@@ -759,6 +759,55 @@ func testLiveRoomGenerationsAndPartialHistory() {
     _ = partial.tick(at: 7.5)
     expect(partial.eventsState != .complete, "a later status matching 101 does not complete it either")
 
+    // Sync 101 first sets the baseline, then a reconnect before the replay settles, then only
+    // 0–50: 51–100 are still missing, whichever path started the baseline.
+    var syncFirst = Mirror(roomId: "lab")
+    _ = syncFirst.connectionOpened(at: 0, canRequest: true)
+    _ = syncFirst.receive(topic: .syncEvents, payload: event(id: 101, seq: 101, state: .reverted), at: 1)
+    expect(syncFirst.eventsState == .incomplete(since: nil), "sync 101 ahead of 0–100: incomplete, got \(syncFirst.eventsState)")
+    syncFirst.connectionClosed(at: 2)
+    _ = syncFirst.connectionOpened(at: 10, canRequest: true)
+    for seq in UInt64(0)...50 {
+        _ = syncFirst.receive(topic: .syncEvents, payload: event(id: seq, seq: seq, state: .reverted), at: 11)
+    }
+    _ = syncFirst.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 101), at: 11)
+    _ = syncFirst.tick(at: 13.5)
+    expect(syncFirst.eventsSeq == 101 && syncFirst.eventsState != .complete,
+           "sync 101 then a reconnect and only 0–50: incomplete, got \(syncFirst.eventsState)")
+    _ = syncFirst.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 101), at: 14)
+    _ = syncFirst.tick(at: 16.5)
+    expect(syncFirst.eventsState != .complete, "a later status matching 101 does not complete it either")
+    var syncFull = Mirror(roomId: "lab")
+    _ = syncFull.connectionOpened(at: 0, canRequest: true)
+    _ = syncFull.receive(topic: .syncEvents, payload: event(id: 101, seq: 101, state: .reverted), at: 1)
+    syncFull.connectionClosed(at: 2)
+    _ = syncFull.connectionOpened(at: 10, canRequest: true)
+    for seq in UInt64(0)...101 {
+        _ = syncFull.receive(topic: .syncEvents, payload: event(id: seq, seq: seq, state: .reverted), at: 11)
+    }
+    _ = syncFull.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 101), at: 11)
+    _ = syncFull.tick(at: 13.5)
+    expect(syncFull.eventsState == .complete, "the replay after the reconnect covers 0–101: complete, got \(syncFull.eventsState)")
+
+    // A status opened the request (the Spark had published nothing before): the baseline the
+    // answer starts still has to be covered after a reconnect.
+    var statusFirst = Mirror(roomId: "lab")
+    _ = statusFirst.connectionOpened(at: 0, canRequest: true)
+    _ = statusFirst.receive(topic: .status, payload: status(epoch: 5, seq: 1), at: 0)
+    _ = statusFirst.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 101), at: 6)
+    let reasked = statusFirst.receive(topic: .status, payload: status(epoch: 5, seq: 3, eventsSeq: 101), at: 7)
+    expect(request(reasked, .events, "status names events")?.since == nil, "events named twice, none held: asks since NONE")
+    _ = statusFirst.receive(topic: .syncEvents, payload: event(id: 101, seq: 101, state: .reverted), at: 8)
+    statusFirst.connectionClosed(at: 9)
+    _ = statusFirst.connectionOpened(at: 20, canRequest: true)
+    for seq in UInt64(0)...50 {
+        _ = statusFirst.receive(topic: .syncEvents, payload: event(id: seq, seq: seq, state: .reverted), at: 21)
+    }
+    _ = statusFirst.receive(topic: .status, payload: status(epoch: 5, seq: 4, eventsSeq: 101), at: 21)
+    _ = statusFirst.tick(at: 23.5)
+    expect(statusFirst.eventsSeq == 101 && statusFirst.eventsState != .complete,
+           "status-opened request, sync 101, reconnect, only 0–50: incomplete, got \(statusFirst.eventsState)")
+
     // An unreadable map payload: bricks kept, map stale, resync requested.
     var bad = currentMirror()
     let good = delta(epoch: 6, seq: 11, base: 5, [])
