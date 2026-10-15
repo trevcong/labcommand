@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "status": "complete",
+  "backend": "python",
+  "replay": {
+    "duration": 600,
+    "points": 80000,
+    "seed": 7,
+    "noise_m": 0.01
+  },
+  "memory_config": {
+    "sensors": [
+      "jt128",
+      "mid360"
+    ],
+    "voxel_size": 0.05,
+    "max_range": 15.0,
+    "tolerance": 1,
+    "min_voxels": 6,
+    "min_extent": 2,
+    "window_s": 1.0,
+    "reference_windows": 5,
+    "recent_windows": 1,
+    "state_dir": null
+  },
+  "created_utc": "2026-10-14T21:02:25.376556+00:00",
+  "environment": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "python": "3.9.6",
+    "numpy": "2.0.2"
+  },
+  "rss_sample_interval_s": 10,
+  "matching": {
+    "window_s": 10,
+    "bbox_padding_m": 0.1,
+    "min_iou": 0.05,
+    "source_distance_m": 0.5,
+    "unit": "per-sensor candidate"
+  },
+  "ticks": 6000,
+  "tick_ms": {
+    "p50": 0.00641700000869605,
+    "p95": 848.3585145500371,
+    "p99": 1205.7350837499932,
+    "max": 1648.171417
+  },
+  "closing_tick_ms": {
+    "p50": 848.3957704999909,
+    "p95": 1238.1480777500285,
+    "p99": 1537.9234364999752,
+    "max": 1648.171417
+  },
+  "generation_ms": {
+    "p50": 15.549729499998222,
+    "p95": 24.15953544999923,
+    "p99": 30.042292830005415,
+    "max": 36.9960419999984
+  },
+  "backend_total_s": 564.6500229840027,
+  "ticks_over_100ms": 600,
+  "accuracy": {
+    "expected": 60,
+    "hits": 60,
+    "hit_rate": 1.0,
+    "censored_targets": 0,
+    "false_alarms": 0,
+    "false_alarms_per_hour": 0.0,
+    "exposure_s": 595,
+    "detection_latency_s": {
+      "p50": 1.0,
+      "p95": 1.0,
+      "p99": 1.0,
+      "max": 1.0
+    },
+    "ignored_transitions": 54,
+    "per_sensor": {
+      "jt128": {
+        "hits": 30,
+        "expected": 30,
+        "hit_rate": 1.0
+      },
+      "mid360": {
+        "hits": 30,
+        "expected": 30,
+        "hit_rate": 1.0
+      }
+    }
+  },
+  "harness_rss": {
+    "start_bytes": 28704768,
+    "end_bytes": 490274816,
+    "growth_bytes": 461570048,
+    "sampled_peak_bytes": 1811693568,
+    "slope_bytes_per_replay_s": -123799.53142252649
+  },
+  "backend_rss": null,
+  "wall_s": 666.231590583
+}
