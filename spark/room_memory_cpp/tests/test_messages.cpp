@@ -1,5 +1,8 @@
 // Codec tests against the Phase 0 hand goldens, ported from spark/room_memory/tests/test_messages.py.
 #include <zlib.h>
+#if defined(ROOM_MEMORY_APPLE_LZFSE)
+#include <compression.h>
+#endif
 
 #include <cmath>
 #include <cstring>
@@ -259,6 +262,33 @@ TEST(lzfse_compressed_block_and_encoder) {
     }
     CHECK_THROWS(Unsupported, delta(Compression::lzfse).to_cdr());
 }
+
+#if defined(ROOM_MEMORY_APPLE_LZFSE)
+// Apple's decoder stops at the first end-of-stream block and ignores what follows it, so the
+// codec must catch trailing bytes and a second stream itself.
+TEST(compressed_lzfse_is_one_complete_stream) {
+    const Bytes golden = hexfile("map_bricks_delta_lzfse_le.hex");
+    const auto with_payload = [&](const Bytes& payload) {
+        return join(join(slice(golden, 0, 68), u32le(static_cast<std::uint32_t>(payload.size()))), payload);
+    };
+    // The golden payload is one raw bvx- block: magic, byte count, bytes, then bvx$.
+    std::uint32_t count;
+    std::memcpy(&count, golden.data() + 76, 4);
+    const Bytes raw = slice(golden, 80, 80 + count);
+    Bytes stream(raw.size() + 4096);
+    stream.resize(compression_encode_buffer(stream.data(), stream.size(), raw.data(), raw.size(), nullptr, COMPRESSION_LZFSE));
+    CHECK(stream.size() > 8 && std::memcmp(stream.data(), "bvx-", 4) != 0);
+    CHECK(MapBricks::from_cdr(with_payload(stream)) == delta(Compression::lzfse));
+    for (const Bytes& tail : std::vector<Bytes>{{0}, {0, 1, 2}, {0, 1, 2, 3}, {'b', 'v', 'x', '$'}, stream}) {
+        CHECK_THROWS(Invalid, MapBricks::from_cdr(with_payload(join(stream, tail))));
+    }
+    CHECK_THROWS(Invalid, MapBricks::from_cdr(with_payload(slice(stream, 0, stream.size() - 1))));
+    // A raw block in front of the compressed one is still one stream; trailing bytes are not.
+    const Bytes mixed = join(join(Bytes{'b', 'v', 'x', '-'}, u32le(0)), stream);
+    CHECK(MapBricks::from_cdr(with_payload(mixed)) == delta(Compression::lzfse));
+    CHECK_THROWS(Invalid, MapBricks::from_cdr(with_payload(join(mixed, {0}))));
+}
+#endif
 
 TEST(every_truncation_throws) {
     for (const auto& [name, g] : goldens()) {

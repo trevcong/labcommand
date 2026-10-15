@@ -16,6 +16,7 @@ from room_memory.memory import (
     VoxelStats,
     load_reference,
     map_delta,
+    pose_offset,
     reference_path,
     save_reference,
 )
@@ -560,6 +561,17 @@ def test_coverage_and_pose_residual():
     memory.close_window(stamp(second + 1))
     assert abs(memory.status(stamp(second + 1), 1.0).pose_residual_m - 0.15) <= 0.01
     assert len(memory.channels["mid360"].stats.keys) == 0  # a shifted window teaches the reference nothing
+
+
+def test_pose_offset_is_binary64():
+    """Overlap counts 9, 10, 1 along x refine to -0.4 voxels: 0.020000000000000004 m at 5 cm, just
+    above learn_max_offset_m (0.02), where float rounding would land just below it. The C++ port
+    pins the same value."""
+    z = 10 * np.arange(10)  # 10 voxels apart, beyond the +-4 search, so y and z refine to 0
+    recent = np.sort(pack(0, 0, z))
+    reference = np.sort(np.concatenate([recent, pack(-1, 0, z[:9]), pack([1], [0], [0])]))
+    offset = pose_offset(recent, reference, 0.05)
+    assert offset == 0.020000000000000004 and offset > MemoryConfig().learn_max_offset_m
 
 
 @pytest.mark.parametrize("changes", [

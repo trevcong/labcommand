@@ -47,6 +47,10 @@ foreach(threads ${THREAD_COUNTS})
   endforeach()
 endforeach()
 add_test(NAME messages COMMAND test_messages)
+# The messages suite encodes real compressed LZFSE payloads with the same framework.
+if(ROOM_MEMORY_APPLE_LZFSE)
+  target_compile_definitions(test_messages PRIVATE ROOM_MEMORY_APPLE_LZFSE)
+endif()
 add_test(NAME cli COMMAND test_cli)
 
 # The installed binary itself, byte for byte, on both change-detection fixtures.

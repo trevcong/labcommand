@@ -209,7 +209,8 @@ inline constexpr std::int64_t kPoseSearchVoxels = 4;
 // voxels that maximizes the count of recent voxels landing on reference-occupied ones, refined
 // by the parabola through that count and its two neighbours (not at the ends of the range);
 // the result is the norm of the three per-axis shifts. Empty when no shift overlaps at all.
-std::optional<float> pose_offset(const Keys& recent, const Membership& reference, double voxel_size);
+// Binary64 like the Python oracle, so the learning gate decides alike; status rounds to float.
+std::optional<double> pose_offset(const Keys& recent, const Membership& reference, double voxel_size);
 
 // Accumulation windows, reference/recent layers, candidates and status for one room. The
 // caller feeds frames with add_cdr or add_points, calls close_window every window_s and
@@ -228,7 +229,7 @@ public:
         std::deque<CellSummary> recent;      // one entry per closed window, empty when it had none
         CandidateTracker tracker;
         std::optional<std::int64_t> hz;
-        std::optional<float> residual;       // pose_offset of the last tracking window with points
+        std::optional<double> residual;      // pose_offset of the last tracking window with points
         std::shared_ptr<const Membership> reference_index;  // over reference.occupied
     };
 

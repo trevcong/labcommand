@@ -2,6 +2,7 @@
 // spark/room_memory/tests/test_memory.py (including the three Codex regressions of 289afb6).
 #include <unistd.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <functional>
@@ -790,6 +791,24 @@ TEST(coverage_and_pose_residual) {
     CHECK(std::fabs(residual - 0.15f) <= 0.01f);
     // A shifted window teaches the reference nothing.
     CHECK(memory.channel("mid360").stats.keys.empty());
+}
+
+// Overlap counts 9, 10, 1 along x refine to -0.4 voxels: 0.020000000000000004 m at 5 cm, just
+// above learn_max_offset_m (0.02), where float rounding would land just below it and learn. The
+// Python oracle pins the same value.
+TEST(pose_offset_is_binary64) {
+    Keys recent, reference;
+    for (std::int64_t m = 0; m < 10; ++m) {
+        // 10 voxels apart, beyond the +-4 search, so y and z refine to 0.
+        recent.push_back(pack(0, 0, 10 * m));
+        reference.push_back(pack(0, 0, 10 * m));
+        if (m < 9) reference.push_back(pack(-1, 0, 10 * m));
+    }
+    reference.push_back(pack(1, 0, 0));
+    std::sort(recent.begin(), recent.end());
+    std::sort(reference.begin(), reference.end());
+    const std::optional<double> offset = pose_offset(recent, Membership(reference), 0.05);
+    CHECK(offset && *offset == 0.020000000000000004 && *offset > MemoryConfig{}.learn_max_offset_m);
 }
 
 TEST(stream_config_rejections) {

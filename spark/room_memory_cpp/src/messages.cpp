@@ -315,12 +315,20 @@ Bytes compress(const Bytes& raw, Compression compression) {
 }
 
 #if defined(ROOM_MEMORY_APPLE_LZFSE)
+// compression_decode_buffer (and Apple's stream decoder) stop at the first end-of-stream block and
+// ignore whatever follows it. A complete stream ends in its 4-byte "bvx$", so it must not decode
+// without its last byte: if it does, the payload carries trailing bytes or a second stream.
 Bytes inflate_lzfse_apple(const Bytes& payload, std::size_t expected, const std::string& what) {
     Bytes out(expected + 1);
-    const std::size_t size = compression_decode_buffer(out.data(), out.size(), payload.data(), payload.size(), nullptr,
-                                                       COMPRESSION_LZFSE);
+    const auto decodes = [&](std::size_t length) {
+        return compression_decode_buffer(out.data(), out.size(), payload.data(), length, nullptr, COMPRESSION_LZFSE) ==
+               expected;
+    };
     // compression_decode_buffer returns 0 on failure, so an empty result is only accepted from a bare "bvx$" (handled by the caller).
-    if (expected == 0 || size != expected) not_one_stream(what, payload.size(), "LZFSE", expected);
+    // The caller has seen a block magic, so the payload holds at least 4 bytes.
+    if (expected == 0 || decodes(payload.size() - 1) || !decodes(payload.size())) {
+        not_one_stream(what, payload.size(), "LZFSE", expected);
+    }
     out.resize(expected);
     return out;
 }

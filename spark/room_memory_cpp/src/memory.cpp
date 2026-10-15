@@ -180,7 +180,7 @@ VoxelLayer VoxelLayer::from_bricks(std::span<const msg::Brick> bricks) {
 
 // MARK: Registration
 
-std::optional<float> pose_offset(const Keys& recent, const Membership& reference, double voxel_size) {
+std::optional<double> pose_offset(const Keys& recent, const Membership& reference, double voxel_size) {
     constexpr std::int64_t R = kPoseSearchVoxels;
     constexpr std::size_t kShifts = 2 * R + 1;
     std::array<std::array<std::uint64_t, kShifts>, 3> counts{};
@@ -224,7 +224,7 @@ std::optional<float> pose_offset(const Keys& recent, const Membership& reference
         const double meters = shift * voxel_size;
         squared += meters * meters;
     }
-    return static_cast<float>(std::sqrt(squared));
+    return std::sqrt(squared);
 }
 
 // MARK: Window counts
@@ -813,11 +813,11 @@ msg::MemoryStatus RoomMemory::status(const msg::Time& stamp, double period_s) {
     for (const Channel& channel : channels_) message.n_open_events += static_cast<std::int64_t>(channel.tracker.open().size());
     message.coverage_known_frac = coverage_;
     if (state_ != msg::MemoryState::building) {
+        std::optional<double> residual;
         for (const Channel& channel : channels_) {
-            if (channel.residual && (!message.pose_residual_m || *channel.residual > *message.pose_residual_m)) {
-                message.pose_residual_m = channel.residual;
-            }
+            if (channel.residual && (!residual || *channel.residual > *residual)) residual = channel.residual;
         }
+        if (residual) message.pose_residual_m = static_cast<float>(*residual);
     }
     message.window_s = static_cast<float>(config_.window_s);
     message.mid360_hz = hz[0];

@@ -338,7 +338,7 @@ The first launch on the Spark should check the bridge's startup log for the whit
 
 ## Deviations from the Python oracle
 
-- **LZFSE**: as in Python, uncompressed `bvx-` blocks are decoded natively, and the encoder writes only NONE/ZLIB. Compressed blocks (`bvx1`/`bvx2`/`bvxn`) are decoded with Apple's Compression framework when `ROOM_MEMORY_APPLE_LZFSE` is on (the default on macOS; there a corrupt compressed block is `Invalid`). Elsewhere, including the Spark, they are `Unsupported` as in Python. The differential tests contain no compressed LZFSE.
+- **LZFSE**: as in Python, uncompressed `bvx-` blocks are decoded natively, and the encoder writes only NONE/ZLIB. Compressed blocks (`bvx1`/`bvx2`/`bvxn`) are decoded with Apple's Compression framework when `ROOM_MEMORY_APPLE_LZFSE` is on (the default on macOS; there a corrupt compressed block is `Invalid`, and so are bytes after the end-of-stream block, which Apple's decoders ignore: the payload must not decode without its last byte). Elsewhere, including the Spark, they are `Unsupported` as in Python. The differential tests contain no compressed LZFSE.
 - **Header strings**: encoders also reject a `room_id` that is not UTF-8, which Python strings cannot be; decoders reject the same, so validation stays symmetric. A `PointCloud2` `frame_id` with invalid UTF-8 is kept as bytes (Python substitutes U+FFFD); it reaches no output.
 - **CLI**: integer flags outside int64 are a usage error (Python accepts big integers). The usage text names `room_memory_offline`. Error messages follow Python's wording but are not byte-compared (only stdout and exit codes are).
 - **Text mode** `elapsed_ms` is this process's own timing, as in Python and Swift.
