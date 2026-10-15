@@ -80,7 +80,12 @@ def test_activity_reaches_a_late_transient_local_subscriber(node):
 
 def test_status_reports_the_last_published_event_seq(node, monkeypatch):
     events = [replace(appeared_event(), header=Header("lab", 0, seq, T10)) for seq in (0, 1)]
-    monkeypatch.setattr(node.memory, "close_window", lambda stamp: events)
+
+    def close_window(stamp):
+        node.memory.event_seq = len(events)  # the engine numbers the events it returns
+        return events
+
+    monkeypatch.setattr(node.memory, "close_window", close_window)
     published = []
     monkeypatch.setattr(node.events, "publish", published.append)
     statuses = []
