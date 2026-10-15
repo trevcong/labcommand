@@ -126,6 +126,11 @@ but only while `isStatusFresh`. Otherwise "STALE · age".
   list goes incomplete and requests `RequestSync{events, since: (epoch, eventsSeq)}`. So does an
   **events_seq gap**: a status `events_seq` above the baseline that the next status still finds
   unreached. An event's state changes only on a message with a higher seq than the last one applied to it.
+- **Answers.** A replayed snapshot behind the newest live seq stays stale until the replay's
+  deltas chain up to it. An events answer settles once its sync topic has been quiet for 2 s.
+  A `SINCE_NONE` answer, not the first live event, settles what exists. Seqs an answer could
+  not fill (the bounded fallback) are skipped: the baseline jumps to the highest replayed seq and
+  the history stays incomplete. A status `events_seq` with no events held triggers `SINCE_NONE`.
 - **Sync topics** are read only while a request is outstanding on that topic. A request repeats
   after 5 s, then 10, 20 and 30 s, until resolved. At most one per topic per 5 s.
 - **On connect**, both topics are requested once `roomId` is known.

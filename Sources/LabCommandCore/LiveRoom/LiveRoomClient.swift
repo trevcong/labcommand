@@ -62,6 +62,8 @@ public final class LiveRoomClient: ObservableObject {
     private let session: URLSession
     private var runTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
+    /// Bumped by `start()`; a cancelled run that is still unwinding must not touch the new one.
+    private var runGeneration = 0
     private var link: Link?
 
     /// Per-connection socket state.
@@ -97,7 +99,9 @@ public final class LiveRoomClient: ObservableObject {
     /// Connects, and reconnects with backoff until `stop()`.
     public func start() {
         guard runTask == nil else { return }
-        runTask = Task { [weak self] in await self?.run() }
+        runGeneration += 1
+        let generation = runGeneration
+        runTask = Task { [weak self] in await self?.run(generation: generation) }
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -112,7 +116,12 @@ public final class LiveRoomClient: ObservableObject {
         tickTask?.cancel()
         runTask = nil
         tickTask = nil
-        link?.socket.cancel(with: .normalClosure, reason: nil)
+        if let current = link {
+            // Close now, so a quick start() never meets this connection's leftovers.
+            current.socket.cancel(with: .normalClosure, reason: nil)
+            if current.mirrorOpened { mirror.connectionClosed(at: Self.now) }
+            link = nil
+        }
         connection = .off
     }
 
@@ -120,21 +129,20 @@ public final class LiveRoomClient: ObservableObject {
 
     // MARK: Connection loop
 
-    private func run() async {
+    private func run(generation: Int) async {
         var attempt = 0
         var failures = 0
-        while !Task.isCancelled {
+        while !Task.isCancelled, generation == runGeneration {
             attempt += 1
             connection = .connecting(url: url, attempt: attempt)
             let (opened, reason) = await connectOnce()
-            if Task.isCancelled { break }
+            if Task.isCancelled || generation != runGeneration { return }
             failures = opened ? 1 : failures + 1
             let delay = max(Self.reconnectFloor, FoxgloveProtocol.reconnectDelay(afterFailures: failures))
             note(opened ? "connection lost: \(reason); retrying in \(Int(delay)) s" : "\(url) unreachable: \(reason); retrying in \(Int(delay)) s")
             connection = .waiting(retryIn: delay, reason: reason)
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
         }
-        connection = .off
     }
 
     private func connectOnce() async -> (opened: Bool, reason: String) {
@@ -143,14 +151,18 @@ public final class LiveRoomClient: ObservableObject {
         link = Link(socket: socket, startedAt: Self.now, lastMessageAt: Self.now)
         socket.resume()
 
+        /// This connection is still the client's; a stopped one only unwinds.
+        func isCurrent() -> Bool { link?.socket === socket }
+
         var reason = "closed"
         do {
-            while !Task.isCancelled {
+            while !Task.isCancelled, isCurrent() {
                 let message = try await withTaskCancellationHandler {
                     try await socket.receive()
                 } onCancel: {
                     socket.cancel(with: .normalClosure, reason: nil)
                 }
+                guard isCurrent() else { break }
                 link?.lastMessageAt = Self.now
                 switch message {
                 case .string(let text): handle(text: text)
@@ -159,13 +171,14 @@ public final class LiveRoomClient: ObservableObject {
                 }
             }
         } catch {
-            reason = link?.failure ?? Self.describe(error, socket: socket)
+            reason = (isCurrent() ? link?.failure : nil) ?? Self.describe(error, socket: socket)
         }
+        socket.cancel(with: .goingAway, reason: nil)
+        guard isCurrent() else { return (false, "stopped") }
         let opened = link?.server != nil
         if link?.mirrorOpened == true {
             mirror.connectionClosed(at: Self.now)
         }
-        socket.cancel(with: .goingAway, reason: nil)
         link = nil
         return (opened, reason)
     }

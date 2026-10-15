@@ -102,6 +102,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     public static let requestRetry: [TimeInterval] = [5, 10, 20, 30]
     /// At most one request per topic per this long (protocol §2).
     public static let requestMinInterval: TimeInterval = 5
+    /// An events answer is complete once its sync topic has been quiet this long.
+    public static let syncSettle: TimeInterval = 2
 
     public enum Action: Sendable, Equatable {
         /// Send this request. `header.stamp` is `{0, 0}`; the sender stamps it.
@@ -178,6 +180,12 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     private var eventsAhead: [UInt64: UInt64] = [:]
     /// The baseline skipped seqs that will never arrive, so history stays incomplete.
     private var eventsHistoryLost = false
+    /// A `SINCE_NONE` events request is out: its answer, not a live event, settles what exists.
+    private var eventsInitialSync = false
+    /// Seqs the initial answer brought, to tell a full history from a bounded fallback.
+    private var initialSyncSeqs: Set<UInt64> = []
+    /// Newest message on the events sync topic, for the settle window.
+    private var lastSyncEventAt: TimeInterval?
     /// Bumped when the node restarts; per-event seq order holds only within one generation.
     private var eventsGeneration = 0
     private var eventGeneration: [UInt64: Int] = [:]
@@ -210,6 +218,9 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         eventsMark = nil
         replayChained = false
         needs = [:]
+        lastSyncEventAt = nil
+        initialSyncSeqs = []
+        eventsInitialSync = canRequest && eventsSeq == nil
         if canRequest {
             needs[.mapBricks] = Need()
             needs[.events] = Need()
@@ -274,6 +285,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     /// Clock tick: status freshness and request repeats.
     public mutating func tick(at now: TimeInterval) -> [Action] {
         refreshFreshness(at: now)
+        settleEventsAnswer(at: now)
         return flushRequests(at: now)
     }
 
@@ -310,11 +322,20 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             voxelSize = message.voxelSize
             mapEpoch = message.header.mapEpoch
             mapSeq = seq
-            mapState = .current
             statusEpochMismatches = 0
-            replayChained = false
-            needs[.mapBricks] = nil
-            reevaluateMap()
+            if !fromSync {
+                // The live topic is in order: its snapshot is the newest there is, even after a restart.
+                highestLiveMapSeq = seq
+            }
+            if seq >= (highestLiveMapSeq ?? seq) {
+                mapState = .current
+                replayChained = false
+                needs[.mapBricks] = nil
+            } else {
+                // A replayed snapshot behind the live topic: the replay's deltas must chain on before it is current.
+                mapState = .stale(.seqGap)
+                replayChained = true
+            }
 
         case .delta:
             guard let epoch = mapEpoch, let last = mapSeq else {
@@ -462,6 +483,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         }
         record(message, at: now, fromSync: false)
         if seq <= base {
+            highestLiveEventsSeq = seq
             eventsAhead = [:]
             eventsHistoryLost = true
             moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
@@ -479,18 +501,19 @@ public struct RoomMemoryMirror: Sendable, Equatable {
 
     private mutating func receiveSyncEvent(_ message: RoomMemory.ChangeEvent, at now: TimeInterval) {
         let seq = message.header.seq
+        lastSyncEventAt = now
+        if eventsInitialSync, initialSyncSeqs.count < Self.eventCapacity * 2 {
+            initialSyncSeqs.insert(seq)
+        }
         guard let base = eventsSeq else {
-            // Answer to a SINCE_NONE request (bounded fallback): apply by event_id; the baseline
-            // becomes the highest seq replayed (protocol §5).
             record(message, at: now, fromSync: true)
             moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
             return
         }
         if seq <= base {
-            // Older than the baseline: history only, and only for an event the Mac has never seen.
-            if eventsById[message.eventId] == nil {
-                record(message, at: now, fromSync: true)
-            }
+            // Older than the baseline (an old open event in a fallback): it may only add what the
+            // Mac never had, never roll an event back.
+            record(message, at: now, fromSync: true, onlyIfNewer: true)
             return
         }
         if eventsAhead[seq] != nil { return }
@@ -530,9 +553,50 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         moveBaseline(to: seq, epoch: epoch, stamp: stamp)
     }
 
-    /// Appends to the ring, and moves the event's state only on a newer seq.
-    private mutating func record(_ message: RoomMemory.ChangeEvent, at now: TimeInterval, fromSync: Bool) {
+    /// Once an events answer has gone quiet, what it could not fill is lost: a bounded fallback
+    /// (protocol §5) skips to the highest seq it replayed and leaves the history incomplete.
+    private mutating func settleEventsAnswer(at now: TimeInterval) {
+        guard let sentAt = needs[.events]?.sentAt, let last = lastSyncEventAt, last >= sentAt,
+              now - last >= Self.syncSettle else { return }
+        lastSyncEventAt = nil
+        if let top = eventsAhead.keys.max(), let epoch = eventsAhead[top] {
+            eventsAhead = [:]
+            loseEventsHistory()
+            let stamp = events.last(where: { $0.seq == top })?.event.header.stamp ?? lastGoodEventStamp ?? RoomMemory.Time(sec: 0, nanosec: 0)
+            moveBaseline(to: top, epoch: epoch, stamp: stamp)
+        }
+        if eventsInitialSync {
+            eventsInitialSync = false
+            // A full history runs 0, 1, 2, … with no hole; anything else is the bounded fallback.
+            if let low = initialSyncSeqs.min(), let high = initialSyncSeqs.max(),
+               !(low == 0 && UInt64(initialSyncSeqs.count) == high - low + 1) {
+                loseEventsHistory()
+            }
+            initialSyncSeqs = []
+        }
+        resolveEventsIfDone()
+    }
+
+    private mutating func loseEventsHistory() {
+        eventsHistoryLost = true
+        if eventsState == .complete {
+            eventsState = .incomplete(since: lastGoodEventStamp)
+        }
+    }
+
+    /// Appends to the ring, and moves the event's state only on a newer seq. With `onlyIfNewer`,
+    /// a message that would not move its event is dropped entirely.
+    private mutating func record(
+        _ message: RoomMemory.ChangeEvent,
+        at now: TimeInterval,
+        fromSync: Bool,
+        onlyIfNewer: Bool = false
+    ) {
         let entry = LiveRoomEvent(seq: message.header.seq, receivedAt: now, fromSync: fromSync, event: message)
+        if onlyIfNewer, let held = eventsById[message.eventId], held.seq >= entry.seq,
+           eventGeneration[message.eventId] == eventsGeneration {
+            return
+        }
         events.append(entry)
         if events.count > Self.eventCapacity {
             events.removeFirst(events.count - Self.eventCapacity)
@@ -560,12 +624,14 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     /// An events request is done once the baseline reaches both the newest live seq and the
     /// status high-water mark, with nothing held ahead (Phase 3 §4.3).
     private mutating func resolveEventsIfDone() {
-        guard let base = eventsSeq else {
+        if eventsSeq == nil, let status, status.eventsSeq == nil {
             // Nothing held and the Spark has published no event: nothing to fetch.
-            if let status, status.eventsSeq == nil { needs[.events] = nil }
+            eventsInitialSync = false
+            needs[.events] = nil
             return
         }
-        guard eventsAhead.isEmpty else { return }
+        // A live event is no proof the history before it was fetched: the initial answer settles that.
+        guard let base = eventsSeq, !eventsInitialSync, eventsAhead.isEmpty else { return }
         guard base >= (highestLiveEventsSeq ?? base), base >= (status?.eventsSeq ?? base) else { return }
         needs[.events] = nil
         if !eventsHistoryLost, connected {
@@ -598,6 +664,23 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         }
 
         // events_seq gap: a high-water mark the baseline still has not reached one status later.
+        if eventsSeq == nil, let mark = message.eventsSeq {
+            // Events exist but none is held (the first was lost, or none has arrived yet).
+            if eventsMark != nil, needs[.events] == nil {
+                if canRequest {
+                    activity.gaps += 1
+                    if eventsState == .complete {
+                        eventsState = .incomplete(since: lastGoodEventStamp)
+                    }
+                    eventsInitialSync = true
+                    needEvents()
+                } else if eventsState == .complete {
+                    activity.gaps += 1
+                    loseEventsHistory()
+                }
+            }
+            eventsMark = mark
+        }
         if let base = eventsSeq, let mark = message.eventsSeq {
             if mark > base {
                 if let previous = eventsMark, base < previous, needs[.events] == nil, eventsAhead.isEmpty {

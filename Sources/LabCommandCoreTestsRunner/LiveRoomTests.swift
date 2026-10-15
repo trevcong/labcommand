@@ -568,6 +568,64 @@ func testLiveRoomEventsSeqGap() {
     expect(request(actions, .events, "status copy") == nil && dup.activity.duplicates == 1, "status copy is a duplicate, not a gap")
 }
 
+/// Reproductions from the Codex review of this branch.
+func testLiveRoomReplayAndFallbackEdges() {
+    // A replayed snapshot behind the live topic is not current until the replay's deltas catch up.
+    var map = currentMirror()
+    _ = map.receive(topic: .status, payload: status(epoch: 8, seq: 2), at: 110)
+    _ = map.receive(topic: .mapBricks, payload: delta(epoch: 8, seq: 13, base: 7, []), at: 110)
+    expect(map.mapState == .stale(.seqGap), "live seq 13 after 10: stale")
+    _ = map.receive(topic: .syncMapBricks, payload: snapshot(epoch: 6, seq: 11, [brick(1)]), at: 111)
+    expect(map.mapState != .current && !map.isMapCurrent, "replayed snapshot at seq 11 < live 13 is not current")
+    _ = map.receive(topic: .syncMapBricks, payload: delta(epoch: 7, seq: 12, base: 6, [brick(2)]), at: 111)
+    _ = map.receive(topic: .syncMapBricks, payload: delta(epoch: 8, seq: 13, base: 7, [brick(3)]), at: 111)
+    expect(map.mapState == .current && map.mapSeq == 13 && map.mapEpoch == 8 && map.bricks.count == 3,
+           "the replay's deltas chain on from its snapshot to the live seq: current")
+
+    // The initial SINCE_NONE answer, not a live event, settles what exists.
+    var cold = Mirror(roomId: "lab")
+    _ = cold.connectionOpened(at: 0, canRequest: true)
+    _ = cold.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 100), at: 0)
+    _ = cold.receive(topic: .events, payload: event(id: 101, seq: 101), at: 1)
+    expect(request(cold.tick(at: 1.5), .events, "live first") == nil, "no repeat yet")
+    _ = cold.receive(topic: .syncEvents, payload: event(id: 10, seq: 10, state: .confirmed), at: 2)
+    expect(cold.eventsById[10]?.event.state == .confirmed, "an old open event from the fallback is kept although a live event came first")
+    _ = cold.tick(at: 4.5)
+    expect(cold.eventsState != .complete, "a fallback with holes leaves the history incomplete")
+    expect(request(cold.tick(at: 60), .events, "settled") == nil, "settled fallback resolves the request")
+
+    // A bounded fallback answering a baseline the Spark no longer keeps: jump to the highest replayed seq.
+    var fallback = currentMirror()
+    _ = fallback.tick(at: 100)
+    _ = fallback.receive(topic: .events, payload: event(id: 1, seq: 40), at: 101)
+    let gap = fallback.receive(topic: .events, payload: event(id: 1, seq: 300), at: 110)
+    expect(request(gap, .events, "deep gap")?.since == .init(epoch: 5, seq: 40), "deep gap requests since (5, 40)")
+    _ = fallback.receive(topic: .syncEvents, payload: event(id: 9, seq: 20, state: .confirmed), at: 111)
+    for seq in UInt64(201)...300 {
+        _ = fallback.receive(topic: .syncEvents, payload: event(id: 1000 + seq, seq: seq, state: .reverted), at: 111)
+    }
+    expect(fallback.eventsSeq == 40, "baseline holds while the answer is arriving")
+    _ = fallback.tick(at: 114)
+    expect(fallback.eventsSeq == 300 && fallback.eventsState != .complete, "settled fallback: baseline jumps to 300, incomplete")
+    expect(fallback.eventsById[9]?.event.state == .confirmed, "the old open event from the fallback is kept")
+    expect(request(fallback.tick(at: 200), .events, "after fallback") == nil, "no endless retries after a fallback")
+    _ = fallback.receive(topic: .events, payload: event(id: 1, seq: 301, state: .confirmed), at: 201)
+    expect(fallback.eventsSeq == 301 && fallback.eventsState != .complete, "live events chain on; lost history stays flagged")
+
+    // Events exist but none ever arrived: the high-water mark alone triggers a SINCE_NONE request.
+    var lost = Mirror(roomId: "lab")
+    _ = lost.connectionOpened(at: 0, canRequest: true)
+    _ = lost.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: nil), at: 0)
+    expect(request(lost.tick(at: 10), .events, "no events") == nil, "no events published: nothing to request")
+    _ = lost.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 0), at: 11)
+    let missing = lost.receive(topic: .status, payload: status(epoch: 5, seq: 3, eventsSeq: 0), at: 12)
+    expect(request(missing, .events, "first event lost")?.since == nil, "lost first event: request since NONE")
+    expect(lost.eventsState != .complete, "lost first event: incomplete while it is fetched")
+    _ = lost.receive(topic: .syncEvents, payload: event(id: 7, seq: 0), at: 13)
+    _ = lost.tick(at: 16)
+    expect(lost.eventsSeq == 0 && lost.eventsState == .complete, "a replay from seq 0 with no hole: complete")
+}
+
 func runLiveRoomTests() {
     testLiveRoomFoxgloveClientFrames()
     print("  LiveRoom: serverInfo capabilities, client advertise + message data, topic/schema match"); passed()
@@ -587,6 +645,8 @@ func runLiveRoomTests() {
     print("  LiveRoom: events ring, duplicates, gap → incomplete + RequestSync, replay closes it, restart generation"); passed()
     testLiveRoomEventsSeqGap()
     print("  LiveRoom: status events_seq unreached on the next status → RequestSync(events); replay to the mark"); passed()
+    testLiveRoomReplayAndFallbackEdges()
+    print("  LiveRoom: replayed snapshot behind live stays stale until chained; initial + bounded fallbacks settle; lost first event"); passed()
 }
 
 /// `swift run LabCommandCoreTestsRunner live-room-probe [seconds] [ws://host:port]`: connects a read-only
