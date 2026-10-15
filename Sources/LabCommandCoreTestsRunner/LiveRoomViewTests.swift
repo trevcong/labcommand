@@ -238,14 +238,16 @@ func testLiveRoomEventRowsAndIncomplete() {
 
     let when = RoomMemory.Time(sec: 1_760_400_010, nanosec: 0)
     var stamped = viewOpened(canRequest: false)
-    viewFeed(&stamped, .events, viewEvent(id: 4, seq: 2, state: .candidate, stamp: when), at: 10)
-    expect(stamped.eventsState == .incomplete(since: when), "no request path keeps the first stamp, got \(stamped.eventsState)")
+    viewFeed(&stamped, .events, viewEvent(id: 4, seq: 0, state: .candidate, stamp: when), at: 10)
+    viewFeed(&stamped, .events, viewEvent(id: 4, seq: 2, state: .confirmed, stamp: RoomMemory.Time(sec: 1_760_400_020, nanosec: 0)), at: 10)
+    expect(stamped.eventsState == .incomplete(since: when), "no request path: since the last message before the hole, got \(stamped.eventsState)")
     let stampedLine = viewScreen(stamped, path: true).incompleteLine
     expect(stampedLine == "incomplete since 00:00:10", "stamp renders UTC, got \(String(describing: stampedLine))")
 
     let zero = RoomMemory.Time(sec: 0, nanosec: 0)
     var zeroTime = viewOpened(canRequest: false)
-    viewFeed(&zeroTime, .events, viewEvent(id: 5, seq: 2, state: .candidate, stamp: zero), at: 10)
+    viewFeed(&zeroTime, .events, viewEvent(id: 5, seq: 0, state: .candidate, stamp: zero), at: 10)
+    viewFeed(&zeroTime, .events, viewEvent(id: 5, seq: 2, state: .confirmed), at: 10)
     let zeroLine = viewScreen(zeroTime, path: true).incompleteLine
     expect(zeroLine == "incomplete since time —", "a zero stamp is time —, got \(String(describing: zeroLine))")
 }

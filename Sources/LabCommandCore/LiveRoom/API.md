@@ -85,7 +85,7 @@ While stale, the last good bricks stay. Render them greyed as "resyncing · as o
 | `eventsById` | `[UInt64: LiveRoomEvent]` | latest applied transition per `event_id` (at most 10,000) |
 | `openEvents` | `[LiveRoomEvent]` | CANDIDATE or CONFIRMED, sorted by `event_id` |
 | `eventsSeq` | `UInt64?` | events baseline: the highest seq applied contiguously |
-| `eventsState` | `EventsState` | `.complete` or `.incomplete(since: RoomMemory.Time?)`. Incomplete renders "incomplete since t", with open events "may be outdated" |
+| `eventsState` | `EventsState` | `.complete` or `.incomplete(since: RoomMemory.Time?)`, computed on every read. Complete only when every seq in `[0, max(status events_seq high-water, highest seq received)]` of this generation was received, no earlier generation was cut off, and a status on the open connection vouches for the high-water. `since` is the stamp of the last message in the gapless run from 0 (nil when seq 0 is missing). Incomplete renders "incomplete since t", with open events "may be outdated" |
 
 `LiveRoomEvent { seq: UInt64, receivedAt: TimeInterval, fromSync: Bool, event: RoomMemory.ChangeEvent }`.
 Only `.confirmed` renders as a change, `.candidate` as a candidate, and terminal states never.

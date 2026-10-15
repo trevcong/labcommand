@@ -694,12 +694,12 @@ func testLiveRoomGenerationsAndPartialHistory() {
     expect(behind.mapState == .current && behind.mapEpoch == 10 && behind.mapSeq == 12 && behind.bricks.count == 2,
            "the delta after that snapshot reaches the status epoch and is applied")
 
-    // Connect already requested events. A second status that still names events, with none held,
-    // is an incomplete history. The outstanding request must not hide that.
+    // Connect already requested events. A status that names events, with none held, is an
+    // incomplete history from the first one on. The outstanding request must not hide that.
     var waiting = Mirror(roomId: "lab")
     _ = waiting.connectionOpened(at: 0, canRequest: true)
     _ = waiting.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 12), at: 0)
-    expect(waiting.eventsState == .complete, "the first status may still be racing the first event")
+    expect(waiting.eventsState == .incomplete(since: nil), "events 0–12 named, none held: incomplete, got \(waiting.eventsState)")
     _ = waiting.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 12), at: 1)
     expect(waiting.eventsState != .complete, "events advertised twice and none held: incomplete while the connect request is out")
     expect(waiting.activity.gaps == 0, "the connect request is not a second gap")
@@ -816,6 +816,167 @@ func testLiveRoomGenerationsAndPartialHistory() {
     expect(request(truncated, .mapBricks, "truncated")?.since == .init(epoch: 5, seq: 10), "truncated map requests since (5, 10)")
 }
 
+/// Codex P2: an outstanding events request must not hide missing seqs.
+func testLiveRoomOutstandingSyncHidesNothing() {
+    var mirror = Mirror(roomId: "lab")
+    let opened = mirror.connectionOpened(at: 0, canRequest: true)
+    expect(request(opened, .events, "P2 connect")?.since == nil, "connect asks for events since NONE")
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 0, seq: 0), at: 0.5)
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 2), at: 1)
+    expect(mirror.eventsState == .incomplete(since: header(5, 0).stamp), "sync 0 only, status names 2: incomplete, got \(mirror.eventsState)")
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 2), at: 2)
+    expect(mirror.eventsState != .complete, "a second status with the request out: still incomplete")
+    _ = mirror.tick(at: 3)
+    expect(mirror.eventsState != .complete, "the answer settled without 1–2: incomplete, got \(mirror.eventsState)")
+    let retried = mirror.tick(at: 5.5)
+    expect(request(retried, .events, "P2 retry")?.since == .init(epoch: 5, seq: 0), "the retry asks since (5, 0)")
+    expect(mirror.eventsState != .complete, "retrying: still incomplete")
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 1, seq: 1), at: 6)
+    expect(mirror.eventsState != .complete, "1 of 1–2: incomplete")
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 2, seq: 2), at: 6)
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 3, eventsSeq: 2), at: 7)
+    expect(mirror.eventsState == .complete, "0–2 held, status 2: complete, got \(mirror.eventsState)")
+    expect(request(mirror.tick(at: 60), .events, "P2 resolved") == nil, "events request resolved")
+}
+
+/// Random interleavings of live, sync, status, reconnect and settle against one invariant: the
+/// mirror reads complete only when it holds every seq in [0, max(status events_seq, highest held)].
+/// Each run ends by reconnecting and replaying everything, which must then read complete.
+func testLiveRoomHistoryInvariantProperty() {
+    var runsCompleteMidway = 0
+    for seed in UInt64(1)...250 {
+        var rng = SplitMix64(seed: seed &* 0x9E37_79B9)
+        func below(_ n: Int) -> Int { Int(rng.next() % UInt64(n)) }
+        func chance(_ p: Double) -> Bool { rng.unit() < p }
+
+        var mirror = Mirror(roomId: "lab")
+        var now: TimeInterval = 0
+        var published: UInt64 = 0
+        var statusSeq: UInt64 = 0
+        var statusHigh: UInt64?
+        var connected = false
+        var canRequest = false
+        var eventsRequest: R.RequestSync?
+        var lastLive: UInt64?
+        var sawComplete = false
+        var trace: [String] = []
+
+        func take(_ actions: [Mirror.Action]) {
+            for case .requestSync(let sent) in actions where sent.topic == .events {
+                eventsRequest = sent
+            }
+        }
+        func check(_ step: String) {
+            trace.append(step)
+            guard mirror.eventsState == .complete else { return }
+            let held = Set(mirror.eventsById.keys)
+            guard let top = [statusHigh, held.max()].compactMap({ $0 }).max() else { return }
+            if published > 0 { sawComplete = true }
+            let missing = (0...top).first { !held.contains($0) }
+            expect(missing == nil && connected,
+                   "seed \(seed): complete with seq \(missing.map(String.init) ?? "—") missing of 0–\(top), connected \(connected); trace \(trace.suffix(25).joined(separator: " "))")
+        }
+        func sendStatus(mark: UInt64?) {
+            statusSeq += 1
+            if let mark { statusHigh = max(statusHigh ?? mark, mark) }
+            take(mirror.receive(topic: .status, payload: status(epoch: 5, seq: statusSeq, eventsSeq: mark), at: now))
+        }
+        func connect(path: Bool) {
+            canRequest = path
+            connected = true
+            take(mirror.connectionOpened(at: now, canRequest: path))
+        }
+        func sync(_ seq: UInt64) {
+            take(mirror.receive(topic: .syncEvents, payload: event(id: seq, seq: seq), at: now))
+        }
+
+        connect(path: chance(0.75))
+        check("open")
+        for _ in 0..<70 {
+            now += 0.1
+            switch below(11) {
+            case 0, 1, 2:
+                // Publish one event; it may be lost on the way, or its status may beat it here.
+                let seq = published
+                published += 1
+                guard connected else { check("publish \(seq) unseen"); break }
+                if chance(0.25) { sendStatus(mark: seq) }
+                if chance(0.8) {
+                    take(mirror.receive(topic: .events, payload: event(id: seq, seq: seq), at: now))
+                    lastLive = seq
+                    check("live \(seq)")
+                } else {
+                    check("lost \(seq)")
+                }
+            case 3:
+                // The same live message twice.
+                guard connected, let seq = lastLive, seq == published - 1 else { break }
+                take(mirror.receive(topic: .events, payload: event(id: seq, seq: seq), at: now))
+                check("dup \(seq)")
+            case 4, 5:
+                guard connected else { break }
+                sendStatus(mark: published == 0 ? nil : published - 1)
+                check("status \(published == 0 ? "none" : String(published - 1))")
+            case 6:
+                // Answer the latest events request: whole, cut short, with holes, or bounded.
+                guard connected, canRequest, let asked = eventsRequest else { break }
+                eventsRequest = nil
+                let from = asked.since.map { $0.seq + 1 } ?? 0
+                guard from < published else { check("answer empty"); break }
+                var seqs = Array(from..<published)
+                switch below(4) {
+                case 0: break
+                case 1: seqs = Array(seqs.prefix(below(seqs.count + 1)))
+                case 2: seqs = seqs.filter { _ in chance(0.7) }
+                default: seqs = Array(seqs.suffix(1 + below(seqs.count)))
+                }
+                for seq in seqs { sync(seq) }
+                check("answer \(from)..<\(published) gave \(seqs.count)")
+            case 7:
+                // Another Mac's answer on the shared topic.
+                guard connected, published > 0 else { break }
+                let seq = UInt64(below(Int(published)))
+                sync(seq)
+                check("stray sync \(seq)")
+            case 8:
+                now += 2.5
+                take(mirror.tick(at: now))
+                check("settle")
+            case 9:
+                now += 6
+                take(mirror.tick(at: now))
+                check("retry")
+            default:
+                if connected {
+                    mirror.connectionClosed(at: now)
+                    connected = false
+                    eventsRequest = nil
+                    check("close")
+                } else {
+                    connect(path: chance(0.7))
+                    check("open path \(canRequest)")
+                }
+            }
+        }
+        if sawComplete { runsCompleteMidway += 1 }
+
+        // Converge: reconnect with a request path, the Spark replays everything, a status, settle.
+        if connected { mirror.connectionClosed(at: now) }
+        connected = false
+        now += 6
+        connect(path: true)
+        check("final open")
+        for seq in 0..<published { sync(seq) }
+        sendStatus(mark: published == 0 ? nil : published - 1)
+        now += 2.5
+        take(mirror.tick(at: now))
+        check("final settle")
+        expect(mirror.eventsState == .complete,
+               "seed \(seed): everything replayed but \(mirror.eventsState); trace \(trace.suffix(25).joined(separator: " "))")
+    }
+    expect(runsCompleteMidway >= 25, "the property is not vacuous: \(runsCompleteMidway) runs read complete midway")
+}
+
 func runLiveRoomTests() {
     testLiveRoomFoxgloveClientFrames()
     print("  LiveRoom: serverInfo capabilities, client advertise + message data, topic/schema match"); passed()
@@ -839,6 +1000,10 @@ func runLiveRoomTests() {
     print("  LiveRoom: replayed snapshot behind live stays stale until chained; initial + bounded fallbacks settle; lost first event"); passed()
     testLiveRoomGenerationsAndPartialHistory()
     print("  LiveRoom: partial first history, replay behind the status epoch, incomplete while a connect request is out, unreadable map → resync"); passed()
+    testLiveRoomOutstandingSyncHidesNothing()
+    print("  LiveRoom: an outstanding events request hides no missing seq; settle and retry stay incomplete until 1–2 arrive"); passed()
+    testLiveRoomHistoryInvariantProperty()
+    print("  LiveRoom: random live/sync/status/reconnect/settle runs never read complete with a seq missing; full replay converges"); passed()
 }
 
 /// `swift run LabCommandCoreTestsRunner live-room-probe [seconds] [ws://host:port]`: connects a read-only

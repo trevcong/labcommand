@@ -141,7 +141,24 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     public private(set) var events: [LiveRoomEvent] = []
     public private(set) var eventsById: [UInt64: LiveRoomEvent] = [:]
     public private(set) var eventsSeq: UInt64?
-    public private(set) var eventsState: EventsState = .complete
+
+    /// One invariant: the history is complete only when every seq in `[0, max(status events_seq
+    /// high-water, highest seq received)]` of this generation has been received, no earlier
+    /// generation was cut off, and a status on the open connection vouches for the high-water.
+    /// Computed, so no message, tick or reconnect path can leave it behind.
+    public var eventsState: EventsState {
+        if historyCut { return .incomplete(since: historyCutSince) }
+        let prefix = receivedSpans.first.flatMap { $0.low == 0 ? $0 : nil }
+        guard let top = [eventsHighWater, receivedSpans.last?.high].compactMap({ $0 }).max() else {
+            // Nothing published and nothing held: the empty history is complete.
+            return .complete
+        }
+        if connected, statusThisConnection, let prefix, prefix.high >= top {
+            return .complete
+        }
+        // Transitions may be missing after the last message of the gapless run from 0.
+        return .incomplete(since: prefix?.topStamp)
+    }
 
     // Status
     public private(set) var status: LiveRoomStatus?
@@ -174,20 +191,31 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     /// A sync delta chained onto the mirror since it went stale: proof it can catch up.
     private var replayChained = false
 
+    // Event history coverage (this generation)
+    /// Seqs received, as disjoint ranges in order. Each keeps the stamp of its top message.
+    private struct Span: Sendable, Equatable {
+        var low: UInt64
+        var high: UInt64
+        var topStamp: RoomMemory.Time
+    }
+
+    private var receivedSpans: [Span] = []
+    /// The highest `events_seq` any status of this generation named.
+    private var eventsHighWater: UInt64?
+    /// A status arrived on the open connection: the high-water is not from before a disconnect.
+    private var statusThisConnection = false
+    /// An earlier generation ended with transitions possibly unseen. Sticky.
+    private var historyCut = false
+    private var historyCutSince: RoomMemory.Time?
+
     // Events bookkeeping
     /// `map_epoch` of the message at the events baseline, for `RequestSync.since`.
     private var eventsEpoch: UInt64?
     private var lastGoodEventStamp: RoomMemory.Time?
     /// Seqs above the baseline already received (seq → map_epoch); the baseline advances through them.
     private var eventsAhead: [UInt64: UInt64] = [:]
-    /// The baseline skipped seqs that will never arrive, so history stays incomplete.
-    private var eventsHistoryLost = false
     /// A `SINCE_NONE` events request is out: its answer, not a live event, settles what exists.
     private var eventsInitialSync = false
-    /// Seqs the initial answer brought, to tell a full history from a bounded fallback.
-    private var initialSyncSeqs: Set<UInt64> = []
-    /// The baseline started at this seq while the initial answer was owed: that answer must replay every seq below it.
-    private var initialHistoryBelow: UInt64?
     /// Newest message on the events sync topic, for the settle window.
     private var lastSyncEventAt: TimeInterval?
     /// Bumped when the node restarts; per-event seq order holds only within one generation.
@@ -224,13 +252,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         replayChained = false
         needs = [:]
         lastSyncEventAt = nil
-        initialSyncSeqs = []
+        statusThisConnection = false
         // A live event may have set the baseline before the initial answer came: that answer is still owed.
-        if eventsInitialSync, !canRequest {
-            eventsInitialSync = false
-            initialHistoryBelow = nil
-            loseEventsHistory()
-        }
         eventsInitialSync = canRequest && (eventsSeq == nil || eventsInitialSync)
         if canRequest {
             needs[.mapBricks] = Need()
@@ -242,11 +265,9 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     /// The socket closed. The bricks stay, but nothing proves them current until the next connection resyncs.
     public mutating func connectionClosed(at now: TimeInterval) {
         connected = false
+        statusThisConnection = false
         needs = [:]
         if mapState == .current { markStale(.disconnected) }
-        if eventsSeq != nil, eventsState == .complete {
-            eventsState = .incomplete(since: lastGoodEventStamp)
-        }
         refreshFreshness(at: now)
     }
 
@@ -476,25 +497,19 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         guard let base = eventsSeq else {
             // First message after launch (or after a reset): it starts the baseline.
             record(message, at: now, fromSync: false)
+            noteReceived(message)
             moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
-            if seq != 0 {
+            if seq != 0, canRequest, !eventsInitialSync {
                 // Seqs start at 0 per publisher: events before this one exist and are not held.
-                // That holds whether or not the connect request is already out; its answer clears it.
-                if canRequest {
-                    if !eventsInitialSync {
-                        eventsInitialSync = true
-                        needEvents()
-                    }
-                } else {
-                    loseEventsHistory()
-                }
+                eventsInitialSync = true
+                needEvents()
             }
-            requireHistory(below: seq)
             resolveEventsIfDone()
             return
         }
         if seq == base &+ 1 {
             record(message, at: now, fromSync: false)
+            noteReceived(message)
             moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
             advanceThroughAhead()
             resolveEventsIfDone()
@@ -507,26 +522,23 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             }
         }
         activity.gaps += 1
-        if eventsState == .complete {
-            eventsState = .incomplete(since: lastGoodEventStamp)
-        }
         if seq <= base {
             // A lower seq that is no duplicate: the node restarted. A new generation starts here.
             eventsGeneration += 1
+            cutHistory()
         }
         record(message, at: now, fromSync: false)
+        noteReceived(message)
         if seq <= base {
             highestLiveEventsSeq = seq
             eventsAhead = [:]
-            eventsHistoryLost = true
             moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
         } else if canRequest {
             // Hold the baseline so the replay can fill the gap; remember what is already here.
             holdAhead(seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
         } else {
-            // Nothing can fill it: skip over.
+            // Nothing can fill it: skip over. The skipped seqs stay missing from the coverage.
             eventsAhead = [:]
-            eventsHistoryLost = true
             moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
         }
         needEvents()
@@ -535,13 +547,10 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     private mutating func receiveSyncEvent(_ message: RoomMemory.ChangeEvent, at now: TimeInterval) {
         let seq = message.header.seq
         lastSyncEventAt = now
-        if eventsInitialSync, initialSyncSeqs.count < Self.eventCapacity * 2 {
-            initialSyncSeqs.insert(seq)
-        }
+        noteReceived(message)
         guard let base = eventsSeq else {
             record(message, at: now, fromSync: true)
             moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
-            requireHistory(below: seq)
             return
         }
         if seq <= base {
@@ -561,16 +570,54 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         resolveEventsIfDone()
     }
 
-    /// The baseline just started at `seq`. While the initial answer is owed, that answer must
-    /// replay every seq below it, whichever topic (or the status that opened the request) led here,
-    /// and until it does the history is incomplete. The bound outlives a reconnect: the seqs
-    /// counted before it are forgotten, the baseline is not.
-    private mutating func requireHistory(below seq: UInt64) {
-        guard eventsInitialSync else { return }
-        initialHistoryBelow = seq
-        if seq != 0, eventsState == .complete {
-            eventsState = .incomplete(since: nil)
+    /// Adds one received seq to this generation's coverage, merging neighbouring ranges.
+    private mutating func noteReceived(_ message: RoomMemory.ChangeEvent) {
+        let seq = message.header.seq
+        let stamp = message.header.stamp
+        guard let index = receivedSpans.firstIndex(where: { seq <= $0.high || seq - $0.high == 1 }) else {
+            receivedSpans.append(Span(low: seq, high: seq, topStamp: stamp))
+            boundSpans()
+            return
         }
+        var span = receivedSpans[index]
+        if seq >= span.low, seq <= span.high { return }
+        if seq > span.high {
+            span.high = seq
+            span.topStamp = stamp
+        } else if span.low - seq == 1 {
+            span.low = seq
+        } else {
+            receivedSpans.insert(Span(low: seq, high: seq, topStamp: stamp), at: index)
+            boundSpans()
+            return
+        }
+        receivedSpans[index] = span
+        if index + 1 < receivedSpans.count, receivedSpans[index + 1].low - span.high == 1 {
+            receivedSpans[index].high = receivedSpans[index + 1].high
+            receivedSpans[index].topStamp = receivedSpans[index + 1].topStamp
+            receivedSpans.remove(at: index + 1)
+        }
+    }
+
+    /// Forgetting a range only ever makes the history less complete, never falsely complete.
+    private mutating func boundSpans() {
+        guard receivedSpans.count > Self.eventCapacity else { return }
+        receivedSpans.remove(at: receivedSpans.first?.low == 0 ? 1 : 0)
+    }
+
+    /// A new publisher generation: coverage starts again at nothing. If the old one held or named
+    /// any event, its unseen tail is lost for good.
+    private mutating func cutHistory() {
+        if !receivedSpans.isEmpty || eventsHighWater != nil, !historyCut {
+            if case .incomplete(let since) = eventsState {
+                historyCutSince = since
+            } else {
+                historyCutSince = receivedSpans.first?.topStamp
+            }
+            historyCut = true
+        }
+        receivedSpans = []
+        eventsHighWater = nil
     }
 
     private mutating func moveBaseline(to seq: UInt64, epoch: UInt64, stamp: RoomMemory.Time) {
@@ -595,7 +642,6 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         eventsAhead[seq] = epoch
         guard eventsAhead.count > Self.eventCapacity, seq == eventsAhead.keys.max() else { return }
         eventsAhead = [:]
-        eventsHistoryLost = true
         moveBaseline(to: seq, epoch: epoch, stamp: stamp)
     }
 
@@ -607,30 +653,12 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         lastSyncEventAt = nil
         if let top = eventsAhead.keys.max(), let epoch = eventsAhead[top] {
             eventsAhead = [:]
-            loseEventsHistory()
             let stamp = events.last(where: { $0.seq == top })?.event.header.stamp ?? lastGoodEventStamp ?? RoomMemory.Time(sec: 0, nanosec: 0)
             moveBaseline(to: top, epoch: epoch, stamp: stamp)
         }
-        if eventsInitialSync {
-            eventsInitialSync = false
-            // A full history runs 0, 1, 2, … with no hole, up to the first live event that set the
-            // baseline; anything else is the bounded fallback.
-            let seqs = initialSyncSeqs
-            let gapless = seqs.isEmpty || (seqs.min() == 0 && UInt64(seqs.count) == seqs.max()! + 1)
-            if !gapless || UInt64(seqs.count) < (initialHistoryBelow ?? 0) {
-                loseEventsHistory()
-            }
-            initialSyncSeqs = []
-            initialHistoryBelow = nil
-        }
+        // Whatever the answer left out stays missing from the coverage.
+        eventsInitialSync = false
         resolveEventsIfDone()
-    }
-
-    private mutating func loseEventsHistory() {
-        eventsHistoryLost = true
-        if eventsState == .complete {
-            eventsState = .incomplete(since: lastGoodEventStamp)
-        }
     }
 
     /// Appends to the ring, and moves the event's state only on a newer seq. With `onlyIfNewer`,
@@ -673,6 +701,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     /// An events request is done once the baseline reaches both the newest live seq and the
     /// status high-water mark, with nothing held ahead (Phase 3 §4.3).
     private mutating func resolveEventsIfDone() {
+        // A mark from before a reconnect is no high-water now: closing early drops the rest of the answer.
+        guard statusThisConnection else { return }
         if eventsSeq == nil, let status, status.eventsSeq == nil {
             // Nothing held and the Spark has published no event: nothing to fetch.
             eventsInitialSync = false
@@ -684,9 +714,6 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         // A status mark below the baseline is a restart (or lag by one); either way not done yet.
         guard base >= (highestLiveEventsSeq ?? base), base == (status?.eventsSeq ?? base) else { return }
         needs[.events] = nil
-        if !eventsHistoryLost, connected {
-            eventsState = .complete
-        }
     }
 
     // MARK: Status
@@ -699,6 +726,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         }
         let previous = status
         status = LiveRoomStatus(message, receivedAt: now)
+        statusThisConnection = connected
         if let previous, message.header.seq < previous.seq {
             // Status seq starts at 0 per publisher: the node restarted.
             nodeRestarted()
@@ -720,23 +748,12 @@ public struct RoomMemoryMirror: Sendable, Equatable {
 
         // events_seq gap: a high-water mark the baseline still has not reached one status later.
         if eventsSeq == nil, let mark = message.eventsSeq {
-            // Events exist but none is held (the first was lost, or none has arrived yet).
-            // The connect request is already outstanding in that case: incompleteness is separate
-            // from opening another request, or the list stays complete for as long as the replay lags.
-            if eventsMark != nil {
-                if canRequest {
-                    if eventsState == .complete {
-                        eventsState = .incomplete(since: lastGoodEventStamp)
-                    }
-                    if needs[.events] == nil {
-                        activity.gaps += 1
-                        eventsInitialSync = true
-                        needEvents()
-                    }
-                } else if eventsState == .complete {
-                    activity.gaps += 1
-                    loseEventsHistory()
-                }
+            // Events exist but none is held (the first was lost, or none has arrived yet). The
+            // coverage already reads incomplete; this only decides whether to ask again.
+            if eventsMark != nil, canRequest, needs[.events] == nil {
+                activity.gaps += 1
+                eventsInitialSync = true
+                needEvents()
             }
             eventsMark = mark
         }
@@ -744,14 +761,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             if mark > base {
                 if let previous = eventsMark, base < previous, needs[.events] == nil, eventsAhead.isEmpty {
                     activity.gaps += 1
-                    if eventsState == .complete {
-                        eventsState = .incomplete(since: lastGoodEventStamp)
-                    }
-                    if canRequest {
-                        needEvents()
-                    } else {
-                        eventsHistoryLost = true
-                    }
+                    needEvents()
                 }
                 eventsMark = mark
                 eventsLowMark = nil
@@ -768,6 +778,10 @@ public struct RoomMemoryMirror: Sendable, Equatable {
                 eventsLowMark = nil
             }
         }
+        // After any generation change above, so a restart's mark starts the new high-water.
+        if let mark = message.eventsSeq {
+            eventsHighWater = max(eventsHighWater ?? mark, mark)
+        }
         resolveEventsIfDone()
     }
 
@@ -781,16 +795,15 @@ public struct RoomMemoryMirror: Sendable, Equatable {
 
     /// Drops the events baseline for a new publisher generation and fetches what exists anew.
     private mutating func startEventsGeneration() {
+        cutHistory()
         guard eventsSeq != nil else { return }
         eventsGeneration += 1
-        loseEventsHistory()
         eventsSeq = nil
         eventsEpoch = nil
         eventsAhead = [:]
         highestLiveEventsSeq = nil
         eventsMark = nil
         eventsLowMark = nil
-        initialHistoryBelow = nil
         if canRequest {
             eventsInitialSync = true
             needEvents()
