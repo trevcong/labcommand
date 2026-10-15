@@ -2,3 +2,6 @@
 build/
 *.app
 .DS_Store
+spark/.venv-local/
+__pycache__/
+.pytest_cache/

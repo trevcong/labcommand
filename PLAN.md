@@ -1,483 +1,264 @@
-# Live Room view (job B)
+# Change overlay + timeline scrubber
 
-Status: plan, revised after the Codex re-review `VERDICT: REVISE` (`~/Developer/lc-tasks/liveroom/PLAN.review2.md`). The first review (`PLAN.review.md`) stays answered in the table below. Branch `live-room-ui` in `~/Developer/labcommand-liveroom-b`. No app code in this revision commit.
+Mac viewer for one occupancy diff. Snapshot A against snapshot B, per sensor, through the existing `ChangeDetection` API. Appeared, disappeared, and moved regions draw on the room cloud. A scrubber reveals those regions in report order. No rig contact on this path.
 
-The first thing an implementer produces is a running app whose Room page is bound to `LiveRoomClient` and has drawn a map and a status bar from `ws://100.118.187.99:8767`. Markers, the event list, and the offline fixture follow that screenshot. They are still part of done.
+`ChangeDetection.swift` stays frozen. This plan does not change its math, its JSON, its defaults, or its tests.
 
-## Review disposition
+## What the code is today
 
-| Finding | Where this plan answers it |
-|---|---|
-| P1 client is part of completion, not a follow-up | "Client on this branch", "Who starts the socket", slice 1, gate step 3 |
-| P1 `events_seq` is `mirror.status?.eventsSeq` (golden value 12) | Status bar, fixture `status` mode, tests |
-| P1 freshness and overlay suppression | Banners, activity pip, markers |
-| P2 event ring vs latest state, `.incomplete(since: nil)` | Event adaptation |
-| P2 voxel centers | Voxel map (the two centers below) |
-| P2 fit visible markers, `mapRevision` vs camera | Voxel map, camera |
-| P2 reproducible screenshots, fixture really offline | Screenshots, fixture launch |
-| P2 resync with no request path | Resync line |
-| P3 selected candidates stay unfilled; caption; 280pt wrap | Event list |
+`ChangeDetection` (`Sources/LabCommandCore/ChangeDetection.swift`) is a pure occupancy diff.
 
-Re-review (`PLAN.review2.md`):
+- `ChangeDetection.compare(_:_:config:)` builds two `OccupancyMap`s and returns a `Report`.
+- `Report.regions` is `[Region]` in v2 order: kind rank `moved`, `appeared`, `disappeared`, `unobserved`, then `voxelCount` descending, then `minKey`, then `fromMinKey`.
+- A `Region` carries `kind`, `voxelCount`, `centroid`, `boundsMin` (inclusive cell corner, meters), `boundsMax` (exclusive corner, meters), `volume`, `minKey`. For `.moved` only, the disappeared partner is `fromCentroid`, `fromBoundsMin`, `fromBoundsMax`, `fromVoxelCount`, `fromMinKey`.
+- `Report.appearedVoxels`, `disappearedVoxels`, and `unknownVoxels` are pre-cut counts. They are not key sets.
+- `Region` does not store the occupied keys. `minKey` is one key. The drawable geometry the API actually gives is the AABB, the centroid, and, for `.moved`, the from-AABB and from-centroid.
+- `Config()` is voxel 0.05 m, `tolerance` 1, `minVoxels` 6, `minExtent` 2, `pairMoves` true, `maxMove` 1.5 m, `evidenceOfAbsence` false, `origin` `(0,0,0)`, `rayStride` 1, `reportUnobserved` false.
 
-| Finding | Where this plan answers it |
-|---|---|
-| P1 land `65122d2` before any client file is copied | "Client on this branch" (prerequisite gate) |
-| P2 canvas-rect marker pixels, then read the rows off the PNG | Screenshots, visual inspection |
-| P2 standalone resync line when history is complete | Resync line, rule 3 |
+`docs/CHANGE-DETECTION.md` measured the files `shot.sh` launches with (`~/Developer/lc-tasks/snapshots/{a,b}/{jt128,mid360}.bin`, same bytes as `Tests/Fixtures/room/snapshots/`):
 
-## Work order
+- Evidence on and `Config()` cuts (`minVoxels` 6, `minExtent` 2): both sensors return `regions` empty. The goldens are `Tests/Fixtures/change-detection/{jt128,mid360}.json`.
+- Evidence on, `minVoxels` 1, `minExtent` 1, pairing on: JT128 has 50 regions, Mid-360 has 272. Pre-cut voxels are JT128 46 / 14 / 854 and Mid-360 255 / 104 / 1286 (appeared / disappeared / unknown). The largest Mid-360 component is one appeared sheet of 7 voxels, 5×3×1 cells. Most regions are one voxel.
 
-Do these in order. Slice 1 is the earliest deliverable. Do not start slice 2 until `build/screenshots/live-room-live.png` exists and its sidecar shows a `.connected` room socket.
+A viewer that calls `compare` with `Config()` will show a room and zero boxes on the real pair. The boxes have to come from a call-site `Config`. That is not a library change.
 
-1. **Slice 0 — codec, then the client.** Cherry-pick `65122d2` and pass its gate before any client file is added. Then land the client from `live-room-client`. Do not write a second one.
-2. **Slice 1 — live map and status bar.** Room destination, `LiveRoomClient` owned by `AppState`, voxels, brick frames, status bar, activity pip, banners. Launch against `ws://100.118.187.99:8767` and save the live screenshot.
-3. **Slice 2 — markers and the event list.** Suppression, event adaptation, the resync line, selection, caption, wrapping.
-4. **Slice 3 — fixture mode.** Bundled goldens, no socket and no SSH, four offline screenshots with the checks below.
-5. **Gate.** Build, tests, both screenshot passes, Codex, commit, `DONE.md`.
+The room is already drawn by `PointCloudRenderer` (`MTKViewDelegate`). Points are `PointVertex` (position, intensity, sensor id), one inline Metal library, primitive `.point`. The camera is `CameraMath.fitToBounds` (FOV `PointCloudRenderer.fovY` = 45°, elevation `CameraMath.defaultElevation` = 30°, margin 0.9) inside a Z-up `lookAt`. Nothing in the app calls `setViewMatrix` from a drag. The fitted camera is the camera the overlay has to match. `DualPointCloudView` feeds that renderer. `LivePointCloudCanvas` in `CommandCenterView` is the SwiftUI slot.
 
-## Client on this branch
+Clouds are decoded by `PointCloud2CDR.decode` (CDR, 4-byte encapsulation header). `PointCloudFrame.timestamp` is the header stamp. `PointCloudFrame.sensor` is not set by the decoder. `RigTransforms.inWorld(_:sensor:)` writes `world`: JT128 is identity (`hesaiToWorld`), Mid-360 is `livoxToWorld` (translation `(0, 0, -0.110)`, yaw −86.5°, roll π). The live client already does this before packing. The sample-PCD path does not. Two sensor-frame clouds overlaid without `inWorld` are not one room. Mid-360 against JT128 without that transform is the meaningless diff the change-detection doc warns about.
 
-The view binds to the client. It does not keep a parallel `LiveRoomSnapshot`, and it does not ship fixture-only.
+`RoomMemory.ChangeEvent` is a different type (lifecycle state, ROS header, `SIMD3` boxes). The scrubber does not read it. There is no mirrored event log on this launch, only two files per sensor.
 
-The contract is `Sources/LabCommandCore/LiveRoom/API.md` on `live-room-client` (`~/Developer/labcommand-liveroom-a`). This worktree has no `MemoryStatus.eventsSeq`. `RoomMemoryMirror` reads that field. The copy list further down does not contain the codec, so copying those files onto the current tree does not compile.
+`AppState.start()` calls `refresh()`, and `ConnectivityService.runAllChecks()` runs `tailscale status`, `ssh`, and ping. `FoxgloveLiveClient` opens nothing until Snapshot or Live, but those buttons call `takeSnapshot()` / `startLive()`, which open `ws://` to the Spark. `shot.sh` waits 20 s and captures the layer-0 window of `build/LabCommand.app`. A launch that still probes will SSH during the shot.
 
-Prerequisite commits, from `live-room-client`, cherry-picked onto `live-room-ui` before any client file is added. Do not start the cherry-pick at `05eaf98`.
+## Architecture
 
-1. `1de0454` — `API.md`, and `Package.swift` excluding it from the target.
-2. `65122d2` — the codec and the golden. This commit is the one the copy must not skip.
-   - `Sources/LabCommandCore/RoomMemoryMessages.swift`: `eventsSeq: UInt64?`, and `eventsSeqNone = UInt64.max` (`EVENTS_SEQ_NONE`).
-   - `Sources/LabCommandCore/RoomMemoryCDR.swift`: write and read `events_seq`. The sentinel decodes to nil. Encoding nil writes the sentinel.
-   - `Sources/LabCommandCoreTestsRunner/RoomMemoryCDRTests.swift`: the hand status expects `eventsSeq == 12`.
-   - `Tests/Fixtures/room/golden/hand/memory_status_le.hex`: `events_seq 12` at pos 72 (`0c 00 00 00 00 00 00 00`).
-   - `scripts/spark/make_room_memory_goldens.py`: the generator sets `events_seq = 12`.
-   - No client sources. No `.msg` edit. The Swift struct is what the client compiles against.
+One new core type family, `ChangeOverlay`, in `LabCommandCore`. Foundation and `Point3D` / `RigidTransform` / `SensorID` / `ChangeDetection` only. No simd, no Metal, no SwiftUI. The app binds.
 
-Gate, still before the copy. All three are true on this branch:
-
-- `eventsSeq` is a stored property of `RoomMemory.MemoryStatus`.
-- Decoding `memory_status_le.hex` yields `eventsSeq == 12`.
-- `swift run LabCommandCoreTestsRunner` passes.
-
-A failed gate stops the slice. The client files stay uncopied.
-
-The client is already committed on `live-room-client` as `05eaf98`, `574feb2`, and `b7ba3c1` (tip `b7ba3c1`), on top of `65122d2`. After the gate, cherry-pick that range, or copy these paths byte for byte from that tip. Do not rewrite the socket, the mirror, or the codecs. Do not edit those files to change resync behavior.
-
-- `Sources/LabCommandCore/LiveRoom/LiveRoomClient.swift`
-- `Sources/LabCommandCore/LiveRoom/LiveRoomProtocol.swift`
-- `Sources/LabCommandCore/LiveRoom/RoomMemoryMirror.swift`
-- `Sources/LabCommandCore/LiveRoom/API.md` (the tip's copy; it has moved past `1de0454`)
-- `Sources/LabCommandCoreTestsRunner/LiveRoomTests.swift`
-- `Tests/Fixtures/room/live/`
-- the `live-room-probe` argv branch and the `runLiveRoomTests()` call in that worktree's `main.swift`
-
-`574feb2` also adds `events_seq` and `EVENTS_SEQ_NONE` to `ros/labcommand_msgs/msg/MemoryStatus.msg` (the phase3-design hunk, so the ROS definition matches the codec). That hunk may arrive with the cherry-pick. Do not edit `.msg` files by hand, and do not take any other hunk from `origin/phase3-design`.
-
-`swift run LabCommandCoreTestsRunner` stays offline: `live-room-probe` is a separate argv and is not part of this gate.
-
-`LiveRoomClient.defaultURL` is `ws://100.118.187.99:8767`, subprotocol `foxglove.sdk.v1`. The bridge probed on 2026-10-15 advertises `connectionGraph` only. It has no `clientPublish`. The Spark still publishes snapshots on the live map topic, so the map arrives with no request path.
-
-## Who starts the socket
-
-`AppState` owns the client. The view never calls `start()` or `stop()`, never builds a `URLSession`, and never writes a `RequestSync`.
-
-```swift
-let room = LiveRoomClient() // default URL, publishRequests: true (the default)
-// AppState.start() calls room.start() in live mode
-// AppState.stop() calls room.stop()
+```text
+LC_SNAPSHOT_A / LC_SNAPSHOT_B
+        │  app reads jt128.bin + mid360.bin (PointCloud2CDR.decode)
+        ▼
+per sensor, sensor frame:
+  ChangeDetection.compare(before, after, config: ChangeOverlay.snapshotConfig())
+        │  Report
+        ▼
+ChangeOverlay.timeline(sensor:report:beforeStamp:afterStamp:)
+ChangeOverlay.merge  — earlier after-stamp first, then SensorID.allCases
+        │  Timeline
+        ▼
+scrubber state (revealed count + kind flags) lives in AppState
+ChangeOverlay.revealed + ChangeOverlay.geometry
+        │  world-frame boxes and arrow centerlines
+        ▼
+PointCloudRenderer second pipeline, same MVP as the points
+SwiftUI scrubber under the canvas, copy from ChangeOverlay
 ```
 
-`start()` connects and reconnects until `stop()`. `stop()` closes the socket. The mirror stays and goes stale inside the client (`connectionClosed`). One client per app. The lidar `FoxgloveLiveClient` is a different socket and stays on the Rig page.
+Diff in the sensor frame, then transform for display. `RigTransforms.inWorld` on the points and `RigidTransform.apply` on the box corners and centroids use the same `RigTransforms.toWorld(sensor)`. Quantizing after the Mid-360 rotation would cross voxel faces and would not be the diff the goldens describe. The CLI does not transform. The viewer does not either, until the geometry is on its way to the screen.
 
-`LiveRoomLaunch` in `LabCommandCore` reads `LABCOMMAND_LIVE_ROOM`:
+The cloud on screen is snapshot B, both sensors, in `world`. Snapshot A is the before argument of `compare` and is not drawn. Drawing both clouds would z-fight the unchanged room. The scrubber does not edit points. It only reveals regions. At revealed-count 0 the B cloud is on screen with no boxes. That is "before any region is drawn," not a reconstruction of cloud A.
 
-| Value | Source | `room.start()` | `refresh`, SSH, rig poll, Tailscale | Lidar client |
-|---|---|---|---|---|
-| unset | live, destination stays Rig | yes | unchanged, existing probes | unchanged |
-| `live` | live, destination Room | yes | skipped | `isAvailable: false` |
-| `map`, `status`, `stale`, `unavailable` | fixture of that mode | client is not constructed | skipped | `isAvailable: false` |
-| anything else | fixture `unavailable` | client is not constructed | skipped | `isAvailable: false` |
+## Viewer config
 
-`--mock` only replaces `RigService`. It does not make Room offline. Fixture mode is the env value above, not `--mock`.
+`ChangeOverlay.snapshotConfig()` returns `ChangeDetection.Config()` with three fields set:
 
-The gate's live screenshot uses `LABCOMMAND_LIVE_ROOM=live`, so that process opens the room socket and does not SSH, deploy, or poll the rig. A normal launch (env unset) still runs the existing probes; that launch is not the gate command.
-
-The screen reads `room.connection` and `room.mirror`. Helpers in `Sources/LabCommandCore/LiveRoomView.swift` are pure functions of those values plus one flag, `requestPathExists`, which `AppState` computes:
-
-`server.canPublish` is true, or `room.requestSyncSink != nil`.
-
-This job leaves the sink nil.
-
-## What the screen is
-
-A third destination, **Room** (`Dest.liveRoom`, label `Room`, shortcut `3`). Rig stays `1`, Settings stays `2`. `Dest.navCases` already feeds the View menu. The Rig page, the lidar canvas, and the recording controls stay as they are.
-
-Same chrome as the rest of the app (`design-refs/DESIGN-VISION.md`, `LabTheme`):
-
-- Header: title "Room" at 15pt semibold, a 6px activity pip, and a `Fixture` chip only in fixture mode.
-- One banner line when a condition below matches.
-- Metal canvas: occupied voxels in the room frame. Change markers on top, only while the map is current.
-- Status bar, 11pt mono, under the canvas.
-- Event list on the right, 280pt. Slice 1 may omit the list; the column appears in slice 2. The live screenshot does not wait for it.
-
-Nothing on this page comes from `ChangeDetection`. Markers come from `RoomMemory.ChangeEvent` values the mirror already applied.
-
-## Status bar
-
-One line, `LabTheme.mono(11)`, color `LabTheme.dim`. The events field is `mirror.status?.eventsSeq`, the server high-water mark copied onto `LiveRoomStatus`. It is not `mirror.eventsSeq` (that is the contiguous baseline). It is not `ChangeEvent.header.seq`. Nil, including a wire `EVENTS_SEQ_NONE`, renders `events —`. A baseline of 4 with a status high-water mark of 12 renders `events 12`.
-
-Order, after the prefix below:
-
-`epoch <n> · coverage <p> · events <n> · <state> · cell <cm>`
-
-| Field | Source | Text |
+| Field | Value | Why |
 |---|---|---|
-| epoch | `mirror.mapEpoch`, else `status?.mapEpoch`, else none | `epoch 43` or `epoch —`. Decimal, no grouping separator |
-| coverage | `status?.coverageKnownFraction` | `coverage —`, or one decimal percent (`coverage 75.0%`, `coverage 0.0%` for a real zero) |
-| events | `status?.eventsSeq` | `events —` or `events 12` |
-| state | `status?.state`, and only while `mirror.isStatusFresh` | `Building` / `Tracking` / `Rig moved` / `Degraded` / `Paused`. Omitted when the status is missing or not fresh |
-| cell | `mirror.voxelSize` | omitted when nil. `0.05` → `cell 5.0 cm` |
+| `evidenceOfAbsence` | `true` | A disappeared cell is one an after-ray traversed. Matches the measured blip table. Origin stays `(0,0,0)` because the diff is in the sensor frame. |
+| `minVoxels` | `1` | The library default 6 drops every component on this pair. |
+| `minExtent` | `1` | The library default 2 drops the only component that clears a lower count, the 7-voxel Mid-360 sheet. |
 
-Percent is `coverage * 100`, one digit, `en_US_POSIX`. Cell size is `voxelSize * 100` centimeters, one digit (protocol §6 rule 10). The word is `cell`. There is no detection-distance claim.
+`pairMoves`, `tolerance`, `voxelSize`, `maxMove`, `moveCountRatio`, `rayStride`, and `reportUnobserved` stay at `Config()` (pairing on, 0.05 m, stride 1, unobserved regions off). `reportUnobserved == false` drops unknown cells from `regions` no matter how large the component is. That is not the cluster cut. The pre-cut `unknownVoxels` count is still shown on every caption, including a playhead. Unobserved boxes are not built unless a report actually contains `.unobserved`.
 
-Prefix, first match:
+`rejected` voxels are a different number. They are the pre-cut appeared and disappeared voxels that did not land in a region after `minVoxels` and `minExtent`. A moved region's `voxelCount` counts on the appeared side and `fromVoxelCount` on the disappeared side. Unknown voxels are not added into that sum. Captions print the two counts as separate clauses.
 
-- connection is not `.connected` → `offline ·`, and no state word
-- `status != nil` and `!isStatusFresh` → `STALE · <age>s ·`, and no state word. Age is whole seconds of `ProcessInfo.processInfo.systemUptime - status.receivedAt` (the mirror's clock)
-- otherwise no prefix
+This config is a viewer choice. `ChangeDetection.Config()` and the goldens stay on the library defaults. Tests lock the three overrides and no others.
 
-The numbers after a prefix are the last held values. The prefix is what keeps them from reading as live.
+On this pair the result is on the order of 50 + 272 regions, mostly one voxel. The overlay draws what `compare` returns, including a `.moved` region the pairing heuristic emits for two similar specks. The viewer does not re-gate moves.
 
-`memory_status_le.hex` after `65122d2` is room `lab-a`, epoch 42, coverage 0.75, state tracking, `events_seq` 12. Its status line is `epoch 42 · coverage 75.0% · events 12 · Tracking` with no cell clause.
+## Overlay geometry
 
-## Activity pip
+`ChangeOverlay.geometry` takes the revealed events, a `RigidTransform` per `SensorID`, and the emphasized event index.
 
-A 6px circle in the header. A `.connected` socket is not enough to turn it green. First match:
+For each event, eight corners are the combinations of `boundsMin` / `boundsMax` on x, y, z, in sensor meters. Each corner goes through `transform.apply`. That is an oriented box. For Mid-360 it is not axis-aligned in world, and it is not replaced by a world AABB. A world AABB of the rotated corners would be a looser box than the voxel.
 
-| Condition | Pip | Motion |
+A one-voxel region has an edge of `voxelSize` (0.05 m). A larger region’s box is the component AABB, so it can contain empty cells. That is what `boundsMin` / `boundsMax` mean. The occupied key set is not recoverable from `minKey` plus the AABB, and this plan does not add keys to `Region`.
+
+`.moved` also emits the from-box from `fromBoundsMin` / `fromBoundsMax`, and an arrow from `fromCentroid` to `centroid`, both transformed the same way. A `.moved` region missing either from-corner or `fromCentroid` contributes the appeared box only. `.appeared` and `.disappeared` emit one box and no arrow. `.unobserved` emits edges only.
+
+Arrow head, in meters, in the plane of the segment and world up `(0,0,1)`:
+
+- `len` is the distance from the transformed `from` to the transformed `to`. `len == 0` emits no arrow.
+- Head length `h = min(0.15, len * 0.35)`.
+- Side vector is `normalize(cross(dir, up))`. If that length is under `1e-4` (a vertical move), use `cross(dir, (0,1,0))` instead.
+- Wings sit at `to - dir * h`, offset by `± side * (h * 0.45)`.
+
+Core returns the centerline and the two wing points. It does not camera-face the head and it does not know the viewport.
+
+Colors live in core as linear 8-bit RGB so the legend and the GPU share one table. Values are the `LabTheme` status colors, not a new palette:
+
+| Kind | Hex | Role |
 |---|---|---|
-| `isStatusFresh` and state is `.rigMoved` | `LabTheme.bad` | still |
-| `.connected`, `memoryTopics` not empty, `isStatusFresh`, `isMapCurrent`, state is `.tracking`, `.building`, or `.degraded` | `LabTheme.good` | opacity 1.0 ↔ 0.55 over 1.6s |
-| `.waiting`, or `.connected` and `!isMapCurrent`, or a status exists and `!isStatusFresh` | `LabTheme.warn` | still |
-| anything else (`.off`, `.connecting`, topics empty, `.paused`, no status) | `LabTheme.idle` | still |
+| `appeared` | `#3FA37A` | `LabTheme.good` |
+| `disappeared` | `#C45A5A` | `LabTheme.bad` |
+| `moved` | `#C4A04A` | `LabTheme.warn` |
+| `unobserved` | `#5C6670` | `LabTheme.faint` |
 
-`isMapCurrent` is `mapState == .current && isStatusFresh`. The green row requires it again so a fresh status over a stale or empty map stays amber.
+The from-box of a move uses the moved color and is edges only. The appeared box of a move is a fill. Emphasized means the playhead event: fill alpha 0.85 instead of 0.28. Every other revealed box stays at 0.28.
 
-## Banners
+## Metal for the room, SwiftUI for the scrubber
 
-At most one line, 13pt, above the canvas. This is Phase 3 §5.4, on the states the client actually has. `LiveRoomConnection` has no incompatible case; do not invent one. Connection loss and a stale status come before any remembered memory state. First match:
+Boxes and arrows go in Metal. The scrubber goes in SwiftUI.
 
-1. `.connected` and `memoryTopics` is empty — `Room memory not running on Spark`. Color `LabTheme.warn`. The canvas is this sentence, not an empty room drawn as current.
-2. `.waiting`, or `.off` after `start()` has run — `connection lost`. Color `LabTheme.bad`. The first `.connecting` of a launch uses `connecting` (`LabTheme.dim`) instead of connection lost.
-3. `status != nil` and `!isStatusFresh` — `STALE · <age>s`. Color `LabTheme.warn`. Age as on the status bar. Do not show `Rig moved`, `Tracking`, or any other last state here.
-4. Fresh `.rigMoved` — `Rig moved: changes suspended · <residual>`. Residual is `0.12 m` (two decimals) or `guard not run` when `poseResidualM` is nil. Color `LabTheme.bad`.
-5. `mapState` is `.stale` and `bricks` is not empty — `resyncing · as of epoch N`. Color `LabTheme.warn`. The mirror does not store a map age; do not invent one.
-6. `mapState` is `.empty`, or `.stale` with no bricks — `Waiting for map`. Color `LabTheme.dim`.
-7. Fresh `.degraded` — `Degraded · <sensors>`, or `Degraded` when none are silent. A sensor is silent only when its Hz is a measured `0` (`mid360Hz == 0` → `Mid-360`, `jt128Hz == 0` → `JT128`). Nil Hz is unmeasured, not silent. Color `LabTheme.warn`.
-8. Fresh `.paused` — `Paused`. Color `LabTheme.dim`.
-9. Fresh `.building` — `Building reference`. Color `LabTheme.dim`.
+A SwiftUI `Canvas` over the `MTKView` cannot share the draw. `viewMatrix` and `projectionMatrix` are private on `PointCloudRenderer`. `draw(in:)` does not invalidate SwiftUI. The fit runs when the drawable size arrives, which is after the first SwiftUI update, so a 2D projection done in `updateNSView` would use the default eye `(0, -5, 3)` or a stale fit. SwiftUI shapes also have no depth against the points, so every box would paint on top of the room.
 
-No match (fresh tracking, map current): no banner.
+The point pipeline stays as it is. One more pair of functions in the same `shaderSource` string (`overlayVertex`, `overlayFragment`), one more `MTLRenderPipelineState` from the same `makeLibrary`. Vertex is `float3 position` plus `float3 color` plus a `float` alpha in a uniform, or alpha in the vertex. The overlay draw uses the same uniform buffer the points already bind at vertex index 1 (`modelViewProjection` only). It runs in the same command encoder, after the points:
 
-`eventsState` is not a banner. Incomplete history is a line on the event list, specified below. `{sec: 0, nanosec: 0}` renders `time —`. Other stamps render `HH:mm:ss` UTC.
+1. Triangle list, 12 triangles per filled box, alpha blending on (`sourceAlpha` / `oneMinusSourceAlpha`). Depth test on, depth write off, so a box hides behind a wall and does not punch a hole in the cloud.
+2. Line list, 12 edges per box, plus the three arrow segments (`from → to`, `to → wing`, `to → wing`). Line width on this GPU is 1. The fill is what makes a voxel read as a color.
+3. Point list at the appeared centroid and, for a move, the from-centroid. `point_size` 10. The existing point shader colors by height or sensor, so these marks use the overlay pipeline, in the kind color. A 0.05 m cube at a room fit is only a few pixels (45° vertical FOV, room on the order of several meters, canvas well under the 1180×800 window). A 10 px centroid mark is what stays visible in the screenshot. The fill still carries the box. Fills and lines keep the depth test (`less`, write off). The centroid points compare depth as `always` and do not write depth, so a return inside the same voxel cannot hide the mark. Boxes and arrows still drop out behind a wall.
 
-Bricks, whenever `!isMapCurrent` and the dictionary is not empty, draw at 35% opacity. That covers a stale status while `mapState` is still `.current`, and a `.stale` map. Markers do not draw in either case. When the map is current, bricks are full opacity even if the state is building or rig-moved; the marker rule is what hides the overlays.
+No instanced voxel brick renderer. A few hundred boxes are about 10⁴ triangle vertices. The point cloud is already ~1.4×10⁵ points (JT128 115,200 plus Mid-360 ~20,000). Sorting boxes by centroid depth is unnecessary at this count. Overlapping translucent boxes can composite in the wrong order. These regions are small and sparse. That artifact is accepted.
 
-## Voxel map
+`PointCloudRenderer` gains `setOverlay(_: ChangeOverlay.Geometry)`. `DualPointCloudView` passes it from `updateNSView`. The renderer keeps the last geometry and rebuilds the three buffers only when it changes. An empty geometry draws nothing and does not affect the point path. Camera fit stays on the point bounds (`RobustBounds.percentile`, `maxFitRange` 15 m). Overlay corners do not pull the camera.
 
-`RoomMapRenderer` is a new Metal renderer used only by Room. It copies the z-up camera from `PointCloudRenderer` (`up = (0,0,1)`, `CameraMath.fitToBounds`, clear `#0B0D10`). It does not share buffers with the lidar canvas. Drag orbits (yaw around z, pitch), scroll dollies, double-click refits. The lidar view is left alone.
+In snapshot mode the point color mode is `.sensor` (Mid-360 cyan, JT128 magenta in the existing shader). Height mode is a rainbow that includes green, red, and yellow and would swallow the kind colors. Sensor coloring leaves good / bad / warn for the overlay.
 
-The client republishes `mirror` on every status and on the 1 s tick. Re-upload voxel and brick-frame buffers only when `(mirror.mapRevision, mirror.voxelSize)` changes. `mapRevision` increments when the brick dictionary changes. Pair it with `voxelSize` because a snapshot can replace `voxelSize` without a brick change. Marker buffers upload when the marker set changes, not when the mirror value is republished unchanged.
+## Scrubber
 
-Voxel index `(ix, iy, iz)` covers `[n·s, (n+1)·s)`. Its center is `(n + 0.5) · s`. Inside brick `(i, j, k)`, local `(x, y, z)` has index `(8i+x, 8j+y, 8k+z)`, using `Brick.evidence(x:y:z:)`.
+The timeline is discrete. Every region of one sensor shares that sensor’s after-frame `PointCloudFrame.timestamp`. There are two stamps per sensor (A and B), not a stamp per region. The playhead is an event index.
 
-| Evidence | Draw |
+`ChangeOverlay.Filter` holds `showAppeared`, `showDisappeared`, `showMoved`, `showUnobserved`. The first three default true. Unobserved defaults false.
+
+`ChangeOverlay.revealed(timeline:filter:count:)` walks events in timeline order, keeps those whose kind is enabled, and returns the first `count` of that filtered list. `count` is `0...filteredCount`. `0` draws no boxes. The default `count` is `filteredCount`, so the first paint and the screenshot show every enabled region. The playhead event is the last revealed event, and it is the emphasized one. When `count` is 0 there is no playhead.
+
+Turning a kind off rebuilds the filtered list and clamps `count` to the new length. Indices in `Timeline.events` do not renumber. Chips show the full-timeline count for that kind, not the revealed prefix.
+
+SwiftUI, docked under the canvas inside the existing `pointCloudCanvas` `VStack` in `CommandCenterView`. The scrubber is shown only in snapshot mode, including a configuration error and a load failure.
+
+- A `Slider` whose state comes from `ChangeOverlay.slider`. When `filteredCount > 0` the range is `0...filteredCount`, the control is enabled, and `count == 0` is a real position on that range (nothing drawn yet, the thumb at the start). When `filteredCount == 0` the control is disabled, the value is 0, and the bound range is `0...1` so SwiftUI still has a non-empty range. That disabled state covers an empty timeline and a nonempty timeline whose filter matches nothing.
+- End labels are the before stamp and the after stamp, formatted by `ChangeOverlay.clock` as `HH:mm:ss` with an explicit time zone (the view passes `.current`; tests pass a fixed zone). Missing stamps read `A` and `B`.
+- Three kind chips, colored with the core RGB, each `kind · count`. An unobserved chip appears only when the timeline contains one. Chip counts are the full timeline, not the revealed prefix.
+- One monospaced caption from `ChangeOverlay.caption`. Counts use a singular noun at 1. The gap is `String(format:)` with the POSIX locale, two fractional digits. The word unavailable is not involved. No Hz. Unknown voxels are never described as rejected or as below the cluster cut.
+
+Caption states, each asserted:
+
+| State | Caption |
 |---|---|
-| occupied | one point at the cell center, color `#C5CDD6`, point size 4 |
-| free | nothing |
-| unknown | nothing at the cell |
+| Playhead (`count > 0`) | `JT128 · moved · 7 voxels · 1.00 m · 854 unknown voxels · 12 rejected voxels`. The gap is the sensor-frame from-centroid to centroid distance and is omitted when the kind is not `.moved` or `fromCentroid` is missing. Unknown and rejected are always on this line. |
+| Empty timeline (no regions) | `0 regions · 46 appeared voxels, 14 disappeared voxels, 854 unknown voxels, 60 rejected voxels`. The three pre-cut totals plus rejected. |
+| Nonempty timeline, `count == 0`, filter still matches events | `0 of 12 regions · 854 unknown voxels, 3 rejected voxels`. |
+| Nonempty timeline, filter matches nothing | `0 of 12 regions · all kinds hidden · 854 unknown voxels, 3 rejected voxels`. |
 
-A brick that contains any unknown voxel also draws its 12 edges in `LabTheme.faint` (`#5C6670`), line width 1. A brick that is entirely known, including all-free, draws no frame. Bricks the mirror does not contain are not framed. Occupied points stay grey so they do not collide with marker green, red, and amber.
+Before the load returns, the caption is `ChangeOverlay.readingLine` (`Reading snapshots.`). A configuration error or a load failure replaces that with its own sentence. Those two are not scrubber states of a timeline. The slider stays in the disabled empty state until a timeline arrives.
 
-The zlib snapshot golden is the numeric pin. After decode of `map_bricks_snapshot_zlib_le.hex` (`voxel_size` 0.05, room `lab`, epoch 43):
+No autoplay. A timer would make the screenshot depend on the 20 s sleep. Left and right arrow keys step `count` by one when the window is key and snapshot mode is on. The local monitor consumes the event so a focused slider does not step twice. Command, option, and control pass through. A text view keeps the keys. They are not menu shortcuts. Cmd-1 and Cmd-2 stay the destination shortcuts.
 
-- Brick `(0, 0, 1)` is all free (`known` all `0xFF`, `occupied` empty): 0 points, 0 frame.
-- Brick `(-1, 2, -3)` has occupied bit 0 of byte 0, local `(0,0,0)`, world index `(-8, 16, -24)`, center `(-0.375, 0.825, -1.175)`.
-- The same brick has occupied bit 7 of byte 63, local `(7,7,7)`, world index `(-1, 23, -17)`, center `(-0.025, 1.175, -0.825)`.
-- That brick also has unknown voxels, so it contributes one 12-edge frame and exactly two points.
+The caption, the chip labels, the empty-state sentences, `readingLine`, `localSessionLine`, and `localChip` are core strings. The views print them.
 
-`(index + 0.5) × 0.05` is the whole formula. `(-24 + 0.5) × 0.05 = -1.175`, and `(-1 + 0.5) × 0.05 = -0.025`.
+## Snapshot launch, no network
 
-### Camera
+`LaunchMode.resolve` reads the environment.
 
-Content bounds are the union of:
+| Environment | Mode |
+|---|---|
+| Neither `LC_SNAPSHOT_A` nor `LC_SNAPSHOT_B` is present | `.rig`. Today’s launch. Probes, timers, polls, actions, and sockets stay available. |
+| Both present and both non-empty after trimming whitespace | `.snapshots(directoryA:directoryB:)`. Local load. No contact. |
+| Anything else: one variable, a missing partner, or a present value that trims to empty | `.configurationError`. A local sentence names the bad side (`is not set`, `is empty`, or both). No load and no contact. This does not fall through to the rig launch. |
 
-- occupied cell centers
-- corners of marker boxes that are actually drawn
-- the four points of each drawn arrow (tail, tip, and both wing tips), using the head size in `ChangeOverlay.makeArrow` on `origin/change-overlay` (`0f5966b`): head `min(0.15, length × 0.35)`, wing `head × 0.45`
+`ChangeOverlay.snapshotDirs` returns the two paths only for `.snapshots`. It returns nil for `.rig` and for `.configurationError`. Nil is not permission to probe. The app branches on `LaunchMode`, not on that optional.
 
-The golden event boxes sit near x = 1.25…2.125. The two occupied centers sit near x = −0.4…0. Fitting occupied centers alone leaves the markers outside the frame.
+Isolation does not stop at `start()`. `SnapshotSession` is the boundary `AppState` calls:
 
-If that union is empty, fit the brick-frame corners. If those are empty too, leave the camera where it is.
+- `begin(rig:)` runs the rig closure only for `.rig`. Snapshot mode returns the two directories and does not call it. A configuration error returns the sentence and does not call it or the loader.
+- `refresh`, `restartTimer`, `pollRig`, and `runAction` take the network work as a closure. `ContactGate.attempt` throws `ContactForbidden` before that closure when `isolates` is true, so the closure does not run. `AppState.refresh`, `AppState.restartTimer`, `AppState.pollRig`, and `AppState.runAction` (every action, including `stopView`) are that call. `restartTimer` may invalidate a local `Timer` first. It does not schedule one.
+- Tunnel start is the other entry. `RigService.ensureTunnels` and `ensureAPITunnel` call `TunnelGate`, which holds a lock across the held-port check, host discovery, and spawn. `startTunnel` is the ssh spawn that factory calls. An isolated `TunnelGate` returns before discovery and before `startTunnel`. Status GET, action POST, the localhost port probe, `stopTunnels`, connectivity probes, and the Foxglove socket stay on the rig path. Snapshot mode does not reach them: those calls sit inside the closures above, and the live client is created with `isAvailable: false`.
 
-Auto-fit on every change of those bounds until the user drags or scrolls. That first window is how a marker that arrives after the snapshot still gets into the frame. After the first drag or scroll, live updates do not fit. Double-click fits once to the current bounds and then stays frozen until the next double-click. A `mapRevision` bump is not itself a fit.
+The same flag disables the controls that would reach those methods. Disabled is not the fence. The fence is the gate. The controls are:
 
-An `.off` connection with an empty mirror draws neither points nor frames. The canvas shows `Room memory unavailable`, 13pt, `LabTheme.dim`, centered. That string is the fixture Off mode and a client that was never started. It is not the copy for "bridge up, topics absent" or "no snapshot yet"; those use the banners above.
+- The Refresh button in `CommandCenterView`, and the View menu Refresh item (`validateMenuItem` returns false).
+- Settings auto-refresh and the interval picker. Both are disabled, and `autoRefreshEnabled` starts false so the row does not look armed.
+- Recording, arm-at-lock, and the status-item Start / Record / Stop items. `runAction` does not consult `RigGate`, so the gate refuses even if a control were enabled. `RigGate` on an unprobed rig still disables the deck. Diagnose stays. It only reads the local snapshot.
+- Live Snapshot and Live are not shown.
 
-## Change markers
+In snapshot mode the status item says `Local` for health and does not add `Spark offline`. The workspace Spark chip binds to `ChangeOverlay.localChip` (`Local`) in `LabTheme.dim`. The headline binds to `ChangeOverlay.localSessionLine` (`Local snapshots. No rig contact.`) after a good load, and to the configuration or load sentence when that is the result. `RigHealth` is not modified.
 
-Colors match `ChangeOverlay.color` on `origin/change-overlay` (`0f5966b`):
+`LC_SCREENSHOT_MODE` is set by `shot.sh` and is not read. The two directory variables are the switch. The shot and a hand launch with the same variables behave the same. A partial pair is a configuration error on both.
 
-| Kind | RGB | Theme |
-|---|---|---|
-| appeared | `(63, 163, 122) / 255` | `good` `#3FA37A` |
-| disappeared | `(196, 90, 90) / 255` | `bad` `#C45A5A` |
-| moved | `(196, 160, 74) / 255` | `warn` `#C4A04A` |
+Load on a detached task, publish on the main actor, so `applicationDidFinishLaunching` still orders the window front before the decode finishes. `shot.sh` sleeps 20 s. A release `compare` of these frames sits far under that. The indoor evidence bar in the change-detection doc is under 100 ms for ~89k points. These files are 115,200 and ~20,000 points per side, two sensors, release, inside the same budget with room to spare. The window title stays `Rig command`. One layer-0 window, the one `LabCommandApp` already creates at 1180×800. The process prints `localSessionLine` to stderr as soon as the isolated launch is chosen, and prints the caption when the load finishes. That line is a label in the shot log. It is not the isolation proof.
 
-Do not merge `origin/change-overlay`. Copy only the draw conventions into `LiveRoomMarkers` and `RoomMapRenderer`:
+Per sensor the loader reads `<dir>/jt128.bin` and `<dir>/mid360.bin`, decodes with `PointCloud2CDR.decode`, and sets `frame.sensor`. A missing file, a `PointCloudError`, or a compare failure publishes `ChangeOverlay.loadFailure` text (`Could not load Mid-360 mid360.bin (missing file).`) into the caption and the headline, and draws no cloud. The window still opens. Sensors are tried in `SensorID.allCases` order, so a pair of missing files reports Mid-360 first. The real directories contain all four files. A load failure stays isolated: refresh, timers, polling, and actions still do not contact.
 
-- Twelve box edges and the twelve triangles (two per face) from `ChangeOverlay.edgePairs` and the overlay renderer's `boxTriangles`.
-- Fill alpha `0.28`, emphasized fill `0.85`.
-- A moved arrow from `fromCentroid` to `centroid`, head as in `ChangeOverlay.makeArrow`.
-- Boxes depth-test and do not write depth. Centroid marks draw with depth compare always.
+After a successful compare, `AppState` holds the two world-frame B frames and the merged `Timeline`. `DualPointCloudView` gets those frames with `liveFeed: nil` and `fitGeneration: 1`. The sample PCD is not loaded, so it cannot sit under the room.
 
-`aabb` is meters in the room frame. No sensor transform. A missing `fromCentroid` on a moved event draws the box only.
+The left column still evaluates `RigHealth` on the initial `RigSnapshot.offline(reason:)`. That headline is `Spark is unreachable` unless `blockReason` is set, and the reasons still say `No SSH path to the Spark`. In snapshot mode the workspace header binds to `ChangeOverlay.localSessionLine` instead of `RigHealth.evaluate`, and the top Spark chip binds to `ChangeOverlay.localChip` (`Local`) in `LabTheme.dim`. `RigHealth` is not modified. The chip must not say unreachable for a launch that never probed.
 
-Draw a marker only when `mirror.isMapCurrent`, and not when the fresh state is `.building` or `.rigMoved`. `.degraded` and `.paused` keep markers while the map is current. A stale status, a stale map, a resync, and a disconnected socket keep the last bricks dimmed and draw no markers. The event list still shows the rows.
-
-What is eligible, before that gate:
-
-| Source | On the map | In the list |
-|---|---|---|
-| `openEvents` entry whose state is `.candidate` | dashed AABB, no fill | Events |
-| `openEvents` entry whose state is `.confirmed` | solid AABB, fill 0.28; arrow if `.moved` and `fromCentroid` is set | Events |
-| `eventsById` entry whose state is `.accepted` and (`mapEpoch == nil` or `mapEpoch < event.header.mapEpoch`), and the map is current | dashed unfilled outline, not counted | History, suffix `accepted · map updating` |
-| other terminal states, and an accepted event whose `mapEpoch` the mirror has reached | no | History |
-
-Dashes are 8 short segments along each edge. Metal lines are not dashed by the API.
-
-The accepted outline is the Mac-side check in protocol §4.2 / Phase 3 §5.5 invariant 4. The Spark publishes the map message before ACCEPTED, and `openEvents` correctly omits terminal states, which is the steady state once `mapEpoch` has caught up. The client does not compute the "still waiting for that epoch" outline. This view does, from `eventsById` and `mapEpoch`. Do not patch `RoomMemoryMirror` for it. The outline is suppressed by the same `isMapCurrent` / building / rig-moved gate as every other marker.
-
-A selected **confirmed** row uses fill `0.85` and draws on top. A selected **candidate** stays dashed and unfilled, and draws on top. A selected accepted-waiting outline stays unfilled. A selected history row that is not in the accepted-waiting case draws no box. Selection of an open row is `eventId`. Selection of a history row is `\(seq)-\(eventId)`.
-
-Kind filters apply before drawing. A chip that is off removes that kind from the marker set.
-
-## Event adaptation
-
-The mirror keeps three collections. The view uses them for different jobs.
-
-- `events` is the transition ring (last 1000 messages, oldest first). It is not the marker list and not the open-row list.
-- `eventsById` is the latest applied transition per `event_id`.
-- `openEvents` is the latest `.candidate` or `.confirmed` only, sorted by `event_id`. Current rows and current markers come from here.
-
-History rows are the ring entries whose state is `.accepted`, `.reverted`, or `.expired`. One row per message. The row id is `\(seq)-\(event.eventId)`, not `eventId` alone, so two transitions of one change do not collapse. An older candidate that remains in the ring after a confirmed message is not a second Events row and not a second marker.
-
-`eventsState` is an enum. Keep it as an enum all the way into the formatter. A `Time?` cannot tell `.complete` apart from `.incomplete(since: nil)`.
-
-| `eventsState` | Event-list line | Open rows |
-|---|---|---|
-| `.complete` | no incomplete line | no outdated suffix |
-| `.incomplete(since: nil)` | `incomplete` | `· may be outdated` |
-| `.incomplete(since: {0, 0})` | `incomplete since time —` | `· may be outdated` |
-| `.incomplete(since: t)` | `incomplete since HH:mm:ss` | `· may be outdated` |
-
-There is no `outdatedEventIds` set on the client. The suffix comes only from `eventsState != .complete`.
-
-The non-resurrection test drives the public mirror API (`connectionOpened`, `receive`, `tick`) with encoded messages, then reads the marker helper:
-
-1. Snapshot at epoch 43, then a fresh tracking status at that epoch, so `isMapCurrent` is true.
-2. One event, candidate, seq 1 → one dashed unfilled marker. The ring length is 1.
-3. Same `eventId`, confirmed, seq 2 → one filled marker. The ring length is 2. Marker count stays 1.
-4. Same `eventId`, accepted, seq 3, `header.mapEpoch` 44, mirror epoch still 43, status still fresh → one unfilled outline, caption does not count a change, history text contains `accepted · map updating`.
-5. A later snapshot at epoch 44 → zero markers.
-6. Step 3's mirror, queried again, still has one marker after the ring has both transitions. Do not feed a lower live seq to simulate this; the client treats that as a new generation.
-
-## Event list
-
-Right column, 280pt, well background, two sections. Slice 2.
-
-Each row is two lines of 11pt mono, wrapping inside the column (about 256pt of text after padding). No horizontal scroller. Line limit 2 on each line.
-
-```
-● appeared · candidate · 8 voxels · 12:00:10
-evidence — · α 0.05 · Mid-360 · no mask
-```
-
-- Line 1: kind-colored pip, kind, state, voxel count, `HH:mm:ss` UTC.
-- Line 2, `LabTheme.dim`: evidence, alpha, sensors, then `no mask` or `accepted · map updating` or `may be outdated` when those apply.
-- Kind words: `appeared`, `disappeared`, `moved`.
-- State words: `candidate`, `confirmed`, `accepted`, `reverted`, `expired`.
-- `evidence` nil → `evidence —`. A real zero is `evidence 0%` (integer percent).
-- `alpha` nil → `uncalibrated`. A real value is `α 0.05` (two decimals). Never `α 0` for nil.
-- Sensors: `Mid-360`, `JT128`, both as `Mid-360, JT128`, empty bitmask → `sensor —`.
-- `mask == nil` → `no mask`. The mask's occupied voxels are not a second mesh. The AABB is the marker.
-
-**Events.** `openEvents`, newest `header.stamp` first, then higher `header.seq`. The section is hidden when empty only if History is also empty and the connection is up; a live empty room shows the caption below rather than a blank column.
-
-**History.** Terminal ring entries, collapsed by default. Same two-line shape. Hidden when empty.
-
-The caption counts **drawn markers**, after the kind filter and after suppression:
-
-`2 changes · 1 candidate on map`
-
-- `changes` = drawn confirmed boxes
-- `candidates` = drawn candidate boxes
-- the accepted-waiting outline is in neither number
-- suppression or a filter that hides a kind removes it from the count, and the rows stay in the list
-- a current map with nothing open renders `0 changes`
-- `.off` with an empty mirror renders `Room memory unavailable` in the column instead of `0 changes`
-
-Three filter chips, mono 11, on by default: Appeared, Disappeared, Moved. Off hides that kind in both sections and on the map. Chip tint is the kind color when on, `LabTheme.dim` when off. Same chip pattern as `ChangeScrubberView`, fed by `RoomMemory.ChangeEvent.Kind`.
-
-## Resync line
-
-This bridge cannot carry `RequestSync` (`canPublish` is false). With `requestSyncSink == nil` the mirror never queues a request, so `activity.requestsUnsent` stays 0 even while the map is stale. The counter moves only when the mirror emits a request and the client cannot carry it (`noteRequestUnsent`).
-
-Show `cannot request resync` when recovery is needed and no path exists.
-
-- Recovery is needed when `mapState` is `.stale`, or `eventsState` is `.incomplete`.
-- A path exists when `requestPathExists` is true (computed by `AppState`, above).
-- Also show the line when `activity.requestsUnsent > 0`, whether or not the flag is set, because the client already counted a request that did not leave the machine.
-
-When the count is non-zero the text is `cannot request resync · <n> unsent`. Otherwise it is `cannot request resync`. One placement, first match. The text appears once.
-
-1. The visible banner is the map-stale line (`resyncing · as of epoch N`). Append ` · cannot request resync`, and ` · <n> unsent` when the count is non-zero, to that banner.
-2. The event list has an incomplete-history line (`eventsState != .complete`) and rule 1 did not fire. That line gains the same suffix.
-3. Standalone fallback. History is `.complete`, so the incomplete-history line is absent, and the visible banner is not the map-stale line. The text is its own line in the event column, above the sections, 11pt mono, `LabTheme.warn`. This covers a higher banner winning (connection lost, empty topics, stale status, rig moved, degraded, paused, building), the `Waiting for map` banner (a stale map with no bricks is not the map-stale line), no banner, and `requestsUnsent > 0` with a current map and complete history.
-
-The standalone line does not replace the winning banner. It does not outrank connection loss, an empty topic list, or a stale status. The column stays on screen while the line is present, including when Events and History are both empty. Rules 1 and 2 suppress the standalone line.
-
-The view does not set `requestSyncSink`, does not open `:8766`, and does not speak Foxglove. The relay (Phase 3 P11, the owner of the existing `RigService` tunnel) sets the sink before `start()`. Until that owner lands, the sink stays nil and this line is how the operator sees it.
-
-## Fixture source
-
-Fixture mode is a development source. It is not the thing this job ships as the room. `LiveRoomFixture` builds a `RoomMemoryMirror` and a `LiveRoomConnection` by decoding goldens and calling the mirror's public API. It does not construct a `LiveRoomClient`.
-
-Hex parsing matches `RoomMemoryCDRTests.goldenBytes` (skip `#` comments). Load order for each file:
-
-1. `Bundle.main` resource `fixtures/room/golden/hand/<name>.hex`
-2. an explicit root passed by the test (`LiveRoomFixture.load(name:root:)`)
-3. `Tests/Fixtures/room/golden/hand/<name>.hex` relative to that root
-
-Unit tests pass the repo root. They do not depend on the process cwd. `build.sh` copies `Tests/Fixtures/room/golden/hand/` into `LabCommand.app/Contents/Resources/fixtures/room/golden/hand/`. Today it copies `fixtures/api` and one PCD only, which is why a bundled app cannot see the goldens.
-
-| Mode | What the mirror holds | Screen |
-|---|---|---|
-| `map` | zlib snapshot (room `lab`, epoch 43) and a **synthetic** fresh tracking status for room `lab` with `coverage` nil and `eventsSeq` nil. Events: the appeared golden (candidate), the moved golden (confirmed), and one disappeared event built in code (below). Status is re-received once a second with a new `seq` so it stays inside the 3 s freshness window. | full-opacity voxels, three markers, status `epoch 43 · coverage — · events — · Tracking · cell 5.0 cm`, green pip. `events —` while event headers exist is the check that the bar is not reading `header.seq` |
-| `status` | `memory_status_le` only (room `lab-a`, `events_seq` 12). No bricks. | `epoch 42 · coverage 75.0% · events 12 · Tracking`, banner `Waiting for map`, no points |
-| `stale` | same bricks and events as `map`, status received at `now - 4`, connection left `.connected` with topics, no refresh timer | bricks at 35%, zero markers, banner `STALE · 4s`, status prefix `STALE · 4s ·`, no state word, amber pip |
-| `unavailable` | empty mirror, connection `.off` | `Room memory unavailable`, idle pip |
-
-The disappeared event is not a new hex golden. There is no disappeared hand golden. It is a `ChangeEvent` with room `lab`, `eventId` 11, seq 5 (after the moved golden's seq 3 and the appeared golden's seq 4), state `.confirmed`, kind `.disappeared`, box min `(3.0, 0.0, 0.0)` max `(3.5, 0.5, 0.5)`, `fromCentroid` nil, `mask` nil, `alpha` nil, `evidence` nil, sensors Mid-360. The box sits clear of the appeared box (x 1.875…2.125) and the moved box (x 1.25…1.75).
-
-The two goldens and the synthetic status stay in room `lab`. `memory_status_le` stays in room `lab-a` and is only the `status` mode. Mixing them would show epoch 42 over epoch-43 bricks, and the mirror would count the other room as foreign.
-
-The delta golden is not applied. The snapshot is already epoch 43. The mock does not contain a store.
-
-The `Fixture` chip uses `LabTheme.dim` and the help string `Hand goldens. No rig contact.` A segmented control `Map / Status / Stale / Off` sits in the header only in fixture mode.
-
-Map-mode caption from the three drawn markers: `2 changes · 1 candidate on map`.
-
-## Screenshots
-
-The app writes a sidecar next to each PNG when it draws Room: banner, status line, pip name (`good` / `warn` / `bad` / `idle`), marker counts, the event rows, and `canvas <x> <y> <w> <h>` in PNG pixels, origin top-left of the image. The rect is the Metal view's bounds in the captured window. It lies fully inside the PNG, with width and height each greater than 80, on every shot that draws the canvas. `unavailable` replaces the canvas with the centered sentence and omits the rect. Paths:
-
-| Launch | PNG | What the check asserts |
-|---|---|---|
-| `LABCOMMAND_LIVE_ROOM=live` | `build/screenshots/live-room-live.png` | process connected: sidecar contains `ws://100.118.187.99:8767` and `.connected`. Also a status line or one of `Waiting for map`, `Room memory not running on Spark`, `connection lost`, `STALE`, `connecting`, `resyncing`. PNG width and height both > 400 |
-| `=map` | `build/screenshots/live-room-map.png` | sidecar status `epoch 43 · coverage — · events — · Tracking · cell 5.0 cm`, pip `good`, rows contain `appeared`, `candidate`, `moved`, `disappeared`. Inside the `canvas` rect, inset 2 px: at least 8 pixels within ±12 per channel of `#3FA37A`, of `#C45A5A`, and of `#C4A04A`, and at least 8 within ±12 of `#C5CDD6`. Pixels outside the rect do not count. Marker edges are the full kind color; fill alpha `0.28` may fall outside ±12, so the count is edge pixels. The kind chips and the row pips are the same RGB and sit outside the canvas |
-| `=status` | `build/screenshots/live-room-status.png` | sidecar contains `events 12`, `coverage 75.0%`, `Tracking`, and `Waiting for map`. Inside the canvas rect: zero pixels within ±12 of `#3FA37A`, `#C45A5A`, or `#C4A04A` |
-| `=stale` | `build/screenshots/live-room-stale.png` | sidecar contains `STALE · 4s`, pip `warn`, marker count 0. Inside the canvas rect: zero pixels within ±12 of those three marker colors. Dimmed brick grey is not those colors |
-| `=unavailable` | `build/screenshots/live-room-unavailable.png` | sidecar contains `Room memory unavailable`, pip `idle` |
-
-Fixture launches are the four env values, each a separate process, each quit by PID. They do not pass `--mock` and they do not need it. Their sidecars must not contain `connected ws://100.118.187.99:8767`. The live launch is a different process. Wait up to 30 s for `.connected` before capturing. A deadline wrapper is `perl -e 'alarm N; exec @ARGV' --`, not `timeout`.
-
-Capture the window of that PID. `screencapture` of the whole desktop is not the artifact.
-
-### Visual inspection
-
-A sidecar that contains the row words does not prove the rows are readable, and a whole-window color search can pass on the chips alone. After the pixel checks, open each PNG and read it. Record one line per file in the gate notes, and again in `DONE.md`: the words read off the image. Clipped, overlapping, or unreadable glyphs fail even when the sidecar is right.
-
-- `live-room-live.png`: the status line or the banner on screen can be read. The canvas is the map or one of the banner sentences.
-- `live-room-map.png`: the canvas shows grey points, one faint brick frame, a green dashed unfilled box, an amber filled box, and a red filled box, distinct from the three chips. The column shows three rows, two lines each. Kind and state read as `appeared` / `candidate`, `moved`, and `disappeared`. Timestamps are readable. Text stays inside the 280pt column and does not run under the canvas.
-- `live-room-status.png`: `events 12`, `coverage 75.0%`, `Tracking`, and `Waiting for map` are readable. The canvas has no colored change box.
-- `live-room-stale.png`: `STALE · 4s` is readable. Bricks are dim. No colored change box.
-- `live-room-unavailable.png`: `Room memory unavailable` is readable and centered.
+`localSessionLine` is `Local snapshots. No rig contact.` The canvas is the B cloud, the overlay, and the scrubber. The recording deck stays visible and disabled so this mode does not invent a second shell.
 
 ## Files
 
-Slice 0, landed by cherry-pick, not authored here. `65122d2` first, and its gate, before the client files:
+New:
 
-- `Sources/LabCommandCore/RoomMemoryMessages.swift`, `RoomMemoryCDR.swift`, `Sources/LabCommandCoreTestsRunner/RoomMemoryCDRTests.swift`, `Tests/Fixtures/room/golden/hand/memory_status_le.hex`, `scripts/spark/make_room_memory_goldens.py` — from `65122d2` only
-- `Sources/LabCommandCore/LiveRoom/` (client, mirror, protocol, `API.md`) — after that gate
-- `Sources/LabCommandCoreTestsRunner/LiveRoomTests.swift`
-- `Tests/Fixtures/room/live/`
-- `Sources/LabCommandCoreTestsRunner/main.swift` — `runLiveRoomTests()` and the probe argv, from the client worktree
-- `ros/labcommand_msgs/msg/MemoryStatus.msg` — only the `events_seq` hunk inside `574feb2`, if that commit is cherry-picked
+| Path | Role |
+|---|---|
+| `Sources/LabCommandCore/ChangeOverlay.swift` | `snapshotDirs`, `snapshotConfig`, `Timeline`, `Event`, `Filter`, `revealed`, `geometry`, colors, caption, slider, clock, local-session copy |
+| `Sources/LabCommandCore/SnapshotSession.swift` | `LaunchMode`, `ContactGate`, `SnapshotSession`, `SnapshotFiles` |
+| `Sources/LabCommandCoreTestsRunner/ChangeOverlayTests.swift` | Groups below, including the contact regression |
+| `Sources/LabCommand/ChangeScrubberView.swift` | Slider, chips, caption |
 
-Slice 1, new:
+Edit:
 
-- `Sources/LabCommandCore/LiveRoomView.swift` — format, voxels, launch parser. Markers can land in this file in slice 2.
-- `Sources/LabCommand/LiveRoomView.swift` — SwiftUI page
-- `Sources/LabCommand/RoomMapRenderer.swift` — Metal points and brick frames; boxes and arrows in slice 2
-- `Sources/LabCommand/RoomMapView.swift`
+| Path | Change |
+|---|---|
+| `Sources/LabCommandCoreTestsRunner/main.swift` | Call `runChangeOverlayTests()` after `runChangeDetectionTests()` |
+| `Sources/LabCommand/PointCloudRenderer.swift` | Overlay pipeline, `setOverlay`, draw after the points |
+| `Sources/LabCommand/PointCloudView.swift` | `DualPointCloudView` takes a `ChangeOverlay.Geometry` and forwards it |
+| `Sources/LabCommand/AppState.swift` | Env switch, background load, published timeline and filter. `start`, `refresh`, `restartTimer`, `pollRig`, and `runAction` go through `SnapshotSession` |
+| `Sources/LabCommand/CommandCenterView.swift` | Scrubber under the canvas. Snapshot mode hides live controls, disables Refresh and the recording deck, swaps the Spark chip and the rig headline |
+| `Sources/LabCommand/LabCommandApp.swift` | Menu and status-item actions stay disabled in snapshot mode. Arrow keys step the playhead |
+| `Sources/LabCommand/SettingsView.swift` | Auto-refresh and the interval picker disabled in snapshot mode |
+| `Sources/LabCommand/RigService.swift` | `ensureTunnels` and `ensureAPITunnel` enter locked `TunnelGate`. `startTunnel` still spawns ssh. |
+| `Sources/LabCommand/MockRigService.swift` | Passes the snapshot flag through to `RigService` |
 
-Slice 1, edited:
+Do not edit: `ChangeDetection.swift`, `ChangeDetect/main.swift`, `Package.swift` (both targets compile every `.swift` file in their directory), `RoomMemory*`, `RigHealth.swift`, `Info.plist`, `build.sh`.
 
-- `Sources/LabCommand/AppState.swift` — `Dest.liveRoom`, construct and stop `LiveRoomClient` under `LiveRoomLaunch`
-- `Sources/LabCommand/CommandCenterView.swift` — `case .liveRoom`
-- `Sources/LabCommand/LabCommandApp.swift` — only if `stop()` is not already reaching `AppState.stop()` on quit. `AppState` remains the owner
-- `build.sh` — copy the hand goldens into the app bundle. Still `--no-install` for the gate. Do not copy into `~/Applications`
-
-Slice 2 and 3 add the marker and fixture sections of `LiveRoomView.swift`, `LiveRoomViewTests.swift`, and the screenshot script under `scripts/`. The test runner calls the new tests.
-
-Not edited after slice 0: `PointCloudRenderer.swift`, `FoxgloveLiveClient.swift`, the landed `LiveRoom/*.swift` client sources, `RoomMemoryCDR.swift`, `RoomMemoryMessages.swift`, `RoomMemoryCDRTests.swift`, the hand golden, and `make_room_memory_goldens.py`. Those codec files change only by cherry-picking `65122d2`. `.msg` files are not hand-edited. Nothing under `spark/`, `~/Applications/LabCommand.app`, or `~/Developer/labcommand-spark`.
-
-`DesignContractTests` scans `Sources/LabCommand` for `LabTheme.t(16` and larger, and for `coming soon`. Room copy stays at 15pt titles and 11–13pt body.
+`Package.swift` products stay `LabCommand`, `change-detect`, `LabCommandCore`, `LabCommandCoreTestsRunner`.
 
 ## Tests
 
-`swift run LabCommandCoreTestsRunner` from the repo root, after slice 0 so the client's own tests run too. New cases:
+`ChangeOverlayTests.swift` follows the runner style: `expect`, `passed()`, first failure exits 1. No XCTest. No network. No read of `~/Developer/lc-tasks`. The heavy snapshot goldens already live in `ChangeDetectionTests` and are not repeated.
 
-- Decode `memory_status_le.hex`, assert `eventsSeq == 12`, `receive` it on a mirror, and assert the status line contains `events 12`. A nil `eventsSeq` renders `events —`. A mirror with baseline `eventsSeq == 4` and `status.eventsSeq == 12` renders `events 12`.
-- Coverage `0.75` → `coverage 75.0%`, coverage `0` → `coverage 0.0%`, stale age `4.2` → `STALE · 4s`, cell `0.05` → `cell 5.0 cm`. The state word is absent when `isStatusFresh` is false.
-- `alpha` nil → `uncalibrated`. Evidence nil → `evidence —`.
-- `.complete` prints no incomplete line. `.incomplete(since: nil)` prints `incomplete` and not `incomplete since`. `.incomplete(since: a stamp)` prints `incomplete since HH:mm:ss`.
-- Voxel samples for the decoded zlib snapshot: exactly the two centers above, one frame, the all-free brick silent.
-- The candidate → confirmed → accepted sequence in "Event adaptation", including one marker while the ring holds two transitions, and the accepted outline until the snapshot epoch catches up.
-- Building, rig-moved, a stale status, and `mapState == .stale` each produce zero boxes. A confirmed event still produces a box when the fresh state is `.degraded` and the map is current. A selected candidate is dashed and has fill alpha 0.
-- Kind filter off removes that kind from the marker set and from the caption. Caption on the map fixture is `2 changes · 1 candidate on map`.
-- `LiveRoomLaunch` maps the env table above. The fixture cases do not construct a client.
-- Banner priority: a stale status wins over a remembered `.rigMoved`. An empty `memoryTopics` wins over `Waiting for map`. `cannot request resync` appears for a stale map with `requestPathExists == false` and a zero unsent count, and the unsent count is included when `noteRequestUnsent` has run.
-- Resync placement, one line each. Map stale, path absent, unsent 0, events `.complete`, no higher banner: the warning is on the resync banner, and the standalone line is absent. The same recovery while the winning banner is `connection lost` and `eventsState` is `.complete`: the banner stays `connection lost`, and the standalone line is `cannot request resync`. The same with `.incomplete(since: nil)`: the incomplete line is suffixed, and the standalone line is absent. `requestsUnsent == 2` with a current map and `.complete` history: the standalone line is `cannot request resync · 2 unsent`. A stale map with no bricks and `.complete` history uses the standalone line, because the banner is `Waiting for map`.
-- Fixture `map` and `status` do not share a `roomId`. Fixture `status` has `status.eventsSeq == 12`. Fixture `map` has `status.eventsSeq == nil`.
+1. **Config.** `snapshotConfig()` equals `Config()` except `evidenceOfAbsence`, `minVoxels`, and `minExtent`. `compare` on an empty-enough cloud with that config does not throw `invalidConfig`.
+2. **One moved region through the viewer config.** Two single-voxel clusters in sensor frame, about 1 m apart along +x, the after voxel farther from the origin so the evidence ray traverses the before voxel. `compare` with `snapshotConfig()` returns one `.moved`. `timeline` → `revealed` at full count → `geometry` with `RigidTransform.identity` returns two boxes and one arrow. The arrow’s `from` and `to` match the transformed centroids.
+3. **Order.** A report’s regions stay in the order given. `merge` places the earlier after-stamp first. Equal stamps break ties by `SensorID.allCases` (`.mid360`, then `.jt128`).
+4. **Filter.** `count == 0` reveals nothing. `count == 2` reveals the first two enabled events. Clearing `showAppeared` drops appeared events and keeps the relative order of the rest. `showUnobserved` defaults false and hides an unobserved event that is in the timeline.
+5. **Box corners.** Identity transform. The eight corners are exactly the eight combinations of `boundsMin` and `boundsMax`. Twelve edges connect them.
+6. **Rigid transform.** One corner of a Mid-360 event transformed by `RigTransforms.toWorld(.mid360)` equals `livoxToWorld.apply` of that corner. JT128’s transform is `hesaiToWorld`, which is identity.
+7. **Arrow.** Head length is `min(0.15, 0.35 * len)`. Both wings are closer to `to` than to `from`. A `.moved` region with `fromCentroid == centroid` emits no arrow. An appeared region emits no arrow. A `.moved` region with `fromBoundsMin == nil` emits one box and no arrow.
+8. **Colors.** Appeared is `(63, 163, 122)`, disappeared `(196, 90, 90)`, moved `(196, 160, 74)`, unobserved `(92, 102, 112)`, each channel as `Float / 255`.
+9. **Copy.** One assertion per caption state in the table above. The playhead line contains the sensor label, `moved`, the voxel count, the gap, the unknown total, and the rejected total. The empty line contains `0 regions`, the three pre-cut counts, and rejected, and does not contain `cluster`. Count zero on a nonempty timeline and the all-hidden filter each have their sentence, and each names unknown and rejected separately. `1 voxel` stays singular. `localSessionLine`, `localChip`, and `readingLine` match the sentences above. `snapshotDirs` returns both paths only when both variables are non-empty. A partial pair, including a whitespace value, is a configuration error and not nil-as-rig.
+10. **Clamp and slider.** A filter that removes events clamps a stale `count` through `ChangeOverlay.clampedCount`. `filteredCount == 0` is the disabled slider (`enabled == false`, value 0, range `0...1`). `filteredCount > 0` is enabled, including when `count` is 0.
+11. **No contact.** A `ContactGate` regression, not a log scrape. Factories record a call and then throw. `runProcess` and `openSocket` with `isolates == true` throw `ContactForbidden` and do not enter the factory. The same factories do run when `isolates` is false, so a deleted call fails the test too. `SnapshotSession.begin` on a partial environment does not call the rig closure or the loader, and the sentence names the missing or empty variable. `begin` on two directories does not call the rig closure. `SnapshotFiles.load` on a directory with no bins returns `Could not load Mid-360 mid360.bin (missing file).` and does not throw a contact error. After that failure, and on a ready snapshot mode, `refresh`, `restartTimer`, `pollRig`, and `runAction` (start rig, record, stop, wake, standby, arm, disarm, view, stop view) do not enter their work closures. `.rig` does enter them. The core geometry tests do not stand in for this group.
 
-No new golden hex files. The default test run opens no socket and no SSH.
+## Verification
 
-## Gate
+1. `./build.sh --no-install` from the repo root. Release `swift build -c release --product LabCommand`, bundle at `build/LabCommand.app`. The script’s install path is `~/Applications/LabCommand.app`. `--no-install` skips it. That install path is never written, copied, or deleted. The build introduces no new warnings in the files this change touches. Existing warnings in untouched files stay.
+2. `swift run LabCommandCoreTestsRunner` prints `PASS LabCommandCoreTestsRunner` and exits 0.
+3. `~/Developer/lc-tasks/ws/shot.sh <this-worktree> /tmp/overlay-self.png`. The script runs `build/LabCommand.app` with `LC_SNAPSHOT_A` and `LC_SNAPSHOT_B` pointed at `~/Developer/lc-tasks/snapshots/{a,b}` and `LC_SCREENSHOT_MODE=1`, sleeps 20 s, captures the layer-0 window, and `kill`s that PID. The PNG should show the sensor-colored room, green / red / amber boxes and centroid marks, a move arrow where the report has a `.moved` region, and the slider at the far end with kind counts. `/tmp/lc-shot-app.log` should contain `Local snapshots. No rig contact.` because the process prints that label. A quiet log is not the isolation proof. `ConnectivityService` collects subprocess output on private pipes, so a missing `ssh` string would not show that a probe ran. The proof is test group 11.
 
-1. `./build.sh --no-install` clean. That writes `build/LabCommand.app` and does not copy into `~/Applications`.
-2. `swift run LabCommandCoreTestsRunner` passing, including `runLiveRoomTests()` and the cases above. Do not pass `live-room-probe`.
-3. Live screenshot, from slice 1 onward: launch `build/LabCommand.app/Contents/MacOS/LabCommand` with `LABCOMMAND_LIVE_ROOM=live`. Quit that process by PID (`kill <pid>`). The PNG and sidecar are `build/screenshots/live-room-live.*`, and the sidecar shows `.connected` to `ws://100.118.187.99:8767`.
-4. Fixture screenshots, four processes, the checks in the table above, the canvas-rect crop, and the visual inspection notes. Quit each by PID.
-5. `codex review --base origin/main` (or `codex exec review`). Fix findings until Codex is clean.
-6. Commit on `live-room-ui`. Do not push to `main`. Do not open a PR.
-7. Write `DONE.md` in the worktree root: what was built, the build and test results, both screenshot paths, and the Codex outcome.
+No commit and no push.
 
-## Decisions
+## Risks
 
-1. Room is a third destination. The Rig lidar view stays the recording surface.
-2. The first user-visible cut is the live map and the status bar on `ws://100.118.187.99:8767`. The fixture is a later, explicit, offline mode.
-3. The view binds to `LiveRoomClient.connection` and `.mirror`. `AppState` is the only caller of `start()` and `stop()`.
-4. The status bar's events number is `mirror.status?.eventsSeq`. The hand status golden's value is 12.
-5. Markers draw only while `isMapCurrent`, and not during building or rig-moved. Bricks that are held while the map is not current stay on screen at 35% opacity.
-6. Connection, status freshness, and map freshness are separate. A connected socket is not a green pip and is not a live memory state.
-7. Banner order is the Phase 3 order: topics absent, connection lost, stale status, then rig-moved, map stale, degraded, paused, building. Empty and stale-without-bricks say `Waiting for map`.
-8. Open rows and their markers come from `openEvents`. History rows come from the ring and are keyed by seq and event id. `.incomplete(since: nil)` stays a distinct case.
-9. An accepted event whose `mapEpoch` the mirror has not reached draws an uncounted outline until a current map catches up. The client is not modified for that.
-10. Unknown voxels are a wireframe of any brick that still has an unknown cell. Free cells are undrawn. Occupied cells are grey points. Centers use `(index + 0.5) × voxelSize`.
-11. `mapRevision` and `voxelSize` gate voxel uploads. The camera auto-fits only until the user orbits or zooms, and the fit includes drawn boxes and arrow points.
-12. This bridge has no `clientPublish`. The view reports `cannot request resync` and does not grow a request path. The relay owner sets `requestSyncSink`. When history is complete and the banner is not the map-stale line, that report is a standalone line in the event column.
-13. The change-overlay branch contributes colors, box topology, fill alphas, and the arrow. It is not merged.
-14. Selected candidates stay dashed and unfilled. The caption counts drawn markers. Event rows wrap on two lines inside 280pt.
-15. `65122d2` is on this branch, and its decode-and-test gate has passed, before any `LiveRoom` client file is added. Marker colors are counted inside the sidecar's canvas rect. Row readability is read off the PNG.
+- **The real pair is a field of specks.** At the viewer config the documented counts are 50 and 272 regions, almost all one voxel, and pairing may label nearby dropouts as `.moved`. The screenshot will look speckled because that is the diff. The caption and the chip counts are what tell a reviewer it is the report. Hiding short moves would be a second detector. This plan does not.
+- **Defaults still draw nothing.** Anyone calling `compare` with `Config()` on these files gets an empty `regions` array and a scrubber parked on `0 regions` plus the pre-cut sentence. The library stays that way on purpose. `minExtent` 2 exists to drop the one-cell sheet.
+- **Evidence cost.** `snapshotConfig` casts one ray per occupied after voxel (`rayStride` 1). That is the setting the blip table was measured with. Raising the stride would change which cells count as disappeared. The 20 s shot budget covers a release compare. The load stays off the main actor so the window exists even if a debug build is slower. `shot.sh` runs the release bundle.
+- **1 px lines.** Metal line width will not make a 5 cm cube obvious under a room fit. The translucent fill plus the 10 px centroid point are the visible mark. A moved arrow shorter than a few centimeters is a short segment between two point marks. The head is still in the geometry.
+- **Alpha order.** Unsorted blended boxes can overlap wrong. Accepted at this region count.
+- **Oriented Mid-360 boxes.** Corners are transformed as points. The box matches the transformed cloud. It will not line up with world axes. An axis-aligned world box would be the wrong shape.
+- **AABB is not a voxel mask.** A multi-voxel region draws its bounds, including empty cells inside the box. Per-voxel cubes would need the key set, which `Region` does not have.
+- **Disabled recording controls.** Snapshot mode leaves the deck on screen so the shell does not fork. The controls are disabled because the session is isolated, and `RigGate` would also refuse an unprobed rig. `runAction` itself does not consult `RigGate`, so the contact gate is what refuses a caller that skips the button. The headline and the Spark chip must use the local-session copy, or the shot looks like a failed SSH probe.
+- **The gate is the session boundary, plus the tunnel entry.** `refresh`, a restarted probe timer, `pollRig`, and every action can SSH or open a socket after launch. Those four go through `SnapshotSession` before any of that work. Refresh lives on the workspace button, the View menu, and the status path that a timer would call. Settings can restart the timer. A partial environment is an error, not a reason to start those paths. A new call from `applicationDidFinishLaunching` has to go through `SnapshotSession.begin`. Tunnel spawn is the other entry: `TunnelGate` locks it and returns before `startTunnel` when the launch is isolated.
+- **Camera does not orbit.** The overlay is checked against the fitted view only. Adding orbit is out of scope. `setViewMatrix` already exists for a later pass. The overlay uses the same MVP, so it will follow that matrix when something sets it.
+- **Stale fit.** `fitGeneration` is 1 and is not bumped when the overlay arrives. The camera fits the B cloud once. Overlay bounds must not schedule another fit.
+- **Process kill.** `shot.sh` kills the app PID. A child `ssh` started by `refresh` would be the failure mode this plan avoids by not starting one. Quit is that `kill`. No `Cmd-Q` and no AppleEvent.

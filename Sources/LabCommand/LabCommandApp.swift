@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var statusItem: NSStatusItem?
     private var statusWatch: AnyCancellable?
     private var visibilityObservers: [NSObjectProtocol] = []
+    private var keyMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMainMenu()
@@ -48,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         watchVisibility(of: win)
 
         appState.start()
+        installOverlayKeys()
         installStatusItem()
         statusWatch = appState.objectWillChange.receive(on: DispatchQueue.main).sink { [weak self] _ in
             self?.rebuildStatusMenu()
@@ -86,21 +88,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
         appState.stop()
+    }
+
+    /// Left and right step the playhead. The event is consumed so a focused
+    /// slider does not step twice. Command, option, and control keep their keys.
+    private func installOverlayKeys() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let keyCode = event.keyCode
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
+            let windowNumber = event.window?.windowNumber
+            let textView = event.window?.firstResponder is NSTextView
+            let consume = MainActor.assumeIsolated { () -> Bool in
+                self?.consumeOverlayKey(
+                    keyCode: keyCode,
+                    flags: flags,
+                    windowNumber: windowNumber,
+                    textView: textView
+                ) ?? false
+            }
+            return consume ? nil : event
+        }
+    }
+
+    private func consumeOverlayKey(keyCode: UInt16, flags: UInt, windowNumber: Int?, textView: Bool) -> Bool {
+        guard appState.isolatesNetwork, let window, window.isKeyWindow, window.windowNumber == windowNumber else {
+            return false
+        }
+        let mask = NSEvent.ModifierFlags(rawValue: flags)
+        if mask.contains(.command) || mask.contains(.option) || mask.contains(.control) {
+            return false
+        }
+        if textView { return false }
+        switch keyCode {
+        case 123:
+            appState.stepOverlay(-1)
+            return true
+        case 124:
+            appState.stepOverlay(1)
+            return true
+        default:
+            return false
+        }
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(refreshStatus) {
+            if appState.isolatesNetwork { return false }
             return appState.dest == .workspace || appState.focusMode
         }
         if menuItem.action == #selector(menuStartPath) {
-            return RigGate.canStartRig(appState.rig).0 && !appState.isActing
+            return !appState.isolatesNetwork && RigGate.canStartRig(appState.rig).0 && !appState.isActing
         }
         if menuItem.action == #selector(menuRecord) {
-            return RigGate.canRecord(appState.rig).0 && !appState.isActing
+            return !appState.isolatesNetwork && RigGate.canRecord(appState.rig).0 && !appState.isActing
         }
         if menuItem.action == #selector(menuStopAll) {
-            return RigGate.canStopAll(appState.rig).0 && !appState.isActing
+            return !appState.isolatesNetwork && RigGate.canStopAll(appState.rig).0 && !appState.isActing
         }
         if menuItem.action == #selector(menuDiagnose) {
             return true
@@ -210,9 +258,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         menu.addItem(header("JT128    \(rig.jt128.state.displayLabel)"))
         menu.addItem(header("Clocks   \(rig.clock.state.displayLabel)"))
         menu.addItem(header("Record   \(rig.recording.active ? "Live" : "Idle")"))
-        menu.addItem(header("Health   \(appState.health.label)"))
-        if !rig.sparkReachable {
-            menu.addItem(header("Spark    offline"))
+        if appState.isolatesNetwork {
+            menu.addItem(header("Health   Local"))
+            menu.addItem(header("Spark    local"))
+        } else {
+            menu.addItem(header("Health   \(appState.health.label)"))
+            if !rig.sparkReachable {
+                menu.addItem(header("Spark    offline"))
+            }
         }
         if let hz = rig.mid360.pointRateHz, rig.mid360.state == .streaming {
             menu.addItem(header("Mid rate \(TelemetryFormat.hz(hz))"))
@@ -221,9 +274,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             menu.addItem(header("JT rate  \(TelemetryFormat.hz(hz))"))
         }
         menu.addItem(.separator())
-        addStatusAction(menu, title: rig.stackRunning ? "Restart Rig" : "Start Rig", action: #selector(menuStartPath), enabled: RigGate.canStartRig(rig).0)
-        addStatusAction(menu, title: "Start Recording", action: #selector(menuRecord), enabled: RigGate.canRecord(rig).0)
-        addStatusAction(menu, title: "Stop", action: #selector(menuStopAll), enabled: RigGate.canStopAll(rig).0)
+        let local = appState.isolatesNetwork
+        addStatusAction(menu, title: rig.stackRunning ? "Restart Rig" : "Start Rig", action: #selector(menuStartPath), enabled: !local && RigGate.canStartRig(rig).0)
+        addStatusAction(menu, title: "Start Recording", action: #selector(menuRecord), enabled: !local && RigGate.canRecord(rig).0)
+        addStatusAction(menu, title: "Stop", action: #selector(menuStopAll), enabled: !local && RigGate.canStopAll(rig).0)
         addStatusAction(menu, title: "Diagnose", action: #selector(menuDiagnose), enabled: true)
         addStatusAction(menu, title: appState.focusMode ? "Exit Focus" : "Focus Mode", action: #selector(menuFocus), enabled: true)
         menu.addItem(.separator())

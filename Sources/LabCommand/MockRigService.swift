@@ -151,11 +151,11 @@ public enum MockMode {
     
     /// Creates the appropriate rig service based on command line arguments.
     /// Returns a `RigService` for normal operation or `MockRigService` when `--mock` is passed.
-    public static func createRigService() -> RigServiceProtocol {
+    public static func createRigService(isolates: Bool = false) -> RigServiceProtocol {
         if let fixture = parseArgs() {
             return MockRigService(fixture: fixture)
         }
-        return RigService()
+        return RigService(isolates: isolates)
     }
 }
 

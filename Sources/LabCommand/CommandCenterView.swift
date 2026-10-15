@@ -39,13 +39,17 @@ struct CommandCenterView: View {
 
             Spacer(minLength: 12)
 
-            statusChip(
-                title: "Spark",
-                ok: state.rig.sparkReachable,
-                help: state.rig.sparkReachable
-                    ? "Spark reachable — \(state.detail("spark_ssh"))"
-                    : "Spark unreachable — \(state.detail("spark_ssh"))"
-            )
+            if state.isolatesNetwork {
+                localSparkChip
+            } else {
+                statusChip(
+                    title: "Spark",
+                    ok: state.rig.sparkReachable,
+                    help: state.rig.sparkReachable
+                        ? "Spark reachable — \(state.detail("spark_ssh"))"
+                        : "Spark unreachable — \(state.detail("spark_ssh"))"
+                )
+            }
             sensorChip(state.rig.mid360)
             sensorChip(state.rig.jt128)
 
@@ -57,7 +61,7 @@ struct CommandCenterView: View {
             Button("Refresh") { state.refresh(manual: true) }
                 .font(LabTheme.t(12, .medium))
                 .buttonStyle(QuietButton())
-                .disabled(state.isRefreshing || state.isActing)
+                .disabled(state.isolatesNetwork || state.isRefreshing || state.isActing)
                 .keyboardShortcut("r", modifiers: .command)
                 .accessibilityLabel("Refresh status")
         }
@@ -141,6 +145,22 @@ struct CommandCenterView: View {
         .help(help)
     }
 
+    private var localSparkChip: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(LabTheme.dim)
+                .frame(width: 6, height: 6)
+            Text(ChangeOverlay.localChip)
+                .font(LabTheme.t(12, .medium))
+                .foregroundStyle(LabTheme.dim)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(LabTheme.well))
+        .overlay(Capsule().stroke(LabTheme.line, lineWidth: 1))
+        .help(ChangeOverlay.localSessionLine)
+    }
+
     // MARK: - Content
 
     private var content: some View {
@@ -172,7 +192,9 @@ struct CommandCenterView: View {
                     .font(LabTheme.t(LabTheme.titleSize, .semibold))
                     .foregroundStyle(LabTheme.text)
                 Spacer()
-                LiveStreamControls(live: state.live)
+                if !state.isolatesNetwork {
+                    LiveStreamControls(live: state.live)
+                }
                 Picker("Color", selection: $state.pointCloudColorMode) {
                     ForEach(PointCloudColorMode.allCases, id: \.rawValue) { mode in
                         Text(mode.label).tag(mode)
@@ -181,12 +203,18 @@ struct CommandCenterView: View {
                 .pickerStyle(.segmented)
                 .frame(width: 200)
             }
-            
-            LivePointCloudCanvas(
-                live: state.live,
-                sample: state.currentFrame,
-                colorMode: state.pointCloudColorMode
-            )
+
+            Group {
+                if state.isolatesNetwork {
+                    snapshotCanvas
+                } else {
+                    LivePointCloudCanvas(
+                        live: state.live,
+                        sample: state.currentFrame,
+                        colorMode: state.pointCloudColorMode
+                    )
+                }
+            }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(
                 RoundedRectangle(cornerRadius: LabTheme.radius, style: .continuous)
@@ -196,8 +224,43 @@ struct CommandCenterView: View {
                 RoundedRectangle(cornerRadius: LabTheme.radius, style: .continuous)
                     .stroke(LabTheme.line, lineWidth: 1)
             )
+
+            if state.isolatesNetwork {
+                ChangeScrubberView()
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Snapshot B only. The camera fits those points once (`fitGeneration` 1).
+    private var snapshotCanvas: some View {
+        DualPointCloudView(
+            midFrame: .constant(state.snapshotMid),
+            jtFrame: .constant(state.snapshotJT),
+            colorMode: state.pointCloudColorMode,
+            pointSize: 3.0,
+            fitGeneration: 1,
+            overlay: state.overlayGeometry
+        )
+        .overlay(alignment: .topLeading) {
+            if state.snapshotMid != nil || state.snapshotJT != nil {
+                Text("snapshot B")
+                    .font(LabTheme.mono(11))
+                    .foregroundStyle(LabTheme.dim)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: LabTheme.controlRadius, style: .continuous)
+                            .fill(LabTheme.bg.opacity(0.85))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: LabTheme.controlRadius, style: .continuous)
+                            .stroke(LabTheme.line, lineWidth: 1)
+                    )
+                    .padding(10)
+                    .allowsHitTesting(false)
+            }
+        }
     }
 
     private var leftColumn: some View {
@@ -216,9 +279,16 @@ struct CommandCenterView: View {
             Text("Rig Status")
                 .font(LabTheme.t(LabTheme.titleSize, .semibold))
                 .foregroundStyle(LabTheme.text)
-            Text(state.health.headline)
-                .font(LabTheme.t(13))
-                .foregroundStyle(LabTheme.band(state.health.band))
+            if let line = state.localHeadline {
+                Text(line)
+                    .font(LabTheme.t(13))
+                    .foregroundStyle(state.localFailure == nil ? LabTheme.dim : LabTheme.warn)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(state.health.headline)
+                    .font(LabTheme.t(13))
+                    .foregroundStyle(LabTheme.band(state.health.band))
+            }
         }
     }
 
@@ -296,7 +366,7 @@ struct CommandCenterView: View {
                     }
                     .font(LabTheme.t(12, btn.isPrimary ? .semibold : .medium))
                     .buttonStyle(PrimaryButton(emphasized: btn.isPrimary))
-                    .disabled(!btn.enabled || state.isActing)
+                    .disabled(state.isolatesNetwork || !btn.enabled || state.isActing)
                 }
             }
 
@@ -326,7 +396,7 @@ struct CommandCenterView: View {
                 Button("Arm at lock") { state.armAtLock() }
                     .font(LabTheme.t(11, .medium))
                     .buttonStyle(QuietButton())
-                    .disabled(!RigGate.canArmAtLock(state.rig).0 || state.isActing)
+                    .disabled(state.isolatesNetwork || !RigGate.canArmAtLock(state.rig).0 || state.isActing)
 
                 Button("Diagnose") { state.diagnose() }
                     .font(LabTheme.t(11, .medium))

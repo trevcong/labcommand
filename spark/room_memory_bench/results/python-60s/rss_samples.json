@@ -1,0 +1,44 @@
+[
+  {
+    "time_s": 0.0,
+    "wall_s": 0.016007292000000006,
+    "harness_rss_bytes": 28835840,
+    "backend_rss_bytes": null
+  },
+  {
+    "time_s": 10.0,
+    "wall_s": 14.131066875,
+    "harness_rss_bytes": 1868578816,
+    "backend_rss_bytes": null
+  },
+  {
+    "time_s": 20.0,
+    "wall_s": 23.841444125,
+    "harness_rss_bytes": 1141194752,
+    "backend_rss_bytes": null
+  },
+  {
+    "time_s": 30.0,
+    "wall_s": 37.624445791999996,
+    "harness_rss_bytes": 453918720,
+    "backend_rss_bytes": null
+  },
+  {
+    "time_s": 40.0,
+    "wall_s": 50.008953542,
+    "harness_rss_bytes": 454279168,
+    "backend_rss_bytes": null
+  },
+  {
+    "time_s": 50.0,
+    "wall_s": 61.679212041999996,
+    "harness_rss_bytes": 454950912,
+    "backend_rss_bytes": null
+  },
+  {
+    "time_s": 60.0,
+    "wall_s": 73.022171125,
+    "harness_rss_bytes": 457605120,
+    "backend_rss_bytes": null
+  }
+]

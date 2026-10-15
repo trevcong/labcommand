@@ -6,15 +6,18 @@ import LabCommandCore
 /// spark-capture.sh probe path — the Spark-side collector is the one truth,
 /// shared with the web panel.
 public final class RigService: @unchecked Sendable {
-    public static let apiPort = 8766
-    public static let viewPort = CaptureRecipe.foxglovePort
+    public static let apiPort = TunnelGate.apiPort
+    public static let viewPort = TunnelGate.viewPort
 
     private let lock = NSLock()
     private var viewTunnel: Process?
     private var apiTunnel: Process?
     private let session: URLSession
+    /// Snapshot launches refuse SSH, the port probe, and the localhost API.
+    private let isolates: Bool
 
-    public init() {
+    public init(isolates: Bool = false) {
+        self.isolates = isolates
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 4
         cfg.timeoutIntervalForResource = 6
@@ -61,44 +64,54 @@ public final class RigService: @unchecked Sendable {
         return r == 0
     }
 
-    @discardableResult
-    private func startTunnel(port: Int, key: ReferenceWritableKeyPath<RigService, Process?>) -> String? {
-        if tunnelRunning(key) || portOpen(port) { return nil }
-        var lastError: String?
-        for host in hostOrder() {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-            proc.arguments = CaptureRecipe.viewTunnelArguments(host: host, port: port)
-            proc.standardOutput = Pipe()
-            proc.standardError = Pipe()
-            do {
-                try proc.run()
-            } catch {
-                lastError = error.localizedDescription
-                continue
-            }
-            Thread.sleep(forTimeInterval: 0.25)
-            if proc.isRunning {
-                lock.lock()
-                self[keyPath: key] = proc
-                lock.unlock()
-                if host.contains(".") { SparkHopCache.save(host) }
-                return nil
-            }
-            lastError = "tunnel to \(host) exited"
-        }
-        return lastError ?? "tunnel failed"
-    }
-
     /// Both tunnels. Returns the first error, or nil.
     public func ensureTunnels() -> String? {
-        let apiErr = startTunnel(port: Self.apiPort, key: \.apiTunnel)
-        let viewErr = startTunnel(port: Self.viewPort, key: \.viewTunnel)
-        return apiErr ?? viewErr
+        TunnelGate.ensureTunnels(isolates: isolates, factories: tunnelFactories())
     }
 
     public func ensureAPITunnel() -> String? {
-        startTunnel(port: Self.apiPort, key: \.apiTunnel)
+        TunnelGate.ensureAPITunnel(isolates: isolates, factories: tunnelFactories())
+    }
+
+    private func tunnelFactories() -> TunnelGate.Factories {
+        TunnelGate.Factories(
+            held: { port in
+                self.tunnelRunning(port == Self.apiPort ? \.apiTunnel : \.viewTunnel)
+            },
+            portOpen: { self.portOpen($0) },
+            hosts: { self.hostOrder() },
+            spawn: { port, command in
+                self.startTunnel(port: port, command: command)
+            },
+            rememberHost: { SparkHopCache.save($0) }
+        )
+    }
+
+    /// One ssh forward. `TunnelGate` calls this after the isolation check, under its lock.
+    private func startTunnel(port: Int, command: ProcessSpawn) -> TunnelSpawnOutcome {
+        if isolates {
+            return TunnelSpawnOutcome(stayedUp: false, error: "local session")
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: command.executable)
+        proc.arguments = command.arguments
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
+            return TunnelSpawnOutcome(stayedUp: false, error: error.localizedDescription)
+        }
+        Thread.sleep(forTimeInterval: 0.25)
+        guard proc.isRunning else {
+            return TunnelSpawnOutcome(stayedUp: false)
+        }
+        let key: ReferenceWritableKeyPath<RigService, Process?> =
+            port == Self.apiPort ? \.apiTunnel : \.viewTunnel
+        lock.lock()
+        self[keyPath: key] = proc
+        lock.unlock()
+        return TunnelSpawnOutcome(stayedUp: true)
     }
 
     public func stopTunnels() {

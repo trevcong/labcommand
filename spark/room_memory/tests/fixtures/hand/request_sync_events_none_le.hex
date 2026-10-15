@@ -1,0 +1,14 @@
+# labcommand_msgs/RequestSync TOPIC_EVENTS from a Mac that holds no events yet, CDR little endian.
+# Derived by hand; see memory_status_le.hex. Covers: the SINCE_NONE sentinel (2^64 - 1) in
+# since_epoch, since_seq and the map_epoch that repeats since_epoch; 5-char room_id -> 6 pad bytes.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+06 00 00 00                 # pos 0   room_id length 6 (5 chars + NUL)
+6c 61 62 2d 61 00           # pos 4   "lab-a\0"
+00 00 00 00 00 00           # pos 10  pad to 8
+ff ff ff ff ff ff ff ff     # pos 16  map_epoch SINCE_NONE (repeats since_epoch)
+00 00 00 00 00 00 00 00     # pos 24  seq 0 (first request)
+80 92 ed 68                 # pos 32  stamp.sec 1760400000
+00 65 cd 1d                 # pos 36  stamp.nanosec 500000000
+ff ff ff ff ff ff ff ff     # pos 40  since_epoch SINCE_NONE
+ff ff ff ff ff ff ff ff     # pos 48  since_seq SINCE_NONE
+01                          # pos 56  topic TOPIC_EVENTS

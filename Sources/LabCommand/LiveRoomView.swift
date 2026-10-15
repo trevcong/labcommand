@@ -15,8 +15,8 @@ struct LiveRoomPage: View {
                 url: nil,
                 started: state.roomDidStart,
                 requestPathExists: state.requestPathExists,
-                showsFixture: state.launch.fixtureMode != nil,
-                fixtureMode: state.fixture?.mode ?? state.launch.fixtureMode
+                showsFixture: state.roomLaunch.fixtureMode != nil,
+                fixtureMode: state.fixture?.mode ?? state.roomLaunch.fixtureMode
             )
         }
     }
