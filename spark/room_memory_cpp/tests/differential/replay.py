@@ -1,6 +1,7 @@
 """The Python oracle side of ``room_memory_replay``: runs the same script through
 ``room_memory.memory.RoomMemory`` and prints the same lines (see tools/replay.cpp)."""
 
+import dataclasses
 import pathlib
 
 import numpy as np
@@ -8,10 +9,11 @@ import numpy as np
 from room_memory.memory import MemoryConfig, RoomMemory
 from room_memory.messages import CDRError, RequestSync, Time
 
-_FLOATS = {"voxel_size", "window_s", "occupied_min_ratio", "free_max_ratio", "learn_max_offset_m", "near_range_m",
-           "delta_period_s", "keyframe_period_s", "keyframe_delta_ratio"}
+_FLOATS = {"voxel_size", "window_s", "occupied_min_ratio", "free_max_ratio", "learn_max_offset_m",
+           "fresh_min_fraction", "stable_min_fraction", "activity_radius_m", "delta_period_s",
+           "keyframe_period_s", "keyframe_delta_ratio"}
 _INTS = {"tolerance", "min_voxels", "min_extent", "reference_windows", "recent_windows", "occupied_min_hits",
-         "free_min_seen", "candidate_windows", "expire_windows", "learn_windows"}
+         "free_min_seen", "candidate_windows", "expire_windows", "learn_windows", "fresh_min_voxels"}
 
 
 def _config(fields, pair):
@@ -63,6 +65,13 @@ def run(script):
         elif command == "status":
             status = memory.status(Time(int(args[0]), int(args[1])), float(args[2]))
             out.append(f"status {status.to_cdr().hex()}")
+        elif command == "defaults":
+            for field in dataclasses.fields(MemoryConfig):
+                value = getattr(MemoryConfig(), field.name)
+                text = ",".join(value) if isinstance(value, tuple) else "none" if value is None else str(value)
+                out.append(f"default {field.name} {text}")
+        elif command == "activity":
+            out.append(f"activity {memory.activity(Time(int(args[0]), int(args[1]))).to_cdr().hex()}")
         elif command == "map":
             message = memory.map_update(Time(int(args[0]), int(args[1])))
             out.append(f"map {'none' if message is None else message.hex()}")

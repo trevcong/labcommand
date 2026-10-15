@@ -8,7 +8,9 @@ settled part of per-voxel window counts (``VoxelStats``); one sensor's reference
 node publishes as ``MapBricks`` snapshots and deltas.
 """
 
+import functools
 import math
+import operator
 import os
 import pathlib
 import re
@@ -21,6 +23,7 @@ import numpy as np
 from .core import Config, OccupancyMap, cast_rays, decode_pointcloud2, diff, occupancy_map
 from .core.change_detection import contains, in_range, pack, unpack, validate
 from .messages import (
+    Activity,
     BRICK_DIM,
     Brick,
     ChangeEvent,
@@ -265,12 +268,6 @@ def pose_offset(recent, reference_occupied, voxel_size):
     return math.sqrt(squared)
 
 
-def _near_field(keys, voxel_size, range_m):
-    """Whether a voxel center of ``keys`` lies within ``range_m`` meters of the sensor origin."""
-    x, y, z = ((lane.astype(np.float64) + 0.5) * voxel_size for lane in unpack(keys))
-    return bool(np.any(x * x + y * y + z * z < range_m * range_m))
-
-
 # MARK: Persistence
 
 
@@ -345,8 +342,10 @@ class Candidate:
     region: object
     first_seen: Time
     last_seen: Time
-    windows: int = 1  # windows with fresh support in its unbroken run of matched windows
+    windows: int = 1  # pending: windows in its current run (fresh, same shape, no activity nearby)
     missed: int = 0  # consecutive windows without a match
+    anchor: Optional[np.ndarray] = None  # pending: its (new-pose) voxels when the run started
+    anchor_from: Optional[np.ndarray] = None  # pending: its old-pose voxels then (empty unless moved)
 
 
 def region_keys(region):
@@ -356,28 +355,111 @@ def region_keys(region):
     return np.union1d(region.keys, region.from_keys)
 
 
+def region_fresh(region, occupied, free, min_voxels, min_fraction):
+    """Whether one window's own evidence supports ``region``: at least ``min_voxels`` and
+    ``min_fraction`` of its voxels occupied by the window (appeared, the new pose of a move) or
+    traversed by its rays (``free``: disappeared, the old pose of a move), each pose of a move."""
+    def supported(evidence, keys):
+        count = int(contains(evidence, keys).sum())
+        return count >= min_voxels and count >= min_fraction * len(keys)
+    if region.kind == "disappeared":
+        return supported(free, region.keys)
+    return supported(occupied, region.keys) and (region.kind != "moved" or supported(free, region.from_keys))
+
+
+def _poses(region):
+    """(new-pose or only voxels, old-pose voxels) of a region; the second is empty unless moved."""
+    return region.keys, (_EMPTY_KEYS if region.from_keys is None else region.from_keys)
+
+
+def _count_within(keys, other, tolerance):
+    """How many voxels of ``keys`` have a voxel of ``other`` within ``tolerance`` voxels along
+    each axis (Chebyshev)."""
+    if not len(keys) or not len(other):
+        return 0
+    i, j, k = unpack(keys)
+    covered = np.zeros(len(keys), dtype=bool)
+    span = range(-tolerance, tolerance + 1)
+    for di in span:
+        for dj in span:
+            for dk in span:
+                ii, jj, kk = i + di, j + dj, k + dk
+                todo = in_range(ii, jj, kk) & ~covered
+                if todo.any():
+                    covered[todo] = contains(other, pack(ii[todo], jj[todo], kk[todo]))
+    return int(covered.sum())
+
+
+def _same_shape(keys, anchor, tolerance, fraction):
+    """At least ``fraction`` of each set lies within ``tolerance`` voxels of the other."""
+    return (_count_within(keys, anchor, tolerance) >= fraction * len(keys)
+            and _count_within(anchor, keys, tolerance) >= fraction * len(anchor))
+
+
+def _box(keys):
+    """Inclusive voxel index box ``((i, j, k) low, (i, j, k) high)`` of ``keys``; None when empty."""
+    if not len(keys):
+        return None
+    i, j, k = unpack(keys)
+    return (int(i.min()), int(j.min()), int(k.min())), (int(i.max()), int(j.max()), int(k.max()))
+
+
+def _boxes(*poses):
+    return [box for box in map(_box, poses) if box is not None]
+
+
+def _gap(a, b):
+    """Voxels between two boxes along the axis that separates them most (0 when they touch)."""
+    return max(max(0, b[0][n] - a[1][n], a[0][n] - b[1][n]) for n in range(3))
+
+
 class CandidateTracker:
     """Transition-only bookkeeping for one sensor's change regions (PR 2.3 adds CONFIRMED).
 
-    A region matches the first open, else the first pending, region of the same kind sharing a
-    voxel that no other region of this window matched; otherwise it starts a pending one. A
-    region is *fresh* when this window itself supports it (``update``'s ``fresh``); a stale one
-    keeps a match alive but neither counts toward promotion nor starts a pending region. An
-    appeared or disappeared region that matches no open entry of its kind but shares a voxel
-    with the same side of an open moved candidate (its new pose, its old pose) is a half of that
-    move and starts nothing; when a window has both halves, they are the move itself and count
-    as its match. A pending region becomes a CANDIDATE (and gets its event id) once
-    ``candidate_windows`` fresh windows have matched it without a break, and is dropped silently
-    the first window it is not matched. An open candidate goes EXPIRED after ``expire_windows``
-    consecutive windows without a match. A matched candidate sends nothing: the protocol has one
-    message per transition.
+    A region first matches the first open candidate of its kind sharing a voxel that no other
+    region of this window matched. An appeared or disappeared region that matches none but shares
+    a voxel with the same side of an open moved candidate (its new pose, its old pose) is a half of
+    that move and starts nothing; when a window has both halves, they are the move itself and
+    count as its match. An open candidate goes EXPIRED after ``expire_windows`` consecutive windows
+    without a match. A matched open candidate sends nothing: the protocol has one message per
+    transition.
+
+    The rest are pending, in this order: a moved region matches the first pending move sharing a
+    voxel; a pending move with no such region matches an appeared region on its new-pose anchor
+    plus a disappeared region on its old-pose anchor (its two halves); a moved region that matched
+    nothing takes over a pending appeared on its new pose plus a pending disappeared on its old
+    pose as one pending move, whose run is the shorter of theirs; an appeared or disappeared region
+    matches the first pending entry of its kind sharing a voxel; a fresh appeared or disappeared
+    region left over whose voxel box lies within ``tolerance`` voxels of the same side of a pending
+    entry matched this window joins that entry (a fragment of its edge); a fresh region left over
+    after that starts a pending entry. A pending entry not matched in a window is dropped, and
+    ``interrupt`` (a window without usable points) drops them all.
+
+    A pending entry's *run* counts the windows since it last settled. A window whose own evidence
+    does not support it (``fresh``) sets the run to 0. A fresh window whose voxels keep the run's
+    shape (each pose against its own anchor: at least ``stable_fraction`` of the voxels of each
+    within ``tolerance`` voxels of the other) adds 1; one that does not (or a new entry) starts a
+    new run at 1 with itself as anchor, and its regions are *activity*. Then, with ``radius``, an entry that has an activity region other than
+    its own within ``radius`` voxels (box gap, either pose) sets its run to 0: a change next to
+    motion only counts once the motion has settled. ``tolerance`` None skips the shape check,
+    ``radius`` None the activity check. Last, every entry whose run reached ``candidate_windows``
+    becomes a CANDIDATE (and gets its event id), in region order.
     """
 
-    def __init__(self, candidate_windows=1, expire_windows=1):
+    def __init__(self, candidate_windows=1, expire_windows=1, tolerance=None, radius=None, stable_fraction=1.0):
         self.candidate_windows = candidate_windows
         self.expire_windows = expire_windows
+        self.tolerance = tolerance
+        self.radius = radius
+        self.stable_fraction = stable_fraction
         self.open = []
         self.pending = []
+        self.activity = []  # indices into the last update's regions that were activity
+
+    def interrupt(self):
+        """A window without usable points: no pending run bridges it."""
+        self.pending = []
+        self.activity = []
 
     def update(self, regions, stamp, next_id, fresh=None):
         """Returns ``[(state, candidate)]``: new candidates in region order, then expiries by id.
@@ -386,14 +468,22 @@ class CandidateTracker:
         """
         transitions = []
         open_matched, pending_matched = set(), set()
-        promoted, started = [], []
+
+        def overlaps(a, b):
+            return len(a) and len(b) and len(np.intersect1d(a, b, assume_unique=True))
+
+        def first_index(entries, matched, kind, keys):
+            for index, entry in enumerate(entries):
+                if index not in matched and entry.kind == kind and overlaps(entry.keys, keys):
+                    return index
+            return None
 
         def first(entries, matched, kind, keys):
-            for index, entry in enumerate(entries):
-                if index not in matched and entry.kind == kind and len(np.intersect1d(entry.keys, keys, assume_unique=True)):
-                    matched.add(index)
-                    return entry
-            return None
+            index = first_index(entries, matched, kind, keys)
+            if index is None:
+                return None
+            matched.add(index)
+            return entries[index]
 
         def half_of(kind, keys):
             """The first open move whose pose on this side (new for appeared, old for disappeared)
@@ -406,12 +496,10 @@ class CandidateTracker:
                     return index
             return None
 
-        def promote(candidate):
-            candidate = replace(candidate, event_id=next_id())
-            transitions.append((EventState.CANDIDATE, candidate))
-            promoted.append(candidate)
+        def is_fresh(index):
+            return fresh is None or bool(fresh[index])
 
-        # First pass: matches with open candidates of the same kind, and the halves of open moves.
+        # Open candidates and the halves of open moves.
         unmatched, halves = [], {EventKind.APPEARED: set(), EventKind.DISAPPEARED: set()}
         for index, region in enumerate(regions):
             kind = _KINDS.get(region.kind)
@@ -425,33 +513,120 @@ class CandidateTracker:
             move = half_of(kind, keys) if kind != EventKind.MOVED else None
             if move is not None:
                 halves[kind].add(move)
-            unmatched.append((index, region, kind, keys, move))
+                continue
+            unmatched.append((index, region, kind, keys))
         # A move reported as its two halves (the diff's pairing gates flicker) is still that move.
         # One half alone is not: it keeps nothing alive, so a move whose other half has gone
         # (removed from its new pose, or its old pose filled again) expires and frees the half.
         absorbed = halves[EventKind.APPEARED] & halves[EventKind.DISAPPEARED]
         for move in absorbed:
             self.open[move].last_seen, self.open[move].missed = stamp, 0
-        # Second pass, in region order: the rest match or start pending regions. A half starts
-        # nothing while its move is open, whether or not the move was seen whole.
-        promoted_pending = set()
-        for index, region, kind, keys, move in unmatched:
-            if move is not None:
+
+        # Pending: [entry, region indices, region or None for halves, new pose, old pose, fragments].
+        steps, used, taken_over, started = [], set(), set(), []
+        for index, region, kind, keys in unmatched:
+            if kind == EventKind.MOVED:
+                entry = first(self.pending, pending_matched, kind, keys)
+                if entry is not None:
+                    used.add(index)
+                    steps.append([entry, [index], region, *_poses(region), []])
+        for n, entry in enumerate(self.pending):
+            if n in pending_matched or entry.kind != EventKind.MOVED:
                 continue
-            supported = fresh is None or fresh[index]
-            waiting = first(self.pending, pending_matched, kind, keys)
-            if waiting is not None:
-                waiting.keys, waiting.region, waiting.last_seen = keys, region, stamp
-                waiting.windows += 1 if supported else 0
-                if waiting.windows >= self.candidate_windows:
-                    promoted_pending.add(id(waiting))
-                    promote(waiting)
-            elif not supported:
+            side = {}
+            for kind, anchor in ((EventKind.APPEARED, entry.anchor), (EventKind.DISAPPEARED, entry.anchor_from)):
+                side[kind] = next((index for index, region, k, keys in unmatched
+                                   if index not in used and k == kind and overlaps(region.keys, anchor)), None)
+            if None in side.values():
                 continue
-            elif self.candidate_windows <= 1:
-                promote(Candidate(0, kind, keys, region, stamp, stamp))
+            appeared, disappeared = side[EventKind.APPEARED], side[EventKind.DISAPPEARED]
+            pending_matched.add(n)
+            used.update((appeared, disappeared))
+            steps.append([entry, [appeared, disappeared], None, regions[appeared].keys, regions[disappeared].keys, []])
+        for index, region, kind, keys in unmatched:
+            if index in used or kind != EventKind.MOVED:
+                continue
+            new_half = first_index(self.pending, pending_matched, EventKind.APPEARED, region.keys)
+            old_half = first_index(self.pending, pending_matched, EventKind.DISAPPEARED, region.from_keys)
+            if new_half is None or old_half is None:
+                continue
+            pending_matched.update((new_half, old_half))
+            taken_over.update((new_half, old_half))
+            used.add(index)
+            a, d = self.pending[new_half], self.pending[old_half]
+            first_seen = min(a.first_seen, d.first_seen, key=lambda t: (t.sec, t.nanosec))
+            entry = Candidate(0, kind, keys, region, first_seen, stamp, min(a.windows, d.windows), 0, a.anchor, d.anchor)
+            started.append(entry)
+            steps.append([entry, [index], region, *_poses(region), []])
+        for index, region, kind, keys in unmatched:
+            if index in used or kind == EventKind.MOVED:
+                continue
+            entry = first(self.pending, pending_matched, kind, keys)
+            if entry is not None:
+                used.add(index)
+                steps.append([entry, [index], region, *_poses(region), []])
+        # A fresh fragment next to the same side of a matched entry is part of it.
+        if self.tolerance is not None:
+            matched_steps = list(steps)
+            for index, region, kind, keys in unmatched:
+                if index in used or not is_fresh(index) or kind == EventKind.MOVED:
+                    continue
+                box = _box(region.keys)
+                for step in matched_steps:
+                    entry = step[0]
+                    if entry.kind not in (kind, EventKind.MOVED):
+                        continue
+                    side = 4 if entry.kind == EventKind.MOVED and kind == EventKind.DISAPPEARED else 3
+                    if len(step[side]) and _gap(box, _box(step[side])) <= self.tolerance:
+                        step[side] = np.union1d(step[side], region.keys)
+                        step[5].append(index)
+                        used.add(index)
+                        break
+        new_entries = set()
+        for index, region, kind, keys in unmatched:
+            if index in used or not is_fresh(index):
+                continue
+            entry = Candidate(0, kind, keys, region, stamp, stamp, 0, 0)
+            new_entries.add(id(entry))
+            started.append(entry)
+            steps.append([entry, [index], region, *_poses(region), []])
+
+        # Runs: stale, same shape, or a new run (activity).
+        activity = set()
+        for entry, indices, region, new, old, fragments in steps:
+            entry.keys = np.union1d(new, old) if len(old) else new
+            if region is not None:
+                entry.region = region
+            entry.last_seen = stamp
+            if not all(is_fresh(index) for index in indices):
+                entry.windows = 0
+            elif id(entry) not in new_entries and (
+                    self.tolerance is None or (_same_shape(new, entry.anchor, self.tolerance, self.stable_fraction)
+                                               and _same_shape(old, entry.anchor_from, self.tolerance, self.stable_fraction))):
+                entry.windows += 1
             else:
-                started.append(Candidate(0, kind, keys, region, stamp, stamp))
+                entry.windows, entry.anchor, entry.anchor_from = 1, new, old
+                activity.update(indices + fragments)
+        # Motion nearby restarts the run.
+        if self.radius is not None and activity:
+            moving = {index: _boxes(*_poses(regions[index])) for index in activity}
+            for entry, indices, region, new, old, fragments in steps:
+                if entry.windows == 0:
+                    continue
+                mine = _boxes(new, old)
+                if any(_gap(a, b) <= self.radius for index, boxes in moving.items() if index not in indices + fragments
+                       for b in boxes for a in mine):
+                    entry.windows, entry.anchor, entry.anchor_from = 0, new, old
+        self.activity = sorted(activity)
+
+        # Promotion, in region order.
+        promoted = []
+        for entry, indices, region, new, old, fragments in sorted(steps, key=lambda step: min(step[1])):
+            if entry.windows >= self.candidate_windows:
+                candidate = replace(entry, event_id=next_id())
+                transitions.append((EventState.CANDIDATE, candidate))
+                promoted.append(candidate)
+        promoted_from = {id(step[0]) for step in steps if step[0].windows >= self.candidate_windows}
         expired = set()
         for index in sorted(range(len(self.open)), key=lambda n: self.open[n].event_id):
             if index in open_matched or index in absorbed:
@@ -462,7 +637,8 @@ class CandidateTracker:
                 transitions.append((EventState.EXPIRED, self.open[index]))
         self.open = [c for n, c in enumerate(self.open) if n not in expired] + promoted
         self.pending = [c for n, c in enumerate(self.pending)
-                        if n in pending_matched and id(c) not in promoted_pending] + started
+                        if n in pending_matched and n not in taken_over and id(c) not in promoted_from]
+        self.pending += [c for c in started if id(c) not in promoted_from]
         return transitions
 
 
@@ -477,13 +653,11 @@ class MemoryConfig:
     sensors: Tuple[str, ...] = ("mid360", "jt128")
     voxel_size: float = 0.05
     max_range: Optional[float] = 15.0
-    # tolerance, min_voxels and near_range_m, like the defaults below, were measured on the static
-    # recordings (room_memory_cpp/PLAN.md, "False change events").
-    tolerance: int = 2
-    min_voxels: int = 8
+    tolerance: int = 1
+    min_voxels: int = 6
     min_extent: int = 2
     window_s: float = 1.0
-    # Defaults measured on the static recordings (room_memory_cpp/PLAN.md, "False change events").
+    # Defaults measured on the static recording (room_memory_cpp/PLAN.md, "False change events").
     reference_windows: int = 30
     recent_windows: int = 3
     state_dir: Optional[str] = "~/room-memory"
@@ -492,21 +666,34 @@ class MemoryConfig:
     occupied_min_ratio: float = 0.3
     free_min_seen: int = 2
     free_max_ratio: float = 0.0
-    # Change gate: windows a region must persist before its CANDIDATE, and windows an open
-    # candidate may go unmatched before it EXPIRES.
-    candidate_windows: int = 3
+    # Change gate: windows a region must stay settled (fresh, the same voxels within tolerance,
+    # no activity within activity_radius_m) before its CANDIDATE, and windows an open candidate
+    # may go unmatched before it EXPIRES. 40 windows outlast the longest settled run in the
+    # static recordings, 24 windows of a person's BUILDING-time pose next to the rig (room_memory_cpp/PLAN.md,
+    # "Activity").
+    candidate_windows: int = 40
     expire_windows: int = 3
+    # A region is fresh in a window whose own evidence supports at least fresh_min_voxels and
+    # fresh_min_fraction of its voxels (each pose of a move): occupied by the window where it
+    # appeared, traversed by the window's rays where it disappeared.
+    fresh_min_voxels: int = 3
+    fresh_min_fraction: float = 0.5
+    # A region keeps its shape while at least stable_min_fraction of its voxels lie within tolerance
+    # voxels of the voxels it had when its count started, and the other way round.
+    stable_min_fraction: float = 0.9
+    # Activity (new or reshaping regions) within this distance (meters, voxel box gap) of a pending
+    # region restarts its count (0: never).
+    activity_radius_m: float = 1.0
     # A tracking window adds to the counts of unsettled voxels only while its pose offset is at
     # most this (meters), so a moved rig never teaches the reference its new view.
     learn_max_offset_m: float = 0.02
-    # A change region with a voxel center within this distance (meters) of the sensor is not
-    # reported: the near field next to the rig, where people work (0: every region is).
-    near_range_m: float = 2.0
     # Closed windows that enter TRACKING and may still add to unsettled voxels. An empty window
     # and one whose pose exceeds learn_max_offset_m count. The budget is about learn_windows *
     # window_s seconds. After it, map_update settles once more on its usual schedule, then drops
     # the counts: a voxel outside the frozen reference is not an event and never becomes one.
-    learn_windows: int = 30
+    # 0: tracking teaches the reference nothing. Learning while a person works next to the rig
+    # writes their surroundings into the reference (room_memory_cpp/PLAN.md, "Activity").
+    learn_windows: int = 0
     # Map stream: the sensor whose reference is published ("" = jt128 when configured, else the
     # first configured), the
     # minimum time between map messages, the maximum time between snapshots, and the share of
@@ -547,7 +734,9 @@ class _Channel:
         self.stats = VoxelStats()  # every voxel while BUILDING; the not yet settled ones while TRACKING
         self.reference_windows = 0  # windows with usable points counted into the reference
         self.recent = deque(maxlen=config.recent_windows)  # one entry per closed window, empty when it had none
-        self.tracker = CandidateTracker(config.candidate_windows, config.expire_windows)
+        radius = math.floor(config.activity_radius_m / config.voxel_size + 0.5) if config.activity_radius_m > 0 else None
+        self.tracker = CandidateTracker(config.candidate_windows, config.expire_windows, config.tolerance, radius,
+                                        config.stable_min_fraction)
         self.hz = None
         self.residual = None  # pose_offset of the last tracking window with points
 
@@ -574,10 +763,12 @@ class RoomMemory:
             raise ValueError("candidate_windows and expire_windows must be >= 1")
         if not 0 <= config.learn_max_offset_m < 1e9:
             raise ValueError("learn_max_offset_m must be in [0, 1e9) m")
-        if not 0 <= config.near_range_m < 1e9:
-            raise ValueError("near_range_m must be in [0, 1e9) m")
         if config.learn_windows < 0:
             raise ValueError("learn_windows must be >= 0")
+        if config.fresh_min_voxels < 1 or not 0 <= config.fresh_min_fraction <= 1 or not 0 <= config.stable_min_fraction <= 1:
+            raise ValueError("fresh_min_voxels must be >= 1, fresh_min_fraction and stable_min_fraction in [0, 1]")
+        if not 0 <= config.activity_radius_m < 1e9:
+            raise ValueError("activity_radius_m must be in [0, 1e9) m")
         if not (0 < config.delta_period_s < 1e9 and 0 < config.keyframe_period_s < 1e9
                 and 0 <= config.keyframe_delta_ratio < 1e9):
             raise ValueError("delta_period_s and keyframe_period_s must be in (0, 1e9) s, keyframe_delta_ratio in [0, 1e9)")
@@ -595,6 +786,9 @@ class RoomMemory:
         self.map_epoch = 0
         self.event_seq = 0
         self.status_seq = 0
+        self.activity_seq = 0
+        self._activity = None  # the newest window with activity since the last activity message
+        self._last_activity_ns = None  # stamp of the newest window with activity
         self.dropped_windows = 0
         self.last_window_dropped = False
         self._next_event_id = ((start.sec * 1000 + start.nanosec // 1_000_000) << 20) & ((1 << 64) - 1)
@@ -705,6 +899,7 @@ class RoomMemory:
     def close_window(self, stamp):
         """Integrates the queued frames. Returns the ``ChangeEvent`` messages to publish, in order."""
         events = []
+        activity = []  # (sensor bit, region) of every activity region, all sensors
         dropped = False
         # A window counts only when it enters already tracking. The window that crosses
         # BUILDING → TRACKING is the reference, not part of the learning budget.
@@ -733,6 +928,7 @@ class RoomMemory:
             # A window without usable points still ages the recent layer, but sends nothing.
             if window is None or not len(window.occupied):
                 channel.recent.append(_NO_POINTS)
+                channel.tracker.interrupt()
                 continue
             channel.recent.append(points)
             reference = channel.reference
@@ -747,23 +943,28 @@ class RoomMemory:
                                   np.setdiff1d(observed.known, reference.known, assume_unique=True))
                 self._settle_pending = True
             report = diff(reference.as_occupancy(self.config.voxel_size), recent, self.change, reference.known)
-            # Regions reaching into the near field are not reported, either pose of a move.
-            regions = [region for region in report.regions
-                       if not _near_field(region_keys(region), self.config.voxel_size, self.config.near_range_m)]
             # The recent layer carries a return and its ray for recent_windows windows, so only
-            # this window's own evidence counts toward the persistence gate: an appeared or moved
-            # region is fresh when this window occupies one of its (new-pose) voxels, a disappeared
-            # one when this window's rays traverse one of its voxels.
-            gone = [region.keys for region in regions if region.kind == "disappeared"]
+            # this window's own evidence counts toward the persistence gate: an appeared region (or
+            # the new pose of a move) is supported where this window occupies its voxels, a
+            # disappeared one (or the old pose) where this window's rays traverse them.
+            gone = [region.keys for region in report.regions if region.kind == "disappeared"]
+            gone += [region.from_keys for region in report.regions if region.kind == "moved"]
             free = cast_rays(window, self.change, np.unique(np.concatenate(gone))) if gone else _EMPTY_KEYS
-            fresh = [bool(contains(free if region.kind == "disappeared" else window.occupied, region.keys).any())
-                     for region in regions]
-            for state, candidate in channel.tracker.update(regions, stamp, self._next_id, fresh):
+            fresh = [region_fresh(region, window.occupied, free, self.config.fresh_min_voxels,
+                                  self.config.fresh_min_fraction) for region in report.regions]
+            for state, candidate in channel.tracker.update(report.regions, stamp, self._next_id, fresh):
                 events.append(self._event(channel, state, candidate, stamp))
                 self._log_event(events[-1])
+            activity.extend((channel.sensor.bit, report.regions[index]) for index in channel.tracker.activity)
         if dropped:
             self.dropped_windows += 1
         self.last_window_dropped = dropped
+        if activity:
+            # The largest region, ties to the lower sensor bit, then the earlier region.
+            bit, largest = min(activity, key=lambda item: (-item[1].voxel_count, item[0]))
+            self._activity = (len(activity), sum(region.voxel_count for _, region in activity),
+                              functools.reduce(operator.or_, (b for b, _ in activity)), bit, largest)
+            self._last_activity_ns = _nanoseconds(stamp)
         if self.state == MemoryState.BUILDING and all(self._reference_ready(c) for c in self.channels.values()):
             self.state = MemoryState.TRACKING
             # From here on only the voxels the reference has not settled keep their counts.
@@ -779,6 +980,21 @@ class RoomMemory:
             self.map_epoch += 1
             self.save(stamp)
         return events
+
+    def activity(self, stamp):
+        """The ``Activity`` message at ``stamp`` (call at 1 Hz): the newest tracking window with
+        activity since the previous call, if any, and the time since the newest one ever."""
+        header = Header(self.config.room_id, self.map_epoch, self.activity_seq, stamp)
+        self.activity_seq += 1
+        since = None
+        if self._last_activity_ns is not None:
+            since = max(0, _nanoseconds(stamp) - self._last_activity_ns) / 1e9
+        latest, self._activity = self._activity, None
+        if latest is None:
+            return Activity(header, False, 0, 0, 0, 0, None, None, None, since)
+        count, voxels, sensors, bit, region = latest
+        return Activity(header, True, sensors, bit, count, voxels, tuple(region.centroid.tolist()),
+                        tuple(region.bounds_min.tolist()), tuple(region.bounds_max.tolist()), since)
 
     def _log_event(self, event):
         entry = Logged(event.header.seq, event.header.map_epoch, event.to_cdr())

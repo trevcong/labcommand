@@ -400,6 +400,36 @@ std::pair<msg::MapBricks, VoxelLayer> load_reference(const std::filesystem::path
 
 // MARK: Candidates
 
+std::size_t count_within(const Keys& keys, const Keys& other, std::int64_t tolerance) {
+    if (keys.empty() || other.empty()) return 0;
+    std::size_t count = 0;
+    for (const Key key : keys) {
+        const Index3 v = unpack(key);
+        bool found = false;
+        for (std::int64_t di = -tolerance; di <= tolerance && !found; ++di) {
+            for (std::int64_t dj = -tolerance; dj <= tolerance && !found; ++dj) {
+                for (std::int64_t dk = -tolerance; dk <= tolerance && !found; ++dk) {
+                    const std::int64_t i = v.i + di, j = v.j + dj, k = v.k + dk;
+                    found = in_range(i, j, k) && std::binary_search(other.begin(), other.end(), pack(i, j, k));
+                }
+            }
+        }
+        if (found) ++count;
+    }
+    return count;
+}
+
+bool same_shape(const Keys& keys, const Keys& anchor, std::int64_t tolerance, double fraction) {
+    return static_cast<double>(count_within(keys, anchor, tolerance)) >= fraction * static_cast<double>(keys.size()) &&
+           static_cast<double>(count_within(anchor, keys, tolerance)) >= fraction * static_cast<double>(anchor.size());
+}
+
+std::int64_t box_gap(const Box& a, const Box& b) {
+    std::int64_t gap = 0;
+    for (int n = 0; n < 3; ++n) gap = std::max({gap, b.low[n] - a.high[n], a.low[n] - b.high[n]});
+    return gap;
+}
+
 Keys region_keys(const Region& region) {
     if (region.kind != Region::Kind::moved) return region.keys;
     return set_union(region.keys, region.from_keys);
@@ -437,7 +467,6 @@ RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, const RayBac
         names.push_back(name);
         Channel channel;
         channel.sensor = *found;
-        channel.tracker = CandidateTracker(config_.candidate_windows, config_.expire_windows);
         channels_.push_back(std::move(channel));
     }
     if (unknown) {
@@ -458,10 +487,13 @@ RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, const RayBac
     if (!(config_.learn_max_offset_m >= 0 && config_.learn_max_offset_m < 1e9)) {
         throw std::invalid_argument("learn_max_offset_m must be in [0, 1e9) m");
     }
-    if (!(config_.near_range_m >= 0 && config_.near_range_m < 1e9)) {
-        throw std::invalid_argument("near_range_m must be in [0, 1e9) m");
-    }
     if (config_.learn_windows < 0) throw std::invalid_argument("learn_windows must be >= 0");
+    if (config_.fresh_min_voxels < 1 || !fraction(config_.fresh_min_fraction) || !fraction(config_.stable_min_fraction)) {
+        throw std::invalid_argument("fresh_min_voxels must be >= 1, fresh_min_fraction and stable_min_fraction in [0, 1]");
+    }
+    if (!(config_.activity_radius_m >= 0 && config_.activity_radius_m < 1e9)) {
+        throw std::invalid_argument("activity_radius_m must be in [0, 1e9) m");
+    }
     if (!(config_.delta_period_s > 0 && config_.delta_period_s < 1e9) ||
         !(config_.keyframe_period_s > 0 && config_.keyframe_period_s < 1e9) ||
         !(config_.keyframe_delta_ratio >= 0 && config_.keyframe_delta_ratio < 1e9)) {
@@ -478,6 +510,15 @@ RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, const RayBac
     }
     change_ = config_.change_config();
     validate(change_);
+    // Activity radius in voxels; no activity check at 0.
+    const std::optional<std::int64_t> radius =
+        config_.activity_radius_m > 0
+            ? std::optional<std::int64_t>(static_cast<std::int64_t>(std::floor(config_.activity_radius_m / config_.voxel_size + 0.5)))
+            : std::nullopt;
+    for (Channel& channel : channels_) {
+        channel.tracker = CandidateTracker(config_.candidate_windows, config_.expire_windows, config_.tolerance, radius,
+                                           config_.stable_min_fraction);
+    }
     const std::int64_t millis = start.sec * 1000 + start.nanosec / 1'000'000;
     next_event_id_ = static_cast<std::uint64_t>(millis) << 20;
     load(start);
@@ -602,25 +643,14 @@ bool RoomMemory::reference_ready(const Channel& channel) const {
     return channel.reference_windows >= config_.reference_windows && !channel.reference.occupied.empty();
 }
 
-namespace {
-
-// Whether a voxel center of `keys` lies within `range` meters of the sensor origin.
-bool near_field(const Keys& keys, double voxel_size, double range) {
-    const double limit = range * range;
-    for (const Key key : keys) {
-        const Index3 v = unpack(key);
-        const double x = (static_cast<double>(v.i) + 0.5) * voxel_size;
-        const double y = (static_cast<double>(v.j) + 0.5) * voxel_size;
-        const double z = (static_cast<double>(v.k) + 0.5) * voxel_size;
-        if (x * x + y * y + z * z < limit) return true;
-    }
-    return false;
-}
-
-}  // namespace
-
 std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
     std::vector<msg::ChangeEvent> events;
+    // Every activity region of this window, all sensors.
+    struct Moving {
+        std::int64_t bit;
+        Region region;
+    };
+    std::vector<Moving> activity;
     bool dropped = false;
     const auto quota = static_cast<std::size_t>(config_.recent_windows);
     // A window counts only when it enters already tracking. The window that crosses
@@ -661,6 +691,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         }
         if (window.occupied.empty()) {
             push_recent(CellSummary{});
+            channel.tracker.interrupt();
             continue;
         }
         push_recent(std::move(summary));
@@ -687,12 +718,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         options.before_known = &channel.reference.known;
         options.scope = scope_;
         options.backend = backend_;
-        Report report = diff(channel.reference.as_occupancy(change_.voxel_size), recent, change_, options);
-        // Regions reaching into the near field are not reported, either pose of a move.
-        std::erase_if(report.regions, [&](const Region& region) {
-            return near_field(region.keys, config_.voxel_size, config_.near_range_m) ||
-                   near_field(region.from_keys, config_.voxel_size, config_.near_range_m);
-        });
+        const Report report = diff(channel.reference.as_occupancy(change_.voxel_size), recent, change_, options);
         // The recent layer carries a return and its ray for recent_windows windows, so only this
         // window's own evidence counts toward the persistence gate: an appeared or moved region
         // is fresh when this window occupies one of its (new-pose) voxels, a disappeared one
@@ -700,21 +726,44 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         Keys gone;
         for (const Region& region : report.regions) {
             if (region.kind == Region::Kind::disappeared) gone = set_union(gone, region.keys);
+            if (region.kind == Region::Kind::moved) gone = set_union(gone, region.from_keys);
         }
         const Keys free = gone.empty() ? Keys{} : cast_rays(window, change_, &gone, backend_);
-        std::vector<bool> fresh(report.regions.size());
-        for (std::size_t n = 0; n < fresh.size(); ++n) {
-            const Region& region = report.regions[n];
-            fresh[n] = intersects(region.kind == Region::Kind::disappeared ? free : window.occupied, region.keys);
+        std::vector<bool> supported(report.regions.size());
+        for (std::size_t n = 0; n < supported.size(); ++n) {
+            supported[n] = region_fresh(report.regions[n], window.occupied, free, config_.fresh_min_voxels,
+                                        config_.fresh_min_fraction);
         }
         for (const auto& [state, candidate] :
-             channel.tracker.update(report.regions, stamp, [this] { return next_id(); }, fresh)) {
+             channel.tracker.update(report.regions, stamp, [this] { return next_id(); }, supported)) {
             events.push_back(event(channel, state, candidate, stamp));
             log_event(events.back());
         }
+        for (const std::size_t n : channel.tracker.activity()) activity.push_back(Moving{channel.sensor.bit, report.regions[n]});
     }
     if (dropped) ++dropped_windows_;
     last_window_dropped_ = dropped;
+    if (!activity.empty()) {
+        // The largest region, ties to the lower sensor bit, then the earlier region.
+        const Moving* largest = &activity.front();
+        msg::Activity summary;
+        summary.active = true;
+        summary.n_regions = static_cast<std::int64_t>(activity.size());
+        for (const Moving& moving : activity) {
+            summary.voxel_count += moving.region.voxel_count;
+            summary.sensors |= moving.bit;
+            if (moving.region.voxel_count > largest->region.voxel_count ||
+                (moving.region.voxel_count == largest->region.voxel_count && moving.bit < largest->bit)) {
+                largest = &moving;
+            }
+        }
+        summary.largest_sensor = largest->bit;
+        summary.centroid = largest->region.centroid;
+        summary.aabb_min = largest->region.bounds_min;
+        summary.aabb_max = largest->region.bounds_max;
+        activity_ = std::move(summary);
+        last_activity_ns_ = nanoseconds(stamp);
+    }
     if (state_ == msg::MemoryState::building &&
         std::all_of(channels_.begin(), channels_.end(), [&](const Channel& c) { return reference_ready(c); })) {
         state_ = msg::MemoryState::tracking;
@@ -900,6 +949,26 @@ msg::ChangeEvent RoomMemory::event(const Channel& channel, msg::EventState state
     mask.bricks = layer.to_bricks();
     e.mask = std::move(mask);
     return e;
+}
+
+bool region_fresh(const Region& region, const Keys& occupied, const Keys& free, std::int64_t min_voxels,
+                  double min_fraction) {
+    const auto supported = [&](const Keys& evidence, const Keys& keys) {
+        const auto count = static_cast<std::int64_t>(count_present(evidence, keys));
+        return count >= min_voxels && static_cast<double>(count) >= min_fraction * static_cast<double>(keys.size());
+    };
+    if (region.kind == Region::Kind::disappeared) return supported(free, region.keys);
+    return supported(occupied, region.keys) && (region.kind != Region::Kind::moved || supported(free, region.from_keys));
+}
+
+msg::Activity RoomMemory::activity(const msg::Time& stamp) {
+    msg::Activity message = activity_.value_or(msg::Activity{});
+    activity_.reset();
+    message.header = msg::Header{config_.room_id, map_epoch_, activity_seq_++, stamp};
+    if (last_activity_ns_) {
+        message.since_s = static_cast<float>(static_cast<double>(std::max<std::int64_t>(0, nanoseconds(stamp) - *last_activity_ns_)) / 1e9);
+    }
+    return message;
 }
 
 msg::MemoryStatus RoomMemory::status(const msg::Time& stamp, double period_s) {

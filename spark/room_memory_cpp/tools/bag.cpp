@@ -11,7 +11,9 @@
 // it. The window still open when the records end is not closed: it holds only part of a
 // window's frames.
 //
-// Output, one line each: window, event, map and status lines, then one JSON summary line.
+// Output, one line each: window, event, map, status and activity lines (an Activity message with
+// each status), then one JSON summary line. The summary's max_run is the longest run a pending
+// change region reached per sensor (CandidateTracker), the margin below candidate_windows.
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
@@ -89,7 +91,9 @@ int main(int argc, char** argv) {
     std::int64_t windows = 0;
     std::int64_t frames[2] = {0, 0};
     std::uint64_t events_total = 0;
-    Totals snapshots, deltas, statuses, events;
+    Totals snapshots, deltas, statuses, events, activities;
+    std::int64_t active_messages = 0;
+    std::int64_t max_run[2] = {0, 0};
     std::vector<double> tracking_ms;
     std::vector<double> building_ms;
 
@@ -106,6 +110,12 @@ int main(int argc, char** argv) {
                     static_cast<double>(window_end - first_ns) / 1e9, msg::name(memory->state()), ms, frames[0],
                     frames[1]);
         frames[0] = frames[1] = 0;
+        for (int sensor = 0; sensor < 2; ++sensor) {
+            if (std::find(config.sensors.begin(), config.sensors.end(), names[sensor]) == config.sensors.end()) continue;
+            for (const room_memory::Candidate& c : memory->channel(names[sensor]).tracker.pending()) {
+                max_run[sensor] = std::max(max_run[sensor], c.windows);
+            }
+        }
         for (const msg::ChangeEvent& e : out) {
             const std::size_t size = e.to_cdr().size();
             events.add(size);
@@ -138,6 +148,18 @@ int main(int argc, char** argv) {
                     static_cast<double>(next_status - first_ns) / 1e9, msg::name(status.state), status.n_bricks,
                     status.n_open_events, optional_float(status.coverage_known_frac).c_str(),
                     optional_float(status.pose_residual_m).c_str(), size);
+        const msg::Activity activity = memory->activity(time_of(next_status));
+        const std::size_t activity_size = activity.to_cdr().size();
+        activities.add(activity_size);
+        if (activity.active) {
+            ++active_messages;
+            std::printf("activity %.3f active regions %" PRId64 " voxels %" PRId64 " sensors %" PRId64
+                        " largest %" PRId64 " centroid %.3f %.3f %.3f since %.3f %zu B\n",
+                        static_cast<double>(next_status - first_ns) / 1e9, activity.n_regions, activity.voxel_count,
+                        activity.sensors, activity.largest_sensor, static_cast<double>((*activity.centroid)[0]),
+                        static_cast<double>((*activity.centroid)[1]), static_cast<double>((*activity.centroid)[2]),
+                        static_cast<double>(*activity.since_s), activity_size);
+        }
         next_status += kSecond;
     };
     // The node's two timers: every deadline at or before `ns`, in time order, the window first on a tie.
@@ -208,12 +230,14 @@ int main(int argc, char** argv) {
         "summary {\"duration_s\": %.3f, \"windows\": %" PRId64 ", \"tracking_from_s\": %.3f, \"tracked_s\": %.3f, "
         "\"events\": %" PRIu64 ", "
         "\"bytes\": {\"snapshot\": %" PRIu64 ", \"delta\": %" PRIu64 ", \"status\": %" PRIu64 ", \"events\": %" PRIu64
-        "}, \"messages\": {\"snapshot\": %" PRIu64 ", \"delta\": %" PRIu64 ", \"status\": %" PRIu64
-        ", \"events\": %" PRIu64 "}, \"window_ms\": {\"building_median\": %.2f, \"building_max\": %.2f, "
+        ", \"activity\": %" PRIu64 "}, \"messages\": {\"snapshot\": %" PRIu64 ", \"delta\": %" PRIu64
+        ", \"status\": %" PRIu64 ", \"events\": %" PRIu64 ", \"activity\": %" PRIu64 ", \"active\": %" PRId64
+        "}, \"max_run\": {\"mid360\": %" PRId64 ", \"jt128\": %" PRId64 "}, \"window_ms\": {\"building_median\": %.2f, \"building_max\": %.2f, "
         "\"tracking_median\": %.2f, \"tracking_max\": %.2f}}\n",
         duration, windows, tracking_since < 0 ? -1.0 : static_cast<double>(tracking_since - first_ns) / 1e9, tracked,
-        events_total, snapshots.bytes, deltas.bytes, statuses.bytes, events.bytes, snapshots.count,
-        deltas.count, statuses.count, events.count, median(building_ms), maximum(building_ms), median(tracking_ms),
+        events_total, snapshots.bytes, deltas.bytes, statuses.bytes, events.bytes, activities.bytes, snapshots.count,
+        deltas.count, statuses.count, events.count, activities.count, active_messages, max_run[0], max_run[1],
+        median(building_ms), maximum(building_ms), median(tracking_ms),
         maximum(tracking_ms));
     return 0;
 }

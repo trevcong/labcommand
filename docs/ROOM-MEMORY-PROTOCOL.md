@@ -74,6 +74,7 @@ Topic names are a proposal for PR 2.4 (D18):
 | `/room_memory/map_bricks` | Spark → Mac | `MapBricks` | snapshot when TRACKING starts and then every `keyframe_period_s` (60 s); deltas at least `delta_period_s` (5 s) apart, only when the reference changed (D24) | reliable, keep-last 10 |
 | `/room_memory/events` | Spark → Mac | `ChangeEvent` | one per lifecycle transition, typically < 1/min | reliable, keep-last 100 |
 | `/room_memory/status` | Spark → Mac | `MemoryStatus` | 1 Hz | reliable, keep-last 1 |
+| `/room_memory/activity` | Spark → Mac | `Activity` | 1 Hz, with each status (D28) | reliable, keep-last 1 |
 | `/room_memory/epoch` | Spark → Mac | `Epoch` | 0.2 Hz | reliable, keep-last 1 |
 | `/room_memory/request_sync` | Mac → Spark | `RequestSync` | on (re)connect and on a gap, ≤ 1 per topic per 5 s | reliable, keep-last 10 |
 | `/room_memory/sync/map_bricks` | Spark → Mac | `MapBricks` | answers to `TOPIC_MAP_BRICKS` requests | reliable, keep-last 10 |
@@ -85,7 +86,7 @@ Topic names are a proposal for PR 2.4 (D18):
 
 ## 3. Messages
 
-The `.msg` text below is the legal ROS 2 version of §2.4. §8 (D1) lists every syntax change. Field names, types and order are as §2.4 gives them, except for `MapBricks`, whose brick arrays moved into a compressed payload (D9). §3.5 adds `RequestSync` (D19). The *missing* column says how "not available" travels on the wire, and the *rendering* column says what the Mac shows then. "Stale" is the message-level rendering of §5.
+The `.msg` text below is the legal ROS 2 version of §2.4. §8 (D1) lists every syntax change. Field names, types and order are as §2.4 gives them, except for `MapBricks`, whose brick arrays moved into a compressed payload (D9). §3.5 adds `RequestSync` (D19), §3.6 adds `Activity` (D28). The *missing* column says how "not available" travels on the wire, and the *rendering* column says what the Mac shows then. "Stale" is the message-level rendering of §5.
 
 ### 3.1 `MapBricks`: snapshot or delta
 
@@ -318,6 +319,40 @@ Trevor's D19 gives `RequestSync{room_id, since_epoch, since_seq, stamp}`. The co
 
 **Wire size.** `4 + C + 17` bytes: 53 B for "lab".
 
+### 3.6 `Activity`: transient motion next to the rig, 1 Hz
+
+```
+uint8 SENSOR_MID360=1
+uint8 SENSOR_JT128=2
+string room_id
+uint64 map_epoch
+uint64 seq
+builtin_interfaces/Time stamp
+bool active
+uint8 sensors
+uint8 largest_sensor
+uint32 n_regions
+uint32 voxel_count
+float32[3] centroid
+float32[6] aabb
+float32 since_s
+```
+
+Activity is never a change: nothing in it becomes a `ChangeEvent`, and `MemoryStatus` and `ChangeEvent` are unchanged (D28). An *activity region* is a change region of one sensor's tracking window that the window's own evidence supports and that either appeared new in that window or lost its shape (§4.2). Regions matched to an open event are not activity. `active` false means no such region, not a motionless room: still people, motion below `min_voxels` and motion inside an open event do not show.
+
+| field | type | unit | valid | missing on the wire | rendering when missing / invalid |
+|---|---|---|---|---|---|
+| `seq` | `uint64` | count | per-topic counter, +1 per message | cannot be missing | — |
+| `active` | `bool` | — | a tracking window since the previous `Activity` had activity | cannot be missing | other value than 0/1: message rejected |
+| `sensors` | `uint8` | bitmask | `SENSOR_*` with activity in the newest such window; 0 when inactive | cannot be missing | undefined bit: message rejected |
+| `largest_sensor` | `uint8` | enum | the `SENSOR_*` bit whose frame `centroid` and `aabb` are in (D25); one bit of `sensors`; 0 when inactive | cannot be missing | otherwise rejected |
+| `n_regions` | `uint32` | count | activity regions in that window, all sensors; 0 when inactive | cannot be missing | — |
+| `voxel_count` | `uint32` | voxels | their voxels (a move counts its new pose); 0 when inactive | cannot be missing | — |
+| `centroid`, `aabb` | `float32[3]`, `float32[6]` | m | the largest activity region (most voxels; ties to the lower sensor bit), as a `ChangeEvent` would carry it | NaN ×3, NaN ×6 when inactive | partly NaN: rejected |
+| `since_s` | `float32` | s | from the newest window with activity to `stamp`, ≥ 0 | NaN = none since the node started | negative: rejected |
+
+**Wire size.** `4 + C + 52` bytes: 88 B for "lab".
+
 ## 4. State machines
 
 The Spark owns both machines. The Mac renders them, and it flags a transition that is not in these tables as a protocol violation. It keeps the last legal state and logs the violation; it does not render the illegal state.
@@ -350,7 +385,7 @@ The Spark owns both machines. The Mac renders them, and it flags a transition th
 
 | from | to | trigger | Mac rendering of the new state |
 |---|---|---|---|
-| — | CANDIDATE | disagreement between the reference and recent layers where both have evidence, persisting `candidate_windows` (3) consecutive windows; a shorter one sends nothing (D26) | dashed outline, "candidate"; not counted as a change |
+| — | CANDIDATE | disagreement between the reference and recent layers where both have evidence that stays *settled* for `candidate_windows` (40) consecutive windows: each window's own evidence supports it (`fresh_min_voxels` 3 and `fresh_min_fraction` 0.5 of its voxels, both poses of a move), it keeps its shape (`stable_min_fraction` 0.9 of its voxels within `tolerance` of where they were when the count started, and back), and no activity region (§3.6) is within `activity_radius_m` (1.0 m). A stale window, a lost shape, nearby activity or a window without points starts the count again. Anything shorter sends nothing (D26, D28) | dashed outline, "candidate"; not counted as a change |
 | CANDIDATE | CONFIRMED | persists ≥ T_commit (start at 5 s; tuned in PR 2.3) | solid overlay; counted; arrow for MOVED |
 | CANDIDATE | EXPIRED | gone before T_commit (walk-through): no matching region for `expire_windows` (3) consecutive windows; superseded by a MOVED pairing; or memory left TRACKING for RIG_MOVED | removed from the overlay; history only |
 | CONFIRMED | ACCEPTED | operator accept; the reference absorbs it and `map_epoch` bumps | overlay removed; the map now shows the new state; history entry |
@@ -434,6 +469,7 @@ These extend the app's existing contract (missing ≠ zero, a running container 
 | stream | rate | message size ("lab", default zlib) | steady state |
 |---|---|---|---|
 | MemoryStatus | 1 Hz | 68 B (exact) | 0.07 KB/s |
+| Activity | 1 Hz | 88 B (exact) | 0.09 KB/s |
 | Epoch | 0.2 Hz | 53 B (exact) | 0.01 KB/s |
 | ChangeEvent, no mask | per transition, < 1/min | 136 B (exact) | < 0.01 KB/s |
 | ChangeEvent with a 25 cm box mask | per transition | 253 B (measured) | < 0.01 KB/s |
@@ -441,14 +477,15 @@ These extend the app's existing contract (missing ≠ zero, a running container 
 | MapBricks snapshot | node start, (re)connect, and the answer to a request that cannot be replayed | 52,863–59,024 B (measured, see below) | — |
 | RequestSync (Mac → Spark) | on (re)connect and on a gap | 53 B (exact) | — |
 
-**Measured on the real 5-minute static recording** (`spark/room_memory_cpp/PLAN.md`), both lidars, node defaults, the JT128's reference as the map: 1.28 KB/s mean over all room-memory topics.
+**Measured on the real 5-minute static recording** `static5m` (`spark/room_memory_cpp/PLAN.md`), both lidars, node defaults, the JT128's reference as the map: 0.89 KB/s mean over all room-memory topics. Tracking teaches the reference nothing (`learn_windows` 0), so there are no deltas, and Trevor's motion next to the rig is activity, not events.
 
 | stream | messages | bytes | mean |
 |---|---|---|---|
-| MapBricks snapshot (keyframe, 43 KB) | 6 | 259,350 | 0.87 KB/s |
-| MapBricks delta (new coverage, median 1.2 KB) | 48 | 91,619 | 0.31 KB/s |
-| MemoryStatus | 299 | 20,332 | 0.07 KB/s |
-| ChangeEvent (a real object next to the rig) | 49 | 12,034 | 0.04 KB/s |
+| MapBricks snapshot (keyframe, 43 KB) | 5 | 217,080 | 0.73 KB/s |
+| MapBricks delta | 0 | 0 | 0 |
+| MemoryStatus | 299 | 22,724 | 0.08 KB/s |
+| Activity (71 of them active) | 299 | 26,312 | 0.09 KB/s |
+| ChangeEvent | 0 | 0 | 0 |
 
 **Measured** by the size test in `RoomMemoryCDRTests.swift`.
 - The input is a full-sphere synthetic accumulation of the furnished 8 × 8 × 3 m room: 720 × 360 rays, ±1 cm range noise, seed 1, 5 cm voxels.
@@ -559,12 +596,13 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **D23. A dedicated, read-only bridge on :8767** (§2). The memory topics need `labcommand_msgs` in the bridge's environment, which the lidar bridge on :8765 does not have, and a separate bridge leaves LIVE untouched. Read-only by default because foxglove_bridge 3.4.1 does not enforce `client_topic_whitelist`. `RequestSync` then needs `foxglove_client_publish:=true` or a relay.
 - **D24. Periodic keyframes.** §2.4's "snapshot on (re)connect" cannot be detected through the bridge, so the live topic carries a snapshot every `keyframe_period_s` (60 s). Changed bricks between keyframes go out as deltas at most every `delta_period_s` (5 s, the ≤ 0.2 Hz of §2). A snapshot replaces the next delta once the deltas since the last snapshot would exceed `keyframe_delta_ratio` (0.5) of its size. A keyframe of an unchanged map does not bump `map_epoch`; every delta does.
 - **D25. One published map.** There is no JT128↔Mid-360 extrinsic yet (brief R1), so the references stay per sensor and `map_bricks` carries one of them, `map_sensor` (default: the JT128 when configured; its repeating pattern gives the denser map). `n_bricks` and `coverage_known_frac` describe that map. Events of the other sensor are in that sensor's own frame.
-- **D26. A persistence gate before CANDIDATE.** On the static recording the node sent ~120 CANDIDATE/EXPIRED messages per minute. Most of them came from a reference built as the union of 5 windows of the Mid-360's sparse non-repetitive pattern; per-voxel window counts fix that (`spark/room_memory_cpp/PLAN.md`). As a second line, a region now has to persist `candidate_windows` windows before its CANDIDATE is sent. An open candidate expires only after `expire_windows` unmatched windows, so an intermittently seen change does not flicker. T_commit (CANDIDATE → CONFIRMED) is unchanged and still PR 2.3.
-- **D27. No events in the near field.** The rig stands about 1.3 m from where someone works. Live and in both static recordings, something low there (z up to ~0.8 m in the sensor frames) shifts every few seconds to minutes, seen by both lidars at once, and it was 100 % of the remaining events (live 2–18 per minute). A change region with a voxel center within `near_range_m` (2.0 m) of its sensor is not reported, whichever pose of a move it is. With it, the diff's `tolerance` 2 and `min_voxels` 8 remove the far fragments of the same motion. This is a blind zone, not noise removal: a real change within 2 m of either lidar is not reported. 0.3 m cubes from 2.2 m out are still detected at the same latency (`spark/room_memory_cpp/PLAN.md`, "False change events").
+- **D26. A persistence gate before CANDIDATE (strengthened by D28).** On the static recording the node sent ~120 CANDIDATE/EXPIRED messages per minute. Most of them came from a reference built as the union of 5 windows of the Mid-360's sparse non-repetitive pattern; per-voxel window counts fix that (`spark/room_memory_cpp/PLAN.md`). As a second line, a region now has to persist `candidate_windows` windows before its CANDIDATE is sent. An open candidate expires only after `expire_windows` unmatched windows, so an intermittently seen change does not flicker. T_commit (CANDIDATE → CONFIRMED) is unchanged and still PR 2.3.
+- **D27. No events in the near field (superseded by D28: removed).** The rig stands about 1.3 m from where someone works. Live and in both static recordings, something low there (z up to ~0.8 m in the sensor frames) shifts every few seconds to minutes, seen by both lidars at once, and it was 100 % of the remaining events (live 2–18 per minute). A change region with a voxel center within `near_range_m` (2.0 m) of its sensor is not reported, whichever pose of a move it is. With it, the diff's `tolerance` 2 and `min_voxels` 8 remove the far fragments of the same motion. This is a blind zone, not noise removal: a real change within 2 m of either lidar is not reported. 0.3 m cubes from 2.2 m out are still detected at the same latency (`spark/room_memory_cpp/PLAN.md`, "False change events"). *Removed:* the "something low" was Trevor working at a desk (he confirmed it), real transient motion, and a blind zone also hid real changes next to the rig. `near_range_m` is gone; `tolerance` and `min_voxels` are back at 1 and 6. D28 replaces it.
+- **D28. Activity is not change.** Motion next to the rig (a person working) is reported on `/room_memory/activity` (§3.6), never as a `ChangeEvent`. A region becomes a CANDIDATE only after it has stayed settled for `candidate_windows` windows (§4.2): fresh, the same shape, and no activity within `activity_radius_m`; so a change made by a person is reported that long after they stop moving next to it. `candidate_windows` is 40 (40 s at `window_s` 1): on both static recordings, looped for 30 minutes, the longest settled run of anything Trevor left is 24 windows (the part of his BUILDING-time pose he moved away from). 0.3 m boxes 1.0–4.6 m from either lidar are CANDIDATEs 40–43 s after they appear, disappear or move. Tracking teaches the reference nothing (`learn_windows` 0): learning while he worked wrote his surroundings into the reference and produced a 45-window still residue. Limits: a person who stays perfectly still for longer than the gate after shifting is reported, and so is a reference built while someone sat in it once they leave; without the JT128↔Mid-360 extrinsic (D25) one sensor's activity cannot hold the other's regions. The Mac does not decode `Activity` yet.
 
 ## 9. Verification status
 
-- **Hand goldens.** `Tests/Fixtures/room/golden/hand/*.hex` were written byte by byte from these rules, with every span annotated. There are 12: 9 little endian and 3 big endian, covering all five messages. The tests check:
+- **Hand goldens.** `Tests/Fixtures/room/golden/hand/*.hex` were written byte by byte from these rules, with every span annotated. There are 12: 9 little endian and 3 big endian, covering the first five messages. `spark/room_memory/tests/fixtures/hand` adds two `Activity` goldens (active, and idle with NaN geometry), checked by the Python and C++ codecs only; the Swift suite does not decode `Activity` yet. The tests check:
   - The Swift decoder reads all 12 to the expected values. The big-endian `MapBricks` golden has a little-endian payload inside a big-endian message.
   - The encoder reproduces the 7 uncompressed little-endian goldens exactly.
   - For the zlib and LZFSE goldens, which hold a hand-built stored block and an uncompressed LZFSE block:

@@ -67,8 +67,14 @@ inline void configure(MemoryConfig& config, const std::string& key, const std::s
         config.expire_windows = integer(value);
     } else if (key == "learn_max_offset_m") {
         config.learn_max_offset_m = real(value);
-    } else if (key == "near_range_m") {
-        config.near_range_m = real(value);
+    } else if (key == "fresh_min_voxels") {
+        config.fresh_min_voxels = integer(value);
+    } else if (key == "fresh_min_fraction") {
+        config.fresh_min_fraction = real(value);
+    } else if (key == "stable_min_fraction") {
+        config.stable_min_fraction = real(value);
+    } else if (key == "activity_radius_m") {
+        config.activity_radius_m = real(value);
     } else if (key == "learn_windows") {
         config.learn_windows = integer(value);
     } else if (key == "map_sensor") {

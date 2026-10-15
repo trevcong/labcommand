@@ -776,6 +776,104 @@ class Epoch:
 
 
 @dataclass(frozen=True)
+class Activity:
+    """Transient motion next to the rig, 1 Hz (protocol §3.6). Never a change: activity does not
+    become a ``ChangeEvent``. ``active`` when a tracking window since the previous message had
+    activity; the counts, sensor mask and largest region describe the newest such window, the
+    largest region in the frame of ``largest_sensor``. ``since_s`` counts from that newest
+    activity window, ``None`` (NaN) before the first."""
+
+    header: Header
+    active: bool
+    sensors: int
+    largest_sensor: int
+    n_regions: int
+    voxel_count: int
+    centroid: Optional[Tuple[float, float, float]]
+    aabb_min: Optional[Tuple[float, float, float]]
+    aabb_max: Optional[Tuple[float, float, float]]
+    since_s: Optional[float]
+
+    def __post_init__(self):
+        _f32_fields(self, ("centroid", "aabb_min", "aabb_max", "since_s"))
+
+    def validate(self):
+        context = "Activity"
+        self.header.validate(context)
+        if not isinstance(self.active, bool):
+            raise Invalid(f"{context}: active {self.active!r} is not a bool")
+        _require_int(self.sensors, 0, 0xFF, f"{context}: sensors")
+        if self.sensors & ~SENSORS_ALL:
+            raise Invalid(f"{context}: sensors 0x{self.sensors:x} sets an undefined bit")
+        _require_int(self.largest_sensor, 0, 0xFF, f"{context}: largest_sensor")
+        _require_int(self.n_regions, 0, (1 << 32) - 1, f"{context}: n_regions")
+        _require_int(self.voxel_count, 0, (1 << 32) - 1, f"{context}: voxel_count")
+        geometry = (self.centroid, self.aabb_min, self.aabb_max)
+        if self.active:
+            if self.n_regions < 1 or self.voxel_count < 1:
+                raise Invalid(f"{context}: active needs at least one region and voxel")
+            if self.largest_sensor not in (SENSOR_MID360, SENSOR_JT128) or not self.sensors & self.largest_sensor:
+                raise Invalid(f"{context}: largest_sensor {self.largest_sensor} is not one bit of sensors {self.sensors}")
+            if any(value is None for value in geometry):
+                raise Invalid(f"{context}: active needs the largest region's centroid and aabb")
+            for value, what in zip(geometry, ("centroid", "aabb min", "aabb max")):
+                _require_finite(value, f"{context}: {what}")
+            if any(low > high for low, high in zip(self.aabb_min, self.aabb_max)):
+                raise Invalid(f"{context}: aabb min {self.aabb_min} exceeds max {self.aabb_max}")
+            if self.since_s is None:
+                raise Invalid(f"{context}: active needs since_s")
+        else:
+            if self.n_regions or self.voxel_count or self.sensors or self.largest_sensor:
+                raise Invalid(f"{context}: inactive must have zero counts and sensor bits")
+            if any(value is not None for value in geometry):
+                raise Invalid(f"{context}: inactive must have NaN geometry")
+        if self.since_s is not None and not (math.isfinite(self.since_s) and self.since_s >= 0):
+            raise Invalid(f"{context}: since_s {self.since_s} must be finite and >= 0, or NaN")
+
+    def to_cdr(self):
+        """CDR little endian, encapsulation header included. Raises ``Invalid``."""
+        self.validate()
+        writer = _Writer()
+        writer.header(self.header)
+        writer.u8(1 if self.active else 0)
+        writer.u8(self.sensors)
+        writer.u8(self.largest_sensor)
+        writer.u32(self.n_regions)
+        writer.u32(self.voxel_count)
+        writer.floats(self.centroid or (None, None, None))
+        writer.floats(self.aabb_min or (None, None, None))
+        writer.floats(self.aabb_max or (None, None, None))
+        writer.f32(self.since_s)
+        return bytes(writer.data)
+
+    @classmethod
+    def from_cdr(cls, data):
+        """Decodes either byte order. Raises ``Truncated`` or ``Invalid``."""
+        def body(reader):
+            header = reader.header("")
+            active = reader.u8("active")
+            if active > 1:
+                raise Invalid(f"Activity: active {active} is not a bool")
+            sensors = reader.u8("sensors")
+            largest_sensor = reader.u8("largest_sensor")
+            n_regions = reader.u32("n_regions")
+            voxel_count = reader.u32("voxel_count")
+            geometry = []
+            for what, count in (("centroid", 3), ("aabb", 3), ("aabb", 3)):
+                values = reader.floats(what, count)
+                nans = [math.isnan(value) for value in values]
+                if any(nans) and not all(nans):
+                    raise Invalid(f"Activity: {what} {values} is partly NaN")
+                geometry.append(None if all(nans) else values)
+            since = reader.f32("since_s")
+            activity = cls(header, bool(active), sensors, largest_sensor, n_regions, voxel_count, *geometry,
+                           None if math.isnan(since) else since)
+            activity.validate()
+            return activity
+        return _decode(data, "Activity", body)
+
+
+@dataclass(frozen=True)
 class RequestSync:
     """Mac → Spark resync request (protocol §3.5). ``since`` is ``(epoch, seq)`` or ``None``."""
 

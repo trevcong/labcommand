@@ -12,8 +12,8 @@ from rclpy.parameter import Parameter  # noqa: E402
 from rclpy.qos import QoSProfile, ReliabilityPolicy  # noqa: E402
 
 from room_memory.memory import SENSORS  # noqa: E402
-from room_memory.messages import Header, MemoryState, MemoryStatus  # noqa: E402
-from room_memory.node import EVENTS_TOPIC, STATUS_TOPIC, RoomMemoryNode  # noqa: E402
+from room_memory.messages import Activity, Header, MemoryState, MemoryStatus  # noqa: E402
+from room_memory.node import ACTIVITY_TOPIC, EVENTS_TOPIC, STATUS_TOPIC, RoomMemoryNode  # noqa: E402
 from test_messages import T10, appeared_event  # noqa: E402
 
 
@@ -31,7 +31,7 @@ def node():
 def test_node_wires_topics_and_parameters(node):
     assert node.config.state_dir is None and node.config.max_range is None
     assert node.config.sensors == ("mid360",)
-    assert {publisher.topic_name for publisher in node.publishers} >= {EVENTS_TOPIC, STATUS_TOPIC}
+    assert {publisher.topic_name for publisher in node.publishers} >= {EVENTS_TOPIC, STATUS_TOPIC, ACTIVITY_TOPIC}
     subscribed = {subscription.topic_name for subscription in node.subscriptions}
     assert SENSORS["mid360"].topic in subscribed and SENSORS["jt128"].topic not in subscribed
 
@@ -50,6 +50,16 @@ def test_status_bytes_reach_a_raw_subscriber(node):
     status = MemoryStatus.from_cdr(received[0])
     assert status.header.room_id == "lab" and status.state == MemoryState.DEGRADED and status.jt128_hz is None
     assert status.events_seq is None
+
+
+def test_activity_goes_out_with_each_status(node, monkeypatch):
+    sent = []
+    monkeypatch.setattr(node.activity, "publish", sent.append)
+    node._publish_status()
+    node._publish_status()
+    messages = [Activity.from_cdr(data) for data in sent]
+    assert [m.header.seq for m in messages] == [0, 1] and not any(m.active for m in messages)
+    assert all(m.since_s is None and m.header.room_id == "lab" for m in messages)
 
 
 def test_status_reports_the_last_published_event_seq(node, monkeypatch):

@@ -1,6 +1,6 @@
 // Thin rclcpp node around RoomMemory: raw CDR in, codec bytes out. The C++ twin of
-// spark/room_memory/room_memory/node.py, with the same topics, QoS and parameters: status at
-// 1 Hz, events per transition, map_bricks after each window when RoomMemory::map_update has
+// spark/room_memory/room_memory/node.py, with the same topics, QoS and parameters: status and
+// activity at 1 Hz, events per transition, map_bricks after each window when RoomMemory::map_update has
 // one, and RequestSync answers on the two sync topics (protocol sections 2 and 5). A rejected
 // frame logs one warning per sensor per 10 s (RejectionLog), with the decoder's error.
 //
@@ -31,6 +31,7 @@ using room_memory::RoomMemory;
 namespace msg = room_memory::msg;
 
 constexpr const char* kStatusTopic = "/room_memory/status";
+constexpr const char* kActivityTopic = "/room_memory/activity";
 constexpr const char* kEventsTopic = "/room_memory/events";
 constexpr const char* kMapTopic = "/room_memory/map_bricks";
 constexpr const char* kRequestTopic = "/room_memory/request_sync";
@@ -83,8 +84,11 @@ public:
         config.free_max_ratio = declare_parameter<double>("free_max_ratio", defaults.free_max_ratio);
         config.candidate_windows = declare_parameter<std::int64_t>("candidate_windows", defaults.candidate_windows);
         config.expire_windows = declare_parameter<std::int64_t>("expire_windows", defaults.expire_windows);
+        config.fresh_min_voxels = declare_parameter<std::int64_t>("fresh_min_voxels", defaults.fresh_min_voxels);
+        config.fresh_min_fraction = declare_parameter<double>("fresh_min_fraction", defaults.fresh_min_fraction);
+        config.stable_min_fraction = declare_parameter<double>("stable_min_fraction", defaults.stable_min_fraction);
+        config.activity_radius_m = declare_parameter<double>("activity_radius_m", defaults.activity_radius_m);
         config.learn_max_offset_m = declare_parameter<double>("learn_max_offset_m", defaults.learn_max_offset_m);
-        config.near_range_m = declare_parameter<double>("near_range_m", defaults.near_range_m);
         config.learn_windows = declare_parameter<std::int64_t>("learn_windows", defaults.learn_windows);
         config.map_sensor = declare_parameter<std::string>("map_sensor", defaults.map_sensor);
         config.delta_period_s = declare_parameter<double>("delta_period_s", defaults.delta_period_s);
@@ -94,6 +98,7 @@ public:
 
         events_ = create_generic_publisher(kEventsTopic, kEventType, rclcpp::QoS(100).reliable());
         status_ = create_generic_publisher(kStatusTopic, "labcommand_msgs/msg/MemoryStatus", rclcpp::QoS(1).reliable());
+        activity_ = create_generic_publisher(kActivityTopic, "labcommand_msgs/msg/Activity", rclcpp::QoS(1).reliable());
         map_ = create_generic_publisher(kMapTopic, kMapType, rclcpp::QoS(10).reliable());
         sync_map_ = create_generic_publisher(kSyncMapTopic, kMapType, rclcpp::QoS(10).reliable());
         sync_events_ = create_generic_publisher(kSyncEventsTopic, kEventType, rclcpp::QoS(200).reliable());
@@ -152,7 +157,9 @@ private:
         const auto now_steady = std::chrono::steady_clock::now();
         const double period = std::chrono::duration<double>(now_steady - last_status_).count();
         last_status_ = now_steady;
-        status_->publish(serialized(memory_->status(stamp(), period).to_cdr()));
+        const msg::Time now_stamp = stamp();
+        status_->publish(serialized(memory_->status(now_stamp, period).to_cdr()));
+        activity_->publish(serialized(memory_->activity(now_stamp).to_cdr()));
     }
 
     void answer(const rclcpp::SerializedMessage& message) {
@@ -176,6 +183,7 @@ private:
     room_memory::RejectionLog rejections_;
     std::shared_ptr<rclcpp::GenericPublisher> events_;
     std::shared_ptr<rclcpp::GenericPublisher> status_;
+    std::shared_ptr<rclcpp::GenericPublisher> activity_;
     std::shared_ptr<rclcpp::GenericPublisher> map_;
     std::shared_ptr<rclcpp::GenericPublisher> sync_map_;
     std::shared_ptr<rclcpp::GenericPublisher> sync_events_;

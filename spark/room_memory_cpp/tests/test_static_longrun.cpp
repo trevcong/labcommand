@@ -1,7 +1,11 @@
-// static_longrun: loop a static lidar recording through one RoomMemory for at least 30 minutes
-// of simulated time and require zero change events.
+// static_longrun [b]: loop a static lidar recording through one RoomMemory for at least 30 minutes
+// of simulated time and require zero change events. Without an argument the recording is
+// ROOM_MEMORY_RECORDING (default ~/Developer/lc-tasks/recordings/static5m), with `b`
+// ROOM_MEMORY_RECORDING_B (default .../static5m-b).
 //
-// static5m contains a real motion from 86 s (PLAN.md), so the default slice is [t0, t0+80s).
+// Trevor works next to the rig in both (static5m from 86 s, static5m-b throughout; PLAN.md,
+// "Activity"): his motion must show as activity in the first pass and never as a change event. The
+// default slice is the whole recording (ROOM_MEMORY_LONGRUN_UNTIL_S cuts it shorter).
 // Each loop adds an integer number of window_s to every stamp, and the copy starts on a window
 // boundary. The recent layer still crosses that seam. close_window is followed by map_update,
 // matching room_memory_bag, then deadlines are flushed through the final boundary (the bag CLI
@@ -48,10 +52,9 @@ using room_memory::decode_pointcloud2;
 namespace msg = room_memory::msg;
 
 constexpr std::int64_t kNs = 1'000'000'000;
-constexpr std::int64_t kDefaultUntilS = 80;
+constexpr std::int64_t kDefaultUntilS = 0;  // the whole recording
 constexpr std::int64_t kDefaultSimS = 1800;
-constexpr std::int64_t kPositiveUntilS = 110;
-constexpr std::int64_t kChangeFromS = 86;
+constexpr std::int64_t kChangeFromS = 86;  // Trevor starts moving in static5m
 constexpr std::uint64_t kChunkCap = 128ull << 20;
 constexpr int kSkip = 77;
 
@@ -81,6 +84,7 @@ struct Seen {
 
 struct Replay {
     std::vector<Seen> events;
+    std::vector<std::int64_t> active_s;  // seconds whose Activity message was active
     std::int64_t closed_s = 0;
     std::int64_t tracking_from_s = -1;
     bool tracking = false;
@@ -530,6 +534,7 @@ Replay replay(const std::vector<Frame>& frames, std::int64_t t0, std::int64_t pe
                 close_window();
             } else {
                 (void)memory.status(time_of(next_status), 1.0);
+                if (memory.activity(time_of(next_status)).active) out.active_s.push_back((next_status - t0) / kNs);
                 next_status += kNs;
             }
         }
@@ -569,9 +574,13 @@ void print_buckets(const Replay& run) {
     if (run.closed_s < 1) return;
     const int buckets = static_cast<int>((run.closed_s - 1) / 300) + 1;
     std::vector<int> counts(static_cast<std::size_t>(buckets), 0);
+    std::vector<int> active(static_cast<std::size_t>(buckets), 0);
     for (const Seen& event : run.events) {
         if (event.t_s < 1 || event.t_s > run.closed_s) continue;
         ++counts[static_cast<std::size_t>((event.t_s - 1) / 300)];
+    }
+    for (const std::int64_t t : run.active_s) {
+        if (t >= 1 && t <= run.closed_s) ++active[static_cast<std::size_t>((t - 1) / 300)];
     }
     for (int bucket = 0; bucket < buckets; ++bucket) {
         const std::int64_t start = static_cast<std::int64_t>(bucket) * 300;
@@ -580,8 +589,10 @@ void print_buckets(const Replay& run) {
         const double per_min = windows ? static_cast<double>(counts[static_cast<std::size_t>(bucket)]) * 60.0 /
                                              static_cast<double>(windows)
                                        : 0.0;
-        std::printf("static_longrun bucket %d %" PRId64 "-%" PRId64 " s windows=%" PRId64 " events=%d per_min=%.4f\n",
-                    bucket, start, end, windows, counts[static_cast<std::size_t>(bucket)], per_min);
+        std::printf("static_longrun bucket %d %" PRId64 "-%" PRId64 " s windows=%" PRId64
+                    " events=%d per_min=%.4f active_s=%d\n",
+                    bucket, start, end, windows, counts[static_cast<std::size_t>(bucket)], per_min,
+                    active[static_cast<std::size_t>(bucket)]);
     }
 }
 
@@ -611,21 +622,24 @@ int main() {
     return kSkip;
 }
 #else
-int main() {
+int main(int argc, char** argv) {
     try {
         const auto started = std::chrono::steady_clock::now();
         namespace fs = std::filesystem;
+        const bool second = argc > 1 && std::strcmp(argv[1], "b") == 0;
+        if (argc > 2 || (argc == 2 && !second)) fail("usage: test_static_longrun [b]");
+        const char* variable = second ? "ROOM_MEMORY_RECORDING_B" : "ROOM_MEMORY_RECORDING";
         fs::path recording;
-        if (const char* env = std::getenv("ROOM_MEMORY_RECORDING"); env && *env) {
+        if (const char* env = std::getenv(variable); env && *env) {
             recording = env;
         } else {
             const char* home = std::getenv("HOME");
-            if (!home || !*home) throw Skip("HOME is not set and ROOM_MEMORY_RECORDING is empty");
-            recording = fs::path(home) / "Developer/lc-tasks/recordings/static5m";
+            if (!home || !*home) throw Skip(std::string("HOME is not set and ") + variable + " is empty");
+            recording = fs::path(home) / "Developer/lc-tasks/recordings" / (second ? "static5m-b" : "static5m");
         }
         const std::vector<fs::path> files = mcap_files(recording);
         if (files.empty()) {
-            throw Skip("static recording not found at " + recording.string() + " (set ROOM_MEMORY_RECORDING)");
+            throw Skip("static recording not found at " + recording.string() + " (set " + variable + ")");
         }
 
         const std::int64_t until_env = env_i64("ROOM_MEMORY_LONGRUN_UNTIL_S");
@@ -635,17 +649,8 @@ int main() {
         if (until_s < 0) fail("ROOM_MEMORY_LONGRUN_UNTIL_S must be >= 0");
         if (sim_s < kDefaultSimS) fail("ROOM_MEMORY_LONGRUN_SIM_S must be >= 1800");
         const bool known = known_static5m(recording);
-        if (known && (until_s == 0 || until_s > kDefaultUntilS)) {
-            fail("static5m after 80 s includes the documented motion at 86 s; refusing a 0-event run");
-        }
-        bool positive = known && until_s == kDefaultUntilS;
-        if (const char* flag = std::getenv("ROOM_MEMORY_LONGRUN_POSITIVE")) {
-            if (std::strcmp(flag, "0") == 0) positive = false;
-            else if (std::strcmp(flag, "1") == 0) positive = true;
-            else fail("ROOM_MEMORY_LONGRUN_POSITIVE must be 0 or 1");
-        }
 
-        const std::int64_t load_s = until_s == 0 ? -1 : (positive ? std::max(until_s, kPositiveUntilS) : until_s);
+        const std::int64_t load_s = until_s == 0 ? -1 : until_s;
         const auto loaded_at = std::chrono::steady_clock::now();
         const Loaded loaded = load_recording(files, load_s);
         const double load_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - loaded_at).count();
@@ -665,9 +670,6 @@ int main() {
         const std::int64_t span_ns = span_s * kNs;
         if (loaded.file_max < static_cast<std::uint64_t>(t0) + static_cast<std::uint64_t>(span_ns)) {
             fail("recording ends before the requested " + std::to_string(span_s) + " s interval");
-        }
-        if (positive && loaded.file_max < static_cast<std::uint64_t>(t0) + static_cast<std::uint64_t>(kPositiveUntilS) * static_cast<std::uint64_t>(kNs)) {
-            fail("recording does not cover the 110 s known-positive interval");
         }
 
         std::int64_t slice_frames[2] = {0, 0};
@@ -703,36 +705,12 @@ int main() {
 
         const int loops = static_cast<int>((sim_s + span_s - 1) / span_s);
         std::printf("static_longrun recording=%s interval_s=%" PRId64 " loops=%d sim_floor_s=%" PRId64
-                    " threads=%d positive=%d\n",
-                    recording.string().c_str(), span_s, loops, sim_s, threads(), positive ? 1 : 0);
+                    " threads=%d\n",
+                    recording.string().c_str(), span_s, loops, sim_s, threads());
         std::printf("static_longrun slice mid360 frames=%" PRId64 " points=%" PRId64 " missing_s=%d jt128 frames=%" PRId64
                     " points=%" PRId64 " missing_s=%d\n",
                     slice_frames[0], slice_points[0], missing[0], slice_frames[1], slice_points[1], missing[1]);
         std::fflush(stdout);
-
-        if (positive) {
-            const Replay check = replay(loaded.frames, t0, kPositiveUntilS * kNs, 1);
-            int before = 0;
-            int from_change = 0;
-            std::vector<Seen> early;
-            for (const Seen& event : check.events) {
-                if (event.t_s < kChangeFromS) {
-                    ++before;
-                    early.push_back(event);
-                } else {
-                    ++from_change;
-                }
-            }
-            std::printf("static_longrun positive 0-%" PRId64 " s events_before_%" PRId64 "=%d events_from_%" PRId64
-                        "=%d tracking_from_s=%" PRId64 "\n",
-                        kPositiveUntilS, kChangeFromS, before, kChangeFromS, from_change, check.tracking_from_s);
-            std::fflush(stdout);
-            if (before != 0 || from_change < 1 || !check.tracking) {
-                print_events(early.empty() ? check.events : early, 20);
-                std::fflush(stdout);
-                fail("known-positive pass on static5m did not see the 86 s motion with a clean prefix");
-            }
-        }
 
         const auto replay_at = std::chrono::steady_clock::now();
         const Replay run = replay(loaded.frames, t0, span_ns, loops);
@@ -753,6 +731,21 @@ int main() {
             fail("tracking did not start within the reference window");
         }
         if (tracked + 45 < run.closed_s) fail("tracking exposure is shorter than the closed run minus 45 s");
+        // Trevor's motion in the first pass is activity: on static5m none before he starts at 86 s,
+        // and some within 5 s of it; on any other recording some activity at all.
+        std::int64_t first_active = -1;
+        std::int64_t pass_active = 0;
+        for (const std::int64_t t : run.active_s) {
+            if (t > span_s) break;
+            if (first_active < 0) first_active = t;
+            ++pass_active;
+        }
+        std::printf("static_longrun first_pass active_s=%" PRId64 " first_active_s=%" PRId64 "\n", pass_active, first_active);
+        std::fflush(stdout);
+        if (known && span_s > kChangeFromS + 5 && (first_active < kChangeFromS || first_active > kChangeFromS + 5)) {
+            fail("static5m activity did not start with the motion at 86 s");
+        }
+        if (pass_active < 1) fail("no activity in the first pass");
         if (!run.events.empty()) {
             print_events(run.events, 20);
             std::fflush(stdout);

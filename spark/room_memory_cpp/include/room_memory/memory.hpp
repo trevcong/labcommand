@@ -120,42 +120,89 @@ struct Candidate {
     Region region;
     msg::Time first_seen;
     msg::Time last_seen;
-    std::int64_t windows = 0;  // windows with fresh support in its unbroken run of matched windows
+    std::int64_t windows = 0;  // pending: windows in its current run (fresh, same shape, no activity nearby)
     std::int64_t missed = 0;   // consecutive windows without a match
+    Keys anchor;               // pending: its (new-pose) voxels when the run started
+    Keys anchor_from;          // pending: its old-pose voxels then (empty unless moved)
 };
 
 // Every voxel of a region, both poses for moved, sorted.
 Keys region_keys(const Region& region);
+// How many voxels of `keys` have a voxel of `other` within `tolerance` voxels along each axis
+// (Chebyshev).
+std::size_t count_within(const Keys& keys, const Keys& other, std::int64_t tolerance);
+// At least `fraction` of each set lies within `tolerance` voxels of the other.
+bool same_shape(const Keys& keys, const Keys& anchor, std::int64_t tolerance, double fraction);
+// Whether one window's own evidence supports `region`: at least `min_voxels` and `min_fraction`
+// of its voxels occupied by the window (appeared, the new pose of a move) or traversed by its rays
+// (`free`: disappeared, the old pose of a move), each pose of a move.
+bool region_fresh(const Region& region, const Keys& occupied, const Keys& free, std::int64_t min_voxels,
+                  double min_fraction);
+// Voxels between two boxes along the axis that separates them most (0 when they touch).
+std::int64_t box_gap(const Box& a, const Box& b);
 
-// Transition-only bookkeeping for one sensor's change regions. A region matches the first
-// open, else the first pending, region of the same kind sharing a voxel that no other region
-// of this window matched; otherwise it starts a pending one. A region is fresh when this
-// window itself supports it (update's `fresh`); a stale one keeps a match alive but neither
-// counts toward promotion nor starts a pending region. An appeared or disappeared region that
-// matches no open entry of its kind but shares a voxel with the same side of an open moved
-// candidate (its new pose, its old pose) is a half of that move and starts nothing; when a
-// window has both halves, they are the move itself and count as its match. A pending region
-// becomes a CANDIDATE (and gets its event id) once `candidate_windows` fresh windows have
-// matched it without a break, and is dropped silently the first window it is not matched. An
-// open candidate goes EXPIRED after `expire_windows` consecutive windows without a match. A
-// matched candidate sends nothing.
+// Transition-only bookkeeping for one sensor's change regions. A region first matches the first
+// open candidate of its kind sharing a voxel that no other region of this window matched. An
+// appeared or disappeared region that matches none but shares a voxel with the same side of an
+// open moved candidate (its new pose, its old pose) is a half of that move and starts nothing;
+// when a window has both halves, they are the move itself and count as its match. An open
+// candidate goes EXPIRED after `expire_windows` consecutive windows without a match. A matched
+// open candidate sends nothing.
+//
+// The rest are pending, in this order: a moved region matches the first pending move sharing a
+// voxel; a pending move with no such region matches an appeared region on its new-pose anchor plus
+// a disappeared region on its old-pose anchor (its two halves); a moved region that matched
+// nothing takes over a pending appeared on its new pose plus a pending disappeared on its old pose
+// as one pending move, whose run is the shorter of theirs; an appeared or disappeared region
+// matches the first pending entry of its kind sharing a voxel; a fresh appeared or disappeared
+// region left over whose voxel box lies within `tolerance` voxels of the same side of a pending
+// entry matched this window joins that entry (a fragment of its edge); a fresh region left over
+// after that starts a pending entry. A pending entry not matched in a window is dropped, and
+// interrupt (a window without usable points) drops them all.
+//
+// A pending entry's run counts the windows since it last settled. A window whose own evidence
+// does not support it (`fresh`) sets the run to 0. A fresh window whose voxels keep the run's
+// shape (each pose against its own anchor: at least `stable_fraction` of the voxels of each within
+// `tolerance` voxels of the other) adds 1; one that does not (or a new entry) starts a new run at
+// 1 with itself as anchor, and its regions are activity. Then, with `radius`, an entry that has an activity region other than its own within
+// `radius` voxels (box gap, either pose) sets its run to 0: a change next to motion only counts
+// once the motion has settled. No `tolerance` skips the shape check, no `radius` the activity
+// check. Last, every entry whose run reached `candidate_windows` becomes a CANDIDATE (and gets its
+// event id), in region order.
 class CandidateTracker {
 public:
-    CandidateTracker(std::int64_t candidate_windows = 1, std::int64_t expire_windows = 1)
-        : candidate_windows_(candidate_windows), expire_windows_(expire_windows) {}
+    CandidateTracker(std::int64_t candidate_windows = 1, std::int64_t expire_windows = 1,
+                     std::optional<std::int64_t> tolerance = std::nullopt, std::optional<std::int64_t> radius = std::nullopt,
+                     double stable_fraction = 1.0)
+        : candidate_windows_(candidate_windows),
+          expire_windows_(expire_windows),
+          tolerance_(tolerance),
+          radius_(radius),
+          stable_fraction_(stable_fraction) {}
     // (state, candidate) in a fixed order: new candidates in region order, then expiries by
     // event id. `fresh` holds one flag per region, empty when every region is fresh.
     template <typename NextId>
     std::vector<std::pair<msg::EventState, Candidate>> update(const std::vector<Region>& regions, const msg::Time& stamp,
                                                               NextId&& next_id, const std::vector<bool>& fresh = {});
+    // A window without usable points: no pending run bridges it.
+    void interrupt() {
+        pending_.clear();
+        activity_.clear();
+    }
     const std::vector<Candidate>& open() const { return open_; }
     const std::vector<Candidate>& pending() const { return pending_; }
+    // Indices into the last update's regions that were activity, ascending.
+    const std::vector<std::size_t>& activity() const { return activity_; }
 
 private:
     std::int64_t candidate_windows_;
     std::int64_t expire_windows_;
+    std::optional<std::int64_t> tolerance_;
+    std::optional<std::int64_t> radius_;
+    double stable_fraction_;
     std::vector<Candidate> open_;
     std::vector<Candidate> pending_;
+    std::vector<std::size_t> activity_;
 };
 
 // Node parameters. Distances in meters, window_s in seconds.
@@ -164,13 +211,11 @@ struct MemoryConfig {
     std::vector<std::string> sensors{"mid360", "jt128"};
     double voxel_size = 0.05;
     std::optional<double> max_range = 15.0;
-    // tolerance, min_voxels and near_range_m, like the defaults below, were measured on the static
-    // recordings (PLAN.md, "False change events").
-    std::int64_t tolerance = 2;
-    std::int64_t min_voxels = 8;
+    std::int64_t tolerance = 1;
+    std::int64_t min_voxels = 6;
     std::int64_t min_extent = 2;
     double window_s = 1.0;
-    // Defaults measured on the static recordings (PLAN.md, "False change events").
+    // Defaults measured on the static recording (PLAN.md, "False change events").
     std::int64_t reference_windows = 30;
     std::int64_t recent_windows = 3;
     std::optional<std::string> state_dir = std::string("~/room-memory");
@@ -179,21 +224,34 @@ struct MemoryConfig {
     double occupied_min_ratio = 0.3;
     std::int64_t free_min_seen = 2;
     double free_max_ratio = 0.0;
-    // Change gate: windows a region must persist before its CANDIDATE, and windows an open
-    // candidate may go unmatched before it EXPIRES.
-    std::int64_t candidate_windows = 3;
+    // Change gate: windows a region must stay settled (fresh, the same voxels within tolerance,
+    // no activity within activity_radius_m) before its CANDIDATE, and windows an open candidate
+    // may go unmatched before it EXPIRES. 40 windows outlast the longest settled run in the
+    // static recordings, 24 windows of a person's BUILDING-time pose next to the rig (PLAN.md,
+    // "Activity").
+    std::int64_t candidate_windows = 40;
     std::int64_t expire_windows = 3;
+    // A region is fresh in a window whose own evidence supports at least fresh_min_voxels and
+    // fresh_min_fraction of its voxels (each pose of a move): occupied by the window where it
+    // appeared, traversed by the window's rays where it disappeared.
+    std::int64_t fresh_min_voxels = 3;
+    double fresh_min_fraction = 0.5;
+    // A region keeps its shape while at least stable_min_fraction of its voxels lie within tolerance
+    // voxels of the voxels it had when its count started, and the other way round.
+    double stable_min_fraction = 0.9;
+    // Activity (new or reshaping regions) within this distance (meters, voxel box gap) of a pending
+    // region restarts its count (0: never).
+    double activity_radius_m = 1.0;
     // A tracking window adds to the counts of unsettled voxels only while its pose offset is
     // at most this (meters), so a moved rig never teaches the reference its new view.
     double learn_max_offset_m = 0.02;
-    // A change region with a voxel center within this distance (meters) of the sensor is not
-    // reported: the near field next to the rig, where people work (0: every region is).
-    double near_range_m = 2.0;
     // Closed windows that enter TRACKING and may still add to unsettled voxels. An empty window
     // and one whose pose exceeds learn_max_offset_m count. The budget is about learn_windows *
     // window_s seconds. After it, map_update settles once more on its usual schedule, then drops
     // the counts: a voxel outside the frozen reference is not an event and never becomes one.
-    std::int64_t learn_windows = 30;
+    // 0: tracking teaches the reference nothing. Learning while a person works next to the rig
+    // writes their surroundings into the reference (PLAN.md, "Activity").
+    std::int64_t learn_windows = 0;
     // Map stream: the sensor whose reference is published (empty: jt128 when configured,
     // else the first configured sensor),
     // the minimum time between map messages, the maximum time between snapshots, and the
@@ -274,6 +332,9 @@ public:
     bool add_cdr(const std::string& sensor, std::span<const std::uint8_t> data);
     // Integrates the queued frames. Returns the ChangeEvent messages to publish, in order.
     std::vector<msg::ChangeEvent> close_window(const msg::Time& stamp);
+    // The Activity message at `stamp` (call at 1 Hz): the newest tracking window with activity
+    // since the previous call, if any, and the time since the newest one ever.
+    msg::Activity activity(const msg::Time& stamp);
     // MemoryStatus for the last period_s seconds; resets the per-sensor frame counts.
     // events_seq is the seq of the newest event message, empty before the first.
     msg::MemoryStatus status(const msg::Time& stamp, double period_s);
@@ -328,6 +389,11 @@ private:
     std::uint64_t map_epoch_ = 0;
     std::uint64_t event_seq_ = 0;
     std::uint64_t status_seq_ = 0;
+    std::uint64_t activity_seq_ = 0;
+    // The newest window with activity since the last activity message, and that window's stamp
+    // (the newest window with activity ever).
+    std::optional<msg::Activity> activity_;
+    std::optional<std::int64_t> last_activity_ns_;
     std::int64_t dropped_windows_ = 0;
     bool last_window_dropped_ = false;
     std::uint64_t next_event_id_ = 0;
@@ -355,20 +421,22 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
     std::vector<std::pair<msg::EventState, Candidate>> transitions;
     std::vector<bool> open_matched(open_.size(), false);
     std::vector<bool> pending_matched(pending_.size(), false);
-    std::vector<bool> pending_promoted(pending_.size(), false);
+    std::vector<bool> taken_over(pending_.size(), false);
     std::vector<bool> absorbed(open_.size(), false);
-    std::vector<Candidate> promoted;
-    std::vector<Candidate> started;
-    // Index of the first unmatched entry of `list` of this kind sharing a voxel, marked matched.
-    const auto first = [](const std::vector<Candidate>& list, std::vector<bool>& matched, msg::EventKind kind,
-                          const Keys& keys) -> std::optional<std::size_t> {
+    // Index of the first unmatched entry of `list` of this kind sharing a voxel.
+    const auto first_index = [](const std::vector<Candidate>& list, const std::vector<bool>& matched, msg::EventKind kind,
+                                const Keys& keys) -> std::optional<std::size_t> {
         for (std::size_t n = 0; n < list.size(); ++n) {
-            if (!matched[n] && list[n].kind == kind && intersects(list[n].keys, keys)) {
-                matched[n] = true;
-                return n;
-            }
+            if (!matched[n] && list[n].kind == kind && intersects(list[n].keys, keys)) return n;
         }
         return std::nullopt;
+    };
+    // The same, marked matched.
+    const auto first = [&](const std::vector<Candidate>& list, std::vector<bool>& matched, msg::EventKind kind,
+                           const Keys& keys) -> std::optional<std::size_t> {
+        const auto n = first_index(list, matched, kind, keys);
+        if (n) matched[*n] = true;
+        return n;
     };
     // Index of the first open moved candidate whose pose on this side (the new one for an
     // appeared region, the old one for a disappeared) shares a voxel with `keys`.
@@ -380,11 +448,6 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
         }
         return std::nullopt;
     };
-    const auto promote = [&](Candidate c) {
-        c.event_id = next_id();
-        transitions.emplace_back(msg::EventState::candidate, c);
-        promoted.push_back(std::move(c));
-    };
     const auto kind_of = [](Region::Kind kind) -> std::optional<msg::EventKind> {
         switch (kind) {
             case Region::Kind::appeared: return msg::EventKind::appeared;
@@ -393,9 +456,15 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
             default: return std::nullopt;
         }
     };
-    // First pass: matches with open candidates of the same kind, and the halves of open moves.
-    std::vector<std::optional<Keys>> unmatched(regions.size());
-    std::vector<std::optional<std::size_t>> half(regions.size());
+    const auto is_fresh = [&](std::size_t r) { return fresh.empty() || fresh[r]; };
+
+    // Open candidates and the halves of open moves.
+    struct Loose {
+        std::size_t index;
+        msg::EventKind kind;
+        Keys keys;
+    };
+    std::vector<Loose> unmatched;
     std::vector<bool> new_half(open_.size(), false);
     std::vector<bool> old_half(open_.size(), false);
     for (std::size_t r = 0; r < regions.size(); ++r) {
@@ -411,10 +480,13 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
             match.missed = 0;
             continue;
         }
-        if (*kind != msg::EventKind::moved && (half[r] = half_of(*kind, keys))) {
-            (*kind == msg::EventKind::appeared ? new_half : old_half)[*half[r]] = true;
+        if (*kind != msg::EventKind::moved) {
+            if (const auto h = half_of(*kind, keys)) {
+                (*kind == msg::EventKind::appeared ? new_half : old_half)[*h] = true;
+                continue;
+            }
         }
-        unmatched[r] = std::move(keys);
+        unmatched.push_back(Loose{r, *kind, std::move(keys)});
     }
     // A move reported as its two halves (the diff's pairing gates flicker) is still that move.
     // One half alone is not: it keeps nothing alive, so a move whose other half has gone
@@ -426,32 +498,185 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
             open_[n].missed = 0;
         }
     }
-    // Second pass, in region order: the rest match or start pending regions. A half starts
-    // nothing while its move is open, whether or not the move was seen whole.
-    for (std::size_t r = 0; r < regions.size(); ++r) {
-        if (!unmatched[r] || half[r]) continue;
-        const Region& region = regions[r];
-        const msg::EventKind kind = *kind_of(region.kind);
-        const bool supported = fresh.empty() || fresh[r];
-        Keys keys = std::move(*unmatched[r]);
-        if (const auto m = first(pending_, pending_matched, kind, keys)) {
-            Candidate& waiting = pending_[*m];
-            waiting.keys = std::move(keys);
-            waiting.region = region;
-            waiting.last_seen = stamp;
-            if (supported) ++waiting.windows;
-            if (waiting.windows >= candidate_windows_) {
-                pending_promoted[*m] = true;
-                promote(waiting);
-            }
-        } else if (!supported) {
-            continue;
-        } else if (candidate_windows_ <= 1) {
-            promote(Candidate{0, kind, std::move(keys), region, stamp, stamp, 1, 0});
-        } else {
-            started.push_back(Candidate{0, kind, std::move(keys), region, stamp, stamp, 1, 0});
+
+    // Pending. A step is one entry and the region(s) that matched it this window.
+    struct Step {
+        Candidate* entry;
+        std::size_t a;                 // its region, or the appeared half
+        std::optional<std::size_t> b;  // the disappeared half
+        const Region* region;          // empty for halves: the entry keeps its last moved region
+        Keys pose;
+        Keys from_pose;
+        bool started;
+        std::vector<std::size_t> fragments{};  // regions that joined it as fragments of its edge
+        bool promoted = false;
+    };
+    std::vector<Step> steps;
+    std::vector<bool> used(regions.size(), false);
+    std::vector<Candidate> started;
+    started.reserve(regions.size());  // steps point into it
+    for (const Loose& loose : unmatched) {
+        if (loose.kind != msg::EventKind::moved) continue;
+        if (const auto n = first(pending_, pending_matched, loose.kind, loose.keys)) {
+            used[loose.index] = true;
+            const Region& region = regions[loose.index];
+            steps.push_back(Step{&pending_[*n], loose.index, std::nullopt, &region, region.keys, region.from_keys, false});
         }
     }
+    for (std::size_t n = 0; n < pending_.size(); ++n) {
+        if (pending_matched[n] || pending_[n].kind != msg::EventKind::moved) continue;
+        const auto side = [&](msg::EventKind kind, const Keys& anchor) -> std::optional<std::size_t> {
+            for (const Loose& loose : unmatched) {
+                if (!used[loose.index] && loose.kind == kind && intersects(regions[loose.index].keys, anchor)) {
+                    return loose.index;
+                }
+            }
+            return std::nullopt;
+        };
+        const auto appeared = side(msg::EventKind::appeared, pending_[n].anchor);
+        const auto disappeared = side(msg::EventKind::disappeared, pending_[n].anchor_from);
+        if (!appeared || !disappeared) continue;
+        pending_matched[n] = true;
+        used[*appeared] = used[*disappeared] = true;
+        steps.push_back(Step{&pending_[n], *appeared, *disappeared, nullptr, regions[*appeared].keys,
+                             regions[*disappeared].keys, false});
+    }
+    for (const Loose& loose : unmatched) {
+        if (used[loose.index] || loose.kind != msg::EventKind::moved) continue;
+        const Region& region = regions[loose.index];
+        const auto new_pose = first_index(pending_, pending_matched, msg::EventKind::appeared, region.keys);
+        const auto old_pose = first_index(pending_, pending_matched, msg::EventKind::disappeared, region.from_keys);
+        if (!new_pose || !old_pose) continue;
+        pending_matched[*new_pose] = pending_matched[*old_pose] = true;
+        taken_over[*new_pose] = taken_over[*old_pose] = true;
+        used[loose.index] = true;
+        const Candidate& a = pending_[*new_pose];
+        const Candidate& d = pending_[*old_pose];
+        const bool a_first = a.first_seen.sec < d.first_seen.sec ||
+                             (a.first_seen.sec == d.first_seen.sec && a.first_seen.nanosec <= d.first_seen.nanosec);
+        started.push_back(Candidate{0, loose.kind, loose.keys, region, a_first ? a.first_seen : d.first_seen, stamp,
+                                    std::min(a.windows, d.windows), 0, a.anchor, d.anchor});
+        steps.push_back(Step{&started.back(), loose.index, std::nullopt, &region, region.keys, region.from_keys, false});
+    }
+    for (const Loose& loose : unmatched) {
+        if (used[loose.index] || loose.kind == msg::EventKind::moved) continue;
+        if (const auto n = first(pending_, pending_matched, loose.kind, loose.keys)) {
+            used[loose.index] = true;
+            const Region& region = regions[loose.index];
+            steps.push_back(Step{&pending_[*n], loose.index, std::nullopt, &region, region.keys, region.from_keys, false});
+        }
+    }
+    // A fresh fragment next to the same side of a matched entry is part of it.
+    if (tolerance_) {
+        const std::size_t matched_steps = steps.size();
+        for (const Loose& loose : unmatched) {
+            if (used[loose.index] || !is_fresh(loose.index) || loose.kind == msg::EventKind::moved) continue;
+            const Box box = box_of(regions[loose.index].keys);
+            for (std::size_t n = 0; n < matched_steps; ++n) {
+                Step& step = steps[n];
+                const msg::EventKind kind = step.entry->kind;
+                if (kind != loose.kind && kind != msg::EventKind::moved) continue;
+                Keys& side = kind == msg::EventKind::moved && loose.kind == msg::EventKind::disappeared ? step.from_pose : step.pose;
+                if (side.empty() || box_gap(box, box_of(side)) > *tolerance_) continue;
+                side = set_union(side, regions[loose.index].keys);
+                step.fragments.push_back(loose.index);
+                used[loose.index] = true;
+                break;
+            }
+        }
+    }
+    for (const Loose& loose : unmatched) {
+        if (used[loose.index] || !is_fresh(loose.index)) continue;
+        const Region& region = regions[loose.index];
+        started.push_back(Candidate{0, loose.kind, loose.keys, region, stamp, stamp, 0, 0, {}, {}});
+        steps.push_back(Step{&started.back(), loose.index, std::nullopt, &region, region.keys, region.from_keys, true});
+    }
+
+    // Runs: stale, same shape, or a new run (activity).
+    std::vector<bool> active(regions.size(), false);
+    bool any_active = false;
+    for (Step& step : steps) {
+        Candidate& entry = *step.entry;
+        entry.keys = step.from_pose.empty() ? step.pose : set_union(step.pose, step.from_pose);
+        if (step.region) entry.region = *step.region;
+        entry.last_seen = stamp;
+        if (!is_fresh(step.a) || (step.b && !is_fresh(*step.b))) {
+            entry.windows = 0;
+        } else if (!step.started && (!tolerance_ || (same_shape(step.pose, entry.anchor, *tolerance_, stable_fraction_) &&
+                                                      same_shape(step.from_pose, entry.anchor_from, *tolerance_,
+                                                                 stable_fraction_)))) {
+            ++entry.windows;
+        } else {
+            entry.windows = 1;
+            entry.anchor = step.pose;
+            entry.anchor_from = step.from_pose;
+            active[step.a] = true;
+            if (step.b) active[*step.b] = true;
+            for (const std::size_t r : step.fragments) active[r] = true;
+            any_active = true;
+        }
+    }
+    // Motion nearby restarts the run.
+    activity_.clear();
+    for (std::size_t r = 0; r < regions.size(); ++r) {
+        if (active[r]) activity_.push_back(r);
+    }
+    if (radius_ && any_active) {
+        const auto boxes = [](const Keys& pose, const Keys& from_pose) {
+            std::vector<Box> out;
+            if (!pose.empty()) out.push_back(box_of(pose));
+            if (!from_pose.empty()) out.push_back(box_of(from_pose));
+            return out;
+        };
+        std::vector<std::vector<Box>> moving(activity_.size());
+        for (std::size_t n = 0; n < activity_.size(); ++n) {
+            moving[n] = boxes(regions[activity_[n]].keys, regions[activity_[n]].from_keys);
+        }
+        for (Step& step : steps) {
+            Candidate& entry = *step.entry;
+            if (entry.windows == 0) continue;
+            const std::vector<Box> mine = boxes(step.pose, step.from_pose);
+            bool near = false;
+            for (std::size_t n = 0; n < activity_.size() && !near; ++n) {
+                if (activity_[n] == step.a || (step.b && activity_[n] == *step.b) ||
+                    std::find(step.fragments.begin(), step.fragments.end(), activity_[n]) != step.fragments.end()) {
+                    continue;
+                }
+                for (const Box& theirs : moving[n]) {
+                    for (const Box& box : mine) near = near || box_gap(box, theirs) <= *radius_;
+                }
+            }
+            if (near) {
+                entry.windows = 0;
+                entry.anchor = step.pose;
+                entry.anchor_from = step.from_pose;
+            }
+        }
+    }
+
+    // Promotion, in region order.
+    std::vector<std::size_t> order(steps.size());
+    for (std::size_t n = 0; n < order.size(); ++n) order[n] = n;
+    const auto lead = [&](const Step& step) { return step.b ? std::min(step.a, *step.b) : step.a; };
+    std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) { return lead(steps[x]) < lead(steps[y]); });
+    std::vector<Candidate> promoted;
+    for (const std::size_t n : order) {
+        Step& step = steps[n];
+        if (step.entry->windows < candidate_windows_) continue;
+        step.promoted = true;
+        Candidate c = *step.entry;
+        c.event_id = next_id();
+        transitions.emplace_back(msg::EventState::candidate, c);
+        promoted.push_back(std::move(c));
+    }
+    std::vector<const Candidate*> gone;
+    for (const Step& step : steps) {
+        if (step.promoted) gone.push_back(step.entry);
+    }
+    const auto promoted_from = [&](const Candidate* entry) {
+        return std::find(gone.begin(), gone.end(), entry) != gone.end();
+    };
+
     std::vector<std::size_t> by_id(open_.size());
     for (std::size_t n = 0; n < by_id.size(); ++n) by_id[n] = n;
     std::sort(by_id.begin(), by_id.end(), [&](std::size_t a, std::size_t b) { return open_[a].event_id < open_[b].event_id; });
@@ -470,9 +695,11 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
     open_ = std::move(still_open);
     std::vector<Candidate> still_pending;
     for (std::size_t n = 0; n < pending_.size(); ++n) {
-        if (pending_matched[n] && !pending_promoted[n]) still_pending.push_back(std::move(pending_[n]));
+        if (pending_matched[n] && !taken_over[n] && !promoted_from(&pending_[n])) still_pending.push_back(std::move(pending_[n]));
     }
-    for (Candidate& c : started) still_pending.push_back(std::move(c));
+    for (Candidate& c : started) {
+        if (!promoted_from(&c)) still_pending.push_back(std::move(c));
+    }
     pending_ = std::move(still_pending);
     return transitions;
 }

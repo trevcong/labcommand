@@ -2,7 +2,7 @@
 
 Subscribes to each configured lidar with the sensor-data QoS and ``raw=True``, so frames go
 through the tested ``decode_pointcloud2`` rather than rclpy's deserializer. Publishes the
-codec's CDR bytes on ``/room_memory/status`` (1 Hz), ``/room_memory/events`` and
+codec's CDR bytes on ``/room_memory/status`` and ``/room_memory/activity`` (1 Hz), ``/room_memory/events`` and
 ``/room_memory/map_bricks`` (after each window, when ``map_update`` has a message), and answers
 ``/room_memory/request_sync`` on the two sync topics (protocol §2, §5); the ``labcommand_msgs``
 classes only provide the type support. A rejected frame logs one warning per sensor per 10 s.
@@ -11,6 +11,7 @@ classes only provide the type support. A rejected frame logs one warning per sen
 import time
 
 import rclpy
+from labcommand_msgs.msg import Activity as ActivityMsg
 from labcommand_msgs.msg import ChangeEvent as ChangeEventMsg
 from labcommand_msgs.msg import MapBricks as MapBricksMsg
 from labcommand_msgs.msg import MemoryStatus as MemoryStatusMsg
@@ -24,6 +25,7 @@ from .messages import CDRError, RequestSync, SyncTopic, Time
 from .rejectlog import RejectionLog
 
 STATUS_TOPIC = "/room_memory/status"
+ACTIVITY_TOPIC = "/room_memory/activity"
 EVENTS_TOPIC = "/room_memory/events"
 MAP_TOPIC = "/room_memory/map_bricks"
 REQUEST_TOPIC = "/room_memory/request_sync"
@@ -60,8 +62,11 @@ class RoomMemoryNode(Node):
             "free_max_ratio": defaults.free_max_ratio,
             "candidate_windows": defaults.candidate_windows,
             "expire_windows": defaults.expire_windows,
+            "fresh_min_voxels": defaults.fresh_min_voxels,
+            "fresh_min_fraction": defaults.fresh_min_fraction,
+            "stable_min_fraction": defaults.stable_min_fraction,
+            "activity_radius_m": defaults.activity_radius_m,
             "learn_max_offset_m": defaults.learn_max_offset_m,
-            "near_range_m": defaults.near_range_m,
             "learn_windows": defaults.learn_windows,
             "map_sensor": defaults.map_sensor,
             "delta_period_s": defaults.delta_period_s,
@@ -78,6 +83,7 @@ class RoomMemoryNode(Node):
         reliable = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE)
         self.events = self.create_publisher(ChangeEventMsg, EVENTS_TOPIC, reliable)
         self.status = self.create_publisher(MemoryStatusMsg, STATUS_TOPIC, QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
+        self.activity = self.create_publisher(ActivityMsg, ACTIVITY_TOPIC, QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
         self._rejections = RejectionLog()
         maps = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self.map = self.create_publisher(MapBricksMsg, MAP_TOPIC, maps)
@@ -140,9 +146,11 @@ class RoomMemoryNode(Node):
 
     def _publish_status(self):
         now = time.monotonic()
-        message = self.memory.status(_time(self), now - self._last_status)
+        stamp = _time(self)
+        message = self.memory.status(stamp, now - self._last_status)
         self._last_status = now
         self.status.publish(message.to_cdr())
+        self.activity.publish(self.memory.activity(stamp).to_cdr())
 
 
 def main(args=None):

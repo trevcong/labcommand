@@ -127,6 +127,27 @@ ChangeEvent appeared_event() {
     return e;
 }
 
+Activity activity() {
+    Activity a;
+    a.header = head("lab", 43, 21);
+    a.active = true;
+    a.sensors = kSensorMid360 | kSensorJT128;
+    a.largest_sensor = kSensorJT128;
+    a.n_regions = 3;
+    a.voxel_count = 16909060;
+    a.centroid = std::array<float, 3>{f32(0.5), f32(1.25), f32(0.0625)};
+    a.aabb_min = std::array<float, 3>{f32(0.25), f32(1.0), f32(0.0)};
+    a.aabb_max = std::array<float, 3>{f32(0.75), f32(1.5), f32(0.125)};
+    a.since_s = f32(2.5);
+    return a;
+}
+
+Activity activity_idle() {
+    Activity a;
+    a.header = head("lab", 1, 0);
+    return a;
+}
+
 RequestSync request_map() { return RequestSync{head("lab", 43, 2), RequestSync::Since{43, 12}, SyncTopic::map_bricks}; }
 
 RequestSync request_events_none() {
@@ -161,9 +182,14 @@ const std::map<std::string, Golden>& goldens() {
         {"request_sync_map_le.hex", golden<RequestSync>(request_map, true)},
         {"request_sync_map_be.hex", golden<RequestSync>(request_map, false)},
         {"request_sync_events_none_le.hex", golden<RequestSync>(request_events_none, true)},
+        {"activity_le.hex", golden<Activity>(activity, true)},
+        {"activity_idle_le.hex", golden<Activity>(activity_idle, true)},
     };
     return table;
 }
+
+// Derived on this branch; the Swift suite does not decode Activity yet (PROVENANCE.md).
+bool in_swift(const std::string& name) { return name != "activity_le.hex" && name != "activity_idle_le.hex"; }
 
 Bytes inflate_all(const Bytes& data) {
     z_stream stream{};
@@ -217,12 +243,16 @@ TEST(every_hand_golden_is_covered) {
         ++files;
         CHECK(goldens().count(entry.path().filename().string()) == 1);
     }
-    CHECK_EQ(files, std::size_t{12});
+    CHECK_EQ(files, std::size_t{14});
 }
 
 TEST(hand_goldens_match_the_swift_copies) {
     if (!std::filesystem::is_directory(kSwiftHand)) throw harness::Skip("Swift hand goldens not found at " + kSwiftHand.string());
+    std::size_t copies = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(kSwiftHand)) copies += entry.path().extension() == ".hex";
+    CHECK_EQ(copies, std::size_t{12});
     for (const auto& [name, g] : goldens()) {
+        if (!in_swift(name)) continue;
         if (hexfile(name, kSwiftHand) != hexfile(name)) throw harness::Failure("Swift copy differs: " + name);
     }
     CHECK(memory_status().to_cdr() == hexfile("memory_status_le.hex", kSwiftHand));
@@ -314,6 +344,30 @@ TEST(encapsulation_and_strings) {
     data = hexfile("epoch_le.hex");
     data[4 + 7] = 0x41;
     CHECK_THROWS(Invalid, Epoch::from_cdr(data));
+}
+
+TEST(activity_rejects_inconsistent_fields) {
+    Bytes data = hexfile("activity_le.hex");
+    data[4 + 32] = 2;  // active is a bool
+    CHECK_THROWS(Invalid, Activity::from_cdr(data));
+    data = hexfile("activity_le.hex");
+    data[4 + 44 + 3] = 0x7f;  // centroid.x NaN, the rest finite
+    data[4 + 44 + 2] = 0xc0;
+    CHECK_THROWS(Invalid, Activity::from_cdr(data));
+    data = hexfile("activity_le.hex");
+    data[4 + 34] = 1;  // largest_sensor MID360 is set in sensors: still valid
+    CHECK(Activity::from_cdr(data).largest_sensor == kSensorMid360);
+    data[4 + 33] = 2;  // but not when sensors is JT128 only
+    CHECK_THROWS(Invalid, Activity::from_cdr(data));
+    data = hexfile("activity_idle_le.hex");
+    data[4 + 36] = 1;  // an inactive message with a region
+    CHECK_THROWS(Invalid, Activity::from_cdr(data));
+    Activity idle = activity_idle();
+    idle.since_s = -1.0f;
+    CHECK_THROWS(Invalid, idle.to_cdr());
+    Activity active = activity();
+    active.since_s = std::nullopt;
+    CHECK_THROWS(Invalid, active.to_cdr());
 }
 
 TEST(payload_size_and_stream_checks) {

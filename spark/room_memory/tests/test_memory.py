@@ -21,9 +21,11 @@ from room_memory.memory import (
     map_delta,
     pose_offset,
     reference_path,
+    region_fresh,
     save_reference,
 )
 from room_memory.messages import (
+    Activity,
     Brick,
     ChangeEvent,
     EventKind,
@@ -102,11 +104,12 @@ def test_save_and_load_reference(tmp_path):
 
 
 # Single-window mechanics: every voxel a window sees settles, the recent layer is the last window,
-# every region near the sensor or not is sent and expired at once, and the diff keeps its tolerance
-# 1 and 6-voxel minimum. The node's defaults are measured on the static recordings
+# one supported voxel makes a region fresh, no activity holds a region back, and every region is
+# sent and expired at once. The node's defaults are measured on the static recordings
 # (room_memory_cpp/tests/recording).
 SINGLE_WINDOW = dict(recent_windows=1, occupied_min_hits=1, occupied_min_ratio=0.0, free_min_seen=1,
-                     candidate_windows=1, expire_windows=1, tolerance=1, min_voxels=6, near_range_m=0.0)
+                     candidate_windows=1, expire_windows=1, fresh_min_voxels=1, fresh_min_fraction=0.0,
+                     activity_radius_m=0.0)
 
 
 def mid360_memory(tmp_path, **changes):
@@ -194,18 +197,6 @@ def test_new_coverage_is_not_an_appearance(tmp_path):
     assert events[0].evidence == 1.0
 
 
-def test_regions_reaching_into_the_near_field_are_not_reported(tmp_path):
-    room = scenes.room_shell()
-    memory = mid360_memory(tmp_path, state_dir=None, near_range_m=1.5)
-    second = build_reference(memory, room)
-    # 1.3 m and 2.3 m from the sensor: only the far box is reported.
-    near, far = scenes.box_shell((0.3, 1.2, 0.3)), scenes.box_shell((1.6, 1.6, 0.3))
-    memory.add_points("mid360", np.concatenate([room, near, far]))
-    events = memory.close_window(stamp(second))
-    assert [(e.kind, e.state) for e in events] == [(EventKind.APPEARED, EventState.CANDIDATE)]
-    assert np.all(np.abs(np.array(events[0].centroid) - [1.6, 1.6, 0.3]) <= 0.025)
-
-
 def test_moved_box_is_one_moved_candidate(tmp_path):
     room = scenes.room_shell()
     box = scenes.box_shell((0.0, 0.5, 0.30))
@@ -252,15 +243,16 @@ def test_a_sensor_subset_run_keeps_the_room_loadable(tmp_path):
     """Codex P2: a restart with sensors=['mid360'] saved only reference-mid360.cdr at the next
     epoch, so the saved references disagreed and a restart with both sensors refused the room."""
     room, partial = partial_room()
+    # New coverage joins the references while tracking (learn_windows).
     both = MemoryConfig(sensors=("mid360", "jt128"), max_range=None, reference_windows=3, state_dir=str(tmp_path),
-                        **SINGLE_WINDOW)
+                        learn_windows=30, **SINGLE_WINDOW)
     memory = RoomMemory(both, START)
     for second in range(3):
         memory.add_points("mid360", partial)
         memory.add_points("jt128", partial)
         memory.close_window(stamp(second))
     assert memory.state == MemoryState.TRACKING and memory.map_epoch == 1
-    subset = mid360_memory(tmp_path, delta_period_s=1.0)
+    subset = mid360_memory(tmp_path, delta_period_s=1.0, learn_windows=30)
     assert subset.state == MemoryState.TRACKING and subset.map_epoch == 2
     assert MapBricks.from_cdr(subset.map_update(stamp(10))).header.map_epoch == 2
     # The subset run learns the far wall, so reference-mid360.cdr moves ahead of reference-jt128.cdr.
@@ -368,9 +360,8 @@ def test_tracking_waits_for_settled_reference_occupancy():
     so TRACKING began on an empty reference that pose_offset could never register on, and that no
     window could ever teach. The reference keeps building until it has occupancy."""
     room = scenes.room_shell()
-    # The box below is 1.3 m from the sensor, inside the default near field.
     memory = RoomMemory(MemoryConfig(sensors=("mid360",), state_dir=None, max_range=None, reference_windows=1,
-                                     near_range_m=0.0), START)
+                                     candidate_windows=3), START)
     memory.add_points("mid360", room)
     memory.close_window(stamp(0))
     assert memory.state == MemoryState.BUILDING and memory.map_epoch == 0
@@ -438,15 +429,20 @@ def test_free_space_kept_in_the_recent_layer_is_not_fresh_evidence():
         (EventKind.DISAPPEARED, EventState.CANDIDATE, stamp(second))]
 
 
-def test_a_stale_region_keeps_its_match_but_neither_counts_nor_starts():
-    tracker = CandidateTracker(2, 1)
+def test_a_stale_window_resets_the_run_and_starts_nothing():
+    """Astra: a pending region kept its fresh-window count across stale windows, so fresh, stale,
+    fresh, stale, fresh promoted under a 3-window gate. A stale window keeps the match but sets the
+    run to 0, and a stale region alone starts nothing."""
+    tracker = CandidateTracker(3, 1)
     ids = iter(range(100, 200))
     box = type("Region", (), {"kind": "appeared", "keys": keys_of([[0, 0, 0], [1, 0, 0]]), "from_keys": None})()
     next_id = lambda: next(ids)
     assert tracker.update([box], stamp(0), next_id, [False]) == [] and tracker.pending == []
-    assert tracker.update([box], stamp(1), next_id, [True]) == [] and len(tracker.pending) == 1
-    assert tracker.update([box], stamp(2), next_id, [False]) == [] and tracker.pending[0].windows == 1
-    (started,) = tracker.update([box], stamp(3), next_id, [True])
+    for second, flag in enumerate([True, False, True, False, True], start=1):
+        assert tracker.update([box], stamp(second), next_id, [flag]) == []
+        assert len(tracker.pending) == 1 and tracker.pending[0].windows == (1 if flag else 0)
+    assert tracker.update([box], stamp(6), next_id, [True]) == []
+    (started,) = tracker.update([box], stamp(7), next_id, [True])
     assert started[0] == EventState.CANDIDATE and started[1].first_seen == stamp(1)
 
 
@@ -614,7 +610,8 @@ def partial_room():
 
 def test_map_stream_snapshot_then_deltas_and_keyframes():
     room, partial = partial_room()
-    memory = mid360_memory(None, state_dir=None, delta_period_s=2.0, keyframe_period_s=6.0, keyframe_delta_ratio=100.0)
+    memory = mid360_memory(None, state_dir=None, delta_period_s=2.0, keyframe_period_s=6.0, keyframe_delta_ratio=100.0,
+                           learn_windows=30)
     assert memory.map_update(stamp(0)) is None
     second = build_reference(memory, partial)
     sent = []
@@ -828,7 +825,7 @@ def test_pose_offset_is_binary64():
 @pytest.mark.parametrize("changes", [
     dict(occupied_min_hits=0), dict(free_min_seen=0), dict(occupied_min_ratio=1.5), dict(free_max_ratio=-0.1),
     dict(candidate_windows=0), dict(expire_windows=0), dict(delta_period_s=0), dict(keyframe_period_s=float("nan")),
-    dict(keyframe_delta_ratio=-1), dict(map_sensor="jt128"), dict(learn_max_offset_m=-0.1), dict(near_range_m=-0.1),
+    dict(keyframe_delta_ratio=-1), dict(map_sensor="jt128"), dict(learn_max_offset_m=-0.1),
     dict(learn_windows=-1),
 ])
 def test_stream_config_rejections(changes):
@@ -858,3 +855,169 @@ def test_launch_files_carry_the_memory_config_defaults(launch):
             assert text == value, field.name
         else:
             assert type(value)(text) == value, field.name
+
+
+# MARK: Activity and the settle gate
+
+
+def region(kind, cells, from_cells=None, voxel_count=None):
+    """A diff region as the tracker sees it: kind, sorted keys, and the old pose of a move."""
+    keys = keys_of(cells)
+    return type("Region", (), {"kind": kind, "keys": keys, "from_keys": None if from_cells is None else keys_of(from_cells),
+                               "voxel_count": len(keys) if voxel_count is None else voxel_count})()
+
+
+def block(x, y=0, z=0, side=3):
+    return [[x + i, y + j, z + k] for i in range(side) for j in range(side) for k in range(side)]
+
+
+def run_tracker(tracker, windows, fresh=None):
+    """Feeds one region list per window; returns the window indices with a CANDIDATE."""
+    ids = iter(range(100, 1000))
+    out = []
+    for n, regions in enumerate(windows):
+        if regions is None:
+            tracker.interrupt()
+            continue
+        flags = None if fresh is None else fresh[n]
+        if any(state == EventState.CANDIDATE for state, _ in tracker.update(regions, stamp(n), lambda: next(ids), flags)):
+            out.append(n)
+    return out
+
+
+def test_a_gap_breaks_the_run():
+    """Astra: a window without usable points must not be bridged. 4 settled windows, a gap, 1: no
+    CANDIDATE; the run starts again after the gap."""
+    box = region("appeared", block(0))
+    tracker = CandidateTracker(5, 1, 1, 20, 0.9)
+    assert run_tracker(tracker, [[box]] * 4 + [None] + [[box]] * 5) == [9]
+
+
+def test_a_gap_window_in_the_engine_interrupts_pending_regions():
+    room = scenes.room_shell()
+    boxed = np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))])
+    memory = mid360_memory(None, state_dir=None, recent_windows=1, candidate_windows=3, expire_windows=3)
+    second = build_reference(memory, room)
+    events = []
+    for n, cloud in enumerate([boxed, boxed, None, boxed, boxed, boxed]):
+        if cloud is not None:
+            memory.add_points("mid360", cloud)
+        events.append(memory.close_window(stamp(second + n)))
+    assert [n for n, window in enumerate(events) if window] == [5]
+
+
+def test_a_reshaping_region_is_activity_and_never_promotes():
+    tracker = CandidateTracker(3, 1, 1, 20, 0.9)
+    shapes = [region("appeared", block(0) + block(3 + 3 * (n % 2), 0, 0)) for n in range(8)]
+    assert run_tracker(tracker, [[shape] for shape in shapes]) == []
+    assert tracker.activity == [0] and tracker.pending[0].windows == 1
+
+
+def test_a_change_next_to_motion_waits_until_the_motion_settles():
+    """A stable box 4 voxels from a region that keeps reshaping counts only once that stops."""
+    tracker = CandidateTracker(3, 1, 1, 5, 0.9)
+    box = region("appeared", block(0))
+    moving = [region("appeared", block(7, 0, 3 * (n % 2))) for n in range(6)]
+    windows = [[box, moving[n]] for n in range(6)] + [[box]] * 4
+    assert run_tracker(tracker, windows) == [8]
+
+
+def test_motion_beyond_the_radius_does_not_hold_a_change():
+    tracker = CandidateTracker(3, 1, 1, 5, 0.9)
+    box = region("appeared", block(0))
+    windows = [[box, region("appeared", block(20, 0, 3 * (n % 2)))] for n in range(6)]
+    assert run_tracker(tracker, windows) == [2]
+
+
+def test_a_still_residue_beyond_the_gate_is_reported():
+    """The documented limit: a region that stays still, fresh and alone for candidate_windows is a
+    change, whatever made it."""
+    tracker = CandidateTracker(40, 1, 1, 20, 0.9)
+    assert run_tracker(tracker, [[region("disappeared", block(0))]] * 41) == [39]
+
+
+def test_an_edge_that_flickers_keeps_the_shape():
+    """Sparse returns at range: a voxel or two of the boundary comes and goes (at least 90 %
+    within tolerance), and a small fragment off its edge joins it instead of being motion."""
+    tracker = CandidateTracker(4, 1, 1, 20, 0.9)
+    base = block(0, side=5)
+    windows = [[region("appeared", base)], [region("appeared", base + [[6, 0, 0]])],
+               [region("appeared", base), region("appeared", [[5, 3, 3], [6, 3, 3], [5, 4, 3]])],
+               [region("appeared", base[:-2])]]
+    assert run_tracker(tracker, windows) == [3]
+    assert tracker.activity == []
+
+
+def test_fresh_needs_a_count_and_a_share_of_the_voxels():
+    keys = block(0)  # 27 voxels
+    appeared = region("appeared", keys)
+    seen = lambda n: keys_of(keys[:n])
+    assert not region_fresh(appeared, seen(2), keys_of([]), 3, 0.5)
+    assert not region_fresh(appeared, seen(13), keys_of([]), 3, 0.5)
+    assert region_fresh(appeared, seen(14), keys_of([]), 3, 0.5)
+    moved = region("moved", keys, block(10))
+    assert not region_fresh(moved, seen(27), keys_of([]), 3, 0.5)  # the old pose needs its own rays
+    assert region_fresh(moved, seen(27), keys_of(block(10)[:14]), 3, 0.5)
+    assert region_fresh(region("disappeared", keys), keys_of([]), seen(14), 3, 0.5)
+
+
+def test_a_move_seen_as_its_halves_keeps_its_run():
+    """The diff reports one move whole in some windows and as its two halves in others; the
+    pending move keeps counting through both, in either region order."""
+    old, new = block(0), block(10)
+    whole = region("moved", new, old)
+    halves = [region("appeared", new), region("disappeared", old)]
+    for order in (halves, halves[::-1]):
+        tracker = CandidateTracker(4, 1, 1, 20, 0.9)
+        assert run_tracker(tracker, [[whole], order, [whole], order]) == [3]
+        assert len(tracker.open) == 1 and tracker.open[0].kind == EventKind.MOVED
+    # A stale half sets the run to 0.
+    tracker = CandidateTracker(4, 1, 1, 20, 0.9)
+    assert run_tracker(tracker, [[whole], halves, halves, halves], [None, [True, False], None, None]) == []
+    assert tracker.pending[0].windows == 2
+
+
+def test_a_move_takes_over_its_pending_halves():
+    """Halves first (2 and 1 settled windows), then the whole move: one pending move whose run is
+    the shorter of theirs plus this window, both halves consumed. (No activity check: the new
+    disappeared half would hold the appeared one back.)"""
+    old, new = block(0), block(10)
+    tracker = CandidateTracker(4, 1, 1, None, 0.9)
+    appeared, disappeared, whole = region("appeared", new), region("disappeared", old), region("moved", new, old)
+    run_tracker(tracker, [[appeared], [appeared, disappeared]])
+    assert [(c.kind, c.windows) for c in tracker.pending] == [(EventKind.APPEARED, 2), (EventKind.DISAPPEARED, 1)]
+    ids = iter(range(100, 200))
+    assert tracker.update([whole], stamp(2), lambda: next(ids)) == []
+    assert [(c.kind, c.windows, c.first_seen) for c in tracker.pending] == [(EventKind.MOVED, 2, stamp(0))]
+    (started,) = tracker.update([whole], stamp(3), lambda: next(ids)) + tracker.update([whole], stamp(4), lambda: next(ids))
+    assert started[0] == EventState.CANDIDATE and started[1].kind == EventKind.MOVED
+
+
+def test_activity_reports_the_newest_window_with_motion():
+    room = scenes.room_shell()
+    memory = mid360_memory(None, state_dir=None, recent_windows=1, candidate_windows=5, activity_radius_m=1.0)
+    idle = memory.activity(stamp(0))
+    assert (idle.active, idle.since_s, idle.header.seq) == (False, None, 0)
+    second = build_reference(memory, room)
+    for n in range(4):
+        box = scenes.box_shell((0.3 + 0.3 * (n % 2), 1.2, 0.3))
+        memory.add_points("mid360", np.concatenate([room, box]))
+        assert memory.close_window(stamp(second + n)) == []
+    moving = memory.activity(stamp(second + 4))
+    assert moving.active and moving.sensors == moving.largest_sensor == SENSOR_MID360 and moving.n_regions >= 1
+    assert moving.voxel_count > 0 and moving.since_s == 1.0 and moving.header.seq == 1
+    assert Activity.from_cdr(moving.to_cdr()) == moving
+    for n in range(4, 6):
+        memory.add_points("mid360", room)
+        memory.close_window(stamp(second + n))
+    later = memory.activity(stamp(second + 9))
+    assert not later.active and later.n_regions == 0 and later.centroid is None and later.since_s == 6.0
+
+
+@pytest.mark.parametrize("changes", [
+    dict(fresh_min_voxels=0), dict(fresh_min_fraction=1.5), dict(stable_min_fraction=-0.1),
+    dict(stable_min_fraction=float("nan")), dict(activity_radius_m=-1.0), dict(activity_radius_m=float("inf")),
+])
+def test_gate_config_rejections(changes):
+    with pytest.raises(ValueError):
+        RoomMemory(MemoryConfig(state_dir=None, **changes), START)

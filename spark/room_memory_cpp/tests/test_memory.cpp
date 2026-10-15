@@ -71,16 +71,13 @@ struct TempDir {
 };
 
 // Single-window mechanics: every voxel a window sees settles, the recent layer is the last
-// window, every region near the sensor or not is sent and expired at once, and the diff keeps
-// its tolerance 1 and 6-voxel minimum. The node's defaults are measured on the static
-// recordings (tests/recording).
+// window, one supported voxel makes a region fresh, no activity holds a region back, and every
+// region is sent and expired at once. The node's defaults are measured on the static recordings
+// (tests/recording).
 MemoryConfig mid360_config(const std::optional<std::string>& state_dir) {
     MemoryConfig config;
     config.sensors = {"mid360"};
     config.max_range = std::nullopt;
-    config.tolerance = 1;
-    config.min_voxels = 6;
-    config.near_range_m = 0.0;
     config.reference_windows = 3;
     config.recent_windows = 1;
     config.occupied_min_hits = 1;
@@ -88,6 +85,9 @@ MemoryConfig mid360_config(const std::optional<std::string>& state_dir) {
     config.free_min_seen = 1;
     config.candidate_windows = 1;
     config.expire_windows = 1;
+    config.fresh_min_voxels = 1;
+    config.fresh_min_fraction = 0.0;
+    config.activity_radius_m = 0.0;
     config.state_dir = state_dir;
     return config;
 }
@@ -291,22 +291,6 @@ TEST(new_coverage_is_not_an_appearance) {
     CHECK(events[0].evidence == 1.0f);
 }
 
-TEST(regions_reaching_into_the_near_field_are_not_reported) {
-    const Cloud room = scenes::room_shell();
-    MemoryConfig config = mid360_config(std::nullopt);
-    config.near_range_m = 1.5;
-    RoomMemory memory(config, kStart);
-    const std::int64_t second = build_reference(memory, room);
-    // 1.3 m and 2.3 m from the sensor: only the far box is reported.
-    const Cloud near = scenes::box_shell({0.3, 1.2, 0.3});
-    const Cloud far = scenes::box_shell({1.6, 1.6, 0.3});
-    memory.add_points("mid360", scenes::concat({&room, &near, &far}));
-    const auto events = memory.close_window(stamp(second));
-    CHECK((transitions(events) == std::vector<std::pair<EventKind, EventState>>{{EventKind::appeared, EventState::candidate}}));
-    const std::array<float, 3> center = {1.6f, 1.6f, 0.3f};
-    for (int a = 0; a < 3; ++a) CHECK(std::fabs(events[0].centroid[a] - center[a]) <= 0.025f);
-}
-
 TEST(moved_box_is_one_moved_candidate) {
     const Cloud room = scenes::room_shell();
     const Cloud box = scenes::box_shell({0.0, 0.5, 0.30});
@@ -380,6 +364,7 @@ TEST(a_sensor_subset_run_keeps_the_room_loadable) {
     CHECK(memory.state() == MemoryState::tracking && memory.map_epoch() == 1);
     MemoryConfig mid360 = mid360_config(dir.path.string());
     mid360.delta_period_s = 1.0;
+    mid360.learn_windows = 30;  // the subset run learns new coverage
     RoomMemory subset(mid360, kStart);
     CHECK(subset.state() == MemoryState::tracking && subset.map_epoch() == 2);
     CHECK_EQ(msg::MapBricks::from_cdr(*subset.map_update(stamp(10))).header.map_epoch, std::uint64_t{2});
@@ -601,7 +586,7 @@ TEST(tracking_waits_for_settled_reference_occupancy) {
     config.state_dir = std::nullopt;
     config.max_range = std::nullopt;
     config.reference_windows = 1;
-    config.near_range_m = 0.0;  // the box below is 1.3 m from the sensor, inside the default near field
+    config.candidate_windows = 3;
     RoomMemory memory(config, kStart);
     memory.add_points("mid360", room);
     memory.close_window(stamp(0));
@@ -692,17 +677,24 @@ TEST(free_space_kept_in_the_recent_layer_is_not_fresh_evidence) {
     CHECK(events[2][0].first_seen == stamp(second));
 }
 
-TEST(a_stale_region_keeps_its_match_but_neither_counts_nor_starts) {
-    CandidateTracker tracker(2, 1);
+// Astra: a pending region kept its fresh-window count across stale windows, so fresh, stale,
+// fresh, stale, fresh promoted under a 3-window gate. A stale window keeps the match but sets the
+// run to 0, and a stale region alone starts nothing.
+TEST(a_stale_window_resets_the_run_and_starts_nothing) {
+    CandidateTracker tracker(3, 1);
     std::uint64_t ids = 100;
     const auto next = [&] { return ids++; };
     Region box;
     box.kind = Region::Kind::appeared;
     box.keys = keys({{0, 0, 0}, {1, 0, 0}});
     CHECK(tracker.update({box}, stamp(0), next, {false}).empty() && tracker.pending().empty());
-    CHECK(tracker.update({box}, stamp(1), next, {true}).empty() && tracker.pending().size() == 1);
-    CHECK(tracker.update({box}, stamp(2), next, {false}).empty() && tracker.pending()[0].windows == 1);
-    const auto started = tracker.update({box}, stamp(3), next, {true});
+    const bool flags[] = {true, false, true, false, true};
+    for (int n = 0; n < 5; ++n) {
+        CHECK(tracker.update({box}, stamp(n + 1), next, {flags[n]}).empty());
+        CHECK(tracker.pending().size() == 1 && tracker.pending()[0].windows == (flags[n] ? 1 : 0));
+    }
+    CHECK(tracker.update({box}, stamp(6), next, {true}).empty());
+    const auto started = tracker.update({box}, stamp(7), next, {true});
     CHECK(started.size() == 1 && started[0].first == EventState::candidate && started[0].second.first_seen == stamp(1));
 }
 
@@ -882,6 +874,7 @@ TEST(map_stream_snapshot_then_deltas_and_keyframes) {
         if (room[n] < 1.5f) partial.insert(partial.end(), room.begin() + static_cast<std::ptrdiff_t>(n), room.begin() + static_cast<std::ptrdiff_t>(n) + 3);
     }
     MemoryConfig config = mid360_config(std::nullopt);
+    config.learn_windows = 30;
     config.delta_period_s = 2.0;
     config.keyframe_period_s = 6.0;
     config.keyframe_delta_ratio = 100.0;
@@ -923,6 +916,7 @@ TEST(map_stream_sends_a_snapshot_when_deltas_outgrow_the_keyframe) {
         if (room[n] < 1.5f) partial.insert(partial.end(), room.begin() + static_cast<std::ptrdiff_t>(n), room.begin() + static_cast<std::ptrdiff_t>(n) + 3);
     }
     MemoryConfig config = mid360_config(std::nullopt);
+    config.learn_windows = 30;
     config.delta_period_s = 1.0;
     config.keyframe_delta_ratio = 0.01;
     RoomMemory memory(config, kStart);
@@ -1199,9 +1193,230 @@ TEST(stream_config_rejections) {
              [](MemoryConfig& c) { c.candidate_windows = 0; }, [](MemoryConfig& c) { c.expire_windows = 0; },
              [](MemoryConfig& c) { c.delta_period_s = 0; }, [](MemoryConfig& c) { c.keyframe_period_s = NAN; },
              [](MemoryConfig& c) { c.keyframe_delta_ratio = -1; }, [](MemoryConfig& c) { c.map_sensor = "jt128"; },
-             [](MemoryConfig& c) { c.learn_max_offset_m = -0.1; }, [](MemoryConfig& c) { c.near_range_m = -0.1; },
+             [](MemoryConfig& c) { c.learn_max_offset_m = -0.1; },
              [](MemoryConfig& c) { c.learn_windows = -1; }}) {
         MemoryConfig config = mid360_config(std::nullopt);
+        edit(config);
+        CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart));
+    }
+}
+
+// MARK: Activity and the settle gate (the same cases as test_memory.py)
+
+namespace {
+
+Region region_of(Region::Kind kind, const std::vector<std::array<std::int64_t, 3>>& cells,
+                 const std::vector<std::array<std::int64_t, 3>>& from_cells = {}) {
+    Region r;
+    r.kind = kind;
+    r.keys = keys(cells);
+    r.from_keys = keys(from_cells);
+    r.voxel_count = static_cast<std::int64_t>(r.keys.size());
+    return r;
+}
+
+std::vector<std::array<std::int64_t, 3>> block(std::int64_t x, std::int64_t y = 0, std::int64_t z = 0, std::int64_t side = 3) {
+    std::vector<std::array<std::int64_t, 3>> cells;
+    for (std::int64_t i = 0; i < side; ++i) {
+        for (std::int64_t j = 0; j < side; ++j) {
+            for (std::int64_t k = 0; k < side; ++k) cells.push_back({x + i, y + j, z + k});
+        }
+    }
+    return cells;
+}
+
+std::vector<std::array<std::int64_t, 3>> join_cells(std::vector<std::array<std::int64_t, 3>> a,
+                                                    const std::vector<std::array<std::int64_t, 3>>& b) {
+    a.insert(a.end(), b.begin(), b.end());
+    return a;
+}
+
+// Feeds one region list per window (nullopt: a window without points); returns the windows with a CANDIDATE.
+std::vector<int> run_tracker(CandidateTracker& tracker, const std::vector<std::optional<std::vector<Region>>>& windows,
+                             const std::vector<std::vector<bool>>& fresh = {}) {
+    std::uint64_t ids = 100;
+    std::vector<int> out;
+    for (std::size_t n = 0; n < windows.size(); ++n) {
+        if (!windows[n]) {
+            tracker.interrupt();
+            continue;
+        }
+        const std::vector<bool> flags = fresh.empty() ? std::vector<bool>{} : fresh[n];
+        for (const auto& [state, c] : tracker.update(*windows[n], stamp(static_cast<std::int64_t>(n)), [&] { return ids++; }, flags)) {
+            if (state == EventState::candidate) {
+                out.push_back(static_cast<int>(n));
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+using Windows = std::vector<std::optional<std::vector<Region>>>;
+
+}  // namespace
+
+// Astra: a window without usable points must not be bridged.
+TEST(a_gap_breaks_the_run) {
+    const Region box = region_of(Region::Kind::appeared, block(0));
+    CandidateTracker tracker(5, 1, 1, 20, 0.9);
+    Windows windows(4, std::vector<Region>{box});
+    windows.push_back(std::nullopt);
+    for (int n = 0; n < 5; ++n) windows.push_back(std::vector<Region>{box});
+    CHECK((run_tracker(tracker, windows) == std::vector<int>{9}));
+}
+
+TEST(a_gap_window_in_the_engine_interrupts_pending_regions) {
+    const Cloud room = scenes::room_shell();
+    const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
+    const Cloud boxed = scenes::concat({&room, &box});
+    MemoryConfig config = mid360_config(std::nullopt);
+    config.candidate_windows = 3;
+    config.expire_windows = 3;
+    RoomMemory memory(config, kStart);
+    const std::int64_t second = build_reference(memory, room);
+    std::vector<int> with_events;
+    for (int n = 0; n < 6; ++n) {
+        if (n != 2) memory.add_points("mid360", boxed);
+        if (!memory.close_window(stamp(second + n)).empty()) with_events.push_back(n);
+    }
+    CHECK((with_events == std::vector<int>{5}));
+}
+
+TEST(a_reshaping_region_is_activity_and_never_promotes) {
+    CandidateTracker tracker(3, 1, 1, 20, 0.9);
+    Windows windows;
+    for (int n = 0; n < 8; ++n) {
+        windows.push_back(std::vector<Region>{region_of(Region::Kind::appeared, join_cells(block(0), block(3 + 3 * (n % 2))))});
+    }
+    CHECK(run_tracker(tracker, windows).empty());
+    CHECK((tracker.activity() == std::vector<std::size_t>{0}) && tracker.pending()[0].windows == 1);
+}
+
+TEST(a_change_next_to_motion_waits_until_the_motion_settles) {
+    CandidateTracker tracker(3, 1, 1, 5, 0.9);
+    const Region box = region_of(Region::Kind::appeared, block(0));
+    Windows windows;
+    for (int n = 0; n < 6; ++n) windows.push_back(std::vector<Region>{box, region_of(Region::Kind::appeared, block(7, 0, 3 * (n % 2)))});
+    for (int n = 0; n < 4; ++n) windows.push_back(std::vector<Region>{box});
+    CHECK((run_tracker(tracker, windows) == std::vector<int>{8}));
+}
+
+TEST(motion_beyond_the_radius_does_not_hold_a_change) {
+    CandidateTracker tracker(3, 1, 1, 5, 0.9);
+    const Region box = region_of(Region::Kind::appeared, block(0));
+    Windows windows;
+    for (int n = 0; n < 6; ++n) windows.push_back(std::vector<Region>{box, region_of(Region::Kind::appeared, block(20, 0, 3 * (n % 2)))});
+    CHECK((run_tracker(tracker, windows) == std::vector<int>{2}));
+}
+
+// The documented limit: a region that stays still, fresh and alone for candidate_windows is a change.
+TEST(a_still_residue_beyond_the_gate_is_reported) {
+    CandidateTracker tracker(40, 1, 1, 20, 0.9);
+    const Windows windows(41, std::vector<Region>{region_of(Region::Kind::disappeared, block(0))});
+    CHECK((run_tracker(tracker, windows) == std::vector<int>{39}));
+}
+
+// Sparse returns at range: a voxel or two of the boundary comes and goes, and a small fragment off
+// its edge joins it instead of being motion.
+TEST(an_edge_that_flickers_keeps_the_shape) {
+    CandidateTracker tracker(4, 1, 1, 20, 0.9);
+    const auto base = block(0, 0, 0, 5);
+    auto trimmed = base;
+    trimmed.resize(trimmed.size() - 2);
+    const Windows windows = {
+        std::vector<Region>{region_of(Region::Kind::appeared, base)},
+        std::vector<Region>{region_of(Region::Kind::appeared, join_cells(base, {{6, 0, 0}}))},
+        std::vector<Region>{region_of(Region::Kind::appeared, base),
+                            region_of(Region::Kind::appeared, {{5, 3, 3}, {6, 3, 3}, {5, 4, 3}})},
+        std::vector<Region>{region_of(Region::Kind::appeared, trimmed)},
+    };
+    CHECK((run_tracker(tracker, windows) == std::vector<int>{3}));
+    CHECK(tracker.activity().empty());
+}
+
+TEST(fresh_needs_a_count_and_a_share_of_the_voxels) {
+    const auto cells = block(0);
+    const Region appeared = region_of(Region::Kind::appeared, cells);
+    const auto seen = [&](std::size_t n) { return keys(std::vector<std::array<std::int64_t, 3>>(cells.begin(), cells.begin() + static_cast<std::ptrdiff_t>(n))); };
+    CHECK(!region_fresh(appeared, seen(2), {}, 3, 0.5));
+    CHECK(!region_fresh(appeared, seen(13), {}, 3, 0.5));
+    CHECK(region_fresh(appeared, seen(14), {}, 3, 0.5));
+    const Region moved = region_of(Region::Kind::moved, cells, block(10));
+    CHECK(!region_fresh(moved, seen(27), {}, 3, 0.5));
+    const auto old_cells = block(10);
+    CHECK(region_fresh(moved, seen(27), keys(std::vector<std::array<std::int64_t, 3>>(old_cells.begin(), old_cells.begin() + 14)), 3, 0.5));
+    CHECK(region_fresh(region_of(Region::Kind::disappeared, cells), {}, seen(14), 3, 0.5));
+}
+
+TEST(a_move_seen_as_its_halves_keeps_its_run) {
+    const Region whole = region_of(Region::Kind::moved, block(10), block(0));
+    const Region appeared = region_of(Region::Kind::appeared, block(10));
+    const Region disappeared = region_of(Region::Kind::disappeared, block(0));
+    for (const std::vector<Region>& order : {std::vector<Region>{appeared, disappeared}, std::vector<Region>{disappeared, appeared}}) {
+        CandidateTracker tracker(4, 1, 1, 20, 0.9);
+        CHECK((run_tracker(tracker, {std::vector<Region>{whole}, order, std::vector<Region>{whole}, order}) == std::vector<int>{3}));
+        CHECK(tracker.open().size() == 1 && tracker.open()[0].kind == EventKind::moved);
+    }
+    CandidateTracker tracker(4, 1, 1, 20, 0.9);
+    const std::vector<Region> halves{appeared, disappeared};
+    CHECK(run_tracker(tracker, {std::vector<Region>{whole}, halves, halves, halves}, {{}, {true, false}, {}, {}}).empty());
+    CHECK(tracker.pending()[0].windows == 2);
+}
+
+// Halves first (2 and 1 settled windows), then the whole move: one pending move whose run is the
+// shorter of theirs plus this window, both halves consumed. (No activity check: the new
+// disappeared half would hold the appeared one back.)
+TEST(a_move_takes_over_its_pending_halves) {
+    CandidateTracker tracker(4, 1, 1, std::nullopt, 0.9);
+    const Region appeared = region_of(Region::Kind::appeared, block(10));
+    const Region disappeared = region_of(Region::Kind::disappeared, block(0));
+    const Region whole = region_of(Region::Kind::moved, block(10), block(0));
+    run_tracker(tracker, {std::vector<Region>{appeared}, std::vector<Region>{appeared, disappeared}});
+    CHECK(tracker.pending().size() == 2 && tracker.pending()[0].windows == 2 && tracker.pending()[1].windows == 1);
+    std::uint64_t ids = 100;
+    const auto next = [&] { return ids++; };
+    CHECK(tracker.update({whole}, stamp(2), next).empty());
+    CHECK(tracker.pending().size() == 1 && tracker.pending()[0].kind == EventKind::moved && tracker.pending()[0].windows == 2 &&
+          tracker.pending()[0].first_seen == stamp(0));
+    CHECK(tracker.update({whole}, stamp(3), next).empty());
+    const auto started = tracker.update({whole}, stamp(4), next);
+    CHECK(started.size() == 1 && started[0].first == EventState::candidate && started[0].second.kind == EventKind::moved);
+}
+
+TEST(activity_reports_the_newest_window_with_motion) {
+    const Cloud room = scenes::room_shell();
+    MemoryConfig config = mid360_config(std::nullopt);
+    config.candidate_windows = 5;
+    config.activity_radius_m = 1.0;
+    RoomMemory memory(config, kStart);
+    const msg::Activity idle = memory.activity(stamp(0));
+    CHECK(!idle.active && !idle.since_s && idle.header.seq == 0);
+    const std::int64_t second = build_reference(memory, room);
+    for (int n = 0; n < 4; ++n) {
+        const Cloud box = scenes::box_shell({0.3 + 0.3 * (n % 2), 1.2, 0.3});
+        memory.add_points("mid360", scenes::concat({&room, &box}));
+        CHECK(memory.close_window(stamp(second + n)).empty());
+    }
+    const msg::Activity moving = memory.activity(stamp(second + 4));
+    CHECK(moving.active && moving.sensors == msg::kSensorMid360 && moving.largest_sensor == msg::kSensorMid360);
+    CHECK(moving.n_regions >= 1 && moving.voxel_count > 0 && moving.since_s == 1.0f && moving.header.seq == 1);
+    CHECK(msg::Activity::from_cdr(moving.to_cdr()) == moving);
+    for (int n = 4; n < 6; ++n) {
+        memory.add_points("mid360", room);
+        memory.close_window(stamp(second + n));
+    }
+    const msg::Activity later = memory.activity(stamp(second + 9));
+    CHECK(!later.active && later.n_regions == 0 && !later.centroid && later.since_s == 6.0f);
+}
+
+TEST(gate_config_rejections) {
+    for (const auto& edit : std::initializer_list<void (*)(MemoryConfig&)>{
+             [](MemoryConfig& c) { c.fresh_min_voxels = 0; }, [](MemoryConfig& c) { c.fresh_min_fraction = 1.5; },
+             [](MemoryConfig& c) { c.stable_min_fraction = -0.1; }, [](MemoryConfig& c) { c.stable_min_fraction = NAN; },
+             [](MemoryConfig& c) { c.activity_radius_m = -1.0; }, [](MemoryConfig& c) { c.activity_radius_m = INFINITY; }}) {
+        MemoryConfig config;
+        config.state_dir = std::nullopt;
         edit(config);
         CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart));
     }

@@ -9,6 +9,8 @@
 //   hex <sensor> <hex>          add_cdr with inline bytes
 //   close <sec> <nanosec>       close_window
 //   status <sec> <nanosec> <period_s>
+//   activity <sec> <nanosec>    the Activity message
+//   defaults                    every MemoryConfig default, one "default <key> <value>" line each
 //   map <sec> <nanosec>         map_update
 //   sync <sec> <nanosec> <hex>  sync with a CDR RequestSync
 #include <cstdio>
@@ -95,6 +97,33 @@ int main(int argc, char** argv) {
                 const std::size_t eq = pair.find('=');
                 room_memory::tools::configure(config, pair.substr(0, eq), pair.substr(eq + 1));
             }
+        } else if (command == "defaults") {
+            const MemoryConfig d;
+            std::string sensors;
+            for (const std::string& name : d.sensors) sensors += (sensors.empty() ? "" : ",") + name;
+            const std::pair<const char*, std::string> fields[] = {
+                {"room_id", d.room_id}, {"sensors", sensors}, {"voxel_size", std::to_string(d.voxel_size)},
+                {"max_range", d.max_range ? std::to_string(*d.max_range) : "none"},
+                {"tolerance", std::to_string(d.tolerance)}, {"min_voxels", std::to_string(d.min_voxels)},
+                {"min_extent", std::to_string(d.min_extent)}, {"window_s", std::to_string(d.window_s)},
+                {"reference_windows", std::to_string(d.reference_windows)},
+                {"recent_windows", std::to_string(d.recent_windows)}, {"state_dir", d.state_dir.value_or("none")},
+                {"occupied_min_hits", std::to_string(d.occupied_min_hits)},
+                {"occupied_min_ratio", std::to_string(d.occupied_min_ratio)},
+                {"free_min_seen", std::to_string(d.free_min_seen)}, {"free_max_ratio", std::to_string(d.free_max_ratio)},
+                {"candidate_windows", std::to_string(d.candidate_windows)},
+                {"expire_windows", std::to_string(d.expire_windows)},
+                {"fresh_min_voxels", std::to_string(d.fresh_min_voxels)},
+                {"fresh_min_fraction", std::to_string(d.fresh_min_fraction)},
+                {"stable_min_fraction", std::to_string(d.stable_min_fraction)},
+                {"activity_radius_m", std::to_string(d.activity_radius_m)},
+                {"learn_max_offset_m", std::to_string(d.learn_max_offset_m)},
+                {"learn_windows", std::to_string(d.learn_windows)}, {"map_sensor", d.map_sensor},
+                {"delta_period_s", std::to_string(d.delta_period_s)},
+                {"keyframe_period_s", std::to_string(d.keyframe_period_s)},
+                {"keyframe_delta_ratio", std::to_string(d.keyframe_delta_ratio)},
+            };
+            for (const auto& [key, value] : fields) std::cout << "default " << key << " " << value << "\n";
         } else if (command == "start") {
             const msg::Time start = time_of(words);
             try {
@@ -123,6 +152,8 @@ int main(int argc, char** argv) {
             double period = 0;
             words >> period;
             std::cout << "status " << hex(memory->status(stamp, period).to_cdr()) << "\n";
+        } else if (command == "activity") {
+            std::cout << "activity " << hex(memory->activity(time_of(words)).to_cdr()) << "\n";
         } else if (command == "map") {
             const std::optional<msg::Bytes> message = memory->map_update(time_of(words));
             std::cout << "map " << (message ? hex(*message) : "none") << "\n";

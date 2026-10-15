@@ -62,8 +62,8 @@ foreach(sensor jt128 mid360)
                    -P ${CMAKE_CURRENT_SOURCE_DIR}/compare_cli.cmake)
 endforeach()
 
-# 30+ minutes of a looped static recording. The mcap is not in git; the binary skips (exit 77)
-# when it is absent. libzstd is only for this reader, not the core.
+# 30+ minutes of each looped static recording. The mcaps are not in git; the binary skips (exit 77)
+# when one is absent. libzstd is only for this reader, not the core.
 set(ROOM_MEMORY_ZSTD_INCLUDE "")
 set(ROOM_MEMORY_ZSTD_LIBRARY "")
 find_path(ROOM_MEMORY_ZSTD_INCLUDE zstd.h)
@@ -89,10 +89,13 @@ if(ROOM_MEMORY_ZSTD_INCLUDE AND ROOM_MEMORY_ZSTD_LIBRARY)
   target_link_libraries(test_static_longrun PRIVATE ${ROOM_MEMORY_ZSTD_LIBRARY})
   target_compile_definitions(test_static_longrun PRIVATE ROOM_MEMORY_HAS_ZSTD=1)
 endif()
+# Both recordings, one at a time: a whole recording takes about 5 GB.
 add_test(NAME static_longrun COMMAND test_static_longrun)
-set_tests_properties(static_longrun PROPERTIES
+add_test(NAME static_longrun_b COMMAND test_static_longrun b)
+set_tests_properties(static_longrun static_longrun_b PROPERTIES
   SKIP_RETURN_CODE 77
   TIMEOUT 300
+  RESOURCE_LOCK static_recording_memory
   ENVIRONMENT "OMP_NUM_THREADS=${HOST_CORES}")
 
 # Differential tests against the Python oracle (pytest), when a Python with numpy is given.

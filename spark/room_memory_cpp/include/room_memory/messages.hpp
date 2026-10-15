@@ -178,6 +178,28 @@ struct Epoch {
     static Epoch from_cdr(std::span<const std::uint8_t> data);
 };
 
+// Transient motion next to the rig, 1 Hz (protocol 3.6). Never a change: activity does not become a
+// ChangeEvent. `active` when a tracking window since the previous message had activity; the counts,
+// sensor mask and largest region describe the newest such window, the largest region in the frame
+// of `largest_sensor`. `since_s` counts from that newest activity window, empty (NaN) before the first.
+struct Activity {
+    Header header;
+    bool active = false;
+    std::int64_t sensors = 0;
+    std::int64_t largest_sensor = 0;
+    std::int64_t n_regions = 0;
+    std::int64_t voxel_count = 0;
+    std::optional<std::array<float, 3>> centroid;
+    std::optional<std::array<float, 3>> aabb_min;
+    std::optional<std::array<float, 3>> aabb_max;
+    std::optional<float> since_s;
+    friend bool operator==(const Activity&, const Activity&) = default;
+
+    void validate() const;
+    Bytes to_cdr() const;
+    static Activity from_cdr(std::span<const std::uint8_t> data);
+};
+
 // Mac -> Spark resync request (protocol 3.5). `since` is (epoch, seq) or empty.
 struct RequestSync {
     struct Since {

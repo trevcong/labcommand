@@ -87,10 +87,6 @@ int main(int argc, char** argv) {
     config.candidate_windows = 1;
     config.expire_windows = 1;
     config.state_dir = std::nullopt;
-    // The indoor move lies within the default near field.
-    config.tolerance = 1;
-    config.min_voxels = 6;
-    config.near_range_m = 0.0;
     RoomMemory memory(config, msg::Time{0, 0}, nullptr, full ? DiffScope::full : DiffScope::regions);
     std::vector<double> add_ms, close_ms;
     double reference_ms = 0;

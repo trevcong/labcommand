@@ -743,6 +743,83 @@ Epoch Epoch::from_cdr(std::span<const std::uint8_t> data) {
     });
 }
 
+void Activity::validate() const {
+    const std::string context = "Activity";
+    header.validate(context);
+    require_int(sensors, 0, 0xFF, context + ": sensors");
+    if (sensors & ~kSensorsAll) throw Invalid(context + ": sensors sets an undefined bit");
+    require_int(largest_sensor, 0, 0xFF, context + ": largest_sensor");
+    require_int(n_regions, 0, (std::int64_t{1} << 32) - 1, context + ": n_regions");
+    require_int(voxel_count, 0, (std::int64_t{1} << 32) - 1, context + ": voxel_count");
+    if (active) {
+        if (n_regions < 1 || voxel_count < 1) throw Invalid(context + ": active needs at least one region and voxel");
+        if ((largest_sensor != kSensorMid360 && largest_sensor != kSensorJT128) || !(sensors & largest_sensor)) {
+            throw Invalid(context + ": largest_sensor is not one bit of sensors");
+        }
+        if (!centroid || !aabb_min || !aabb_max) throw Invalid(context + ": active needs the largest region's centroid and aabb");
+        require_finite(*centroid, context + ": centroid");
+        require_finite(*aabb_min, context + ": aabb min");
+        require_finite(*aabb_max, context + ": aabb max");
+        for (int a = 0; a < 3; ++a) {
+            if ((*aabb_min)[a] > (*aabb_max)[a]) throw Invalid(context + ": aabb min exceeds max");
+        }
+        if (!since_s) throw Invalid(context + ": active needs since_s");
+    } else {
+        if (n_regions || voxel_count || sensors || largest_sensor) {
+            throw Invalid(context + ": inactive must have zero counts and sensor bits");
+        }
+        if (centroid || aabb_min || aabb_max) throw Invalid(context + ": inactive must have NaN geometry");
+    }
+    if (since_s && !(std::isfinite(*since_s) && *since_s >= 0)) {
+        throw Invalid(context + ": since_s must be finite and >= 0, or NaN");
+    }
+}
+
+Bytes Activity::to_cdr() const {
+    validate();
+    Writer writer;
+    writer.header(header);
+    writer.u8(active ? 1 : 0);
+    writer.u8(static_cast<std::uint8_t>(sensors));
+    writer.u8(static_cast<std::uint8_t>(largest_sensor));
+    writer.u32(static_cast<std::uint64_t>(n_regions));
+    writer.u32(static_cast<std::uint64_t>(voxel_count));
+    for (const auto* values : {&centroid, &aabb_min, &aabb_max}) {
+        if (*values) {
+            writer.floats(**values);
+        } else {
+            for (int n = 0; n < 3; ++n) writer.f32(std::nullopt);
+        }
+    }
+    writer.f32(since_s);
+    return writer.take();
+}
+
+Activity Activity::from_cdr(std::span<const std::uint8_t> data) {
+    return decode<Activity>(data, "Activity", [](Reader& reader) {
+        Activity a;
+        a.header = reader.header("");
+        const std::uint8_t active = reader.u8("active");
+        if (active > 1) throw Invalid("Activity: active " + str(std::uint64_t{active}) + " is not a bool");
+        a.active = active == 1;
+        a.sensors = reader.u8("sensors");
+        a.largest_sensor = reader.u8("largest_sensor");
+        a.n_regions = reader.u32("n_regions");
+        a.voxel_count = reader.u32("voxel_count");
+        const std::pair<std::optional<std::array<float, 3>>*, const char*> geometry[] = {
+            {&a.centroid, "centroid"}, {&a.aabb_min, "aabb"}, {&a.aabb_max, "aabb"}};
+        for (const auto& [field, what] : geometry) {
+            const std::array<float, 3> values = reader.floats(what);
+            const int nans = std::isnan(values[0]) + std::isnan(values[1]) + std::isnan(values[2]);
+            if (nans != 0 && nans != 3) throw Invalid(std::string("Activity: ") + what + " is partly NaN");
+            if (nans == 0) *field = values;
+        }
+        a.since_s = maybe(reader.f32("since_s"));
+        a.validate();
+        return a;
+    });
+}
+
 void RequestSync::validate() const {
     const std::string context = "RequestSync";
     header.validate(context);

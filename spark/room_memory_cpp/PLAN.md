@@ -180,7 +180,7 @@ The node defaults on the same recording: **0 events in 30–86 s and 0 false eve
 
 The regression test then treated exactly that region and time as the real change and required 0 events anywhere else. It no longer does (next section).
 
-### Second round: the near field
+### Second round: the near field (superseded: see "Activity", the third round)
 
 **Live, at 2ed75e1 with these defaults**, the node sent false events at a rate that rose from ~2 per minute right after the reference was built to ~18 per minute 35 minutes later. A 150 s capture of `/room_memory/events`: 45 events (APPEARED 39, DISAPPEARED 28, MOVED 13 messages), mostly CANDIDATE then EXPIRED, 6–24 voxels, 0.9–1.9 m from the rig, z −0.1 … 0.7 m, around (−1, −1) and (−1, 0) for the Mid-360 and (0, 1) for the JT128. That is the "real change" spot above. A second 5-minute recording of the static room (`static5m-b`, 2026-10-14 21:44 CT, 304.7 s, 6,085 frames) reproduces it: **103 event messages, rising from 10 to 16, 21, 21 and 29 per minute**, 96 of them within 2.0 m horizontally of the sensor and the other 7 (2.0–2.6 m) on the same bearing in the same seconds.
 
@@ -207,7 +207,7 @@ What each knob does on `static5m-b` (events per recording, previous defaults plu
 | `near_range_m` 1.6, `tolerance` 2, `min_voxels` 8 | 2 | 4 |
 | `near_range_m` 1.7 or 1.8, `tolerance` 2 | 0 | 0 |
 | `near_range_m` 2.0, `tolerance` 2 | 0 | 0; 6 over 30 minutes (the fragment above) |
-| **`near_range_m` 2.0, `tolerance` 2, `min_voxels` 8 (the defaults)** | **0; 0 over 35 minutes** | **0; 0 over 30 minutes** |
+| **`near_range_m` 2.0, `tolerance` 2, `min_voxels` 8 (the defaults then)** | **0; 0 over 35 minutes** | **0; 0 over 30 minutes** |
 
 Region size, persistence and evidence thresholds alone do not get there: the object's regions (6–168 voxels, alive 2–90 s) overlap the cubes' (80–157 voxels, persistent). Hence:
 - **`near_range_m` 2.0.** A change region with any voxel center within 2.0 m of its sensor (3-D, either pose of a move) is dropped before the gate. It covers the spot in both frames with margin (1.7 m already clears both recordings), and stays under the 2.05 m near face of the closest cube. **This is a blind zone, not noise removal:** anything that really changes within 2 m of either lidar is not reported.
@@ -219,7 +219,65 @@ The live JT128 events at (0.87, 2.64), 2.8 m out, were not in either recording, 
 
 The regression test (`tests/recording/test_static_recording.py`) now runs on both recordings (`ROOM_MEMORY_RECORDING`, `ROOM_MEMORY_RECORDING_B`, each skipped when absent) and requires **no event at all**, over each recording, over each one played back to back for at least 30 minutes (`bag_stream.py --loop`), and from a saved union reference. The seven cube cases run on both and must find their cube and nothing else. Their latencies and sizes are the ones below, on both recordings.
 
-### Synthetic changes in the real recording
+### Third round: activity, not change
+
+**Ground truth.** Trevor confirms he sat at a desk about 1.3 m from the rig, working, in both recordings and live. The "something low" above is him: real, transient motion. The blind zone (`near_range_m`) is removed, `tolerance` and `min_voxels` are back at 1 and 6, and his motion is reported as *activity* on its own topic (`/room_memory/activity`, `labcommand_msgs/Activity`, protocol §3.6, D28), never as a `ChangeEvent`.
+
+**What separates him from a box.** Per-window region traces (each window's diff regions, chained by kind and shared voxels):
+- Injected 0.3 m cubes keep their voxels: every window within 1 voxel (Chebyshev, both ways) of their first window, ±5 % voxels, and this window's own evidence covers ≥ 0.8 of them (a move: new pose ~0.93 occupied, old pose 100 % traversed). A move alternates between one MOVED region and its two halves from window to window. At 4.6 m the Mid-360's sparse pattern lets 1–9 % of a cube's edge voxels come and go, and a 6-voxel fragment off its edge appears for single windows.
+- Trevor's regions mostly appear, reshape and vanish. What stays still is mostly the part of his BUILDING-time pose he moved away from (DISAPPEARED): with the shape check alone, runs of 16–29 s (static5m) and up to 71 s (static5m-b). Motion next to such a residue is what marks it: counting a region only once no activity is near it cuts those runs to 12–28.
+
+**The gate** (`CandidateTracker`, both engines, byte for byte):
+1. *Fresh*: this window's own evidence supports ≥ `fresh_min_voxels` (3) and ≥ `fresh_min_fraction` (0.5) of the region's voxels: occupied by the window where it appeared, traversed by its rays where it disappeared; a move needs both poses. (Before: one voxel was enough, and only the new pose of a move was checked.) A stale window sets the run to 0, so fresh, stale, fresh, stale, fresh never promotes.
+2. *Same shape*: at least `stable_min_fraction` (0.9) of the voxels lie within `tolerance` voxels of the voxels the run started with, and back, each pose of a move against its own anchor. Otherwise a new run starts at 1 and the region is *activity*. A new region is activity in its first window. A fresh appeared or disappeared region whose voxel box is within `tolerance` of the same side of a matched pending region joins it (a fragment of its edge) instead.
+3. *Settled*: a pending region with an activity region (other than its own) within `activity_radius_m` (1.0 m, gap between voxel boxes, either pose) sets its run to 0.
+4. A window without usable points drops every pending region of its sensor. A pending move is matched by one MOVED region or by its two halves; a MOVED region takes over a pending APPEARED plus DISAPPEARED on its poses (run = the shorter of theirs).
+5. CANDIDATE when the run reaches `candidate_windows` (40). Open events are unchanged.
+
+`Activity` (1 Hz, with each status): whether a tracking window since the last message had activity, the newest such window's region count, voxels and sensor bits, the largest region's centroid and box in its sensor's frame, and the seconds since the newest activity window. `MemoryStatus`, `ChangeEvent` and every golden are unchanged; the two new hand goldens are `activity_le.hex` and `activity_idle_le.hex`. The Mac (Swift) does not decode `Activity` yet: a follow-up adds the decoder, copies the two goldens to `Tests/Fixtures/room/golden/hand` and shows the activity state.
+
+**Learning off (`learn_windows` 0).** grok1's budget (tracking windows that may still add to unsettled voxels, then the map freezes; cherry-picked as `learn_windows`) was ablated at 0, 30 and 1,000,000 (the old always-learn). All give 0 events, but the longest settled run on `static5m-b` is 15 windows without learning and 45 with it: a pending MOVED of 140 voxels at the desk, still from 253 to 298 s, ended by his next motion. Learning made it: the 30-window budget added 1,900 known voxels to the JT128 reference, 475 of them within 1 m of that move (128 of the 179 within 0.5 m learned as free), so his coming back there became an appearance in known space. Coverage barely changes (1,838 bricks with or without the budget on `static5m`, 1,852 vs 1,848 on `static5m-b`), the map stops changing after the tracking snapshot (no deltas, `map_epoch` steady), and a change in space the reference never saw stays unknown until a restart rebuilds it (no accept / re-reference yet).
+
+**N.** Longest run any pending region reached (`room_memory_bag` summary `max_run`, per sensor Mid-360 / JT128), final defaults:
+
+| run | static5m | static5m-b |
+|---|---|---|
+| one pass | 23 / 12 | 20 / 15 |
+| 30+ minutes looped | 24 / 18 | 20 / 17 |
+
+`candidate_windows` 40 (40 s) leaves 16 windows of margin over the longest (24: Trevor's BUILDING-time pose at the desk, static5m Mid-360). 10–30 s would leave 0–6. The recording tests require every run to stay ≤ 30.
+
+**`stable_min_fraction` 0.9 and fragments.** With an exact shape check (1.0) the 4.6 m Mid-360 cube is never reported (its run restarts every few windows); 0.95 and 0.9 find it at 42 s with the fragment joining it; 0.85 took 64 s once. Trevor's longest runs are the same at 0.9 and 0.95 (static5m-b Mid-360 17 at 0.95, 20 at 0.9). Ignoring small activity (only regions ≥ 12 voxels reset neighbours) or activity inside a region's own box instead let his residue through (runs 39, one MOVED event): his small fidgets next to a residue are what hold it.
+
+**`tolerance` 1, `min_voxels` 6.** Back to the core values: 2 and 8 only removed far fragments of his motion, which the gate now holds back; 0 events on both recordings and loops at 1/6. Under the new gate 2/8 is worse, not more conservative, because `tolerance` is also the shape tolerance and small regions are the motion that holds residues back: static5m-b gives 1 event (a MOVED at the desk, 293 s), the longest runs grow to 33 / 39 windows, and the activity seconds fall from 144 to 54 (static5m: 71 to 31). Astra (the advisor) and Codex (the reviewer) both recommend 1/6 with 2/8 kept as an ablation only.
+
+**Results** (both recordings, node defaults; `tests/recording`, `static_longrun`):
+- 0 change events per pass and over 30+ minutes looped (35 min static5m, 35.5 min static5m-b; `static_longrun` 2,093 s and 1,824 s of whole recordings, 0 in every 5-minute bucket).
+- Activity in 71 of 299 seconds (static5m, the first at 87 s, none before his motion at 86 s) and 144 of 304 (static5m-b, from 45 s).
+- Output 0.89 KB/s (static5m): 5 snapshots, no deltas, 299 statuses, 299 activity messages of 88 B.
+- Window cost while he moves (static5m-b): median 7.8 ms, p99 12.2 ms per 1 s window of both sensors (before: 9.1 ms median; the 38 ms maximum is the first tracking window, as before). `bench_memory`: 1.12 ms per 10 Hz tick, event bytes identical to Python.
+
+| case (0.3 m cubes) | sensor | center (sensor frame) | range | injected | latency |
+|---|---|---|---|---|---|
+| appear | Mid-360 | (1.4, 0.3, 0.3) | 1.5 m | 45 s / 200 s | 40 s / 40–43 s |
+| appear | JT128 | (−1.2, −0.8, 0.45) | 1.5 m | 45 s / 200 s | 40 s / 40 s |
+| disappear | Mid-360 | (1.0, 0.0, 0.0) | 1.0 m | 45 s / 200 s | 42 s / 42 s |
+| disappear | JT128 | (−1.5, 0.3, 0.2) | 1.5 m | 45 s / 200 s | 42 s / 42 s |
+| move 0.6 m | Mid-360 | (−0.4, 1.4, 0.3) → (0.2, 1.4, 0.3) | 1.5 m | 45 s / 200 s | 42 s / 42 s |
+| move 0.86 m | JT128 | (−0.9, −1.2, 0.45) → (−1.4, −0.6, 0.45) | 1.6 m | 45 s / 200 s | 42 s / 42 s |
+| appear, appear, appear | Mid-360, Mid-360, JT128 | (−2.2, 1.4, 0), (4.6, −0.4, 0), (−2.4, 0.6, 0.2) | 2.6, 4.6, 2.5 m | 180 s | 40, 42, 40 s |
+| disappear | Mid-360, JT128 | (−2.2, 1.4, 0), (−2.4, 0.6, 0.2) | 2.6, 2.5 m | 180 s | 42, 42 s |
+| move | Mid-360, JT128 | as below | 2.2, 2.5 m | 180 s | 42–43, 42 s |
+
+Same on both recordings (±0–3 s), each found as the right kind near its cube and nothing else; the near ones are more than 1 m (box gap) from where he works. The test bound is `candidate_windows × window_s + 8 s` = 48 s (was 8 s).
+
+**Limits.**
+- A change is reported 40 s after it settles, and a change within 1 m of continuing motion only once that motion has stopped for 40 s.
+- Someone who shifts and then sits perfectly still for more than 40 s is reported (a test pins it). Without the JT128↔Mid-360 extrinsic, motion seen by one lidar cannot hold the other's regions: on static5m-b the JT128 saw nothing move for 45 s while the Mid-360 saw him fidget.
+- A reference built while someone sat in it holds them: when they leave, where they sat is DISAPPEARED 40 s later. A union-of-5 reference saved by the first node shows exactly that on reload (one DISAPPEARED at the desk per recording; `test_a_saved_union_reference_loads_and_only_his_old_pose_shows`). **Delete the saved references (`~/room-memory/lab`) when deploying this version**: the live node's reference learned for 35+ minutes next to him.
+- `active` false is no qualifying activity, not a motionless room: still people, motion under `min_voxels` and motion inside an open event do not show.
+
+### Synthetic changes in the real recording (second round, 3-window gate)
 
 `bag_stream.py --inject`: a 0.3 m cube drawn by ray casting into one sensor's real frames, at 180 s, in observed free space (2-voxel free margin). Each real return whose ray enters the cube first is moved to the entry point, plus 1 cm range noise (added to the range, not scaled by the entry fraction: before the fix a 10 m return entering at 2 m got 2 mm). So the cube occludes what is behind it and is sampled at the sensor's own density, and when it leaves, the real returns behind it are free-space evidence. Detection is the first CANDIDATE of the right kind and sensor within 0.25 m of the cube. Latency is counted from the injection to the end of the window that sends it.
 
@@ -345,16 +403,16 @@ On the Spark itself the GB10's cores differ from the M5's; the code has no Apple
 ## Node
 
 `room_memory_node` (node name `room_memory`) declares the Python node's parameters with the same defaults, which are `MemoryConfig`'s (a pytest checks both launch files against it):
-- the earlier ones: `room_id`, `sensors`, `voxel_size`, `max_range` (≤ 0: none), `tolerance` (now 2), `min_voxels` (now 8), `min_extent`, `window_s`, `reference_windows` (now 30), `recent_windows` (now 3), `state_dir` (empty: none, `~` expanded);
+- the earlier ones: `room_id`, `sensors`, `voxel_size`, `max_range` (≤ 0: none), `tolerance` 1, `min_voxels` 6, `min_extent`, `window_s`, `reference_windows` (now 30), `recent_windows` (now 3), `state_dir` (empty: none, `~` expanded);
 - the count rule: `occupied_min_hits` 2, `occupied_min_ratio` 0.3, `free_min_seen` 2, `free_max_ratio` 0;
-- the gate: `candidate_windows` 3, `expire_windows` 3;
-- learning: `learn_max_offset_m` 0.02;
-- the near field: `near_range_m` 2.0 (0: none);
+- the gate: `candidate_windows` 40, `expire_windows` 3, `fresh_min_voxels` 3, `fresh_min_fraction` 0.5, `stable_min_fraction` 0.9, `activity_radius_m` 1.0 (0: no activity check);
+- learning: `learn_max_offset_m` 0.02, `learn_windows` 0 (tracking windows that may still teach the reference);
 - the map stream: `map_sensor` (empty: the JT128 when configured), `delta_period_s` 5, `keyframe_period_s` 60, `keyframe_delta_ratio` 0.5.
 
 It subscribes to `/livox/lidar` and `/lidar_points` as generic (serialized) subscriptions with the sensor-data QoS, so the raw CDR goes through `decode_pointcloud2`. It publishes the codec bytes with generic publishers:
 - `/room_memory/events`: reliable, depth 100;
 - `/room_memory/status`: reliable, depth 1, 1 Hz;
+- `/room_memory/activity` (`labcommand_msgs/msg/Activity`): reliable, depth 1, 1 Hz with each status;
 - `/room_memory/map_bricks`: reliable, depth 10, after each window when `map_update` returns a message;
 - `/room_memory/sync/map_bricks` and `/room_memory/sync/events`: reliable, depth 10 and 200.
 
