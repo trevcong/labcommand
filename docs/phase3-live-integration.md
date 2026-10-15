@@ -24,7 +24,7 @@ No Spark, rig or app was touched to write this.
 
 ## 0. Bottom line
 
-- **A dedicated, read-only bridge for memory topics.**
+- **A dedicated, read-only bridge for memory topics.** This and the next point are Phase 3's proposals (P12, P11). The transport stays open in the protocol (D28, Q5) until Trevor chooses.
   - The Mac opens one memory WebSocket to a second foxglove_bridge instance, which runs inside the room-memory container (P12).
   - That bridge serves only `/room_memory/*` and accepts no client publishing.
   - The existing `:8765` bridge, LIVE and SNAPSHOT are not touched.
@@ -32,7 +32,7 @@ No Spark, rig or app was touched to write this.
   - The bridge documents `client_topic_whitelist`, but at the deployed version and on `main` the parameter is parsed and never applied ([F2]).
   - With client publishing on, any peer that reaches the port could publish any known type on any topic, including a forged `/livox/lidar` cloud into the memory node.
 - **The budget is easy in steady state and hard on reconnects.**
-  - Steady state is about 0.46 KB/s down and 0.27 KB/s up, estimated with per-packet overhead (§3).
+  - Steady state is about 1.5 KB/s down and 0.3 KB/s up, estimated with per-packet overhead (§3). Two thirds of it is the 60 s keyframe (protocol D29).
   - A first connect costs about 110 KB. A reconnect that keeps its baseline costs at most about 75 KB: at most one snapshot plus the missed events, with no events fallback (§4.3).
   - The protocol's own retry rate allows about 22 KB/s during a resync storm, 4.5× the budget. Backoff on the Mac and a snapshot-answer cap on the Spark bound it (P3, P4).
   - A byte bucket on `map_bricks` caps the map's long-run rate at 3 KB/s. A snapshot up to protocol §7's 2 MB cap is delayed for a bounded time, never held indefinitely. A map that would exceed the cap is reported on `:8766`, not published (P15).
@@ -45,8 +45,8 @@ No Spark, rig or app was touched to write this.
   - `status` and `epoch` become transient_local (protocol §2, D24), so a Mac shows the memory state on connect. The nodes need a small change for that (§2.5).
 - **The governing invariant: the mirror is never shown as current while it is wrong.** It may be stale, incomplete or empty, and it says so. Every test in §7 checks this under faults.
 - **The Spark side is not ready for live integration yet.**
-  - Both nodes (Python oracle, C++ production) publish only `status` and `events`, both volatile.
-  - They have no `map_bricks`, no `epoch`, no sync topics, no RIG_MOVED, and never emit CONFIRMED. Those are PR 2.3 and 2.4.
+  - Both nodes (Python oracle, C++ production, PR #14) publish `map_bricks` with 60 s keyframes, `events`, `status`, `activity` and the sync topics, and answer `RequestSync`.
+  - They have no `epoch`, no `EventsFallback` header, no RIG_MOVED, and never emit CONFIRMED. Those are PR 2.3 and 2.4.
   - They keep each sensor's points in that sensor's own frame, so they have no room frame yet (P14).
   - The rollout (§9) gates on them.
 
@@ -243,7 +243,7 @@ Message sizes are protocol §7's exact or measured figures, for `room_id` "lab" 
 | `ChangeEvent`, no mask | per transition | 136 (exact) | 268 | — | — |
 | `ChangeEvent`, 25 cm box mask | per transition | 253 (measured) | 396 | — | — |
 | `MapBricks` delta, 25 cm box | on a reference change | 367 (measured) | 508 | — | — |
-| `MapBricks` snapshot | connect / resync | 52,863–59,024 (measured) | 57,808–64,540 (44–49 segments) | — | — |
+| `MapBricks` snapshot | keyframe every 60 s (protocol D29); connect / resync | 52,863–59,024 (measured) | 57,808–64,540 (44–49 segments) | 960–1,080 as keyframes | ~50 |
 
 Small messages pay 2–3× their size in headers, which is why §3.2 counts wire bytes.
 
@@ -251,7 +251,7 @@ Small messages pay 2–3× their size in headers, which is why §3.2 counts wire
 
 | scenario | down | up | notes |
 |---|---|---|---|
-| **Steady, static room** (status, activity and epoch only) | 0.46 KB/s | 0.27 KB/s | ~0.73 KB/s total; ~7× under budget. With the `:8766` poll, ~1.1 KB/s |
+| **Steady, static room** (status, activity, epoch and the 60 s keyframe) | ~1.5 KB/s | ~0.3 KB/s | ~1.8 KB/s total; ~2.8× under budget. Without the keyframe ~0.73 KB/s. With the `:8766` poll, ~2.2 KB/s |
 | **Quiet day** (60 changes/h; each 3 transitions with mask; each accepted with a 0.4 KB delta) | +0.04 KB/s | +0.01 KB/s | events and deltas are noise next to status |
 | **People walking through** (≈ 2 CANDIDATE/EXPIRED transitions per second while someone moves; no mask on CANDIDATE, P5) | +0.54 KB/s | +0.25 KB/s | ~1.2 KB/s total while active. Person-sized masks on CANDIDATE (est. 0.5–1 KB each) would make it 2–3 KB/s, hence P5 |
 | **First connect** (no baseline: app launch, or a new room or generation) | ~65 KB snapshot + ≤ ~48 KB event fallback (≤ 120 messages × 396 B) + advertise | ~6 KB ACKs, < 1 KB requests | ~110–120 KB; 6 % of the 2 MB cap |
@@ -264,9 +264,9 @@ Small messages pay 2–3× their size in headers, which is why §3.2 counts wire
 - On the dedicated bridge that is eight channels. `ChangeEvent`'s definition includes `MapBricks` and `builtin_interfaces/Time`.
 - The estimate is under 10 KB. Stage S1 measures it.
 
-**Amortized reconnect limit.** At 0.73 KB/s steady and about 115 KB per first connect, the 5 KB/s mean holds only if reconnects average at most one per ~27 s. A reconnect with a baseline costs at most ~75 KB, so the bound is conservative. Hence P3's floor on the reconnect delay.
+**Amortized reconnect limit.** At 1.8 KB/s steady and about 115 KB per first connect, the 5 KB/s mean holds only if reconnects average at most one per ~36 s. A reconnect with a baseline costs at most ~75 KB, so the bound is conservative. Hence P3's floor on the reconnect delay.
 
-**Every snapshot figure scales with the map.** The rows above use the measured 53–59 KB snapshot. Protocol §7 targets ≤ 500 KB and caps at 2 MB. The first-connect, re-reference, storm and P1 figures grow in proportion. The `map_bricks` bucket (§3.3) keeps the map's long-run rate at 3 KB/s whatever the snapshot size, and delays messages instead.
+**Every snapshot figure scales with the map.** The rows above use the measured 53–59 KB snapshot. Protocol §7 targets ≤ 500 KB and caps at 2 MB. The first-connect, re-reference, storm and keyframe figures grow in proportion. The `map_bricks` bucket (§3.3) keeps the map's long-run rate at 3 KB/s whatever the snapshot size, and delays messages instead.
 
 ### 3.3 Spark-side shaping (PR 2.4)
 
@@ -299,7 +299,7 @@ Small messages pay 2–3× their size in headers, which is why §3.2 counts wire
     - If status reported the working epoch, D20 would mark every Mac STALE 2 s into each hold. Each Mac would then request, and get a "nothing missed" snapshot that the bucket also gates.
     - If a snapshot answer carried the working map, the held delta, whose base is the published epoch, would no longer chain from it, and every Mac would resync again.
     - If ACCEPTED went out at once, every Mac would remove the change's overlay while its map still lacked the change. It would look CURRENT with the old geometry and no overlay for the whole hold, up to ~10 min.
-  - **Live snapshots.** A live snapshot, under P7 or P1, publishes the working reference. It supersedes any held delta, which is discarded unpublished. The ACCEPTED transitions held with that delta are published right after the snapshot.
+  - **Live snapshots.** A live snapshot, under P7 or a keyframe (protocol D29), publishes the working reference. It supersedes any held delta, which is discarded unpublished. The ACCEPTED transitions held with that delta are published right after the snapshot.
 - **No mask on CANDIDATE (P5).** The protocol already allows `mask` count 0, which renders "no mask" from `aabb`. CONFIRMED and later transitions carry the mask.
 - **Snapshot answers are capped (P4).** Every Mac on the shared sync topic receives every answer (protocol §5), so N Macs multiply the cost of each one.
 
@@ -370,10 +370,11 @@ So the request is the one connect mechanism.
 
 **Status and epoch (P2, now protocol §2 and D24).** `status` and `epoch` are full-state messages with depth 1, and they are transient_local, so a new client shows the memory state on connect instead of after up to 5 s. A copy delivered twice is harmless. The `seq` rule ignores it, case 2 of that rule (protocol §5) cannot mistake it for a restart, and D20's epoch check needs two consecutive disagreeing messages. §2.5 is the node change.
 
-**No request path (P1, fallback only).** If `:8766` is down and no request can go out, a connecting Mac gets a map only when the node publishes a snapshot on the live topic.
-- For that case the node publishes a live snapshot every 60 s. The cost is ~1.1 KB/s.
+**Keyframes (P1, now protocol D29 in PR #14).** The node publishes a live snapshot every `keyframe_period_s` (60 s), whatever the requests do.
+- A Mac whose request path fails still gets a current map within 60 s. That includes a failure the Spark cannot see, such as one Mac's ssh tunnel down while the relay serves the others. So the keyframes stay on when the relay works.
+- The cost is ~1.1 KB/s with overheads at the measured snapshot size (§3.2); the `map_bricks` bucket (§3.3) covers it.
 - The live topic stays volatile, and TCP keeps it in order, so a periodic snapshot cannot rewind anyone.
-- It is off whenever the relay works (Q4).
+- A keyframe is not the connect mechanism: the request is (above). It bounds how long a Mac without a request path waits.
 
 ### 4.4 `RequestSync` (D19) in operation
 
@@ -622,7 +623,7 @@ When several conditions hold at once, the banner shows the first that applies:
 | F11 | Spark clock steps back | possible `event_id` seed collision after a restart (§2.3) | an `event_id` reused with another `kind`: protocol violation | the node refuses to start if its clock is earlier than the newest `first_seen` in its event log (PR 2.4) |
 | F12 | Spark disk full | reference save fails | not visible today | proposed: DEGRADED with a reason in the `:8766` block (Q9); the node keeps serving from memory |
 | F13 | Resync storm (flapping link, many Macs) | request counter; bytes per minute | slow recovery | P3, P4 |
-| F14 | `:8766` relay down | POST fails | map stays STALE; "cannot request resync" | P1 fallback snapshots; ssh tunnel restart (existing `RigService` path) |
+| F14 | `:8766` relay down | POST fails | map stays STALE; "cannot request resync" | keyframes every 60 s (protocol D29); ssh tunnel restart (existing `RigService` path) |
 | F15 | Large accept or re-reference | delta over half a snapshot | none | snapshot instead (P7) |
 | F16 | Two Macs act on one event | compare-and-set fails for the second | the second sees the first's outcome | compare-and-set (protocol §3.6) |
 | F17 | Wrong room | `room_id` ≠ `:8766` `room_id` | messages ignored (protocol §1.4); "room mismatch" diagnostic | fix the node's `room_id` parameter |
@@ -756,8 +757,8 @@ Each stage has an owner, go/no-go criteria and a rollback.
 | **S0** Mac only | `RoomMemoryStore` (PR 1.1), `MemoryMirror`, session traces, §7.2 tests; memory mode behind a launch flag, off by default | Claude Code; Codex review | all §7.2 tests pass; 10,000 fault schedules with 0 invariant violations | flag stays off; nothing ships |
 | **S1** bench stack | §7.3 on a dev machine; V1–V5 answered and written into this doc | Claude Code | V1–V5 answered; budget test passes with measured overheads; every §4.8 row recovers | if the relay is not acceptable (Q4), choose between `clientPublish` with grant-only control and P1-only operation, and re-review §8. If P12 is rejected, the bench uses the `:8765` bridge's image rebuilt with `labcommand_msgs` instead |
 | **S2** Spark shadow | PR 2.3 and 2.4 merged, including the room frame (P14) and the bucket (P15); room-memory container running `room_memory_cpp` only, no bridge; memory topics recorded to MCAP | Trevor deploys | room frame in the state directory (both transforms, or `frame_sensor` alone until the extrinsic, Q10); every recorded `MapBricks` and `ChangeEvent` in it, with z up; 24 h with no crash; p99 window < 200 ms; static-room false CONFIRMED ≤ Q3 bar; rig nudge → RIG_MOVED and no events; Spark goldens decode on the Mac | `docker stop` the memory container; the lidar stack is untouched |
-| **S3** read-only mirror | the dedicated bridge starts in the memory container (`address`, whitelist, `capabilities: []`); Tailscale grant for 8767; P1 fallback snapshots on (no relay yet); Mac connects with the flag on | Trevor (Spark, grant), Claude Code (app) | 24 h soak (§7.5): 0 wrong-current, 0 violations, ≤ 5 KB/s every hour; bridge kill → STALE ≤ 5 s → CURRENT within one P1 period (≤ 60 s) with no wrong frame | stop the dedicated bridge (the node keeps running); app flag off. If P12 is rejected: the `:8765` bridge image is rebuilt with `labcommand_msgs` and the memory topics are added to its whitelist, a scheduled bridge restart that interrupts LIVE; rollback is the previous pinned image |
-| **S4** resync requests | `:8766` relay (P11) live; P1 turned off | Trevor (`command_center.py`), Claude Code | a forced gap recovers by replay; a forced 2-minute outage recovers by one snapshot; storm test within P3/P4 bounds | disable the relay endpoint; P1 back on; the Mac behaves as at S3 |
+| **S3** read-only mirror | the dedicated bridge starts in the memory container (`address`, whitelist, `capabilities: []`); Tailscale grant for 8767; keyframes on (protocol D29, always; no relay yet); Mac connects with the flag on | Trevor (Spark, grant), Claude Code (app) | 24 h soak (§7.5): 0 wrong-current, 0 violations, ≤ 5 KB/s every hour; bridge kill → STALE ≤ 5 s → CURRENT within one P1 period (≤ 60 s) with no wrong frame | stop the dedicated bridge (the node keeps running); app flag off. If P12 is rejected: the `:8765` bridge image is rebuilt with `labcommand_msgs` and the memory topics are added to its whitelist, a scheduled bridge restart that interrupts LIVE; rollback is the previous pinned image |
+| **S4** resync requests | `:8766` relay (P11) live; keyframes stay on | Trevor (`command_center.py`), Claude Code | a forced gap recovers by replay; a forced 2-minute outage recovers by one snapshot; storm test within P3/P4 bounds | disable the relay endpoint; the Mac behaves as at S3 (keyframes only) |
 | **S5** operator actions | P6 accepted (the `.msg` and protocol §3.6 are in PR #13); `OperatorAction` Swift codec, goldens, `colcon build`; the node's handler and action log; accept/dismiss and the other actions in the app | Claude Code; Codex | accept bumps `map_epoch` on both ends and arrives as one delta followed by the ACCEPTED transition; an accept during a bucket hold keeps the overlay until its delta is applied; double-click is a no-op; a stale accept is refused and logged | disable the action endpoint; the app hides the buttons |
 | **S6** soak and product bar | 7-day soak; PR 3.2 scripted sessions | Trevor, Claude Code | §7.5 passes all week; PR 3.2 bar met (Q2, Q3) | stay at S5 and fix; memory mode stays opt-in |
 
@@ -771,7 +772,7 @@ None of these is in effect until accepted. Each would change `ROOM-MEMORY-PROTOC
 
 | id | change | where | why |
 |---|---|---|---|
-| P1 | Fallback only: when no request path exists, a live `map_bricks` snapshot every 60 s | protocol §2, §5 | a connecting Mac otherwise gets no map; ~1.1 KB/s, and only while the relay is unavailable |
+| P1 | A live `map_bricks` snapshot every 60 s, always on. **Now protocol D29, implemented in both nodes by PR #14** | protocol §2, §5, D29 | a Mac without a working request path, including one whose own tunnel failed while the relay works, otherwise gets no map; ~1.1 KB/s |
 | P2 | `status` and `epoch` durability transient_local, depth 1; every other topic explicitly volatile. **Written into protocol §2 by PR #13 (D24).** Node change: §2.5 | protocol §2 (D18, D24) | memory state on connect; duplicates are harmless on full-state topics |
 | P3 | Mac: memory-socket reconnect floor 5 s, failure count not reset by connections under 60 s; request backoff 5 → 30 s | protocol §5 | bounds reconnect and request storms (§3.2) |
 | P4 | Spark: ≤ 1 snapshot answer per topic per 15 s across clients; `events` answers through a shared 3 KB/s bucket with a 48 KB burst, repeats of a waiting `since` answered once; request inputs rate-limited | protocol §5 | the sync topics are shared, so answers multiply with clients |
@@ -801,7 +802,7 @@ None of these is in effect until accepted. Each would change `ROOM-MEMORY-PROTOC
 3. **How many false alarms per hour are acceptable,** counted as false CONFIRMED events per hour in a static room? The brief proposes ≤ 1/h. The answer is the go/no-go threshold at S2 and S6.
 4. **May `command_center.py` relay requests and operator actions (P11)?** If not, the alternative is bridge `clientPublish`. At the deployed bridge version, the Tailscale grant would then be its only control (§8). This and P12 are protocol Q5 (D28), which keeps both transports, the dedicated bridge on :8767 and :8765 with the :8766 relay, until Trevor chooses.
 5. **What runs the `:8765` bridge, with which parameters?** In particular `address`, `capabilities` and `topic_whitelist`. If it uses the defaults, it accepts client publishing from the LAN and the tailnet today (§8).
-6. **Should memory mode be on at launch?** LIVE is off at launch by policy. Memory mode costs ~0.7 KB/s, so it could run whenever the app is open, or be opt-in like LIVE.
+6. **Should memory mode be on at launch?** LIVE is off at launch by policy. Memory mode costs ~1.8 KB/s, so it could run whenever the app is open, or be opt-in like LIVE.
 7. **How many Macs?** With one, the shared sync topics stay cheap. With several, P4 is necessary rather than prudent.
 8. **Is the full event history needed on the Mac,** beyond the last 100 messages? If so, it needs a paged read on `:8766` (§4.5) and a retention policy for the Spark's event log (brief R10).
 9. **Should a failed reference save (disk full) put the node in DEGRADED?** That changes protocol §4.1's DEGRADED trigger.
