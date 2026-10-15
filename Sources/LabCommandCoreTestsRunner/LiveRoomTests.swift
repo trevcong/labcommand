@@ -1164,6 +1164,39 @@ func testLiveRoomNoneEventsSeqIsRestartEvidence() {
     expect(unheld.activity.historyCuts == 1, "one fallen mark after the cut may be lag: no second cut")
 }
 
+/// Codex P2: every status-based restart resets the map high-water mark with the events state. The
+/// live map reached seq 10; the publisher restarts and its startup snapshot is missed. D20 asks for
+/// the map, and the new generation's snapshot at seq 0 is current, whichever evidence told.
+func testLiveRoomEveryRestartResetsMapHighWater() {
+    func check(_ name: String, events: ClosedRange<UInt64>? = nil, before: [Data] = [], restart: [Data]) {
+        var mirror = currentMirror()
+        if let events {
+            for seq in events { _ = mirror.receive(topic: .events, payload: event(id: 1, seq: seq), at: 101) }
+        }
+        for payload in before { _ = mirror.receive(topic: .status, payload: payload, at: 102) }
+        var actions: [Mirror.Action] = []
+        for (index, payload) in restart.enumerated() {
+            actions += mirror.receive(topic: .status, payload: payload, at: 103 + TimeInterval(index))
+        }
+        expect(mirror.activity.historyCuts == 1, "\(name): restart detected, got \(mirror.activity.historyCuts) cuts")
+        expect(mirror.mapState == .stale(.epochMismatch) && request(actions, .mapBricks, "\(name) D20") != nil,
+               "\(name): missed startup snapshot, D20 requests the map, got \(mirror.mapState)")
+        _ = mirror.receive(topic: .syncMapBricks, payload: snapshot(epoch: 1, seq: 0, [brick(6)]), at: 110)
+        expect(mirror.mapState == .current && mirror.mapEpoch == 1 && mirror.mapSeq == 0,
+               "\(name): the new generation's snapshot at seq 0 is current, not stale against live seq 10, got \(mirror.mapState)")
+    }
+
+    check("status seq reset", restart: [status(epoch: 1, seq: 0), status(epoch: 1, seq: 1)])
+    check("events_seq below the baseline twice", events: 0...5,
+          restart: [status(epoch: 1, seq: 900, eventsSeq: 2), status(epoch: 1, seq: 901, eventsSeq: 2)])
+    check("NONE twice with a baseline", events: 0...5,
+          restart: [status(epoch: 1, seq: 900), status(epoch: 1, seq: 901)])
+    check("NONE twice after a mark named but never held", before: [status(epoch: 5, seq: 2, eventsSeq: 5)],
+          restart: [status(epoch: 1, seq: 900), status(epoch: 1, seq: 901)])
+    check("a mark below an earlier status's mark twice", events: 0...3, before: [status(epoch: 5, seq: 50, eventsSeq: 8)],
+          restart: [status(epoch: 1, seq: 51, eventsSeq: 4), status(epoch: 1, seq: 52, eventsSeq: 4)])
+}
+
 /// Random interleavings of live, sync and duplicate deliveries over several events, with statuses
 /// between them: the history is cut only on a status step that resets the status seq. No event
 /// message, at any seq or from any event id, cuts it or rolls an event back.
@@ -1313,6 +1346,8 @@ func runLiveRoomTests() {
     print("  LiveRoom: random multi-event live/sync/duplicate interleavings: only a status reset cuts the history, no event rolls back"); passed()
     testLiveRoomNoneEventsSeqIsRestartEvidence()
     print("  LiveRoom: events_seq NONE (or below what the generation reached) on two statuses in a row is a restart; once is lag"); passed()
+    testLiveRoomEveryRestartResetsMapHighWater()
+    print("  LiveRoom: every status restart path (seq reset, low mark, NONE, fallen mark) resets the map high-water: a seq 0 snapshot is current"); passed()
 }
 
 /// `swift run LabCommandCoreTestsRunner live-room-probe [seconds] [ws://host:port]`: connects a read-only

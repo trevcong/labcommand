@@ -619,9 +619,9 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         receivedSpans.remove(at: receivedSpans.first?.low == 0 ? 1 : 0)
     }
 
-    /// A new publisher generation, reached only from status evidence (a status seq reset, or
-    /// `events_seq` below what this generation reached, or NONE, twice): coverage starts again at nothing. If the old one held
-    /// or named any event, its unseen tail is lost for good.
+    /// A new publisher generation, reached only from status evidence through `nodeRestarted` (a status
+    /// seq reset, or `events_seq` below what this generation reached, or NONE, twice): coverage starts
+    /// again at nothing. If the old one held or named any event, its unseen tail is lost for good.
     private mutating func cutHistory() {
         activity.historyCuts += 1
         if !receivedSpans.isEmpty || eventsHighWater != nil, !historyCut {
@@ -769,7 +769,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         let reached = [eventsSeq, eventsHighWater].compactMap { $0 }.max()
         if let reached, message.eventsSeq.map({ $0 < reached }) ?? true {
             if eventsLow {
-                startEventsGeneration()
+                nodeRestarted()
             } else {
                 eventsLow = true
             }
@@ -806,16 +806,15 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         resolveEventsIfDone()
     }
 
-    /// The node restarted: live seqs start again at 0 on every topic.
+    /// The node restarted: live seqs start again at 0 on every topic. Every status-based restart
+    /// (a status seq reset, or `events_seq` below what this generation reached, or NONE, twice)
+    /// lands here, so map and events state reset together. Drops the events baseline and fetches
+    /// what exists anew.
     private mutating func nodeRestarted() {
         // The old generation's live seqs prove nothing about the new one's snapshot. D20 catches
-        // a missed startup snapshot, and the answer to that request may then be current.
+        // a missed startup snapshot, and the answer to that request may then be current. Before
+        // the events guard: a restart with no events baseline still resets the map high-water.
         highestLiveMapSeq = nil
-        startEventsGeneration()
-    }
-
-    /// Drops the events baseline for a new publisher generation and fetches what exists anew.
-    private mutating func startEventsGeneration() {
         cutHistory()
         // Even with no baseline: a leftover low status must not count toward the next generation.
         eventsLow = false
