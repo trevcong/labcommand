@@ -21,3 +21,4 @@
 0a 00                       # pos 64  per_sensor_hz[0] Mid-360 10 Hz
 ff ff                       # pos 66  per_sensor_hz[1] JT128 HZ_UNAVAILABLE
 03 00 00 00                 # pos 68  dropped_windows 3
+0c 00 00 00 00 00 00 00     # pos 72  events_seq 12 (already 8-aligned)

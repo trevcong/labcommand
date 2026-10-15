@@ -1,0 +1,36 @@
+# labcommand_msgs/MapBricks KIND_DELTA, COMPRESSION_LZFSE, CDR little endian: the values of
+# map_bricks_delta_le.hex with compression 2. Derived by hand; see memory_status_le.hex. LZFSE
+# output is not canonical either, so the payload is an LZFSE stream made of one *uncompressed*
+# block ("bvx-", uint32 byte count, the bytes) and the end-of-stream marker "bvx$". The test
+# treats it like map_bricks_snapshot_zlib_le.hex; the verbatim bytes are at pos 76-217.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+04 00 00 00                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   "lab\0"
+2b 00 00 00 00 00 00 00     # pos 8   map_epoch 43
+0c 00 00 00 00 00 00 00     # pos 16  seq 12
+8a 92 ed 68                 # pos 24  stamp.sec 1760400010
+80 b2 e6 0e                 # pos 28  stamp.nanosec 250000000
+02                          # pos 32  compression COMPRESSION_LZFSE
+01                          # pos 33  kind KIND_DELTA
+00 00 00 00 00 00           # pos 34  pad to 8
+2a 00 00 00 00 00 00 00     # pos 40  base_epoch 42
+cd cc 4c 3d                 # pos 48  voxel_size 0.05
+08                          # pos 52  brick_dim 8
+00 00 00                    # pos 53  pad to 4
+01 00 00 00                 # pos 56  n_bricks 1
+02 00 00 00                 # pos 60  n_removed 2
+9a 00 00 00                 # pos 64  payload length 154 (4 + 4 + 142 + 4)
+62 76 78 2d                 # pos 68  LZFSE "bvx-": uncompressed block
+8e 00 00 00                 # pos 72  block byte count 142, little endian
+ff ff 02 00 fd ff           # pos 76  brick_ijk (-1, 2, -3)
+01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 82  occ: voxel (0,0,0)
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 98
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 114
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80   # pos 130 occ: voxel (7,7,7)
+03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 146 known: voxels (0,0,0), (1,0,0)
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 162
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 178
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80   # pos 194 known: voxel (7,7,7)
+00 00 00 00                 # pos 210 removed_bricks_idx[0] 0
+05 00 00 00                 # pos 214 removed_bricks_idx[1] 5
+62 76 78 24                 # pos 218 LZFSE "bvx$": end of stream
