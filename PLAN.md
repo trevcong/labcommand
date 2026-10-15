@@ -1,6 +1,6 @@
 # Live Room view (job B)
 
-Status: plan, revised after Codex `VERDICT: REVISE` on this file (`~/Developer/lc-tasks/liveroom/PLAN.review.md`). Branch `live-room-ui` in `~/Developer/labcommand-liveroom-b`. No app code in the revision commit.
+Status: plan, revised after the Codex re-review `VERDICT: REVISE` (`~/Developer/lc-tasks/liveroom/PLAN.review2.md`). The first review (`PLAN.review.md`) stays answered in the table below. Branch `live-room-ui` in `~/Developer/labcommand-liveroom-b`. No app code in this revision commit.
 
 The first thing an implementer produces is a running app whose Room page is bound to `LiveRoomClient` and has drawn a map and a status bar from `ws://100.118.187.99:8767`. Markers, the event list, and the offline fixture follow that screenshot. They are still part of done.
 
@@ -18,11 +18,19 @@ The first thing an implementer produces is a running app whose Room page is boun
 | P2 resync with no request path | Resync line |
 | P3 selected candidates stay unfilled; caption; 280pt wrap | Event list |
 
+Re-review (`PLAN.review2.md`):
+
+| Finding | Where this plan answers it |
+|---|---|
+| P1 land `65122d2` before any client file is copied | "Client on this branch" (prerequisite gate) |
+| P2 canvas-rect marker pixels, then read the rows off the PNG | Screenshots, visual inspection |
+| P2 standalone resync line when history is complete | Resync line, rule 3 |
+
 ## Work order
 
 Do these in order. Slice 1 is the earliest deliverable. Do not start slice 2 until `build/screenshots/live-room-live.png` exists and its sidecar shows a `.connected` room socket.
 
-1. **Slice 0 — client on this branch.** Land the client. Do not write a second one.
+1. **Slice 0 — codec, then the client.** Cherry-pick `65122d2` and pass its gate before any client file is added. Then land the client from `live-room-client`. Do not write a second one.
 2. **Slice 1 — live map and status bar.** Room destination, `LiveRoomClient` owned by `AppState`, voxels, brick frames, status bar, activity pip, banners. Launch against `ws://100.118.187.99:8767` and save the live screenshot.
 3. **Slice 2 — markers and the event list.** Suppression, event adaptation, the resync line, selection, caption, wrapping.
 4. **Slice 3 — fixture mode.** Bundled goldens, no socket and no SSH, four offline screenshots with the checks below.
@@ -32,22 +40,40 @@ Do these in order. Slice 1 is the earliest deliverable. Do not start slice 2 unt
 
 The view binds to the client. It does not keep a parallel `LiveRoomSnapshot`, and it does not ship fixture-only.
 
-The contract is `Sources/LabCommandCore/LiveRoom/API.md` in `~/Developer/labcommand-liveroom-a` (branch `live-room-client`). Commits already on that branch, both on top of `origin/main` `ba767bb`:
+The contract is `Sources/LabCommandCore/LiveRoom/API.md` on `live-room-client` (`~/Developer/labcommand-liveroom-a`). This worktree has no `MemoryStatus.eventsSeq`. `RoomMemoryMirror` reads that field. The copy list further down does not contain the codec, so copying those files onto the current tree does not compile.
 
-- `1de0454` — `API.md`, and `Package.swift` excluding it from the target
-- `65122d2` — `MemoryStatus.eventsSeq`, `EVENTS_SEQ_NONE` → `nil`, and `events_seq 12` in `Tests/Fixtures/room/golden/hand/memory_status_le.hex`
+Prerequisite commits, from `live-room-client`, cherry-picked onto `live-room-ui` before any client file is added. Do not start the cherry-pick at `05eaf98`.
 
-The implementation that matches that API is still untracked in the same worktree, and it is ahead of `1de0454` (`publishRequests` is on the initializer). At the start of implementation, copy these in unchanged, byte for byte, including the worktree `API.md` if it differs from `1de0454`:
+1. `1de0454` — `API.md`, and `Package.swift` excluding it from the target.
+2. `65122d2` — the codec and the golden. This commit is the one the copy must not skip.
+   - `Sources/LabCommandCore/RoomMemoryMessages.swift`: `eventsSeq: UInt64?`, and `eventsSeqNone = UInt64.max` (`EVENTS_SEQ_NONE`).
+   - `Sources/LabCommandCore/RoomMemoryCDR.swift`: write and read `events_seq`. The sentinel decodes to nil. Encoding nil writes the sentinel.
+   - `Sources/LabCommandCoreTestsRunner/RoomMemoryCDRTests.swift`: the hand status expects `eventsSeq == 12`.
+   - `Tests/Fixtures/room/golden/hand/memory_status_le.hex`: `events_seq 12` at pos 72 (`0c 00 00 00 00 00 00 00`).
+   - `scripts/spark/make_room_memory_goldens.py`: the generator sets `events_seq = 12`.
+   - No client sources. No `.msg` edit. The Swift struct is what the client compiles against.
+
+Gate, still before the copy. All three are true on this branch:
+
+- `eventsSeq` is a stored property of `RoomMemory.MemoryStatus`.
+- Decoding `memory_status_le.hex` yields `eventsSeq == 12`.
+- `swift run LabCommandCoreTestsRunner` passes.
+
+A failed gate stops the slice. The client files stay uncopied.
+
+The client is already committed on `live-room-client` as `05eaf98`, `574feb2`, and `b7ba3c1` (tip `b7ba3c1`), on top of `65122d2`. After the gate, cherry-pick that range, or copy these paths byte for byte from that tip. Do not rewrite the socket, the mirror, or the codecs. Do not edit those files to change resync behavior.
 
 - `Sources/LabCommandCore/LiveRoom/LiveRoomClient.swift`
 - `Sources/LabCommandCore/LiveRoom/LiveRoomProtocol.swift`
 - `Sources/LabCommandCore/LiveRoom/RoomMemoryMirror.swift`
-- `Sources/LabCommandCore/LiveRoom/API.md`
+- `Sources/LabCommandCore/LiveRoom/API.md` (the tip's copy; it has moved past `1de0454`)
 - `Sources/LabCommandCoreTestsRunner/LiveRoomTests.swift`
 - `Tests/Fixtures/room/live/`
 - the `live-room-probe` argv branch and the `runLiveRoomTests()` call in that worktree's `main.swift`
 
-If those files are committed on `live-room-client` by then, merge or cherry-pick that branch instead of copying. Do not rewrite the socket, the mirror, or the codecs. Do not edit those files to change resync behavior. `swift run LabCommandCoreTestsRunner` stays offline: `live-room-probe` is a separate argv and is not part of this gate.
+`574feb2` also adds `events_seq` and `EVENTS_SEQ_NONE` to `ros/labcommand_msgs/msg/MemoryStatus.msg` (the phase3-design hunk, so the ROS definition matches the codec). That hunk may arrive with the cherry-pick. Do not edit `.msg` files by hand, and do not take any other hunk from `origin/phase3-design`.
+
+`swift run LabCommandCoreTestsRunner` stays offline: `live-room-probe` is a separate argv and is not part of this gate.
 
 `LiveRoomClient.defaultURL` is `ws://100.118.187.99:8767`, subprotocol `foxglove.sdk.v1`. The bridge probed on 2026-10-15 advertises `connectionGraph` only. It has no `clientPublish`. The Spark still publishes snapshots on the live map topic, so the map arrives with no request path.
 
@@ -313,7 +339,13 @@ Show `cannot request resync` when recovery is needed and no path exists.
 - A path exists when `requestPathExists` is true (computed by `AppState`, above).
 - Also show the line when `activity.requestsUnsent > 0`, whether or not the flag is set, because the client already counted a request that did not leave the machine.
 
-When the count is non-zero the line is `cannot request resync · <n> unsent`. It is appended to the resync banner when the banner is the map-stale line, and it is the incomplete-history line's suffix when the map banner is something else. It does not outrank connection loss, an empty topic list, or a stale status.
+When the count is non-zero the text is `cannot request resync · <n> unsent`. Otherwise it is `cannot request resync`. One placement, first match. The text appears once.
+
+1. The visible banner is the map-stale line (`resyncing · as of epoch N`). Append ` · cannot request resync`, and ` · <n> unsent` when the count is non-zero, to that banner.
+2. The event list has an incomplete-history line (`eventsState != .complete`) and rule 1 did not fire. That line gains the same suffix.
+3. Standalone fallback. History is `.complete`, so the incomplete-history line is absent, and the visible banner is not the map-stale line. The text is its own line in the event column, above the sections, 11pt mono, `LabTheme.warn`. This covers a higher banner winning (connection lost, empty topics, stale status, rig moved, degraded, paused, building), the `Waiting for map` banner (a stale map with no bricks is not the map-stale line), no banner, and `requestsUnsent > 0` with a current map and complete history.
+
+The standalone line does not replace the winning banner. It does not outrank connection loss, an empty topic list, or a stale status. The column stays on screen while the line is present, including when Events and History are both empty. Rules 1 and 2 suppress the standalone line.
 
 The view does not set `requestSyncSink`, does not open `:8766`, and does not speak Foxglove. The relay (Phase 3 P11, the owner of the existing `RigService` tunnel) sets the sink before `start()`. Until that owner lands, the sink stays nil and this line is how the operator sees it.
 
@@ -348,28 +380,40 @@ Map-mode caption from the three drawn markers: `2 changes · 1 candidate on map`
 
 ## Screenshots
 
-The app writes a sidecar next to each PNG when it draws Room: banner, status line, pip name (`good` / `warn` / `bad` / `idle`), marker counts, and the event rows. Paths:
+The app writes a sidecar next to each PNG when it draws Room: banner, status line, pip name (`good` / `warn` / `bad` / `idle`), marker counts, the event rows, and `canvas <x> <y> <w> <h>` in PNG pixels, origin top-left of the image. The rect is the Metal view's bounds in the captured window. It lies fully inside the PNG, with width and height each greater than 80, on every shot that draws the canvas. `unavailable` replaces the canvas with the centered sentence and omits the rect. Paths:
 
 | Launch | PNG | What the check asserts |
 |---|---|---|
 | `LABCOMMAND_LIVE_ROOM=live` | `build/screenshots/live-room-live.png` | process connected: sidecar contains `ws://100.118.187.99:8767` and `.connected`. Also a status line or one of `Waiting for map`, `Room memory not running on Spark`, `connection lost`, `STALE`, `connecting`, `resyncing`. PNG width and height both > 400 |
-| `=map` | `build/screenshots/live-room-map.png` | sidecar status `epoch 43 · coverage — · events — · Tracking · cell 5.0 cm`, pip `good`, rows contain `appeared`, `candidate`, `moved`, `disappeared`. PNG has at least one pixel within ±12 per channel of `#3FA37A`, `#C45A5A`, `#C4A04A`, and `#C5CDD6` |
-| `=status` | `build/screenshots/live-room-status.png` | sidecar contains `events 12`, `coverage 75.0%`, `Tracking`, and `Waiting for map` |
-| `=stale` | `build/screenshots/live-room-stale.png` | sidecar contains `STALE · 4s`, pip `warn`, marker count 0 |
+| `=map` | `build/screenshots/live-room-map.png` | sidecar status `epoch 43 · coverage — · events — · Tracking · cell 5.0 cm`, pip `good`, rows contain `appeared`, `candidate`, `moved`, `disappeared`. Inside the `canvas` rect, inset 2 px: at least 8 pixels within ±12 per channel of `#3FA37A`, of `#C45A5A`, and of `#C4A04A`, and at least 8 within ±12 of `#C5CDD6`. Pixels outside the rect do not count. Marker edges are the full kind color; fill alpha `0.28` may fall outside ±12, so the count is edge pixels. The kind chips and the row pips are the same RGB and sit outside the canvas |
+| `=status` | `build/screenshots/live-room-status.png` | sidecar contains `events 12`, `coverage 75.0%`, `Tracking`, and `Waiting for map`. Inside the canvas rect: zero pixels within ±12 of `#3FA37A`, `#C45A5A`, or `#C4A04A` |
+| `=stale` | `build/screenshots/live-room-stale.png` | sidecar contains `STALE · 4s`, pip `warn`, marker count 0. Inside the canvas rect: zero pixels within ±12 of those three marker colors. Dimmed brick grey is not those colors |
 | `=unavailable` | `build/screenshots/live-room-unavailable.png` | sidecar contains `Room memory unavailable`, pip `idle` |
 
 Fixture launches are the four env values, each a separate process, each quit by PID. They do not pass `--mock` and they do not need it. Their sidecars must not contain `connected ws://100.118.187.99:8767`. The live launch is a different process. Wait up to 30 s for `.connected` before capturing. A deadline wrapper is `perl -e 'alarm N; exec @ARGV' --`, not `timeout`.
 
 Capture the window of that PID. `screencapture` of the whole desktop is not the artifact.
 
+### Visual inspection
+
+A sidecar that contains the row words does not prove the rows are readable, and a whole-window color search can pass on the chips alone. After the pixel checks, open each PNG and read it. Record one line per file in the gate notes, and again in `DONE.md`: the words read off the image. Clipped, overlapping, or unreadable glyphs fail even when the sidecar is right.
+
+- `live-room-live.png`: the status line or the banner on screen can be read. The canvas is the map or one of the banner sentences.
+- `live-room-map.png`: the canvas shows grey points, one faint brick frame, a green dashed unfilled box, an amber filled box, and a red filled box, distinct from the three chips. The column shows three rows, two lines each. Kind and state read as `appeared` / `candidate`, `moved`, and `disappeared`. Timestamps are readable. Text stays inside the 280pt column and does not run under the canvas.
+- `live-room-status.png`: `events 12`, `coverage 75.0%`, `Tracking`, and `Waiting for map` are readable. The canvas has no colored change box.
+- `live-room-stale.png`: `STALE · 4s` is readable. Bricks are dim. No colored change box.
+- `live-room-unavailable.png`: `Room memory unavailable` is readable and centered.
+
 ## Files
 
-Slice 0, landed, not authored here:
+Slice 0, landed by cherry-pick, not authored here. `65122d2` first, and its gate, before the client files:
 
-- `Sources/LabCommandCore/LiveRoom/` (client, mirror, protocol, `API.md`)
+- `Sources/LabCommandCore/RoomMemoryMessages.swift`, `RoomMemoryCDR.swift`, `Sources/LabCommandCoreTestsRunner/RoomMemoryCDRTests.swift`, `Tests/Fixtures/room/golden/hand/memory_status_le.hex`, `scripts/spark/make_room_memory_goldens.py` — from `65122d2` only
+- `Sources/LabCommandCore/LiveRoom/` (client, mirror, protocol, `API.md`) — after that gate
 - `Sources/LabCommandCoreTestsRunner/LiveRoomTests.swift`
 - `Tests/Fixtures/room/live/`
 - `Sources/LabCommandCoreTestsRunner/main.swift` — `runLiveRoomTests()` and the probe argv, from the client worktree
+- `ros/labcommand_msgs/msg/MemoryStatus.msg` — only the `events_seq` hunk inside `574feb2`, if that commit is cherry-picked
 
 Slice 1, new:
 
@@ -387,7 +431,7 @@ Slice 1, edited:
 
 Slice 2 and 3 add the marker and fixture sections of `LiveRoomView.swift`, `LiveRoomViewTests.swift`, and the screenshot script under `scripts/`. The test runner calls the new tests.
 
-Not edited: `PointCloudRenderer.swift`, `FoxgloveLiveClient.swift`, the landed `LiveRoom/*.swift` client sources, `RoomMemoryCDR.swift`, `RoomMemoryMessages.swift`, the `.msg` files, anything under `spark/`, `~/Applications/LabCommand.app`, `~/Developer/labcommand-spark`.
+Not edited after slice 0: `PointCloudRenderer.swift`, `FoxgloveLiveClient.swift`, the landed `LiveRoom/*.swift` client sources, `RoomMemoryCDR.swift`, `RoomMemoryMessages.swift`, `RoomMemoryCDRTests.swift`, the hand golden, and `make_room_memory_goldens.py`. Those codec files change only by cherry-picking `65122d2`. `.msg` files are not hand-edited. Nothing under `spark/`, `~/Applications/LabCommand.app`, or `~/Developer/labcommand-spark`.
 
 `DesignContractTests` scans `Sources/LabCommand` for `LabTheme.t(16` and larger, and for `coming soon`. Room copy stays at 15pt titles and 11–13pt body.
 
@@ -405,6 +449,7 @@ Not edited: `PointCloudRenderer.swift`, `FoxgloveLiveClient.swift`, the landed `
 - Kind filter off removes that kind from the marker set and from the caption. Caption on the map fixture is `2 changes · 1 candidate on map`.
 - `LiveRoomLaunch` maps the env table above. The fixture cases do not construct a client.
 - Banner priority: a stale status wins over a remembered `.rigMoved`. An empty `memoryTopics` wins over `Waiting for map`. `cannot request resync` appears for a stale map with `requestPathExists == false` and a zero unsent count, and the unsent count is included when `noteRequestUnsent` has run.
+- Resync placement, one line each. Map stale, path absent, unsent 0, events `.complete`, no higher banner: the warning is on the resync banner, and the standalone line is absent. The same recovery while the winning banner is `connection lost` and `eventsState` is `.complete`: the banner stays `connection lost`, and the standalone line is `cannot request resync`. The same with `.incomplete(since: nil)`: the incomplete line is suffixed, and the standalone line is absent. `requestsUnsent == 2` with a current map and `.complete` history: the standalone line is `cannot request resync · 2 unsent`. A stale map with no bricks and `.complete` history uses the standalone line, because the banner is `Waiting for map`.
 - Fixture `map` and `status` do not share a `roomId`. Fixture `status` has `status.eventsSeq == 12`. Fixture `map` has `status.eventsSeq == nil`.
 
 No new golden hex files. The default test run opens no socket and no SSH.
@@ -414,7 +459,7 @@ No new golden hex files. The default test run opens no socket and no SSH.
 1. `./build.sh --no-install` clean. That writes `build/LabCommand.app` and does not copy into `~/Applications`.
 2. `swift run LabCommandCoreTestsRunner` passing, including `runLiveRoomTests()` and the cases above. Do not pass `live-room-probe`.
 3. Live screenshot, from slice 1 onward: launch `build/LabCommand.app/Contents/MacOS/LabCommand` with `LABCOMMAND_LIVE_ROOM=live`. Quit that process by PID (`kill <pid>`). The PNG and sidecar are `build/screenshots/live-room-live.*`, and the sidecar shows `.connected` to `ws://100.118.187.99:8767`.
-4. Fixture screenshots, four processes, the checks in the table above. Quit each by PID.
+4. Fixture screenshots, four processes, the checks in the table above, the canvas-rect crop, and the visual inspection notes. Quit each by PID.
 5. `codex review --base origin/main` (or `codex exec review`). Fix findings until Codex is clean.
 6. Commit on `live-room-ui`. Do not push to `main`. Do not open a PR.
 7. Write `DONE.md` in the worktree root: what was built, the build and test results, both screenshot paths, and the Codex outcome.
@@ -432,6 +477,7 @@ No new golden hex files. The default test run opens no socket and no SSH.
 9. An accepted event whose `mapEpoch` the mirror has not reached draws an uncounted outline until a current map catches up. The client is not modified for that.
 10. Unknown voxels are a wireframe of any brick that still has an unknown cell. Free cells are undrawn. Occupied cells are grey points. Centers use `(index + 0.5) × voxelSize`.
 11. `mapRevision` and `voxelSize` gate voxel uploads. The camera auto-fits only until the user orbits or zooms, and the fit includes drawn boxes and arrow points.
-12. This bridge has no `clientPublish`. The view reports `cannot request resync` and does not grow a request path. The relay owner sets `requestSyncSink`.
+12. This bridge has no `clientPublish`. The view reports `cannot request resync` and does not grow a request path. The relay owner sets `requestSyncSink`. When history is complete and the banner is not the map-stale line, that report is a standalone line in the event column.
 13. The change-overlay branch contributes colors, box topology, fill alphas, and the arrow. It is not merged.
 14. Selected candidates stay dashed and unfilled. The caption counts drawn markers. Event rows wrap on two lines inside 280pt.
+15. `65122d2` is on this branch, and its decode-and-test gate has passed, before any `LiveRoom` client file is added. Marker colors are counted inside the sidecar's canvas rect. Row readability is read off the PNG.
