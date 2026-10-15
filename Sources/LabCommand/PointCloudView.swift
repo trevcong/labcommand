@@ -107,6 +107,9 @@ public struct DualPointCloudView: NSViewRepresentable {
     /// `midFrame`/`jtFrame` are not drawn and the camera fit for `fitGeneration`
     /// uses the captured points.
     var liveFeed: LiveFrameMailbox?
+
+    /// Change boxes and arrows in the same camera as the cloud. Empty draws nothing.
+    var overlay: ChangeOverlay.Geometry
     
     init(
         midFrame: Binding<PointCloudFrame?>,
@@ -115,7 +118,8 @@ public struct DualPointCloudView: NSViewRepresentable {
         pointSize: Float = 4.0,
         revision: Int = 0,
         fitGeneration: Int? = nil,
-        liveFeed: LiveFrameMailbox? = nil
+        liveFeed: LiveFrameMailbox? = nil,
+        overlay: ChangeOverlay.Geometry = .empty
     ) {
         self._midFrame = midFrame
         self._jtFrame = jtFrame
@@ -124,6 +128,7 @@ public struct DualPointCloudView: NSViewRepresentable {
         self.revision = revision
         self.fitGeneration = fitGeneration
         self.liveFeed = liveFeed
+        self.overlay = overlay
     }
     
     public func makeCoordinator() -> Coordinator {
@@ -160,6 +165,7 @@ public struct DualPointCloudView: NSViewRepresentable {
         renderer.colorMode = colorMode
         renderer.pointSize = pointSize
         renderer.liveFeed = liveFeed
+        renderer.setOverlay(overlay)
         
         let fitPending = fitGeneration != nil && context.coordinator.lastFitGeneration != fitGeneration
         if liveFeed != nil {
