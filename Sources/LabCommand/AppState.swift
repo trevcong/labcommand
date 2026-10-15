@@ -368,7 +368,7 @@ final class AppState: ObservableObject {
         let sparkWasUp = rig.sparkReachable
         Task.detached(priority: .userInitiated) {
             let err = work(io, spec)
-            Thread.sleep(forTimeInterval: 3.5)
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
             let rig = io.fetchStatus(sparkWasReachable: sparkWasUp)
             await MainActor.run {
                 self.applyRig(rig)
