@@ -189,6 +189,11 @@ struct MemoryConfig {
     // A change region with a voxel center within this distance (meters) of the sensor is not
     // reported: the near field next to the rig, where people work (0: every region is).
     double near_range_m = 2.0;
+    // Closed windows that enter TRACKING and may still add to unsettled voxels. An empty window
+    // and one whose pose exceeds learn_max_offset_m count. The budget is about learn_windows *
+    // window_s seconds. After it, map_update settles once more on its usual schedule, then drops
+    // the counts: a voxel outside the frozen reference is not an event and never becomes one.
+    std::int64_t learn_windows = 30;
     // Map stream: the sensor whose reference is published (empty: jt128 when configured,
     // else the first configured sensor),
     // the minimum time between map messages, the maximum time between snapshots, and the
@@ -278,6 +283,8 @@ public:
     // added to the references (map_epoch + 1, references saved) and sent as a delta of the
     // changed map bricks; a snapshot instead when keyframe_period_s has passed since the last
     // one, or when the deltas since it would exceed keyframe_delta_ratio of its size.
+    // After learn_windows tracking windows, that settle pass drops every sensor's counts.
+    // Later ticks do not settle, and a keyframe of the unchanged map does not bump map_epoch.
     std::optional<msg::Bytes> map_update(const msg::Time& stamp);
     // The answer to one RequestSync (protocol section 5), to publish in order on the sync
     // topic of request.topic. Empty for another room_id, and for a map request before the
@@ -315,6 +322,9 @@ private:
     DiffScope scope_;
     std::vector<Channel> channels_;
     msg::MemoryState state_ = msg::MemoryState::building;
+    // Closed windows that entered TRACKING, and whether a later settle pass still has counts.
+    std::int64_t tracking_windows_ = 0;
+    bool settle_pending_ = false;
     std::uint64_t map_epoch_ = 0;
     std::uint64_t event_seq_ = 0;
     std::uint64_t status_seq_ = 0;

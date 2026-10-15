@@ -11,7 +11,7 @@ from room_memory.messages import CDRError, RequestSync, Time
 _FLOATS = {"voxel_size", "window_s", "occupied_min_ratio", "free_max_ratio", "learn_max_offset_m", "near_range_m",
            "delta_period_s", "keyframe_period_s", "keyframe_delta_ratio"}
 _INTS = {"tolerance", "min_voxels", "min_extent", "reference_windows", "recent_windows", "occupied_min_hits",
-         "free_min_seen", "candidate_windows", "expire_windows"}
+         "free_min_seen", "candidate_windows", "expire_windows", "learn_windows"}
 
 
 def _config(fields, pair):

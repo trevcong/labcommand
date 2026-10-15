@@ -61,14 +61,17 @@ def replay(recording, *injections, config=(), loop=1):
     result = subprocess.run([BAG, *config], stdin=stream.stdout, capture_output=True, check=True)
     stream.stdout.close()
     assert stream.wait() == 0
-    events, summary = [], None
+    events, maps, summary = [], [], None
     for line in result.stdout.decode().splitlines():
         words = line.split()
         if words[0] == "event":
             events.append({"t": float(words[1]), "kind": words[2], "state": words[3], "sensors": int(words[6]),
                            "voxels": int(words[8]), "centroid": tuple(float(v) for v in words[10:13])})
+        elif words[0] == "map":
+            maps.append({"t": float(words[1]), "kind": words[2], "epoch": int(words[4]), "bricks": int(words[6])})
         elif words[0] == "summary":
             summary = json.loads(line[len("summary "):])
+    summary["maps"] = maps
     return events, summary
 
 
@@ -146,3 +149,20 @@ def test_injected_change_is_detected(recording, name):
     assert 0 < latency <= LATENCY_BOUND_S, f"{name}: latency {latency} s"
     others = [e for e in events if e is not found]
     assert others == [], f"{name}: other events {others[:5]}"
+
+
+def test_learning_budget_stops_the_epoch_clock(unmodified):
+    """Defaults: an epoch increase by tracking_from_s + learn_windows * window_s + delta_period_s,
+    and after that one epoch, snapshots only, with one brick count."""
+    _, summary = unmodified
+    maps = summary["maps"]
+    opening = maps[0]
+    assert opening["kind"] == "SNAPSHOT"
+    horizon = summary["tracking_from_s"] + 30 * 1.0 + 5.0
+    early = [item for item in maps if item["t"] <= horizon + 1e-6]
+    late = [item for item in maps if item["t"] > horizon + 1e-6]
+    assert any(item["epoch"] > opening["epoch"] for item in early)
+    assert len(late) >= 2
+    assert len({item["epoch"] for item in late}) == 1
+    assert {item["kind"] for item in late} == {"SNAPSHOT"}
+    assert len({item["bricks"] for item in late}) == 1

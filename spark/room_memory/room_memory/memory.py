@@ -502,6 +502,11 @@ class MemoryConfig:
     # A change region with a voxel center within this distance (meters) of the sensor is not
     # reported: the near field next to the rig, where people work (0: every region is).
     near_range_m: float = 2.0
+    # Closed windows that enter TRACKING and may still add to unsettled voxels. An empty window
+    # and one whose pose exceeds learn_max_offset_m count. The budget is about learn_windows *
+    # window_s seconds. After it, map_update settles once more on its usual schedule, then drops
+    # the counts: a voxel outside the frozen reference is not an event and never becomes one.
+    learn_windows: int = 30
     # Map stream: the sensor whose reference is published ("" = jt128 when configured, else the
     # first configured), the
     # minimum time between map messages, the maximum time between snapshots, and the share of
@@ -571,6 +576,8 @@ class RoomMemory:
             raise ValueError("learn_max_offset_m must be in [0, 1e9) m")
         if not 0 <= config.near_range_m < 1e9:
             raise ValueError("near_range_m must be in [0, 1e9) m")
+        if config.learn_windows < 0:
+            raise ValueError("learn_windows must be >= 0")
         if not (0 < config.delta_period_s < 1e9 and 0 < config.keyframe_period_s < 1e9
                 and 0 <= config.keyframe_delta_ratio < 1e9):
             raise ValueError("delta_period_s and keyframe_period_s must be in (0, 1e9) s, keyframe_delta_ratio in [0, 1e9)")
@@ -583,6 +590,8 @@ class RoomMemory:
         self.channels = {name: _Channel(SENSORS[name], config) for name in names}
         self.map_sensor = config.map_sensor or ("jt128" if "jt128" in names else names[0])
         self.state = MemoryState.BUILDING
+        self._tracking_windows = 0  # closed windows that entered TRACKING
+        self._settle_pending = False  # unsettled counts a later map_update may merge
         self.map_epoch = 0
         self.event_seq = 0
         self.status_seq = 0
@@ -697,6 +706,12 @@ class RoomMemory:
         """Integrates the queued frames. Returns the ``ChangeEvent`` messages to publish, in order."""
         events = []
         dropped = False
+        # A window counts only when it enters already tracking. The window that crosses
+        # BUILDING → TRACKING is the reference, not part of the learning budget.
+        tracking = self.state == MemoryState.TRACKING
+        if tracking:
+            self._tracking_windows += 1
+        learning = tracking and self._tracking_windows <= self.config.learn_windows
         for channel in self.channels.values():
             frames, channel.frames = channel.frames, []
             if channel.failed and not frames:
@@ -724,12 +739,13 @@ class RoomMemory:
             recent = window if len(channel.recent) == 1 else occupancy_map(np.concatenate(channel.recent), self.change)
             # The rig-pose estimate uses this window alone, so a move shows in full at once.
             channel.residual = pose_offset(window.occupied, reference.occupied, self.config.voxel_size)
-            # Voxels the reference has not settled keep counting, so new coverage joins it, unless
-            # the rig may have moved.
-            if channel.residual is not None and channel.residual <= self.config.learn_max_offset_m:
+            # Voxels the reference has not settled keep counting, so new coverage joins it, until
+            # the learning budget is spent, and unless the rig may have moved.
+            if learning and channel.residual is not None and channel.residual <= self.config.learn_max_offset_m:
                 observed = VoxelLayer.observe(window, self.change)
                 channel.stats.add(np.setdiff1d(observed.occupied, reference.known, assume_unique=True),
                                   np.setdiff1d(observed.known, reference.known, assume_unique=True))
+                self._settle_pending = True
             report = diff(reference.as_occupancy(self.config.voxel_size), recent, self.change, reference.known)
             # Regions reaching into the near field are not reported, either pose of a move.
             regions = [region for region in report.regions
@@ -751,8 +767,15 @@ class RoomMemory:
         if self.state == MemoryState.BUILDING and all(self._reference_ready(c) for c in self.channels.values()):
             self.state = MemoryState.TRACKING
             # From here on only the voxels the reference has not settled keep their counts.
+            # learn_windows 0 drops those leftovers: this run teaches the reference nothing.
             for channel in self.channels.values():
                 channel.stats.erase(channel.reference.known)
+            if self.config.learn_windows == 0:
+                for channel in self.channels.values():
+                    channel.stats = VoxelStats()
+                self._settle_pending = False
+            elif any(len(channel.stats.keys) for channel in self.channels.values()):
+                self._settle_pending = True
             self.map_epoch += 1
             self.save(stamp)
         return events
@@ -788,7 +811,9 @@ class RoomMemory:
         once ``delta_period_s`` has passed since the last message, voxels that settled since join
         the references (``map_epoch`` + 1, references saved) and go out as a delta of the changed
         bricks; a snapshot instead when ``keyframe_period_s`` has passed since the last one, or
-        when the deltas since it would exceed ``keyframe_delta_ratio`` of its size."""
+        when the deltas since it would exceed ``keyframe_delta_ratio`` of its size. After
+        ``learn_windows`` tracking windows, that settle pass drops every sensor's counts. Later
+        ticks do not settle, and a keyframe of the unchanged map does not bump ``map_epoch``."""
         if self.state == MemoryState.BUILDING:
             return None
         ns = _nanoseconds(stamp)
@@ -800,13 +825,20 @@ class RoomMemory:
         if not keyframe_due and ns - self._last_map_ns < int(self.config.delta_period_s * 1e9):
             return None
         changed = False
-        for channel in self.channels.values():
-            fresh = channel.stats.settled(self.config.settle_rule())
-            if not len(fresh.known):
-                continue
-            channel.stats.erase(fresh.known)
-            self._set_reference(channel, channel.reference.merge(fresh))
-            changed = True
+        if self._settle_pending:
+            for channel in self.channels.values():
+                fresh = channel.stats.settled(self.config.settle_rule())
+                if not len(fresh.known):
+                    continue
+                channel.stats.erase(fresh.known)
+                self._set_reference(channel, channel.reference.merge(fresh))
+                changed = True
+            # The budget is spent: merge whatever just settled, then drop the rest, including
+            # counts that never reached the rule. A tick that is not due returned above.
+            if self._tracking_windows >= self.config.learn_windows:
+                for channel in self.channels.values():
+                    channel.stats = VoxelStats()
+                self._settle_pending = False
         if not changed and not keyframe_due:
             return None
         if changed:

@@ -695,6 +695,125 @@ def test_coverage_and_pose_residual():
     assert len(memory.channels["mid360"].stats.keys) == 0  # a shifted window teaches the reference nothing
 
 
+def budget_memory(**changes):
+    """One reference window, then one tracking window of budget. The due tick is 3 s later, so the
+    window that spends the budget is not itself a map tick."""
+    values = dict(reference_windows=1, learn_windows=1, delta_period_s=3.0, keyframe_period_s=4.0,
+                  keyframe_delta_ratio=100.0)
+    values.update(changes)
+    return mid360_memory(None, state_dir=None, **values)
+
+
+def feed(memory, cloud, second):
+    if cloud is not None:
+        memory.add_points("mid360", cloud)
+    memory.close_window(stamp(second))
+    data = memory.map_update(stamp(second))
+    return None if data is None else MapBricks.from_cdr(data)
+
+
+def test_learning_budget_flushes_on_the_next_due_tick_then_freezes():
+    room, partial = partial_room()
+    memory = budget_memory()
+    opening = feed(memory, partial, 0)
+    assert opening.kind == MapKind.SNAPSHOT and opening.header.map_epoch == 1
+    assert len(memory.channels["mid360"].stats.keys) == 0
+    # The learning window is not due, so the new wall stays in the counts.
+    assert feed(memory, room, 1) is None and len(memory.channels["mid360"].stats.keys) > 0
+    assert feed(memory, room, 2) is None and len(memory.channels["mid360"].stats.keys) > 0
+    flushed = feed(memory, room, 3)
+    assert flushed.kind == MapKind.DELTA and flushed.header.map_epoch == 2 and flushed.base_epoch == 1
+    learned = memory.channels["mid360"].reference.to_bricks()
+    assert len(learned) > len(opening.bricks) and len(memory.channels["mid360"].stats.keys) == 0
+    key = feed(memory, room, 4)
+    assert key.kind == MapKind.SNAPSHOT and key.header.map_epoch == 2 and key.bricks == learned
+    assert feed(memory, room, 5) is None
+    again = feed(memory, room, 8)
+    assert again.kind == MapKind.SNAPSHOT and again.header.map_epoch == 2 and again.bricks == learned
+    box = scenes.box_shell((0.3, 1.2, 0.3))
+    memory.add_points("mid360", np.concatenate([room, box]))
+    events = memory.close_window(stamp(9))
+    assert any(e.kind == EventKind.APPEARED and np.all(np.abs(np.array(e.centroid) - [0.3, 1.2, 0.3]) <= 0.05)
+               for e in events)
+    assert memory.map_update(stamp(9)) is None
+    far = scenes.box_shell((8.0, 8.0, 0.5))
+    memory.add_points("mid360", np.concatenate([room, far]))
+    # The open box expires. The outside cluster is not a candidate and is not learned.
+    assert all(e.state != EventState.CANDIDATE for e in memory.close_window(stamp(10)))
+    frozen = feed(memory, room, 12)
+    assert frozen.kind == MapKind.SNAPSHOT and frozen.header.map_epoch == 2 and frozen.bricks == learned
+
+
+def test_an_empty_tracking_window_consumes_the_learn_budget():
+    room, partial = partial_room()
+    memory = budget_memory()
+    opening = feed(memory, partial, 0)
+    assert feed(memory, None, 1) is None and len(memory.channels["mid360"].stats.keys) == 0
+    memory.add_points("mid360", room)
+    assert memory.close_window(stamp(2)) == [] and len(memory.channels["mid360"].stats.keys) == 0
+    assert memory.map_update(stamp(3)) is None and memory.map_epoch == 1
+    assert memory.channels["mid360"].reference.to_bricks() == opening.bricks
+    key = feed(memory, room, 4)
+    assert key.kind == MapKind.SNAPSHOT and key.header.map_epoch == 1 and key.bricks == opening.bricks
+
+
+def test_a_pose_rejected_window_consumes_the_learn_budget():
+    room, partial = partial_room()
+    memory = budget_memory()
+    opening = feed(memory, partial, 0)
+    shifted = (partial + np.float32([0.1, 0.05, 0.1])).astype(np.float32)
+    assert feed(memory, shifted, 1) is None
+    assert memory.channels["mid360"].residual > memory.config.learn_max_offset_m
+    assert len(memory.channels["mid360"].stats.keys) == 0
+    memory.add_points("mid360", room)
+    # The shifted window's candidate expires. The aligned room teaches nothing.
+    assert all(e.state != EventState.CANDIDATE for e in memory.close_window(stamp(2)))
+    assert len(memory.channels["mid360"].stats.keys) == 0
+    assert memory.map_update(stamp(3)) is None and memory.map_epoch == 1
+    key = feed(memory, room, 4)
+    assert key.kind == MapKind.SNAPSHOT and key.header.map_epoch == 1 and key.bricks == opening.bricks
+
+
+def test_learn_windows_zero_drops_leftovers_and_keeps_known_space_events():
+    room, partial = partial_room()
+    memory = budget_memory(learn_windows=0)
+    opening = feed(memory, partial, 0)
+    assert len(memory.channels["mid360"].stats.keys) == 0
+    for second in range(1, 4):
+        memory.add_points("mid360", room)
+        assert memory.close_window(stamp(second)) == []
+        assert memory.map_update(stamp(second)) is None and memory.map_epoch == 1
+    assert memory.channels["mid360"].reference.to_bricks() == opening.bricks
+    box = scenes.box_shell((0.3, 1.2, 0.3))
+    memory.add_points("mid360", np.concatenate([room, box]))
+    events = memory.close_window(stamp(4))
+    assert any(e.kind == EventKind.APPEARED and np.all(np.abs(np.array(e.centroid) - [0.3, 1.2, 0.3]) <= 0.05)
+               for e in events)
+    sent = memory.map_update(stamp(4))
+    assert MapBricks.from_cdr(sent).kind == MapKind.SNAPSHOT
+    assert MapBricks.from_cdr(sent).header.map_epoch == 1 and MapBricks.from_cdr(sent).bricks == opening.bricks
+    far = scenes.box_shell((8.0, 8.0, 0.5))
+    memory.add_points("mid360", np.concatenate([room, far]))
+    assert all(e.state != EventState.CANDIDATE for e in memory.close_window(stamp(5)))
+    assert memory.channels["mid360"].reference.to_bricks() == opening.bricks
+
+
+def test_a_reload_with_learn_windows_zero_does_not_learn(tmp_path):
+    room, partial = partial_room()
+    memory = mid360_memory(tmp_path, reference_windows=1, learn_windows=0, delta_period_s=1.0, keyframe_period_s=100.0)
+    memory.add_points("mid360", partial)
+    assert memory.close_window(stamp(0)) == []
+    assert memory.state == MemoryState.TRACKING and memory.map_epoch == 1
+    bricks = memory.channels["mid360"].reference.to_bricks()
+    restarted = RoomMemory(memory.config, stamp(10))
+    opening = MapBricks.from_cdr(restarted.map_update(stamp(10)))
+    assert restarted.map_epoch == 2 and opening.header.map_epoch == 2 and opening.bricks == bricks
+    restarted.add_points("mid360", room)
+    assert restarted.close_window(stamp(11)) == []
+    assert restarted.map_update(stamp(11)) is None and restarted.map_epoch == 2
+    assert restarted.channels["mid360"].reference.to_bricks() == bricks
+
+
 def test_pose_offset_is_binary64():
     """Overlap counts 9, 10, 1 along x refine to -0.4 voxels: 0.020000000000000004 m at 5 cm, just
     above learn_max_offset_m (0.02), where float rounding would land just below it. The C++ port
@@ -710,6 +829,7 @@ def test_pose_offset_is_binary64():
     dict(occupied_min_hits=0), dict(free_min_seen=0), dict(occupied_min_ratio=1.5), dict(free_max_ratio=-0.1),
     dict(candidate_windows=0), dict(expire_windows=0), dict(delta_period_s=0), dict(keyframe_period_s=float("nan")),
     dict(keyframe_delta_ratio=-1), dict(map_sensor="jt128"), dict(learn_max_offset_m=-0.1), dict(near_range_m=-0.1),
+    dict(learn_windows=-1),
 ])
 def test_stream_config_rejections(changes):
     with pytest.raises(ValueError):

@@ -461,6 +461,7 @@ RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, const RayBac
     if (!(config_.near_range_m >= 0 && config_.near_range_m < 1e9)) {
         throw std::invalid_argument("near_range_m must be in [0, 1e9) m");
     }
+    if (config_.learn_windows < 0) throw std::invalid_argument("learn_windows must be >= 0");
     if (!(config_.delta_period_s > 0 && config_.delta_period_s < 1e9) ||
         !(config_.keyframe_period_s > 0 && config_.keyframe_period_s < 1e9) ||
         !(config_.keyframe_delta_ratio >= 0 && config_.keyframe_delta_ratio < 1e9)) {
@@ -622,6 +623,11 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
     std::vector<msg::ChangeEvent> events;
     bool dropped = false;
     const auto quota = static_cast<std::size_t>(config_.recent_windows);
+    // A window counts only when it enters already tracking. The window that crosses
+    // BUILDING → TRACKING is the reference, not part of the learning budget.
+    const bool tracking = state_ == msg::MemoryState::tracking;
+    if (tracking) ++tracking_windows_;
+    const bool learning = tracking && tracking_windows_ <= config_.learn_windows;
     for (Channel& channel : channels_) {
         const std::size_t frames = std::exchange(channel.frames, 0);
         std::vector<float> points = std::move(channel.points);
@@ -669,12 +675,13 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         // The rig-pose estimate uses this window alone, so a move shows in full at once.
         if (!channel.reference_index) channel.reference_index = std::make_shared<const Membership>(channel.reference.occupied);
         channel.residual = pose_offset(window.occupied, *channel.reference_index, config_.voxel_size);
-        // Voxels the reference has not settled keep counting, so new coverage joins it, unless
-        // the rig may have moved.
-        if (channel.residual && *channel.residual <= config_.learn_max_offset_m) {
+        // Voxels the reference has not settled keep counting, so new coverage joins it, until
+        // the learning budget is spent, and unless the rig may have moved.
+        if (learning && channel.residual && *channel.residual <= config_.learn_max_offset_m) {
             const VoxelLayer observed = VoxelLayer::observe(window, change_, backend_);
             channel.stats.add(set_difference(observed.occupied, channel.reference.known),
                               set_difference(observed.known, channel.reference.known));
+            settle_pending_ = true;
         }
         DiffOptions options;
         options.before_known = &channel.reference.known;
@@ -712,7 +719,19 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         std::all_of(channels_.begin(), channels_.end(), [&](const Channel& c) { return reference_ready(c); })) {
         state_ = msg::MemoryState::tracking;
         // From here on only the voxels the reference has not settled keep their counts.
+        // learn_windows 0 drops those leftovers: this run teaches the reference nothing.
         for (Channel& channel : channels_) channel.stats.erase(channel.reference.known);
+        if (config_.learn_windows == 0) {
+            for (Channel& channel : channels_) channel.stats = VoxelStats{};
+            settle_pending_ = false;
+        } else {
+            for (const Channel& channel : channels_) {
+                if (!channel.stats.keys.empty()) {
+                    settle_pending_ = true;
+                    break;
+                }
+            }
+        }
         ++map_epoch_;
         save(stamp);
     }
@@ -770,12 +789,20 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
     const bool keyframe_due = ns - last_keyframe_ns_ >= period_ns(config_.keyframe_period_s);
     if (!keyframe_due && ns - last_map_ns_ < period_ns(config_.delta_period_s)) return std::nullopt;
     bool changed = false;
-    for (Channel& channel : channels_) {
-        VoxelLayer fresh = channel.stats.settled(config_.settle_rule());
-        if (fresh.known.empty()) continue;
-        channel.stats.erase(fresh.known);
-        set_reference(channel, channel.reference.merge(fresh));
-        changed = true;
+    if (settle_pending_) {
+        for (Channel& channel : channels_) {
+            VoxelLayer fresh = channel.stats.settled(config_.settle_rule());
+            if (fresh.known.empty()) continue;
+            channel.stats.erase(fresh.known);
+            set_reference(channel, channel.reference.merge(fresh));
+            changed = true;
+        }
+        // The budget is spent: merge whatever just settled, then drop the rest, including
+        // counts that never reached the rule. A tick that is not due returned above.
+        if (tracking_windows_ >= config_.learn_windows) {
+            for (Channel& channel : channels_) channel.stats = VoxelStats{};
+            settle_pending_ = false;
+        }
     }
     if (!changed && !keyframe_due) return std::nullopt;
     if (changed) {

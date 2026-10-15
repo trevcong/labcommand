@@ -108,6 +108,37 @@ std::vector<std::pair<EventKind, EventState>> transitions(const std::vector<msg:
 
 Keys occupied_keys(const Cloud& cloud) { return occupancy_map(cloud, Config()).occupied; }
 
+Cloud partial_shell(const Cloud& room) {
+    Cloud partial;
+    for (std::size_t n = 0; n < room.size(); n += 3) {
+        if (room[n] < 1.5f) {
+            partial.insert(partial.end(), room.begin() + static_cast<std::ptrdiff_t>(n),
+                           room.begin() + static_cast<std::ptrdiff_t>(n) + 3);
+        }
+    }
+    return partial;
+}
+
+// One reference window, then one tracking window of budget. The due tick is 3 s later, so the
+// window that spends the budget is not itself a map tick.
+MemoryConfig budget_config(std::int64_t learn_windows = 1) {
+    MemoryConfig config = mid360_config(std::nullopt);
+    config.reference_windows = 1;
+    config.learn_windows = learn_windows;
+    config.delta_period_s = 3.0;
+    config.keyframe_period_s = 4.0;
+    config.keyframe_delta_ratio = 100.0;
+    return config;
+}
+
+std::optional<msg::MapBricks> feed(RoomMemory& memory, const Cloud* cloud, std::int64_t second) {
+    if (cloud != nullptr) memory.add_points("mid360", *cloud);
+    memory.close_window(stamp(second));
+    const auto bytes = memory.map_update(stamp(second));
+    if (!bytes) return std::nullopt;
+    return msg::MapBricks::from_cdr(*bytes);
+}
+
 }  // namespace
 
 TEST(bricks_follow_the_protocol_bit_layout) {
@@ -1007,6 +1038,145 @@ TEST(coverage_and_pose_residual) {
 // Overlap counts 9, 10, 1 along x refine to -0.4 voxels: 0.020000000000000004 m at 5 cm, just
 // above learn_max_offset_m (0.02), where float rounding would land just below it and learn. The
 // Python oracle pins the same value.
+TEST(learning_budget_flushes_on_the_next_due_tick_then_freezes) {
+    const Cloud room = scenes::room_shell();
+    const Cloud partial = partial_shell(room);
+    RoomMemory memory(budget_config(), kStart);
+    const auto opening = feed(memory, &partial, 0);
+    CHECK(opening && opening->kind == msg::MapKind::snapshot && opening->header.map_epoch == 1);
+    CHECK(memory.channel("mid360").stats.keys.empty());
+    // The learning window is not due, so the new wall stays in the counts.
+    CHECK(!feed(memory, &room, 1) && !memory.channel("mid360").stats.keys.empty());
+    CHECK(!feed(memory, &room, 2) && !memory.channel("mid360").stats.keys.empty());
+    const auto flushed = feed(memory, &room, 3);
+    CHECK(flushed && flushed->kind == msg::MapKind::delta && flushed->header.map_epoch == 2);
+    CHECK(flushed->base_epoch == 1);
+    const auto learned = memory.channel("mid360").reference.to_bricks();
+    CHECK(learned.size() > opening->bricks.size() && memory.channel("mid360").stats.keys.empty());
+    const auto key = feed(memory, &room, 4);
+    CHECK(key && key->kind == msg::MapKind::snapshot && key->header.map_epoch == 2 && key->bricks == learned);
+    CHECK(!feed(memory, &room, 5));
+    const auto again = feed(memory, &room, 8);
+    CHECK(again && again->kind == msg::MapKind::snapshot && again->header.map_epoch == 2 && again->bricks == learned);
+    const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
+    const Cloud boxed = scenes::concat({&room, &box});
+    memory.add_points("mid360", boxed);
+    const auto events = memory.close_window(stamp(9));
+    CHECK(std::any_of(events.begin(), events.end(), [](const msg::ChangeEvent& event) {
+        return event.kind == EventKind::appeared && std::fabs(event.centroid[0] - 0.3) <= 0.05 &&
+               std::fabs(event.centroid[1] - 1.2) <= 0.05 && std::fabs(event.centroid[2] - 0.3) <= 0.05;
+    }));
+    CHECK(!memory.map_update(stamp(9)));
+    const Cloud far_box = scenes::box_shell({8.0, 8.0, 0.5});
+    const Cloud far = scenes::concat({&room, &far_box});
+    memory.add_points("mid360", far);
+    // The open box expires. The outside cluster is not a candidate and is not learned.
+    const auto far_events = memory.close_window(stamp(10));
+    CHECK(std::none_of(far_events.begin(), far_events.end(),
+                       [](const msg::ChangeEvent& event) { return event.state == EventState::candidate; }));
+    const auto frozen = feed(memory, &room, 12);
+    CHECK(frozen && frozen->kind == msg::MapKind::snapshot && frozen->header.map_epoch == 2 &&
+          frozen->bricks == learned);
+}
+
+TEST(an_empty_tracking_window_consumes_the_learn_budget) {
+    const Cloud room = scenes::room_shell();
+    const Cloud partial = partial_shell(room);
+    RoomMemory memory(budget_config(), kStart);
+    const auto opening = feed(memory, &partial, 0);
+    CHECK(opening && !feed(memory, nullptr, 1) && memory.channel("mid360").stats.keys.empty());
+    memory.add_points("mid360", room);
+    CHECK(memory.close_window(stamp(2)).empty() && memory.channel("mid360").stats.keys.empty());
+    CHECK(!memory.map_update(stamp(3)) && memory.map_epoch() == 1);
+    CHECK(memory.channel("mid360").reference.to_bricks() == opening->bricks);
+    const auto key = feed(memory, &room, 4);
+    CHECK(key && key->kind == msg::MapKind::snapshot && key->header.map_epoch == 1 && key->bricks == opening->bricks);
+}
+
+TEST(a_pose_rejected_window_consumes_the_learn_budget) {
+    const Cloud room = scenes::room_shell();
+    const Cloud partial = partial_shell(room);
+    RoomMemory memory(budget_config(), kStart);
+    const auto opening = feed(memory, &partial, 0);
+    Cloud shifted = partial;
+    for (std::size_t n = 0; n < shifted.size(); n += 3) {
+        shifted[n] += 0.1f;
+        shifted[n + 1] += 0.05f;
+        shifted[n + 2] += 0.1f;
+    }
+    CHECK(opening && !feed(memory, &shifted, 1));
+    const auto residual = memory.channel("mid360").residual;
+    CHECK(residual && *residual > memory.config().learn_max_offset_m);
+    CHECK(memory.channel("mid360").stats.keys.empty());
+    memory.add_points("mid360", room);
+    // The shifted window's candidate expires. The aligned room teaches nothing.
+    const auto settled = memory.close_window(stamp(2));
+    CHECK(std::none_of(settled.begin(), settled.end(),
+                       [](const msg::ChangeEvent& event) { return event.state == EventState::candidate; }));
+    CHECK(memory.channel("mid360").stats.keys.empty());
+    CHECK(!memory.map_update(stamp(3)) && memory.map_epoch() == 1);
+    const auto key = feed(memory, &room, 4);
+    CHECK(key && key->kind == msg::MapKind::snapshot && key->header.map_epoch == 1 && key->bricks == opening->bricks);
+}
+
+TEST(learn_windows_zero_drops_leftovers_and_keeps_known_space_events) {
+    const Cloud room = scenes::room_shell();
+    const Cloud partial = partial_shell(room);
+    RoomMemory memory(budget_config(0), kStart);
+    const auto opening = feed(memory, &partial, 0);
+    CHECK(opening && memory.channel("mid360").stats.keys.empty());
+    for (std::int64_t second = 1; second < 4; ++second) {
+        memory.add_points("mid360", room);
+        CHECK(memory.close_window(stamp(second)).empty());
+        CHECK(!memory.map_update(stamp(second)) && memory.map_epoch() == 1);
+    }
+    CHECK(memory.channel("mid360").reference.to_bricks() == opening->bricks);
+    const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
+    const Cloud boxed = scenes::concat({&room, &box});
+    memory.add_points("mid360", boxed);
+    const auto events = memory.close_window(stamp(4));
+    CHECK(std::any_of(events.begin(), events.end(), [](const msg::ChangeEvent& event) {
+        return event.kind == EventKind::appeared && std::fabs(event.centroid[0] - 0.3) <= 0.05 &&
+               std::fabs(event.centroid[1] - 1.2) <= 0.05 && std::fabs(event.centroid[2] - 0.3) <= 0.05;
+    }));
+    const msg::MapBricks sent = msg::MapBricks::from_cdr(*memory.map_update(stamp(4)));
+    CHECK(sent.kind == msg::MapKind::snapshot && sent.header.map_epoch == 1 && sent.bricks == opening->bricks);
+    const Cloud far_box = scenes::box_shell({8.0, 8.0, 0.5});
+    const Cloud far = scenes::concat({&room, &far_box});
+    memory.add_points("mid360", far);
+    const auto far_events = memory.close_window(stamp(5));
+    CHECK(std::none_of(far_events.begin(), far_events.end(),
+                       [](const msg::ChangeEvent& event) { return event.state == EventState::candidate; }));
+    CHECK(memory.channel("mid360").reference.to_bricks() == opening->bricks);
+}
+
+TEST(a_reload_with_learn_windows_zero_does_not_learn) {
+    TempDir dir;
+    MemoryConfig config = mid360_config(dir.path.string());
+    config.reference_windows = 1;
+    config.learn_windows = 0;
+    config.delta_period_s = 1.0;
+    config.keyframe_period_s = 100.0;
+    const Cloud room = scenes::room_shell();
+    const Cloud partial = partial_shell(room);
+    RoomMemory memory(config, kStart);
+    memory.add_points("mid360", partial);
+    CHECK(memory.close_window(stamp(0)).empty());
+    CHECK(memory.state() == MemoryState::tracking);
+    CHECK_EQ(memory.map_epoch(), std::uint64_t{1});
+    const auto bricks = memory.channel("mid360").reference.to_bricks();
+    RoomMemory restarted(config, stamp(10));
+    CHECK(restarted.state() == MemoryState::tracking);
+    CHECK_EQ(restarted.map_epoch(), std::uint64_t{2});
+    const msg::MapBricks opening = msg::MapBricks::from_cdr(*restarted.map_update(stamp(10)));
+    CHECK(opening.header.map_epoch == 2 && opening.bricks == bricks);
+    restarted.add_points("mid360", room);
+    CHECK(restarted.close_window(stamp(11)).empty());
+    CHECK(!restarted.map_update(stamp(11)));
+    CHECK_EQ(restarted.map_epoch(), std::uint64_t{2});
+    CHECK(restarted.channel("mid360").reference.to_bricks() == bricks);
+}
+
 TEST(pose_offset_is_binary64) {
     Keys recent, reference;
     for (std::int64_t m = 0; m < 10; ++m) {
@@ -1029,7 +1199,8 @@ TEST(stream_config_rejections) {
              [](MemoryConfig& c) { c.candidate_windows = 0; }, [](MemoryConfig& c) { c.expire_windows = 0; },
              [](MemoryConfig& c) { c.delta_period_s = 0; }, [](MemoryConfig& c) { c.keyframe_period_s = NAN; },
              [](MemoryConfig& c) { c.keyframe_delta_ratio = -1; }, [](MemoryConfig& c) { c.map_sensor = "jt128"; },
-             [](MemoryConfig& c) { c.learn_max_offset_m = -0.1; }, [](MemoryConfig& c) { c.near_range_m = -0.1; }}) {
+             [](MemoryConfig& c) { c.learn_max_offset_m = -0.1; }, [](MemoryConfig& c) { c.near_range_m = -0.1; },
+             [](MemoryConfig& c) { c.learn_windows = -1; }}) {
         MemoryConfig config = mid360_config(std::nullopt);
         edit(config);
         CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart));

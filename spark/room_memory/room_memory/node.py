@@ -62,6 +62,7 @@ class RoomMemoryNode(Node):
             "expire_windows": defaults.expire_windows,
             "learn_max_offset_m": defaults.learn_max_offset_m,
             "near_range_m": defaults.near_range_m,
+            "learn_windows": defaults.learn_windows,
             "map_sensor": defaults.map_sensor,
             "delta_period_s": defaults.delta_period_s,
             "keyframe_period_s": defaults.keyframe_period_s,

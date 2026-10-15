@@ -85,6 +85,7 @@ public:
         config.expire_windows = declare_parameter<std::int64_t>("expire_windows", defaults.expire_windows);
         config.learn_max_offset_m = declare_parameter<double>("learn_max_offset_m", defaults.learn_max_offset_m);
         config.near_range_m = declare_parameter<double>("near_range_m", defaults.near_range_m);
+        config.learn_windows = declare_parameter<std::int64_t>("learn_windows", defaults.learn_windows);
         config.map_sensor = declare_parameter<std::string>("map_sensor", defaults.map_sensor);
         config.delta_period_s = declare_parameter<double>("delta_period_s", defaults.delta_period_s);
         config.keyframe_period_s = declare_parameter<double>("keyframe_period_s", defaults.keyframe_period_s);

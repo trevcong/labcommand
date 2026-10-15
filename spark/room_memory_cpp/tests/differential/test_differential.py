@@ -20,7 +20,9 @@ import goldens
 import replay
 import scenes
 from room_memory import offline
-from room_memory.messages import ChangeEvent, Header, MapBricks, MapKind, RequestSync, SyncTopic, Time
+from room_memory.messages import (
+    ChangeEvent, EventKind, EventState, Header, MapBricks, MapKind, RequestSync, SyncTopic, Time,
+)
 
 OFFLINE = os.environ.get("ROOM_MEMORY_OFFLINE")
 REPLAY = os.environ.get("ROOM_MEMORY_REPLAY")
@@ -594,6 +596,109 @@ def test_settled_reference_map_stream_and_sync(tmp_path, variant):
     answers = [line for line in out.splitlines() if line.startswith("sync ")]
     # Replays: the map since the first message, the events since the first one and since the latest (nothing missed).
     assert answers[4] == "sync 0" and answers[-2:] == ["sync 0", "sync invalid"] and answers[0] == "sync 1"
+
+
+def _steps(out):
+    """Each close, the events it emitted, and the map line that follows it."""
+    steps = []
+    current = None
+    for line in out.splitlines():
+        if line.startswith("close "):
+            current = {"events": [], "map": None}
+            steps.append(current)
+        elif line.startswith("event ") and current is not None:
+            current["events"].append(ChangeEvent.from_cdr(bytes.fromhex(line.split()[1])))
+        elif line.startswith("map ") and current is not None:
+            payload = line.split()[1]
+            current["map"] = None if payload == "none" else MapBricks.from_cdr(bytes.fromhex(payload))
+    return steps
+
+
+def _both_points(paths, name):
+    return [f"points mid360 {paths[name]}", f"points jt128 {paths[name]}"]
+
+
+def test_learn_budget_freezes_both_sensors_and_keeps_keyframes(tmp_path):
+    """Budget 1, due tick 3 s later: the new wall is published on that tick, then keyframes repeat it."""
+    room = scenes.room_shell()
+    partial = room[room[:, 0] < 1.5]
+    paths = {
+        "partial": floats(tmp_path, "partial", partial),
+        "room": floats(tmp_path, "room", room),
+        "boxed": floats(tmp_path, "boxed", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))])),
+        "far": floats(tmp_path, "far", np.concatenate([room, scenes.box_shell((8.0, 8.0, 0.5))])),
+    }
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360,jt128 max_range=none reference_windows=1 learn_windows=1 "
+             "delta_period_s=3 keyframe_period_s=4 keyframe_delta_ratio=100 state_dir={state}",
+             "start 1760400000 0"]
+    for second, name in ((0, "partial"), (1, "room"), (2, "room"), (3, "room"), (4, "room"), (8, "room"),
+                         (9, "boxed"), (10, "far"), (12, "room")):
+        stamp = f"{1760400000 + second} 0"
+        lines += _both_points(paths, name) + [f"close {stamp}", f"map {stamp}"]
+    steps = _steps(run_both(tmp_path, "\n".join(lines)))
+    assert steps[0]["map"].kind == MapKind.SNAPSHOT and steps[0]["map"].header.map_epoch == 1
+    assert steps[1]["map"] is None and steps[2]["map"] is None
+    assert steps[3]["map"].kind == MapKind.DELTA and steps[3]["map"].header.map_epoch == 2
+    learned = steps[4]["map"]
+    assert learned.kind == MapKind.SNAPSHOT and learned.header.map_epoch == 2
+    assert len(learned.bricks) > len(steps[0]["map"].bricks)
+    assert steps[5]["map"].kind == MapKind.SNAPSHOT and steps[5]["map"].bricks == learned.bricks
+    assert steps[5]["map"].header.map_epoch == 2
+    assert steps[6]["map"] is None and any(
+        event.kind == EventKind.APPEARED and event.state == EventState.CANDIDATE for event in steps[6]["events"])
+    # The open box expires. The outside cluster starts no candidate.
+    assert steps[7]["map"] is None and all(event.state != EventState.CANDIDATE for event in steps[7]["events"])
+    assert steps[8]["map"].kind == MapKind.SNAPSHOT and steps[8]["map"].header.map_epoch == 2
+    assert steps[8]["map"].bricks == learned.bricks
+
+
+def test_empty_and_shifted_windows_spend_the_learn_budget(tmp_path):
+    room = scenes.room_shell()
+    partial = room[room[:, 0] < 1.5]
+    shifted = (partial + np.float32([0.1, 0.05, 0.1])).astype(np.float32)
+    paths = {"partial": floats(tmp_path, "partial", partial), "room": floats(tmp_path, "room", room),
+             "shifted": floats(tmp_path, "shifted", shifted)}
+    config = (f"config {SINGLE_WINDOW} sensors=mid360,jt128 max_range=none reference_windows=1 learn_windows=1 "
+              "delta_period_s=3 keyframe_period_s=4 keyframe_delta_ratio=100 state_dir={state}")
+
+    def script(middle):
+        lines = [config, "start 1760400000 0"]
+        for second, name in [(0, "partial"), *middle, (3, "room"), (4, "room")]:
+            stamp = f"{1760400000 + second} 0"
+            if name is not None:
+                lines += _both_points(paths, name)
+            lines += [f"close {stamp}", f"map {stamp}"]
+        return "\n".join(lines)
+
+    for name, middle in (("empty", [(1, None)]), ("shifted", [(1, "shifted")])):
+        side = tmp_path / name
+        side.mkdir()
+        steps = _steps(run_both(side, script(middle)))
+        opening = steps[0]["map"]
+        assert opening.kind == MapKind.SNAPSHOT and opening.header.map_epoch == 1
+        assert steps[1]["map"] is None and steps[2]["map"] is None
+        key = steps[3]["map"]
+        assert key.kind == MapKind.SNAPSHOT and key.header.map_epoch == 1 and key.bricks == opening.bricks
+
+
+def test_learn_windows_zero_reloads_without_learning(tmp_path):
+    room = scenes.room_shell()
+    partial = room[room[:, 0] < 1.5]
+    paths = {"partial": floats(tmp_path, "partial", partial), "room": floats(tmp_path, "room", room)}
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360,jt128 max_range=none reference_windows=1 learn_windows=0 "
+             "delta_period_s=1 keyframe_period_s=100 state_dir={state}", "start 1760400000 0"]
+    lines += _both_points(paths, "partial") + ["close 1760400000 0", "map 1760400000 0",
+                                                "config state_dir={state}", "start 1760400010 0", "map 1760400010 0"]
+    lines += _both_points(paths, "room") + ["close 1760400011 0", "map 1760400011 0"]
+    out = run_both(tmp_path, "\n".join(lines))
+    assert "init TRACKING 2" in out
+    maps = [None if line.split()[1] == "none" else MapBricks.from_cdr(bytes.fromhex(line.split()[1]))
+            for line in out.splitlines() if line.startswith("map ")]
+    assert maps[0].kind == MapKind.SNAPSHOT and maps[0].header.map_epoch == 1
+    assert maps[1].header.map_epoch == 2 and maps[1].bricks == maps[0].bricks
+    assert maps[2] is None
+    closes = [line.split() for line in out.splitlines() if line.startswith("close ")]
+    assert closes[-1][1] == "0" and closes[-1][3] == "2"
 
 
 EXCERPT = goldens.HERE.parents[1] / "room_memory_cpp" / "tests" / "fixtures" / "static5m-mid360-excerpt.mcap"

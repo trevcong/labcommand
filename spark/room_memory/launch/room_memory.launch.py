@@ -33,6 +33,7 @@ ARGUMENTS = {
     "expire_windows": ("3", int),
     "learn_max_offset_m": ("0.02", float),
     "near_range_m": ("2.0", float),
+    "learn_windows": ("30", int),
     "map_sensor": ("", str),
     "delta_period_s": ("5.0", float),
     "keyframe_period_s": ("60.0", float),
