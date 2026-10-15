@@ -13,11 +13,13 @@ import pytest
 from room_memory import messages as m
 
 HAND = pathlib.Path(__file__).resolve().parent / "fixtures" / "hand"
+# The Swift suite's copy of the hand goldens (absent in the image).
+SWIFT_HAND = pathlib.Path(__file__).resolve().parents[3] / "Tests" / "Fixtures" / "room" / "golden" / "hand"
 T10 = m.Time(1760400010, 250000000)
 
 
-def hexfile(name):
-    text = (HAND / name).read_text()
+def hexfile(name, directory=HAND):
+    text = (directory / name).read_text()
     return bytes.fromhex(" ".join(line.split("#", 1)[0] for line in text.splitlines()))
 
 
@@ -43,7 +45,7 @@ def snapshot_zlib():
 
 def memory_status():
     return m.MemoryStatus(
-        head("lab-a", 42, 7, m.Time(1760400000, 500000000)), m.MemoryState.TRACKING, 3200, 2, 0.75, None, 1.0, 10, None, 3,
+        head("lab-a", 42, 7, m.Time(1760400000, 500000000)), m.MemoryState.TRACKING, 3200, 2, 0.75, None, 1.0, 10, None, 3, 12,
     )
 
 
@@ -103,6 +105,13 @@ def test_provenance_hashes():
     assert sorted(table) == sorted(path.name for path in HAND.glob("*.hex")) == sorted(GOLDENS)
     for name, digest in table.items():
         assert hashlib.sha256((HAND / name).read_bytes()).hexdigest() == digest, name
+
+
+@pytest.mark.skipif(not SWIFT_HAND.is_dir(), reason=f"Swift hand goldens not found at {SWIFT_HAND}")
+def test_hand_goldens_match_the_swift_copies():
+    for name in GOLDENS:
+        assert hexfile(name, SWIFT_HAND) == hexfile(name), name
+    assert memory_status().to_cdr() == hexfile("memory_status_le.hex", SWIFT_HAND)
 
 
 @pytest.mark.parametrize("name", sorted(GOLDENS))
@@ -251,10 +260,20 @@ def test_change_event_partial_nan_from_centroid_is_invalid():
     lambda s: replace(s, window_s=0.0),
     lambda s: replace(s, mid360_hz=m.HZ_UNAVAILABLE),
     lambda s: replace(s, state=9),
+    lambda s: replace(s, events_seq=m.EVENTS_SEQ_NONE),
 ])
 def test_memory_status_rejections(change):
     with pytest.raises(m.Invalid):
         change(memory_status()).to_cdr()
+
+
+def test_memory_status_events_seq_none():
+    data = bytearray(hexfile("memory_status_le.hex"))
+    assert len(data) == 4 + 80
+    data[4 + 72:4 + 80] = b"\xff" * 8
+    expected = replace(memory_status(), events_seq=None)
+    assert m.MemoryStatus.from_cdr(bytes(data)) == expected
+    assert expected.to_cdr() == bytes(data)
 
 
 def test_request_sync_rules():

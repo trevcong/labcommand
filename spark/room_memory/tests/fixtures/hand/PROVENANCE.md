@@ -1,6 +1,6 @@
 # Hand CDR goldens: provenance
 
-Copied byte for byte from `Tests/Fixtures/room/golden/hand/` on the Phase 0 branch (`labcommand-memory` worktree), commit `95f49f2` ("Apply D5/D9/D19: keep all-free bricks, header compression (zlib default), RequestSync message"). They were derived by hand from `ros/labcommand_msgs/msg/*.msg` and `docs/ROOM-MEMORY-PROTOCOL.md` §1; every span is annotated. Format: whitespace-separated hex bytes, `#` starts a comment.
+Copied byte for byte from `Tests/Fixtures/room/golden/hand/` on the Phase 0 branch (`labcommand-memory` worktree), commit `95f49f2` ("Apply D5/D9/D19: keep all-free bricks, header compression (zlib default), RequestSync message"). They were derived by hand from `ros/labcommand_msgs/msg/*.msg` and `docs/ROOM-MEMORY-PROTOCOL.md` §1; every span is annotated. `memory_status_le.hex` was refreshed from `phase3-design` (PR #13) commit `d751db6` for `events_seq`. Format: whitespace-separated hex bytes, `#` starts a comment.
 
 | file | sha256 |
 |---|---|
@@ -12,7 +12,7 @@ Copied byte for byte from `Tests/Fixtures/room/golden/hand/` on the Phase 0 bran
 | `map_bricks_delta_le.hex` | `1b48dafbd91316e4a0386fe9202d3f80fd2721177ba3635edd191034e7c6eb3a` |
 | `map_bricks_delta_lzfse_le.hex` | `ddceca55f37a2c65263f44496138e5a062be4c5a04f3dbad4356799d63839280` |
 | `map_bricks_snapshot_zlib_le.hex` | `9b80f3d96469b5a4d85f39ba4e42022d055a00eac86ce94cff8b098472e85f73` |
-| `memory_status_le.hex` | `5c61b83629521b66129c96c9b9e8957901d7f05c863353cd19d32643ab5738f0` |
+| `memory_status_le.hex` | `39d08f9bed9a80d4cabffcd034307a4e7909de30ee8a925ea245d5783c8246b5` |
 | `request_sync_events_none_le.hex` | `fdd4ee58eb7753752a11a66079f9f36f4e67c292aae742b697b406c454e3762b` |
 | `request_sync_map_be.hex` | `a301146eb9f9cf0512d1c679fb270a1c6ec95d88319ad87dc9b13c594b0503a2` |
 | `request_sync_map_le.hex` | `8d1da54561d93a617fbaf87b5cc450cd47763a765dcb6a8ad191f467d9a7664f` |

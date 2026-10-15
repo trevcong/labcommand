@@ -658,6 +658,7 @@ void MemoryStatus::validate() const {
     if (mid360_hz) require_int(*mid360_hz, 0, kHzUnavailable - 1, context + ": mid360_hz (65535 is the unavailable sentinel)");
     if (jt128_hz) require_int(*jt128_hz, 0, kHzUnavailable - 1, context + ": jt128_hz (65535 is the unavailable sentinel)");
     require_int(dropped_windows, 0, (std::int64_t{1} << 32) - 1, context + ": dropped_windows");
+    if (events_seq == kEventsSeqNone) throw Invalid(context + ": events_seq (2^64 - 1 is EVENTS_SEQ_NONE; use nullopt)");
 }
 
 Bytes MemoryStatus::to_cdr() const {
@@ -673,6 +674,7 @@ Bytes MemoryStatus::to_cdr() const {
     writer.u16(static_cast<std::uint64_t>(mid360_hz.value_or(kHzUnavailable)));
     writer.u16(static_cast<std::uint64_t>(jt128_hz.value_or(kHzUnavailable)));
     writer.u32(static_cast<std::uint64_t>(dropped_windows));
+    writer.u64(events_seq.value_or(kEventsSeqNone));
     return writer.take();
 }
 
@@ -691,6 +693,8 @@ MemoryStatus MemoryStatus::from_cdr(std::span<const std::uint8_t> data) {
         if (mid != kHzUnavailable) s.mid360_hz = mid;
         if (jt != kHzUnavailable) s.jt128_hz = jt;
         s.dropped_windows = reader.u32("dropped_windows");
+        const std::uint64_t events_seq = reader.u64("events_seq");
+        if (events_seq != kEventsSeqNone) s.events_seq = events_seq;
         s.validate();
         return s;
     });

@@ -29,6 +29,7 @@ inline constexpr std::size_t kMaxPayloadBytes = std::size_t{16} << 20;
 inline constexpr std::size_t kMaxTrailingPadding = 3;
 inline constexpr std::int64_t kHzUnavailable = 0xFFFF;
 inline constexpr std::uint64_t kSinceNone = ~std::uint64_t{0};
+inline constexpr std::uint64_t kEventsSeqNone = ~std::uint64_t{0};
 inline constexpr std::int64_t kSensorMid360 = 1;
 inline constexpr std::int64_t kSensorJT128 = 2;
 inline constexpr std::int64_t kSensorsAll = kSensorMid360 | kSensorJT128;
@@ -154,6 +155,7 @@ struct MemoryStatus {
     std::optional<std::int64_t> mid360_hz;
     std::optional<std::int64_t> jt128_hz;
     std::int64_t dropped_windows = 0;
+    std::optional<std::uint64_t> events_seq;  // seq of the newest live events message; empty before the first
     friend bool operator==(const MemoryStatus&, const MemoryStatus&) = default;
 
     void validate() const;

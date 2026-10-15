@@ -24,6 +24,7 @@ target_link_libraries(room_memory_test_support PUBLIC room_memory_offline_cli)
 target_include_directories(room_memory_test_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(room_memory_test_support PUBLIC
   ROOM_MEMORY_FIXTURES="${ROOM_MEMORY_FIXTURES}"
+  ROOM_MEMORY_SWIFT_HAND="${REPO_ROOT}/Tests/Fixtures/room/golden/hand"
   ROOM_MEMORY_CD_FIXTURES="${ROOM_MEMORY_CD_FIXTURES}"
   ROOM_MEMORY_SNAPSHOTS="${ROOM_MEMORY_SNAPSHOTS}"
   ROOM_MEMORY_PHASE0_FIXTURES="${ROOM_MEMORY_PHASE0_FIXTURES}"

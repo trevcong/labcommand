@@ -823,6 +823,7 @@ msg::MemoryStatus RoomMemory::status(const msg::Time& stamp, double period_s) {
     message.mid360_hz = hz[0];
     message.jt128_hz = hz[1];
     message.dropped_windows = dropped_windows_;
+    if (event_seq_) message.events_seq = event_seq_ - 1;
     return message;
 }
 

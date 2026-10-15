@@ -336,6 +336,7 @@ extension RoomMemory.MemoryStatus {
         writer.u16(mid360Hz ?? RoomCDR.hzUnavailable)
         writer.u16(jt128Hz ?? RoomCDR.hzUnavailable)
         writer.u32(droppedWindows)
+        writer.u64(eventsSeq ?? Self.eventsSeqNone)
         return writer.data
     }
 
@@ -355,6 +356,8 @@ extension RoomMemory.MemoryStatus {
             let window = try reader.f32("window_s")
             let mid360Hz = try reader.u16("per_sensor_hz[0]")
             let jt128Hz = try reader.u16("per_sensor_hz[1]")
+            let droppedWindows = try reader.u32("dropped_windows")
+            let eventsSeq = try reader.u64("events_seq")
             let status = RoomMemory.MemoryStatus(
                 header: header,
                 state: state,
@@ -365,7 +368,8 @@ extension RoomMemory.MemoryStatus {
                 windowS: window.isNaN ? nil : window,
                 mid360Hz: mid360Hz == RoomCDR.hzUnavailable ? nil : mid360Hz,
                 jt128Hz: jt128Hz == RoomCDR.hzUnavailable ? nil : jt128Hz,
-                droppedWindows: try reader.u32("dropped_windows")
+                droppedWindows: droppedWindows,
+                eventsSeq: eventsSeq == Self.eventsSeqNone ? nil : eventsSeq
             )
             try status.validate()
             return status
@@ -384,6 +388,9 @@ extension RoomMemory.MemoryStatus {
         }
         if mid360Hz == RoomCDR.hzUnavailable || jt128Hz == RoomCDR.hzUnavailable {
             throw RoomMemoryCDRError.invalid("\(context): \(RoomCDR.hzUnavailable) Hz is the unavailable sentinel; use nil")
+        }
+        if eventsSeq == Self.eventsSeqNone {
+            throw RoomMemoryCDRError.invalid("\(context): \(Self.eventsSeqNone) is the EVENTS_SEQ_NONE sentinel; use nil")
         }
     }
 }

@@ -817,7 +817,8 @@ class RoomMemory:
 
         DEGRADED while a configured sensor measured 0 Hz or the last window was dropped.
         ``n_bricks`` and ``coverage_known_frac`` describe the map sensor's reference;
-        ``pose_residual_m`` is the largest per-sensor residual of the last tracking windows.
+        ``pose_residual_m`` is the largest per-sensor residual of the last tracking windows;
+        ``events_seq`` is the seq of the newest event message, None before the first.
         """
         hz = [None, None]
         for channel in self.channels.values():
@@ -840,6 +841,7 @@ class RoomMemory:
             mid360_hz=hz[0],
             jt128_hz=hz[1],
             dropped_windows=self.dropped_windows,
+            events_seq=self.event_seq - 1 if self.event_seq else None,
         )
         self.status_seq += 1
         return message

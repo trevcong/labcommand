@@ -128,6 +128,7 @@ def test_reference_build_then_tracking_with_unknown_back_face(tmp_path):
     status = memory.status(stamp(0), 1.0)
     assert status.state == MemoryState.DEGRADED and status.header.map_epoch == 0 and status.mid360_hz == 0
     assert status.jt128_hz is None and status.pose_residual_m is None and status.coverage_known_frac is None
+    assert status.events_seq is None
     memory.add_points("mid360", before)
     assert memory.status(stamp(0), 1.0).state == MemoryState.BUILDING
     second = build_reference(memory, before)
@@ -157,6 +158,7 @@ def test_reference_build_then_tracking_with_unknown_back_face(tmp_path):
     assert memory.close_window(stamp(second + 1)) == []
     status = memory.status(stamp(second + 1), 2.0)
     assert status.state == MemoryState.TRACKING and status.n_open_events == 3 and status.mid360_hz == 1
+    assert status.events_seq == events[-1].header.seq == 2
     assert status.n_bricks == len(memory.channels["mid360"].reference.to_bricks())
     assert MemoryStatus.from_cdr(status.to_cdr()) == status
 
@@ -165,7 +167,8 @@ def test_reference_build_then_tracking_with_unknown_back_face(tmp_path):
     assert [e.state for e in expired] == [EventState.EXPIRED] * 3
     assert sorted(e.event_id for e in expired) == sorted(e.event_id for e in events)
     assert all(e.last_seen == stamp(second + 1) for e in expired)
-    assert memory.status(stamp(second + 2), 1.0).n_open_events == 0
+    status = memory.status(stamp(second + 2), 1.0)
+    assert status.n_open_events == 0 and status.events_seq == expired[-1].header.seq == 5
 
 
 def test_new_coverage_is_not_an_appearance(tmp_path):

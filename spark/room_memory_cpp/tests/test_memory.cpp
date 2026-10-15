@@ -182,7 +182,7 @@ TEST(reference_build_then_tracking_with_unknown_back_face) {
     RoomMemory memory(config, kStart);
     msg::MemoryStatus status = memory.status(stamp(0), 1.0);
     CHECK(status.state == MemoryState::degraded && status.header.map_epoch == 0 && status.mid360_hz == 0);
-    CHECK(!status.jt128_hz && !status.pose_residual_m && !status.coverage_known_frac);
+    CHECK(!status.jt128_hz && !status.pose_residual_m && !status.coverage_known_frac && !status.events_seq);
     memory.add_points("mid360", board.before);
     CHECK(memory.status(stamp(0), 1.0).state == MemoryState::building);
     const std::int64_t second = build_reference(memory, board.before);
@@ -211,6 +211,7 @@ TEST(reference_build_then_tracking_with_unknown_back_face) {
     CHECK(memory.close_window(stamp(second + 1)).empty());
     status = memory.status(stamp(second + 1), 2.0);
     CHECK(status.state == MemoryState::tracking && status.n_open_events == 3 && status.mid360_hz == 1);
+    CHECK(status.events_seq == events.back().header.seq && status.events_seq == std::uint64_t{2});
     CHECK_EQ(status.n_bricks, static_cast<std::int64_t>(memory.channel("mid360").reference.to_bricks().size()));
     CHECK(msg::MemoryStatus::from_cdr(status.to_cdr()) == status);
 
@@ -224,7 +225,9 @@ TEST(reference_build_then_tracking_with_unknown_back_face) {
     std::sort(a.begin(), a.end());
     std::sort(b.begin(), b.end());
     CHECK(a == b);
-    CHECK_EQ(memory.status(stamp(second + 2), 1.0).n_open_events, std::int64_t{0});
+    status = memory.status(stamp(second + 2), 1.0);
+    CHECK_EQ(status.n_open_events, std::int64_t{0});
+    CHECK(status.events_seq == expired.back().header.seq && status.events_seq == std::uint64_t{5});
 }
 
 TEST(new_coverage_is_not_an_appearance) {

@@ -98,6 +98,7 @@ def memory_status_le():
     msg.window_s = 1.0
     msg.per_sensor_hz = [10, MemoryStatus.HZ_UNAVAILABLE]
     msg.dropped_windows = 3
+    msg.events_seq = 12
     return msg
 
 

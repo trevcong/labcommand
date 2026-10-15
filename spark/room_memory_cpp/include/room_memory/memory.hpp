@@ -246,6 +246,7 @@ public:
     // Integrates the queued frames. Returns the ChangeEvent messages to publish, in order.
     std::vector<msg::ChangeEvent> close_window(const msg::Time& stamp);
     // MemoryStatus for the last period_s seconds; resets the per-sensor frame counts.
+    // events_seq is the seq of the newest event message, empty before the first.
     msg::MemoryStatus status(const msg::Time& stamp, double period_s);
     // The live MapBricks message due at `stamp`, if any (call once per window, after
     // close_window). Nothing while BUILDING. The first message is a snapshot. Afterwards,

@@ -27,6 +27,7 @@ MAX_PAYLOAD_BYTES = 16 << 20
 MAX_TRAILING_PADDING = 3
 HZ_UNAVAILABLE = 0xFFFF
 SINCE_NONE = (1 << 64) - 1
+EVENTS_SEQ_NONE = (1 << 64) - 1
 SENSOR_MID360 = 1
 SENSOR_JT128 = 2
 SENSORS_ALL = SENSOR_MID360 | SENSOR_JT128
@@ -663,6 +664,7 @@ class MemoryStatus:
     mid360_hz: Optional[int]
     jt128_hz: Optional[int]
     dropped_windows: int
+    events_seq: Optional[int]  # seq of the newest live events message; None before the first
 
     def __post_init__(self):
         _f32_fields(self, ("coverage_known_frac", "pose_residual_m", "window_s"))
@@ -683,6 +685,9 @@ class MemoryStatus:
             if value is not None:
                 _require_int(value, 0, HZ_UNAVAILABLE - 1, f"{context}: {name} (65535 is the unavailable sentinel; use None)")
         _require_int(self.dropped_windows, 0, (1 << 32) - 1, f"{context}: dropped_windows")
+        if self.events_seq is not None:
+            _require_int(self.events_seq, 0, EVENTS_SEQ_NONE - 1,
+                         f"{context}: events_seq ({EVENTS_SEQ_NONE} is EVENTS_SEQ_NONE; use None)")
 
     def to_cdr(self):
         """CDR little endian, encapsulation header included. Raises ``Invalid``."""
@@ -698,6 +703,7 @@ class MemoryStatus:
         writer.u16(HZ_UNAVAILABLE if self.mid360_hz is None else self.mid360_hz)
         writer.u16(HZ_UNAVAILABLE if self.jt128_hz is None else self.jt128_hz)
         writer.u32(self.dropped_windows)
+        writer.u64(EVENTS_SEQ_NONE if self.events_seq is None else self.events_seq)
         return bytes(writer.data)
 
     @classmethod
@@ -710,9 +716,12 @@ class MemoryStatus:
             n_open = reader.u32("n_open_events")
             optional = [reader.f32(name) for name in ("coverage_known_frac", "pose_residual_m", "window_s")]
             hz = [reader.u16(f"per_sensor_hz[{index}]") for index in range(2)]
+            dropped = reader.u32("dropped_windows")
+            events_seq = reader.u64("events_seq")
             status = cls(
                 header, state, n_bricks, n_open, *(None if math.isnan(value) else value for value in optional),
-                *(None if value == HZ_UNAVAILABLE else value for value in hz), reader.u32("dropped_windows"),
+                *(None if value == HZ_UNAVAILABLE else value for value in hz), dropped,
+                None if events_seq == EVENTS_SEQ_NONE else events_seq,
             )
             status.validate()
             return status

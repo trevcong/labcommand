@@ -14,10 +14,12 @@ using namespace room_memory::msg;
 namespace {
 
 const std::filesystem::path kHand = std::filesystem::path(ROOM_MEMORY_FIXTURES) / "hand";
+// The Swift suite's copy of the hand goldens (absent in the image).
+const std::filesystem::path kSwiftHand = ROOM_MEMORY_SWIFT_HAND;
 const Time kT10{1760400010, 250000000};
 
-Bytes hexfile(const std::string& name) {
-    const std::string text = harness::read_text(kHand / name);
+Bytes hexfile(const std::string& name, const std::filesystem::path& dir = kHand) {
+    const std::string text = harness::read_text(dir / name);
     std::string digits;
     std::istringstream lines(text);
     for (std::string line; std::getline(lines, line);) {
@@ -74,6 +76,7 @@ MemoryStatus memory_status() {
     s.window_s = f32(1.0);
     s.mid360_hz = 10;
     s.dropped_windows = 3;
+    s.events_seq = 12;
     return s;
 }
 
@@ -212,6 +215,14 @@ TEST(every_hand_golden_is_covered) {
         CHECK(goldens().count(entry.path().filename().string()) == 1);
     }
     CHECK_EQ(files, std::size_t{12});
+}
+
+TEST(hand_goldens_match_the_swift_copies) {
+    if (!std::filesystem::is_directory(kSwiftHand)) throw harness::Skip("Swift hand goldens not found at " + kSwiftHand.string());
+    for (const auto& [name, g] : goldens()) {
+        if (hexfile(name, kSwiftHand) != hexfile(name)) throw harness::Failure("Swift copy differs: " + name);
+    }
+    CHECK(memory_status().to_cdr() == hexfile("memory_status_le.hex", kSwiftHand));
 }
 
 TEST(golden_decodes_to_value) {
@@ -389,12 +400,23 @@ TEST(memory_status_rejections) {
         [](MemoryStatus& s) { s.window_s = 0.0f; },
         [](MemoryStatus& s) { s.mid360_hz = kHzUnavailable; },
         [](MemoryStatus& s) { s.state = static_cast<MemoryState>(9); },
+        [](MemoryStatus& s) { s.events_seq = kEventsSeqNone; },
     };
     for (const auto& change : changes) {
         MemoryStatus s = memory_status();
         change(s);
         CHECK_THROWS(Invalid, s.to_cdr());
     }
+}
+
+TEST(memory_status_events_seq_none) {
+    Bytes data = hexfile("memory_status_le.hex");
+    CHECK_EQ(data.size(), std::size_t{4 + 80});
+    std::memset(data.data() + 4 + 72, 0xFF, 8);
+    MemoryStatus expected = memory_status();
+    expected.events_seq = std::nullopt;
+    CHECK(MemoryStatus::from_cdr(data) == expected);
+    CHECK(expected.to_cdr() == data);
 }
 
 TEST(request_sync_rules) {
