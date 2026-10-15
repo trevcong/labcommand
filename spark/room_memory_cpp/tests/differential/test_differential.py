@@ -240,7 +240,9 @@ def test_new_coverage_and_moves(tmp_path):
         "added": floats(tmp_path, "added", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))])),
     }
     lines = ["config sensors=mid360 max_range=none reference_windows=3 state_dir=none", "start 1760400000 0"]
-    sequence = ["partial", "partial", "partial", "room", "added", "box", "moved", "moved", "room", "added", "added"]
+    # The gate needs 3 fresh windows: the box added at the end stays for three.
+    sequence = ["partial", "partial", "partial", "room", "added", "box", "moved", "moved", "room", "added", "added",
+                "added"]
     for second, name in enumerate(sequence):
         lines += [f"points mid360 {paths[name]}", f"close {1760400000 + second} 0"]
     out = run_both(tmp_path, "\n".join(lines))
@@ -280,7 +282,7 @@ def test_degraded_and_dropped(tmp_path):
     cdr.write_bytes(scenes.encode_pointcloud2(room))
     r = floats(tmp_path, "room", room)
     run_both(tmp_path, f"""
-config state_dir=none reference_windows=1
+config state_dir=none reference_windows=1 occupied_min_hits=1
 start 1760400000 0
 points mid360 {r}
 hex jt128 00010000
@@ -349,6 +351,55 @@ def test_codex_recent_windows_age_through_gaps(tmp_path):
               "close 1760400010 0"]
     out = run_both(tmp_path, "\n".join(lines))
     assert out.count("event ") >= 2
+
+
+def test_codex_tracking_waits_for_reference_occupancy(tmp_path):
+    """Codex P2: one reference window under occupied_min_hits=2 settles nothing; both engines keep
+    building until the reference has occupancy, then track (and detect) as usual."""
+    room = scenes.room_shell()
+    r = floats(tmp_path, "room", room)
+    boxed = floats(tmp_path, "boxed", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))]))
+    lines = ["config sensors=mid360 state_dir={state} max_range=none reference_windows=1", "start 1760400000 0"]
+    for second, path in enumerate([r, r, boxed, boxed, boxed]):
+        lines += [f"points mid360 {path}", f"close {1760400000 + second} 0", f"status {1760400000 + second} 0 1.0"]
+    out = run_both(tmp_path, "\n".join(lines))
+    closes = [line for line in out.splitlines() if line.startswith("close ")]
+    assert closes == ["close 0 BUILDING 0"] + ["close 0 TRACKING 1"] * 3 + ["close 1 TRACKING 1"]
+
+
+def test_codex_candidates_need_fresh_windows(tmp_path):
+    """Codex P2: a box in one window stays in the 3-window recent layer but is no candidate; a box
+    in three windows is, in both engines."""
+    room = scenes.room_shell()
+    r = floats(tmp_path, "room", room)
+    boxed = floats(tmp_path, "boxed", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))]))
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360 max_range=none reference_windows=3 recent_windows=3 "
+             "candidate_windows=3 expire_windows=3 state_dir=none", "start 1760400000 0"]
+    for second, path in enumerate([r, r, r, boxed, r, r, r, r, boxed, boxed, boxed, r]):
+        lines += [f"points mid360 {path}", f"close {1760400000 + second} 0"]
+    out = run_both(tmp_path, "\n".join(lines))
+    events = [int(line.split()[1]) for line in out.splitlines() if line.startswith("close ")]
+    assert events == [0] * 10 + [1, 0]
+
+
+def test_a_move_seen_as_its_halves_stays_one_move(tmp_path):
+    """A corner of the moved box is too small for the move-count gate (48 vs 148 voxels), so the diff
+    reports an APPEARED and a DISAPPEARED region; both engines keep the open MOVED alive on them,
+    send nothing new, and expire it once the box is back."""
+    room = scenes.room_shell()
+    box = scenes.box_shell((0.0, 0.5, 0.30))
+    moved = scenes.shifted(box, 1)
+    low = moved.min(axis=0)
+    corner = moved[(moved[:, 1] <= low[1] + 0.1) & (moved[:, 2] <= low[2] + 0.1)]
+    paths = {name: floats(tmp_path, name, np.concatenate([room, cloud]))
+             for name, cloud in (("box", box), ("moved", moved), ("corner", corner))}
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360 max_range=none reference_windows=3 expire_windows=2 state_dir=none",
+             "start 1760400000 0"]
+    for second, name in enumerate(["box", "box", "box", "moved", "corner", "corner", "box", "box"]):
+        lines += [f"points mid360 {paths[name]}", f"close {1760400000 + second} 0"]
+    out = run_both(tmp_path, "\n".join(lines))
+    events = [int(line.split()[1]) for line in out.splitlines() if line.startswith("close ")]
+    assert events == [0, 0, 0, 1, 0, 0, 0, 1]
 
 
 @pytest.mark.parametrize("variant", [

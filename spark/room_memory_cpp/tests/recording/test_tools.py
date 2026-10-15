@@ -1,0 +1,63 @@
+"""The recording tools themselves, on synthetic input: bag_stream.py's injected cubes and
+room_memory_bag's timer schedule. No recording needed; the bag test needs ROOM_MEMORY_BAG."""
+
+import os
+import pathlib
+import struct
+import subprocess
+import sys
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+import bag_stream  # noqa: E402
+
+BAG = os.environ.get("ROOM_MEMORY_BAG")
+
+
+@pytest.mark.parametrize("background_m", [10.0, 4.0])
+def test_injected_returns_get_the_documented_range_noise(monkeypatch, background_m):
+    """Codex P2: the noise term was scaled by the intersection fraction, so a return 10 m out whose
+    cube entry is about 2 m away got about 2 mm of noise instead of 1 cm."""
+    rng = np.random.default_rng(1)
+    center = np.array([2.0, 0.5, 0.3])
+    axis = center / np.linalg.norm(center)
+    # Rays in a narrow cone around the cube center (never axis aligned), all entering its front.
+    directions = axis + rng.normal(0.0, 0.01, size=(4000, 3))
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+    points = (directions * background_m).astype(np.float32)
+    noisy = bag_stream.draw_cube(points, center, 0.3, np.random.default_rng(2))
+    monkeypatch.setattr(bag_stream, "RANGE_NOISE_M", 0.0)
+    clean = bag_stream.draw_cube(points, center, 0.3, np.random.default_rng(2))
+    assert np.all(np.linalg.norm(clean, axis=1) < 2.2)  # every ray hit the cube
+    noise = np.linalg.norm(noisy.astype(np.float64), axis=1) - np.linalg.norm(clean.astype(np.float64), axis=1)
+    assert abs(noise.std() - 0.01) < 0.0005 and abs(noise.mean()) < 0.001
+
+
+def records(seconds, hz=10):
+    """Mid-360 float records of a 2 m wall at `hz` from t = 1000 s."""
+    y, z = np.meshgrid(np.linspace(-1, 1, 40), np.linspace(-0.5, 0.5, 20))
+    wall = np.stack([np.full(y.size, 2.0), y.ravel(), z.ravel()], axis=1).astype("<f4").tobytes()
+    out = b""
+    for n in range(seconds * hz):
+        out += struct.pack("<BBQI", 1, 0, 1000 * 10**9 + n * 10**9 // hz, len(wall)) + wall
+    return out
+
+
+@pytest.mark.skipif(not BAG, reason="ROOM_MEMORY_BAG (the room_memory_bag binary) not set")
+def test_statuses_tick_every_second_independently_of_the_window():
+    """Codex P2: with window_s=2 both statuses of a window were sent after it closed, the first with
+    two seconds of frames and the second with none (DEGRADED every other second)."""
+    result = subprocess.run([BAG, "sensors=mid360", "window_s=2", "reference_windows=2"], input=records(12),
+                            capture_output=True, check=True)
+    lines = [line.split() for line in result.stdout.decode().splitlines()]
+    timed = [(float(words[2] if words[0] == "window" else words[1]), words[0], words) for words in lines
+             if words[0] in ("window", "status")]
+    statuses = [words for _, kind, words in timed if kind == "status"]
+    assert all(words[2] != "DEGRADED" for words in statuses), statuses
+    assert [float(words[1]) for words in statuses] == [float(s) for s in range(1, 12)]
+    assert sum(kind == "window" for _, kind, _ in timed) == 5
+    # Window and status lines come in time order.
+    times = [t for t, _, _ in timed]
+    assert times == sorted(times)

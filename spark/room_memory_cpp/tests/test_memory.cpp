@@ -318,6 +318,7 @@ TEST(degraded_and_dropped_windows) {
     MemoryConfig config;
     config.state_dir = std::nullopt;
     config.reference_windows = 1;
+    config.occupied_min_hits = 1;  // one window settles occupancy: each reference is ready after one window
     RoomMemory memory(config, kStart);
     memory.add_points("mid360", scenes::room_shell());
     const msg::Bytes header_only = {0x00, 0x01, 0x00, 0x00};
@@ -385,6 +386,113 @@ TEST(each_sensor_reference_freezes_at_its_own_window_count) {
     const auto events = memory.close_window(stamp(2));
     CHECK(events.size() == 1 && events[0].kind == EventKind::appeared && events[0].state == EventState::candidate &&
           events[0].sensors == msg::kSensorMid360);
+}
+
+// Codex P2: reference_windows=1 under occupied_min_hits=2 settled no occupancy in its one
+// window, so TRACKING began on an empty reference that pose_offset could never register on and
+// no window could ever teach. The reference keeps building until it has occupancy.
+TEST(tracking_waits_for_settled_reference_occupancy) {
+    const Cloud room = scenes::room_shell();
+    MemoryConfig config;
+    config.sensors = {"mid360"};
+    config.state_dir = std::nullopt;
+    config.max_range = std::nullopt;
+    config.reference_windows = 1;
+    RoomMemory memory(config, kStart);
+    memory.add_points("mid360", room);
+    memory.close_window(stamp(0));
+    CHECK(memory.state() == MemoryState::building && memory.map_epoch() == 0);
+    CHECK(memory.channel("mid360").reference_windows == 1 && memory.channel("mid360").reference.occupied.empty());
+    memory.add_points("mid360", room);
+    memory.close_window(stamp(1));
+    CHECK(memory.state() == MemoryState::tracking && memory.map_epoch() == 1);
+    CHECK(memory.status(stamp(1), 1.0).n_bricks > 0);
+    const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
+    const Cloud boxed = scenes::concat({&room, &box});
+    std::vector<msg::ChangeEvent> events;
+    for (int second = 2; second < 5; ++second) {
+        memory.add_points("mid360", boxed);
+        for (auto& e : memory.close_window(stamp(second))) events.push_back(std::move(e));
+    }
+    CHECK((transitions(events) == std::vector<std::pair<EventKind, EventState>>{{EventKind::appeared, EventState::candidate}}));
+    CHECK(events[0].first_seen == stamp(2));
+}
+
+// Codex P2: with recent_windows=3 a box seen in one window stayed in three consecutive reports
+// and passed the 3-window persistence gate alone. Only windows that observe it count now.
+TEST(a_return_kept_in_the_recent_layer_is_not_fresh_evidence) {
+    const Cloud room = scenes::room_shell();
+    const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
+    const Cloud boxed = scenes::concat({&room, &box});
+    MemoryConfig config = mid360_config(std::nullopt);
+    config.recent_windows = 3;
+    config.candidate_windows = 3;
+    config.expire_windows = 3;
+    {
+        RoomMemory memory(config, kStart);
+        const std::int64_t second = build_reference(memory, room);
+        memory.add_points("mid360", boxed);
+        CHECK(memory.close_window(stamp(second)).empty());
+        for (std::int64_t later = second + 1; later < second + 6; ++later) {
+            memory.add_points("mid360", room);
+            CHECK(memory.close_window(stamp(later)).empty());
+        }
+    }
+    // The same box seen in three windows in a row is a candidate on the third.
+    RoomMemory memory(config, kStart);
+    const std::int64_t second = build_reference(memory, room);
+    std::vector<std::vector<msg::ChangeEvent>> events;
+    for (int n = 0; n < 3; ++n) {
+        memory.add_points("mid360", boxed);
+        events.push_back(memory.close_window(stamp(second + n)));
+    }
+    CHECK(events[0].empty() && events[1].empty());
+    CHECK((transitions(events[2]) == std::vector<std::pair<EventKind, EventState>>{{EventKind::appeared, EventState::candidate}}));
+    CHECK(events[2][0].first_seen == stamp(second));
+}
+
+TEST(a_stale_region_keeps_its_match_but_neither_counts_nor_starts) {
+    CandidateTracker tracker(2, 1);
+    std::uint64_t ids = 100;
+    const auto next = [&] { return ids++; };
+    Region box;
+    box.kind = Region::Kind::appeared;
+    box.keys = keys({{0, 0, 0}, {1, 0, 0}});
+    CHECK(tracker.update({box}, stamp(0), next, {false}).empty() && tracker.pending().empty());
+    CHECK(tracker.update({box}, stamp(1), next, {true}).empty() && tracker.pending().size() == 1);
+    CHECK(tracker.update({box}, stamp(2), next, {false}).empty() && tracker.pending()[0].windows == 1);
+    const auto started = tracker.update({box}, stamp(3), next, {true});
+    CHECK(started.size() == 1 && started[0].first == EventState::candidate && started[0].second.first_seen == stamp(1));
+}
+
+// With 1 cm injection noise the diff's move-count gate flickered on the static recording: the
+// open MOVED expired and reopened as an APPEARED plus a DISAPPEARED every few seconds.
+TEST(a_move_reported_as_its_halves_stays_one_open_move) {
+    CandidateTracker tracker(1, 1);
+    std::uint64_t ids = 100;
+    const auto next = [&] { return ids++; };
+    Region move;
+    move.kind = Region::Kind::moved;
+    move.keys = keys({{10, 0, 0}, {11, 0, 0}});
+    move.from_keys = keys({{0, 0, 0}, {1, 0, 0}});
+    Region appeared;
+    appeared.kind = Region::Kind::appeared;
+    appeared.keys = keys({{11, 0, 0}, {12, 0, 0}});
+    Region disappeared;
+    disappeared.kind = Region::Kind::disappeared;
+    disappeared.keys = keys({{0, 0, 0}});
+    Region speck = appeared;
+    speck.keys = keys({{30, 0, 0}});
+    const auto opened = tracker.update({move}, stamp(0), next);
+    CHECK(opened.size() == 1 && opened[0].first == EventState::candidate && opened[0].second.kind == EventKind::moved);
+    const auto halves = tracker.update({appeared, disappeared, speck}, stamp(1), next);
+    CHECK(halves.size() == 1 && halves[0].first == EventState::candidate && halves[0].second.event_id == 101);
+    CHECK(tracker.pending().empty() && tracker.open().size() == 2);
+    CHECK(tracker.open()[0].event_id == 100 && tracker.open()[0].kind == EventKind::moved);
+    CHECK(tracker.open()[0].last_seen == stamp(1) && tracker.open()[0].missed == 0);
+    const auto gone = tracker.update({}, stamp(2), next);
+    CHECK(gone.size() == 2 && gone[0].first == EventState::expired && gone[0].second.event_id == 100 &&
+          gone[0].second.last_seen == stamp(1) && gone[1].second.event_id == 101);
 }
 
 // Codex fix 3: windows without usable data still age the recent layer.

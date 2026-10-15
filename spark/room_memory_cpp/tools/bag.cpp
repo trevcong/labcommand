@@ -3,11 +3,13 @@
 //
 // Records on stdin, little endian: u8 kind (0 CDR sensor_msgs/PointCloud2, 1 float32 x, y, z),
 // u8 sensor (0 mid360, 1 jt128), u64 receive time (ns since the Unix epoch), u32 length, then
-// the bytes. tools/bag_stream.py writes them from a rosbag2 mcap. Windows are window_s long
-// from the first record. When a record falls past the current window, the window closes with
-// its end time as the stamp: close_window, map_update, then status for every whole second
-// boundary passed, as the node's timers do. The window still open when the records end is
-// not closed: it holds only part of a window's frames.
+// the bytes. tools/bag_stream.py writes them from a rosbag2 mcap. Like the node's two timers,
+// windows end every window_s and statuses fall every second from the first record, each on
+// its own schedule. Before a record is consumed, every deadline at or before its time fires
+// in time order (the window first on a tie), stamped with the deadline: a window runs
+// close_window then map_update, a status reports the frames received in the second before
+// it. The window still open when the records end is not closed: it holds only part of a
+// window's frames.
 //
 // Output, one line each: window, event, map and status lines, then one JSON summary line.
 #include <algorithm>
@@ -91,53 +93,61 @@ int main(int argc, char** argv) {
     std::vector<double> tracking_ms;
     std::vector<double> building_ms;
 
-    const auto close_until = [&](std::int64_t ns) {
-        while (ns >= window_end) {
-            const msg::Time stamp = time_of(window_end);
-            const auto start = std::chrono::steady_clock::now();
-            const std::vector<msg::ChangeEvent> out = memory->close_window(stamp);
-            const std::optional<msg::Bytes> map = memory->map_update(stamp);
-            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-            const bool tracking = memory->state() != msg::MemoryState::building;
-            (tracking ? tracking_ms : building_ms).push_back(ms);
-            if (tracking && tracking_since < 0) tracking_since = window_end;
-            std::printf("window %" PRId64 " %.3f %s %.2f ms frames %" PRId64 " %" PRId64 "\n", windows,
-                        static_cast<double>(window_end - first_ns) / 1e9, msg::name(memory->state()), ms, frames[0],
-                        frames[1]);
-            frames[0] = frames[1] = 0;
-            for (const msg::ChangeEvent& e : out) {
-                const std::size_t size = e.to_cdr().size();
-                events.add(size);
-                ++events_total;
-                static const char* kinds[] = {"APPEARED", "DISAPPEARED", "MOVED"};
-                static const char* states[] = {"CANDIDATE", "CONFIRMED", "ACCEPTED", "REVERTED", "EXPIRED"};
-                std::printf("event %.3f %s %s %" PRIu64 " sensors %" PRId64 " voxels %" PRId64
-                            " centroid %.3f %.3f %.3f %zu B\n",
-                            static_cast<double>(window_end - first_ns) / 1e9, kinds[static_cast<int>(e.kind)],
-                            states[static_cast<int>(e.state)], e.event_id & 0xFFFFF, e.sensors, e.voxel_count,
-                            static_cast<double>(e.centroid[0]), static_cast<double>(e.centroid[1]),
-                            static_cast<double>(e.centroid[2]), size);
+    const auto close_window = [&] {
+        const msg::Time stamp = time_of(window_end);
+        const auto start = std::chrono::steady_clock::now();
+        const std::vector<msg::ChangeEvent> out = memory->close_window(stamp);
+        const std::optional<msg::Bytes> map = memory->map_update(stamp);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        const bool tracking = memory->state() != msg::MemoryState::building;
+        (tracking ? tracking_ms : building_ms).push_back(ms);
+        if (tracking && tracking_since < 0) tracking_since = window_end;
+        std::printf("window %" PRId64 " %.3f %s %.2f ms frames %" PRId64 " %" PRId64 "\n", windows,
+                    static_cast<double>(window_end - first_ns) / 1e9, msg::name(memory->state()), ms, frames[0],
+                    frames[1]);
+        frames[0] = frames[1] = 0;
+        for (const msg::ChangeEvent& e : out) {
+            const std::size_t size = e.to_cdr().size();
+            events.add(size);
+            ++events_total;
+            static const char* kinds[] = {"APPEARED", "DISAPPEARED", "MOVED"};
+            static const char* states[] = {"CANDIDATE", "CONFIRMED", "ACCEPTED", "REVERTED", "EXPIRED"};
+            std::printf("event %.3f %s %s %" PRIu64 " sensors %" PRId64 " voxels %" PRId64
+                        " centroid %.3f %.3f %.3f %zu B\n",
+                        static_cast<double>(window_end - first_ns) / 1e9, kinds[static_cast<int>(e.kind)],
+                        states[static_cast<int>(e.state)], e.event_id & 0xFFFFF, e.sensors, e.voxel_count,
+                        static_cast<double>(e.centroid[0]), static_cast<double>(e.centroid[1]),
+                        static_cast<double>(e.centroid[2]), size);
+        }
+        if (map) {
+            const msg::MapBricks decoded = msg::MapBricks::from_cdr(*map);
+            (decoded.kind == msg::MapKind::snapshot ? snapshots : deltas).add(map->size());
+            std::printf("map %.3f %s epoch %" PRIu64 " bricks %zu removed %zu %zu B\n",
+                        static_cast<double>(window_end - first_ns) / 1e9,
+                        decoded.kind == msg::MapKind::snapshot ? "SNAPSHOT" : "DELTA", decoded.header.map_epoch,
+                        decoded.bricks.size(), decoded.removed.size(), map->size());
+        }
+        window_end += window_ns;
+        ++windows;
+    };
+    const auto publish_status = [&] {
+        const msg::MemoryStatus status = memory->status(time_of(next_status), 1.0);
+        const std::size_t size = status.to_cdr().size();
+        statuses.add(size);
+        std::printf("status %.3f %s bricks %" PRId64 " open %" PRId64 " coverage %s residual %s %zu B\n",
+                    static_cast<double>(next_status - first_ns) / 1e9, msg::name(status.state), status.n_bricks,
+                    status.n_open_events, optional_float(status.coverage_known_frac).c_str(),
+                    optional_float(status.pose_residual_m).c_str(), size);
+        next_status += kSecond;
+    };
+    // The node's two timers: every deadline at or before `ns`, in time order, the window first on a tie.
+    const auto advance_to = [&](std::int64_t ns) {
+        while (std::min(window_end, next_status) <= ns) {
+            if (window_end <= next_status) {
+                close_window();
+            } else {
+                publish_status();
             }
-            if (map) {
-                const msg::MapBricks decoded = msg::MapBricks::from_cdr(*map);
-                (decoded.kind == msg::MapKind::snapshot ? snapshots : deltas).add(map->size());
-                std::printf("map %.3f %s epoch %" PRIu64 " bricks %zu removed %zu %zu B\n",
-                            static_cast<double>(window_end - first_ns) / 1e9,
-                            decoded.kind == msg::MapKind::snapshot ? "SNAPSHOT" : "DELTA", decoded.header.map_epoch,
-                            decoded.bricks.size(), decoded.removed.size(), map->size());
-            }
-            while (next_status <= window_end) {
-                const msg::MemoryStatus status = memory->status(time_of(next_status), 1.0);
-                const std::size_t size = status.to_cdr().size();
-                statuses.add(size);
-                std::printf("status %.3f %s bricks %" PRId64 " open %" PRId64 " coverage %s residual %s %zu B\n",
-                            static_cast<double>(next_status - first_ns) / 1e9, msg::name(status.state), status.n_bricks,
-                            status.n_open_events, optional_float(status.coverage_known_frac).c_str(),
-                            optional_float(status.pose_residual_m).c_str(), size);
-                next_status += kSecond;
-            }
-            window_end += window_ns;
-            ++windows;
         }
     };
 
@@ -168,7 +178,7 @@ int main(int argc, char** argv) {
             window_end = ns + window_ns;
             next_status = ns + kSecond;
         }
-        close_until(ns);
+        advance_to(ns);
         const std::string name = names[sensor];
         if (std::find(config.sensors.begin(), config.sensors.end(), name) == config.sensors.end()) continue;
         ++frames[sensor];

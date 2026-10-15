@@ -64,7 +64,8 @@ def draw_cube(points, center, side, rng):
     far = np.nanmin(np.where(np.isnan(t1), np.inf, np.maximum(t1, t2)), axis=1)
     finite = np.isfinite(p).all(axis=1)
     hit = finite & (near <= far) & (near > 0) & (near < 1)
-    scale = near[hit] * (1 + rng.normal(0, RANGE_NOISE_M, hit.sum()) / np.linalg.norm(p[hit], axis=1))
+    # The entry point at `near` of the original range, plus the noise as a share of that range.
+    scale = near[hit] + rng.normal(0, RANGE_NOISE_M, hit.sum()) / np.linalg.norm(p[hit], axis=1)
     out = points.copy()
     out[hit] = (p[hit] * scale[:, None]).astype(np.float32)
     return out

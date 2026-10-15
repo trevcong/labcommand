@@ -536,6 +536,10 @@ void RoomMemory::set_reference(Channel& channel, VoxelLayer reference) {
     if (&channel == &channels_[map_channel_]) coverage_ = coverage_of(channel.reference);
 }
 
+bool RoomMemory::reference_ready(const Channel& channel) const {
+    return channel.reference_windows >= config_.reference_windows && !channel.reference.occupied.empty();
+}
+
 std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
     std::vector<msg::ChangeEvent> events;
     bool dropped = false;
@@ -547,9 +551,9 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         if (channel.failed && frames == 0) dropped = true;
         channel.failed = 0;
         if (state_ == msg::MemoryState::building) {
-            // A sensor's reference freezes at its own quota while the others catch up, and
+            // A sensor's reference freezes once it is ready while the others catch up, and
             // only windows with at least one occupied voxel count toward it.
-            if (frames && channel.reference_windows < config_.reference_windows) {
+            if (frames && !reference_ready(channel)) {
                 const OccupancyMap window = occupancy_map(points, change_);
                 if (!window.occupied.empty()) {
                     const VoxelLayer observed = VoxelLayer::observe(window, change_, backend_);
@@ -599,7 +603,17 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         options.scope = scope_;
         options.backend = backend_;
         const Report report = diff(channel.reference.as_occupancy(change_.voxel_size), recent, change_, options);
-        for (const auto& [state, candidate] : channel.tracker.update(report.regions, stamp, [this] { return next_id(); })) {
+        // The recent layer carries a return for recent_windows windows, so only this window's
+        // own returns count toward the persistence gate: an appeared or moved region is fresh
+        // when this window occupies one of its (new-pose) voxels. A disappearance in the
+        // recent layer is one in this window too, so it is always fresh.
+        std::vector<bool> fresh(report.regions.size());
+        for (std::size_t n = 0; n < fresh.size(); ++n) {
+            const Region& region = report.regions[n];
+            fresh[n] = region.kind == Region::Kind::disappeared || intersects(window.occupied, region.keys);
+        }
+        for (const auto& [state, candidate] :
+             channel.tracker.update(report.regions, stamp, [this] { return next_id(); }, fresh)) {
             events.push_back(event(channel, state, candidate, stamp));
             log_event(events.back());
         }
@@ -607,8 +621,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
     if (dropped) ++dropped_windows_;
     last_window_dropped_ = dropped;
     if (state_ == msg::MemoryState::building &&
-        std::all_of(channels_.begin(), channels_.end(),
-                    [&](const Channel& c) { return c.reference_windows >= config_.reference_windows; })) {
+        std::all_of(channels_.begin(), channels_.end(), [&](const Channel& c) { return reference_ready(c); })) {
         state_ = msg::MemoryState::tracking;
         // From here on only the voxels the reference has not settled keep their counts.
         for (Channel& channel : channels_) channel.stats.erase(channel.reference.known);

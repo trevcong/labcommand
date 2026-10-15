@@ -217,7 +217,8 @@ def test_inconsistent_saved_state_is_refused(tmp_path):
 
 
 def test_degraded_and_dropped_windows(tmp_path):
-    memory = RoomMemory(MemoryConfig(state_dir=None, reference_windows=1), START)
+    # One window settles occupancy, so each sensor's reference is ready after its first window.
+    memory = RoomMemory(MemoryConfig(state_dir=None, reference_windows=1, occupied_min_hits=1), START)
     memory.add_points("mid360", scenes.room_shell())
     assert memory.add_cdr("jt128", b"\x00\x01\x00\x00") is False
     memory.close_window(stamp(0))
@@ -272,6 +273,85 @@ def test_each_sensor_reference_freezes_at_its_own_window_count():
     assert [(e.kind, e.state, e.sensors) for e in events] == [
         (EventKind.APPEARED, EventState.CANDIDATE, SENSOR_MID360),
     ]
+
+
+def test_tracking_waits_for_settled_reference_occupancy():
+    """Codex P2: reference_windows=1 under occupied_min_hits=2 settled no occupancy in its one window,
+    so TRACKING began on an empty reference that pose_offset could never register on, and that no
+    window could ever teach. The reference keeps building until it has occupancy."""
+    room = scenes.room_shell()
+    memory = RoomMemory(MemoryConfig(sensors=("mid360",), state_dir=None, max_range=None, reference_windows=1), START)
+    memory.add_points("mid360", room)
+    memory.close_window(stamp(0))
+    assert memory.state == MemoryState.BUILDING and memory.map_epoch == 0
+    assert memory.channels["mid360"].reference_windows == 1 and not len(memory.channels["mid360"].reference.occupied)
+    memory.add_points("mid360", room)
+    memory.close_window(stamp(1))
+    assert memory.state == MemoryState.TRACKING and memory.map_epoch == 1
+    assert memory.status(stamp(1), 1.0).n_bricks > 0
+    boxed = np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))])
+    events = []
+    for second in range(2, 5):
+        memory.add_points("mid360", boxed)
+        events += memory.close_window(stamp(second))
+    assert [(e.kind, e.state, e.first_seen) for e in events] == [(EventKind.APPEARED, EventState.CANDIDATE, stamp(2))]
+
+
+def test_a_return_kept_in_the_recent_layer_is_not_fresh_evidence():
+    """Codex P2: with recent_windows=3 a box seen in one window stayed in three consecutive reports
+    and passed the 3-window persistence gate alone. Only windows that observe it count now."""
+    room = scenes.room_shell()
+    boxed = np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))])
+    gate = dict(recent_windows=3, candidate_windows=3, expire_windows=3)
+    memory = mid360_memory(None, state_dir=None, **gate)
+    second = build_reference(memory, room)
+    memory.add_points("mid360", boxed)
+    assert memory.close_window(stamp(second)) == []
+    for later in range(second + 1, second + 6):
+        memory.add_points("mid360", room)
+        assert memory.close_window(stamp(later)) == []
+    # The same box seen in three windows in a row is a candidate on the third.
+    memory = mid360_memory(None, state_dir=None, **gate)
+    second = build_reference(memory, room)
+    events = []
+    for n in range(3):
+        memory.add_points("mid360", boxed)
+        events.append(memory.close_window(stamp(second + n)))
+    assert events[:2] == [[], []]
+    assert [(e.kind, e.state, e.first_seen) for e in events[2]] == [(EventKind.APPEARED, EventState.CANDIDATE, stamp(second))]
+
+
+def test_a_stale_region_keeps_its_match_but_neither_counts_nor_starts():
+    tracker = CandidateTracker(2, 1)
+    ids = iter(range(100, 200))
+    box = type("Region", (), {"kind": "appeared", "keys": keys_of([[0, 0, 0], [1, 0, 0]]), "from_keys": None})()
+    next_id = lambda: next(ids)
+    assert tracker.update([box], stamp(0), next_id, [False]) == [] and tracker.pending == []
+    assert tracker.update([box], stamp(1), next_id, [True]) == [] and len(tracker.pending) == 1
+    assert tracker.update([box], stamp(2), next_id, [False]) == [] and tracker.pending[0].windows == 1
+    (started,) = tracker.update([box], stamp(3), next_id, [True])
+    assert started[0] == EventState.CANDIDATE and started[1].first_seen == stamp(1)
+
+
+def test_a_move_reported_as_its_halves_stays_one_open_move():
+    """With 1 cm injection noise the diff's move-count gate flickered on the static recording: the
+    open MOVED expired and reopened as an APPEARED plus a DISAPPEARED every few seconds."""
+    tracker = CandidateTracker(1, 1)
+    ids = iter(range(100, 200))
+    next_id = lambda: next(ids)
+    region = lambda kind, keys, from_keys=None: type("Region", (), {"kind": kind, "keys": keys, "from_keys": from_keys})()
+    move = region("moved", keys_of([[10, 0, 0], [11, 0, 0]]), keys_of([[0, 0, 0], [1, 0, 0]]))
+    appeared, disappeared = region("appeared", keys_of([[11, 0, 0], [12, 0, 0]])), region("disappeared", keys_of([0, 0, 0]))
+    speck = region("appeared", keys_of([30, 0, 0]))
+    ((state, opened),) = tracker.update([move], stamp(0), next_id)
+    assert state == EventState.CANDIDATE and opened.kind == EventKind.MOVED
+    halves = tracker.update([appeared, disappeared, speck], stamp(1), next_id)
+    assert [(s, c.event_id) for s, c in halves] == [(EventState.CANDIDATE, 101)] and tracker.pending == []
+    assert [(c.event_id, c.kind, c.last_seen, c.missed) for c in tracker.open] == [
+        (100, EventKind.MOVED, stamp(1), 0), (101, EventKind.APPEARED, stamp(1), 0)]
+    gone = tracker.update([], stamp(2), next_id)
+    assert [(s, c.event_id, c.last_seen) for s, c in gone] == [(EventState.EXPIRED, 100, stamp(1)),
+                                                               (EventState.EXPIRED, 101, stamp(1))]
 
 
 def test_recent_observations_age_through_missing_windows(tmp_path):

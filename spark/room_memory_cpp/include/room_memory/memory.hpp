@@ -112,8 +112,8 @@ struct Candidate {
     Region region;
     msg::Time first_seen;
     msg::Time last_seen;
-    std::int64_t windows = 0;  // consecutive windows with a matching region
-    std::int64_t missed = 0;   // consecutive windows without one
+    std::int64_t windows = 0;  // windows with fresh support in its unbroken run of matched windows
+    std::int64_t missed = 0;   // consecutive windows without a match
 };
 
 // Every voxel of a region, both poses for moved, sorted.
@@ -121,20 +121,25 @@ Keys region_keys(const Region& region);
 
 // Transition-only bookkeeping for one sensor's change regions. A region matches the first
 // open, else the first pending, region of the same kind sharing a voxel that no other region
-// of this window matched; otherwise it starts a pending one. A pending region becomes a
-// CANDIDATE (and gets its event id) once it has matched in `candidate_windows` consecutive
-// windows, and is dropped silently the first window it is not matched. An open candidate
-// goes EXPIRED after `expire_windows` consecutive windows without a match. A matched
-// candidate sends nothing.
+// of this window matched; otherwise it starts a pending one. A region is fresh when this
+// window itself supports it (update's `fresh`); a stale one keeps a match alive but neither
+// counts toward promotion nor starts a pending region. An appeared or disappeared region that
+// matches no open entry of its kind but shares a voxel with an open moved candidate (either
+// pose) is that move seen as its two halves: it keeps the move alive and starts nothing. A
+// pending region becomes a CANDIDATE (and gets its event id) once `candidate_windows` fresh
+// windows have matched it without a break, and is dropped silently the first window it is not
+// matched. An open candidate goes
+// EXPIRED after `expire_windows` consecutive windows without a match. A matched candidate
+// sends nothing.
 class CandidateTracker {
 public:
     CandidateTracker(std::int64_t candidate_windows = 1, std::int64_t expire_windows = 1)
         : candidate_windows_(candidate_windows), expire_windows_(expire_windows) {}
     // (state, candidate) in a fixed order: new candidates in region order, then expiries by
-    // event id.
+    // event id. `fresh` holds one flag per region, empty when every region is fresh.
     template <typename NextId>
     std::vector<std::pair<msg::EventState, Candidate>> update(const std::vector<Region>& regions, const msg::Time& stamp,
-                                                              NextId&& next_id);
+                                                              NextId&& next_id, const std::vector<bool>& fresh = {});
     const std::vector<Candidate>& open() const { return open_; }
     const std::vector<Candidate>& pending() const { return pending_; }
 
@@ -265,6 +270,9 @@ public:
 
 private:
     Channel& find(const std::string& sensor);
+    // A built reference: its quota of windows and some settled occupancy, which tracking needs
+    // (pose_offset registers on it, and without it no window may teach the reference).
+    bool reference_ready(const Channel& channel) const;
     std::vector<std::filesystem::path> paths() const;
     void load();
     std::uint64_t next_id();
@@ -306,11 +314,13 @@ private:
 
 template <typename NextId>
 std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(const std::vector<Region>& regions,
-                                                                            const msg::Time& stamp, NextId&& next_id) {
+                                                                            const msg::Time& stamp, NextId&& next_id,
+                                                                            const std::vector<bool>& fresh) {
     std::vector<std::pair<msg::EventState, Candidate>> transitions;
     std::vector<bool> open_matched(open_.size(), false);
     std::vector<bool> pending_matched(pending_.size(), false);
     std::vector<bool> pending_promoted(pending_.size(), false);
+    std::vector<bool> absorbed(open_.size(), false);
     std::vector<Candidate> promoted;
     std::vector<Candidate> started;
     // Index of the first unmatched entry of `list` of this kind sharing a voxel, marked matched.
@@ -324,12 +334,20 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
         }
         return std::nullopt;
     };
+    // Index of the first open moved candidate sharing a voxel with `keys`.
+    const auto whole_move = [&](const Keys& keys) -> std::optional<std::size_t> {
+        for (std::size_t n = 0; n < open_.size(); ++n) {
+            if (open_[n].kind == msg::EventKind::moved && intersects(open_[n].keys, keys)) return n;
+        }
+        return std::nullopt;
+    };
     const auto promote = [&](Candidate c) {
         c.event_id = next_id();
         transitions.emplace_back(msg::EventState::candidate, c);
         promoted.push_back(std::move(c));
     };
-    for (const Region& region : regions) {
+    for (std::size_t r = 0; r < regions.size(); ++r) {
+        const Region& region = regions[r];
         msg::EventKind kind;
         switch (region.kind) {
             case Region::Kind::appeared: kind = msg::EventKind::appeared; break;
@@ -337,6 +355,7 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
             case Region::Kind::moved: kind = msg::EventKind::moved; break;
             default: continue;
         }
+        const bool supported = fresh.empty() || fresh[r];
         Keys keys = region_keys(region);
         if (const auto n = first(open_, open_matched, kind, keys)) {
             Candidate& match = open_[*n];
@@ -344,15 +363,23 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
             match.region = region;
             match.last_seen = stamp;
             match.missed = 0;
+        } else if (const auto w = kind != msg::EventKind::moved ? whole_move(keys) : std::nullopt) {
+            // A move reported as its two halves (the diff's pairing gates flicker) is still that move.
+            absorbed[*w] = true;
+            open_[*w].last_seen = stamp;
+            open_[*w].missed = 0;
         } else if (const auto m = first(pending_, pending_matched, kind, keys)) {
             Candidate& waiting = pending_[*m];
             waiting.keys = std::move(keys);
             waiting.region = region;
             waiting.last_seen = stamp;
-            if (++waiting.windows >= candidate_windows_) {
+            if (supported) ++waiting.windows;
+            if (waiting.windows >= candidate_windows_) {
                 pending_promoted[*m] = true;
                 promote(waiting);
             }
+        } else if (!supported) {
+            continue;
         } else if (candidate_windows_ <= 1) {
             promote(Candidate{0, kind, std::move(keys), region, stamp, stamp, 1, 0});
         } else {
@@ -364,7 +391,7 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
     std::sort(by_id.begin(), by_id.end(), [&](std::size_t a, std::size_t b) { return open_[a].event_id < open_[b].event_id; });
     std::vector<bool> expired(open_.size(), false);
     for (const std::size_t n : by_id) {
-        if (!open_matched[n] && ++open_[n].missed >= expire_windows_) {
+        if (!open_matched[n] && !absorbed[n] && ++open_[n].missed >= expire_windows_) {
             expired[n] = true;
             transitions.emplace_back(msg::EventState::expired, open_[n]);
         }

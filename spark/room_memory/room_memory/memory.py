@@ -309,8 +309,8 @@ class Candidate:
     region: object
     first_seen: Time
     last_seen: Time
-    windows: int = 1  # consecutive windows with a matching region
-    missed: int = 0  # consecutive windows without one
+    windows: int = 1  # windows with fresh support in its unbroken run of matched windows
+    missed: int = 0  # consecutive windows without a match
 
 
 def region_keys(region):
@@ -325,10 +325,15 @@ class CandidateTracker:
 
     A region matches the first open, else the first pending, region of the same kind sharing a
     voxel that no other region of this window matched; otherwise it starts a pending one. A
-    pending region becomes a CANDIDATE (and gets its event id) once it has matched in
-    ``candidate_windows`` consecutive windows, and is dropped silently the first window it is not
-    matched. An open candidate goes EXPIRED after ``expire_windows`` consecutive windows without
-    a match. A matched candidate sends nothing: the protocol has one message per transition.
+    region is *fresh* when this window itself supports it (``update``'s ``fresh``); a stale one
+    keeps a match alive but neither counts toward promotion nor starts a pending region. An
+    appeared or disappeared region that matches no open entry of its kind but shares a voxel
+    with an open moved candidate (either pose) is that move seen as its two halves: it keeps the
+    move alive and starts nothing. A pending region becomes a CANDIDATE (and gets its event id)
+    once ``candidate_windows`` fresh windows have matched it without a break, and is dropped
+    silently the first window it is not matched. An open candidate goes EXPIRED after
+    ``expire_windows`` consecutive windows without a match. A matched candidate sends nothing:
+    the protocol has one message per transition.
     """
 
     def __init__(self, candidate_windows=1, expire_windows=1):
@@ -337,10 +342,13 @@ class CandidateTracker:
         self.open = []
         self.pending = []
 
-    def update(self, regions, stamp, next_id):
-        """Returns ``[(state, candidate)]``: new candidates in region order, then expiries by id."""
+    def update(self, regions, stamp, next_id, fresh=None):
+        """Returns ``[(state, candidate)]``: new candidates in region order, then expiries by id.
+
+        ``fresh`` holds one flag per region, None when every region is fresh.
+        """
         transitions = []
-        open_matched, pending_matched = set(), set()
+        open_matched, pending_matched, absorbed = set(), set(), set()
         promoted, started = [], []
 
         def first(entries, matched, kind, keys):
@@ -350,35 +358,50 @@ class CandidateTracker:
                     return entry
             return None
 
+        def whole_move(keys):
+            for index, entry in enumerate(self.open):
+                if entry.kind == EventKind.MOVED and len(np.intersect1d(entry.keys, keys, assume_unique=True)):
+                    return index
+            return None
+
         def promote(candidate):
             candidate = replace(candidate, event_id=next_id())
             transitions.append((EventState.CANDIDATE, candidate))
             promoted.append(candidate)
 
         promoted_pending = set()
-        for region in regions:
+        for index, region in enumerate(regions):
             kind = _KINDS.get(region.kind)
             if kind is None:
                 continue
+            supported = fresh is None or fresh[index]
             keys = region_keys(region)
             match = first(self.open, open_matched, kind, keys)
             if match is not None:
                 match.keys, match.region, match.last_seen, match.missed = keys, region, stamp, 0
                 continue
+            # A move reported as its two halves (the diff's pairing gates flicker) is still that move.
+            move = whole_move(keys) if kind != EventKind.MOVED else None
+            if move is not None:
+                absorbed.add(move)
+                self.open[move].last_seen, self.open[move].missed = stamp, 0
+                continue
             waiting = first(self.pending, pending_matched, kind, keys)
             if waiting is not None:
                 waiting.keys, waiting.region, waiting.last_seen = keys, region, stamp
-                waiting.windows += 1
+                waiting.windows += 1 if supported else 0
                 if waiting.windows >= self.candidate_windows:
                     promoted_pending.add(id(waiting))
                     promote(waiting)
+            elif not supported:
+                continue
             elif self.candidate_windows <= 1:
                 promote(Candidate(0, kind, keys, region, stamp, stamp))
             else:
                 started.append(Candidate(0, kind, keys, region, stamp, stamp))
         expired = set()
         for index in sorted(range(len(self.open)), key=lambda n: self.open[n].event_id):
-            if index in open_matched:
+            if index in open_matched or index in absorbed:
                 continue
             self.open[index].missed += 1
             if self.open[index].missed >= self.expire_windows:
@@ -596,6 +619,11 @@ class RoomMemory:
         if channel.sensor.name == self.map_sensor:
             self._coverage = _coverage(reference)
 
+    def _reference_ready(self, channel):
+        """A built reference: its quota of windows and some settled occupancy, which tracking
+        needs (``pose_offset`` registers on it, and without it no window may teach the reference)."""
+        return channel.reference_windows >= self.config.reference_windows and len(channel.reference.occupied) > 0
+
     def close_window(self, stamp):
         """Integrates the queued frames. Returns the ``ChangeEvent`` messages to publish, in order."""
         events = []
@@ -606,9 +634,9 @@ class RoomMemory:
                 dropped = True
             channel.failed = 0
             if self.state == MemoryState.BUILDING:
-                # A sensor's reference freezes at its own quota while the others catch up, and
+                # A sensor's reference freezes once it is ready while the others catch up, and
                 # only windows with at least one occupied voxel count toward it.
-                if frames and channel.reference_windows < self.config.reference_windows:
+                if frames and not self._reference_ready(channel):
                     window = occupancy_map(np.concatenate(frames), self.change)
                     if len(window.occupied):
                         observed = VoxelLayer.observe(window, self.change)
@@ -634,15 +662,19 @@ class RoomMemory:
                 channel.stats.add(np.setdiff1d(observed.occupied, reference.known, assume_unique=True),
                                   np.setdiff1d(observed.known, reference.known, assume_unique=True))
             report = diff(reference.as_occupancy(self.config.voxel_size), recent, self.change, reference.known)
-            for state, candidate in channel.tracker.update(report.regions, stamp, self._next_id):
+            # The recent layer carries a return for recent_windows windows, so only this window's
+            # own returns count toward the persistence gate: an appeared or moved region is fresh
+            # when this window occupies one of its (new-pose) voxels. A disappearance in the
+            # recent layer is one in this window too, so it is always fresh.
+            fresh = [region.kind == "disappeared" or bool(contains(window.occupied, region.keys).any())
+                     for region in report.regions]
+            for state, candidate in channel.tracker.update(report.regions, stamp, self._next_id, fresh):
                 events.append(self._event(channel, state, candidate, stamp))
                 self._log_event(events[-1])
         if dropped:
             self.dropped_windows += 1
         self.last_window_dropped = dropped
-        if self.state == MemoryState.BUILDING and all(
-            channel.reference_windows >= self.config.reference_windows for channel in self.channels.values()
-        ):
+        if self.state == MemoryState.BUILDING and all(self._reference_ready(c) for c in self.channels.values()):
             self.state = MemoryState.TRACKING
             # From here on only the voxels the reference has not settled keep their counts.
             for channel in self.channels.values():
