@@ -632,10 +632,11 @@ class RoomMemory:
         No-op without ``state_dir``."""
         if self.config.state_dir is None:
             return
+        # The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
+        save_epoch(epoch_path(self.config.state_dir, self.config.room_id), self.map_epoch)
         header = Header(self.config.room_id, self.map_epoch, 0, stamp)
         for name, path in self._paths().items():
             save_reference(path, self.channels[name].reference, header, self.config.voxel_size)
-        save_epoch(epoch_path(self.config.state_dir, self.config.room_id), self.map_epoch)
 
     def add_points(self, sensor, positions):
         """Queues decoded ``(n, 3)`` positions (meters, sensor frame) for the current window."""

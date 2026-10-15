@@ -547,11 +547,12 @@ void RoomMemory::load(const msg::Time& start) {
 void RoomMemory::save(const msg::Time& stamp) {
     if (!config_.state_dir) return;
     const msg::Header header{config_.room_id, map_epoch_, 0, stamp};
+    // The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
+    save_epoch(epoch_path(*config_.state_dir, config_.room_id), map_epoch_);
     const std::vector<std::filesystem::path> all = paths();
     for (std::size_t n = 0; n < all.size(); ++n) {
         save_reference(all[n], channels_[n].reference, header, static_cast<float>(config_.voxel_size));
     }
-    save_epoch(epoch_path(*config_.state_dir, config_.room_id), map_epoch_);
 }
 
 void RoomMemory::add_points(const std::string& sensor, std::span<const float> xyz) {
