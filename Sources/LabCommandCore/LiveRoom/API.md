@@ -124,7 +124,10 @@ but only while `isStatusFresh`. Otherwise "STALE · age".
   applied between them (D20). A duplicate (`seq ≤ mapSeq` and `epoch ≤ mapEpoch`) is counted and ignored.
 - **Events.** `seq == eventsSeq + 1` applies. A duplicate is counted: a seq already received in this
   generation with the same `event_id` and state (a live copy a replay overtook) never rolls the
-  event back. A live seq at or below the baseline that carries another transition is a restart.
+  event back. A live seq older than its event's latest seq in this generation is out-of-order
+  delivery (a partial replay delivered the later one first): it fills the coverage, never rolls the
+  event back, and never cuts the history. A live seq at or below the baseline that carries another
+  transition is a restart.
   Any other seq is a gap: the list goes incomplete and requests
   `RequestSync{events, since: (epoch, eventsSeq)}`. So does an
   **events_seq gap**: a status `events_seq` above the baseline that the next status still finds

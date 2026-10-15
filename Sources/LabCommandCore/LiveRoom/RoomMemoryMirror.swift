@@ -530,8 +530,16 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             let duplicate: Bool
             if let seen = transitions[seq] {
                 duplicate = seen == Transition(eventId: message.eventId, state: message.state)
-            } else if let held = eventsById[message.eventId] {
-                duplicate = held.event.state == message.state && held.seq >= seq
+            } else if let held = eventsById[message.eventId], eventGeneration[message.eventId] == eventsGeneration {
+                if held.seq > seq {
+                    // Older than the event's latest transition (a partial replay delivered the later
+                    // one first): out-of-order delivery. It fills the coverage, never rolls the event
+                    // back, and proves no restart.
+                    record(message, at: now, fromSync: false)
+                    noteReceived(message)
+                    return
+                }
+                duplicate = held.seq == seq && held.event.state == message.state
             } else {
                 duplicate = false
             }

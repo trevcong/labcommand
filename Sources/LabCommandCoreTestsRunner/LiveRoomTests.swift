@@ -879,6 +879,35 @@ func testLiveRoomDelayedLiveTransitionIsDuplicate() {
     expect(reset.eventsState != .complete && reset.eventsSeq == nil, "status seq reset: new generation, incomplete")
 }
 
+/// Codex P2: another client's replay on the shared sync topic delivers confirmed(1) without
+/// candidate(0). The delayed live candidate(0) is older than the event's latest seq: out-of-order
+/// delivery fills the coverage, never rolls the event back and never cuts the history.
+func testLiveRoomOlderTransitionIsOutOfOrder() {
+    var mirror = Mirror(roomId: "lab")
+    let opened = mirror.connectionOpened(at: 100, canRequest: true)
+    expect(request(opened, .events, "out-of-order connect")?.since == nil, "connect asks for events since NONE")
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 1, seq: 1, state: .confirmed), at: 101)
+    expect(mirror.eventsSeq == 1 && mirror.eventsById[1]?.event.state == .confirmed, "partial replay: confirmed at 1")
+    let gaps = mirror.activity.gaps
+
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 0, state: .candidate), at: 101.5)
+    expect(mirror.eventsById[1]?.event.state == .confirmed, "delayed live candidate at seq 0 does not roll back, got \(String(describing: mirror.eventsById[1]?.event.state))")
+    expect(mirror.eventsSeq == 1, "delayed live seq 0 keeps the baseline at 1")
+    expect(mirror.activity.gaps == gaps, "out-of-order delivery is no gap: \(mirror.activity.gaps - gaps) gaps")
+    _ = mirror.tick(at: 101 + Mirror.syncSettle + 1)
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 1), at: 104.5)
+    expect(mirror.eventsState == .complete, "0–1 held, status 1: complete, got \(mirror.eventsState)")
+    expect(request(mirror.tick(at: 200), .events, "out-of-order resolved") == nil, "events request resolved")
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 2, state: .accepted), at: 201)
+    expect(mirror.eventsSeq == 2 && mirror.eventsById[1]?.event.state == .accepted && mirror.eventsState == .complete,
+           "live seq 2 chains on: complete")
+
+    // A status seq reset still starts a new generation.
+    var reset = mirror
+    _ = reset.receive(topic: .status, payload: status(epoch: 5, seq: 0, eventsSeq: 0), at: 202)
+    expect(reset.eventsState != .complete && reset.eventsSeq == nil, "status seq reset: new generation, incomplete")
+}
+
 /// Random interleavings of live, sync, status, reconnect and settle against one invariant: the
 /// mirror reads complete only when it holds every seq in [0, max(status events_seq, highest held)].
 /// Each run ends by reconnecting and replaying everything, which must then read complete.
@@ -1044,6 +1073,8 @@ func runLiveRoomTests() {
     print("  LiveRoom: an outstanding events request hides no missing seq; settle and retry stay incomplete until 1–2 arrive"); passed()
     testLiveRoomDelayedLiveTransitionIsDuplicate()
     print("  LiveRoom: a replay overtaking live delivery: delayed live transitions are duplicates, never roll back; reused seq or status reset still restarts"); passed()
+    testLiveRoomOlderTransitionIsOutOfOrder()
+    print("  LiveRoom: a partial replay then an older live transition: out-of-order, no rollback, no cut; status reset still restarts"); passed()
     testLiveRoomHistoryInvariantProperty()
     print("  LiveRoom: random live/sync/status/reconnect/settle runs never read complete with a seq missing; full replay converges"); passed()
 }
