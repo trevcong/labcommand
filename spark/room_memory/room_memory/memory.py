@@ -328,12 +328,13 @@ class CandidateTracker:
     region is *fresh* when this window itself supports it (``update``'s ``fresh``); a stale one
     keeps a match alive but neither counts toward promotion nor starts a pending region. An
     appeared or disappeared region that matches no open entry of its kind but shares a voxel
-    with an open moved candidate (either pose) is that move seen as its two halves: it keeps the
-    move alive and starts nothing. A pending region becomes a CANDIDATE (and gets its event id)
-    once ``candidate_windows`` fresh windows have matched it without a break, and is dropped
-    silently the first window it is not matched. An open candidate goes EXPIRED after
-    ``expire_windows`` consecutive windows without a match. A matched candidate sends nothing:
-    the protocol has one message per transition.
+    with the same side of an open moved candidate (its new pose, its old pose) is a half of that
+    move and starts nothing; when a window has both halves, they are the move itself and count
+    as its match. A pending region becomes a CANDIDATE (and gets its event id) once
+    ``candidate_windows`` fresh windows have matched it without a break, and is dropped silently
+    the first window it is not matched. An open candidate goes EXPIRED after ``expire_windows``
+    consecutive windows without a match. A matched candidate sends nothing: the protocol has one
+    message per transition.
     """
 
     def __init__(self, candidate_windows=1, expire_windows=1):
@@ -348,7 +349,7 @@ class CandidateTracker:
         ``fresh`` holds one flag per region, None when every region is fresh.
         """
         transitions = []
-        open_matched, pending_matched, absorbed = set(), set(), set()
+        open_matched, pending_matched = set(), set()
         promoted, started = [], []
 
         def first(entries, matched, kind, keys):
@@ -358,9 +359,14 @@ class CandidateTracker:
                     return entry
             return None
 
-        def whole_move(keys):
+        def half_of(kind, keys):
+            """The first open move whose pose on this side (new for appeared, old for disappeared)
+            shares a voxel with ``keys``."""
             for index, entry in enumerate(self.open):
-                if entry.kind == EventKind.MOVED and len(np.intersect1d(entry.keys, keys, assume_unique=True)):
+                if entry.kind != EventKind.MOVED:
+                    continue
+                pose = entry.region.keys if kind == EventKind.APPEARED else entry.region.from_keys
+                if len(np.intersect1d(pose, keys, assume_unique=True)):
                     return index
             return None
 
@@ -369,23 +375,34 @@ class CandidateTracker:
             transitions.append((EventState.CANDIDATE, candidate))
             promoted.append(candidate)
 
-        promoted_pending = set()
+        # First pass: matches with open candidates of the same kind, and the halves of open moves.
+        unmatched, halves = [], {EventKind.APPEARED: set(), EventKind.DISAPPEARED: set()}
         for index, region in enumerate(regions):
             kind = _KINDS.get(region.kind)
             if kind is None:
                 continue
-            supported = fresh is None or fresh[index]
             keys = region_keys(region)
             match = first(self.open, open_matched, kind, keys)
             if match is not None:
                 match.keys, match.region, match.last_seen, match.missed = keys, region, stamp, 0
                 continue
-            # A move reported as its two halves (the diff's pairing gates flicker) is still that move.
-            move = whole_move(keys) if kind != EventKind.MOVED else None
+            move = half_of(kind, keys) if kind != EventKind.MOVED else None
             if move is not None:
-                absorbed.add(move)
-                self.open[move].last_seen, self.open[move].missed = stamp, 0
+                halves[kind].add(move)
+            unmatched.append((index, region, kind, keys, move))
+        # A move reported as its two halves (the diff's pairing gates flicker) is still that move.
+        # One half alone is not: it keeps nothing alive, so a move whose other half has gone
+        # (removed from its new pose, or its old pose filled again) expires and frees the half.
+        absorbed = halves[EventKind.APPEARED] & halves[EventKind.DISAPPEARED]
+        for move in absorbed:
+            self.open[move].last_seen, self.open[move].missed = stamp, 0
+        # Second pass, in region order: the rest match or start pending regions. A half starts
+        # nothing while its move is open, whether or not the move was seen whole.
+        promoted_pending = set()
+        for index, region, kind, keys, move in unmatched:
+            if move is not None:
                 continue
+            supported = fresh is None or fresh[index]
             waiting = first(self.pending, pending_matched, kind, keys)
             if waiting is not None:
                 waiting.keys, waiting.region, waiting.last_seen = keys, region, stamp

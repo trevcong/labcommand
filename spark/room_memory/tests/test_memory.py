@@ -385,6 +385,52 @@ def test_a_move_reported_as_its_halves_stays_one_open_move():
                                                                (EventState.EXPIRED, 101, stamp(1))]
 
 
+def test_a_lone_half_keeps_nothing_alive():
+    """Codex P2: an object moved from A to B and then removed from B left only the DISAPPEARED at
+    A, which kept resetting the open MOVED: the move never expired and the removal never started
+    a candidate. Only both halves together keep a move alive now; a lone one starts nothing until
+    the move has expired."""
+    tracker = CandidateTracker(3, 3)
+    ids = iter(range(100, 200))
+    next_id = lambda: next(ids)
+    region = lambda kind, keys, from_keys=None: type("Region", (), {"kind": kind, "keys": keys, "from_keys": from_keys})()
+    move = region("moved", keys_of([[10, 0, 0], [11, 0, 0]]), keys_of([[0, 0, 0], [1, 0, 0]]))
+    removed = region("disappeared", keys_of([[0, 0, 0], [1, 0, 0]]))
+    windows = [tracker.update([move], stamp(n), next_id) for n in range(3)]
+    windows += [tracker.update([removed], stamp(n), next_id) for n in range(3, 13)]
+    assert [n for n, w in enumerate(windows) if w] == [2, 5, 8]
+    assert [(s, c.event_id, c.kind) for s, c in windows[2]] == [(EventState.CANDIDATE, 100, EventKind.MOVED)]
+    assert [(s, c.event_id, c.last_seen) for s, c in windows[5]] == [(EventState.EXPIRED, 100, stamp(2))]
+    assert [(s, c.event_id, c.kind, c.first_seen) for s, c in windows[8]] == [
+        (EventState.CANDIDATE, 101, EventKind.DISAPPEARED, stamp(6))]
+    # The other half alone, without persistence: the move expires that window, the half starts the next.
+    tracker = CandidateTracker(1, 1)
+    tracker.update([move], stamp(0), next_id)
+    (gone,) = tracker.update([region("appeared", keys_of([[11, 0, 0], [12, 0, 0]]))], stamp(1), next_id)
+    assert gone[0] == EventState.EXPIRED and gone[1].kind == EventKind.MOVED and tracker.open == []
+    (opened,) = tracker.update([region("appeared", keys_of([[11, 0, 0], [12, 0, 0]]))], stamp(2), next_id)
+    assert opened[0] == EventState.CANDIDATE and opened[1].kind == EventKind.APPEARED
+
+
+def test_a_moved_box_removed_from_its_new_pose_expires_and_disappears():
+    """Codex P2: the DISAPPEARED left at the old pose kept the MOVED open forever on the node
+    defaults; nothing was sent in ten windows without the box."""
+    room = scenes.room_shell()
+    box = scenes.box_shell((0.0, 0.5, 0.30))
+    memory = mid360_memory(None, state_dir=None, recent_windows=3, candidate_windows=3, expire_windows=3)
+    second = build_reference(memory, np.concatenate([room, box]))
+    events = []
+    for n in range(16):
+        memory.add_points("mid360", np.concatenate([room, scenes.shifted(box, 1)]) if n < 3 else room)
+        events.append(memory.close_window(stamp(second + n)))
+    assert [n for n, window in enumerate(events) if window] == [2, 7, 10]
+    ((moved,), (expired,), (removed,)) = events[2], events[7], events[10]
+    assert (moved.kind, moved.state) == (EventKind.MOVED, EventState.CANDIDATE)
+    # The recent layer keeps the new pose for its 3 windows: both halves until the window after the removal.
+    assert (expired.event_id, expired.state, expired.last_seen) == (moved.event_id, EventState.EXPIRED, stamp(second + 4))
+    assert (removed.kind, removed.state, removed.first_seen) == (EventKind.DISAPPEARED, EventState.CANDIDATE, stamp(second + 8))
+
+
 def test_recent_observations_age_through_missing_windows(tmp_path):
     room = scenes.room_shell()
     memory = mid360_memory(tmp_path, state_dir=None, recent_windows=3)

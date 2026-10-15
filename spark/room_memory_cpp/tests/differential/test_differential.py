@@ -418,6 +418,22 @@ def test_a_move_seen_as_its_halves_stays_one_move(tmp_path):
     assert events == [0, 0, 0, 1, 0, 0, 0, 1]
 
 
+def test_codex_a_lone_half_keeps_no_move_alive(tmp_path):
+    """Codex P2: a box moved and then removed from its new pose left only the DISAPPEARED at the old
+    one, which kept the MOVED open forever; both engines now expire it and report the removal."""
+    room = scenes.room_shell()
+    box = scenes.box_shell((0.0, 0.5, 0.30))
+    paths = {name: floats(tmp_path, name, cloud) for name, cloud in (
+        ("box", np.concatenate([room, box])), ("moved", np.concatenate([room, scenes.shifted(box, 1)])), ("room", room))}
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360 max_range=none reference_windows=3 recent_windows=3 "
+             "candidate_windows=3 expire_windows=3 state_dir=none", "start 1760400000 0"]
+    for second, name in enumerate(["box"] * 3 + ["moved"] * 3 + ["room"] * 13):
+        lines += [f"points mid360 {paths[name]}", f"close {1760400000 + second} 0"]
+    out = run_both(tmp_path, "\n".join(lines))
+    events = [int(line.split()[1]) for line in out.splitlines() if line.startswith("close ")]
+    assert events == [0] * 5 + [1] + [0] * 4 + [1] + [0] * 2 + [1] + [0] * 5
+
+
 @pytest.mark.parametrize("variant", [
     "tolerance=1 recent_windows=2",
     "tolerance=0 recent_windows=1 min_extent=1",

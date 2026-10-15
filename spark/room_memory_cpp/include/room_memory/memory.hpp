@@ -124,13 +124,13 @@ Keys region_keys(const Region& region);
 // of this window matched; otherwise it starts a pending one. A region is fresh when this
 // window itself supports it (update's `fresh`); a stale one keeps a match alive but neither
 // counts toward promotion nor starts a pending region. An appeared or disappeared region that
-// matches no open entry of its kind but shares a voxel with an open moved candidate (either
-// pose) is that move seen as its two halves: it keeps the move alive and starts nothing. A
-// pending region becomes a CANDIDATE (and gets its event id) once `candidate_windows` fresh
-// windows have matched it without a break, and is dropped silently the first window it is not
-// matched. An open candidate goes
-// EXPIRED after `expire_windows` consecutive windows without a match. A matched candidate
-// sends nothing.
+// matches no open entry of its kind but shares a voxel with the same side of an open moved
+// candidate (its new pose, its old pose) is a half of that move and starts nothing; when a
+// window has both halves, they are the move itself and count as its match. A pending region
+// becomes a CANDIDATE (and gets its event id) once `candidate_windows` fresh windows have
+// matched it without a break, and is dropped silently the first window it is not matched. An
+// open candidate goes EXPIRED after `expire_windows` consecutive windows without a match. A
+// matched candidate sends nothing.
 class CandidateTracker {
 public:
     CandidateTracker(std::int64_t candidate_windows = 1, std::int64_t expire_windows = 1)
@@ -336,10 +336,13 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
         }
         return std::nullopt;
     };
-    // Index of the first open moved candidate sharing a voxel with `keys`.
-    const auto whole_move = [&](const Keys& keys) -> std::optional<std::size_t> {
+    // Index of the first open moved candidate whose pose on this side (the new one for an
+    // appeared region, the old one for a disappeared) shares a voxel with `keys`.
+    const auto half_of = [&](msg::EventKind kind, const Keys& keys) -> std::optional<std::size_t> {
         for (std::size_t n = 0; n < open_.size(); ++n) {
-            if (open_[n].kind == msg::EventKind::moved && intersects(open_[n].keys, keys)) return n;
+            if (open_[n].kind != msg::EventKind::moved) continue;
+            const Region& pose = open_[n].region;
+            if (intersects(kind == msg::EventKind::appeared ? pose.keys : pose.from_keys, keys)) return n;
         }
         return std::nullopt;
     };
@@ -348,29 +351,56 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
         transitions.emplace_back(msg::EventState::candidate, c);
         promoted.push_back(std::move(c));
     };
+    const auto kind_of = [](Region::Kind kind) -> std::optional<msg::EventKind> {
+        switch (kind) {
+            case Region::Kind::appeared: return msg::EventKind::appeared;
+            case Region::Kind::disappeared: return msg::EventKind::disappeared;
+            case Region::Kind::moved: return msg::EventKind::moved;
+            default: return std::nullopt;
+        }
+    };
+    // First pass: matches with open candidates of the same kind, and the halves of open moves.
+    std::vector<std::optional<Keys>> unmatched(regions.size());
+    std::vector<std::optional<std::size_t>> half(regions.size());
+    std::vector<bool> new_half(open_.size(), false);
+    std::vector<bool> old_half(open_.size(), false);
     for (std::size_t r = 0; r < regions.size(); ++r) {
         const Region& region = regions[r];
-        msg::EventKind kind;
-        switch (region.kind) {
-            case Region::Kind::appeared: kind = msg::EventKind::appeared; break;
-            case Region::Kind::disappeared: kind = msg::EventKind::disappeared; break;
-            case Region::Kind::moved: kind = msg::EventKind::moved; break;
-            default: continue;
-        }
-        const bool supported = fresh.empty() || fresh[r];
+        const auto kind = kind_of(region.kind);
+        if (!kind) continue;
         Keys keys = region_keys(region);
-        if (const auto n = first(open_, open_matched, kind, keys)) {
+        if (const auto n = first(open_, open_matched, *kind, keys)) {
             Candidate& match = open_[*n];
             match.keys = std::move(keys);
             match.region = region;
             match.last_seen = stamp;
             match.missed = 0;
-        } else if (const auto w = kind != msg::EventKind::moved ? whole_move(keys) : std::nullopt) {
-            // A move reported as its two halves (the diff's pairing gates flicker) is still that move.
-            absorbed[*w] = true;
-            open_[*w].last_seen = stamp;
-            open_[*w].missed = 0;
-        } else if (const auto m = first(pending_, pending_matched, kind, keys)) {
+            continue;
+        }
+        if (*kind != msg::EventKind::moved && (half[r] = half_of(*kind, keys))) {
+            (*kind == msg::EventKind::appeared ? new_half : old_half)[*half[r]] = true;
+        }
+        unmatched[r] = std::move(keys);
+    }
+    // A move reported as its two halves (the diff's pairing gates flicker) is still that move.
+    // One half alone is not: it keeps nothing alive, so a move whose other half has gone
+    // (removed from its new pose, or its old pose filled again) expires and frees the half.
+    for (std::size_t n = 0; n < open_.size(); ++n) {
+        if (new_half[n] && old_half[n]) {
+            absorbed[n] = true;
+            open_[n].last_seen = stamp;
+            open_[n].missed = 0;
+        }
+    }
+    // Second pass, in region order: the rest match or start pending regions. A half starts
+    // nothing while its move is open, whether or not the move was seen whole.
+    for (std::size_t r = 0; r < regions.size(); ++r) {
+        if (!unmatched[r] || half[r]) continue;
+        const Region& region = regions[r];
+        const msg::EventKind kind = *kind_of(region.kind);
+        const bool supported = fresh.empty() || fresh[r];
+        Keys keys = std::move(*unmatched[r]);
+        if (const auto m = first(pending_, pending_matched, kind, keys)) {
             Candidate& waiting = pending_[*m];
             waiting.keys = std::move(keys);
             waiting.region = region;

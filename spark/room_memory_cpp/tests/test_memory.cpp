@@ -536,6 +536,48 @@ TEST(a_move_reported_as_its_halves_stays_one_open_move) {
           gone[0].second.last_seen == stamp(1) && gone[1].second.event_id == 101);
 }
 
+// Codex P2: an object moved from A to B and then removed from B left only the DISAPPEARED at A,
+// which kept resetting the open MOVED: the move never expired and the removal never started a
+// candidate. Only both halves together keep a move alive now; a lone one starts nothing until
+// the move has expired.
+TEST(a_lone_half_keeps_nothing_alive) {
+    CandidateTracker tracker(3, 3);
+    std::uint64_t ids = 100;
+    const auto next = [&] { return ids++; };
+    Region move;
+    move.kind = Region::Kind::moved;
+    move.keys = keys({{10, 0, 0}, {11, 0, 0}});
+    move.from_keys = keys({{0, 0, 0}, {1, 0, 0}});
+    Region removed;
+    removed.kind = Region::Kind::disappeared;
+    removed.keys = move.from_keys;
+    std::vector<std::vector<std::pair<EventState, Candidate>>> windows;
+    for (std::int64_t n = 0; n < 13; ++n) windows.push_back(tracker.update({n < 3 ? move : removed}, stamp(n), next));
+    std::vector<std::size_t> busy;
+    for (std::size_t n = 0; n < windows.size(); ++n) {
+        if (!windows[n].empty()) busy.push_back(n);
+    }
+    CHECK((busy == std::vector<std::size_t>{2, 5, 8}));
+    CHECK(windows[2].size() == 1 && windows[2][0].first == EventState::candidate &&
+          windows[2][0].second.event_id == 100 && windows[2][0].second.kind == EventKind::moved);
+    CHECK(windows[5].size() == 1 && windows[5][0].first == EventState::expired &&
+          windows[5][0].second.event_id == 100 && windows[5][0].second.last_seen == stamp(2));
+    CHECK(windows[8].size() == 1 && windows[8][0].first == EventState::candidate &&
+          windows[8][0].second.event_id == 101 && windows[8][0].second.kind == EventKind::disappeared &&
+          windows[8][0].second.first_seen == stamp(6));
+    // The other half alone, without persistence: the move expires that window, the half starts the next.
+    CandidateTracker single(1, 1);
+    single.update({move}, stamp(0), next);
+    Region appeared;
+    appeared.kind = Region::Kind::appeared;
+    appeared.keys = keys({{11, 0, 0}, {12, 0, 0}});
+    const auto gone = single.update({appeared}, stamp(1), next);
+    CHECK(gone.size() == 1 && gone[0].first == EventState::expired && gone[0].second.kind == EventKind::moved &&
+          single.open().empty());
+    const auto opened = single.update({appeared}, stamp(2), next);
+    CHECK(opened.size() == 1 && opened[0].first == EventState::candidate && opened[0].second.kind == EventKind::appeared);
+}
+
 // Codex fix 3: windows without usable data still age the recent layer.
 TEST(recent_observations_age_through_missing_windows) {
     const Cloud room = scenes::room_shell();
