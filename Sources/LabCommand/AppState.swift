@@ -2,19 +2,21 @@ import Foundation
 import Combine
 import LabCommandCore
 
-/// App destinations. Simplified for the redesign — workspace and settings only.
+/// App destinations. Rig, Settings, and the live room.
 enum Dest: String, CaseIterable, Identifiable {
     case workspace
     case settings
+    case liveRoom
 
     var id: String { rawValue }
 
-    static var navCases: [Dest] { [.workspace, .settings] }
+    static var navCases: [Dest] { [.workspace, .settings, .liveRoom] }
 
     var label: String {
         switch self {
         case .workspace: return "Rig"
         case .settings: return "Settings"
+        case .liveRoom: return "Room"
         }
     }
 
@@ -22,6 +24,7 @@ enum Dest: String, CaseIterable, Identifiable {
         switch self {
         case .workspace: return "1"
         case .settings: return "2"
+        case .liveRoom: return "3"
         }
     }
 }
@@ -57,7 +60,16 @@ final class AppState: ObservableObject {
     /// Lidar clouds from Spark, on request only. Publishes on its own so live
     /// updates don't invalidate everything that observes AppState. Mock mode is
     /// for working without Spark — it doesn't reach for the real rig.
-    let live = FoxgloveLiveClient(isAvailable: MockMode.parseArgs() == nil)
+    /// The room gate launch and every fixture leave this dark.
+    let live: FoxgloveLiveClient
+
+    /// Live room socket. Nil in fixture mode: the view reads `fixture` instead.
+    let launch: LiveRoomLaunch
+    let room: LiveRoomClient?
+    @Published private(set) var fixture: LiveRoomFixture?
+    /// True after `start()` has opened the room socket. The Off screen is the other case.
+    private(set) var roomDidStart = false
+    private var fixtureTimer: Timer?
 
     private let service: ConnectivityService
     private let rigIO: RigServiceProtocol
@@ -72,6 +84,17 @@ final class AppState: ObservableObject {
         service: ConnectivityService = ConnectivityService(),
         rigIO: RigServiceProtocol = MockMode.createRigService()
     ) {
+        let launch = LiveRoomLaunch.parse()
+        self.launch = launch
+        self.live = FoxgloveLiveClient(isAvailable: launch.lidarAvailable && MockMode.parseArgs() == nil)
+        switch launch {
+        case .live:
+            self.room = LiveRoomClient()
+            self.fixture = nil
+        case .fixture(let mode):
+            self.room = nil
+            self.fixture = try? LiveRoomFixture.load(mode: mode, root: nil, now: ProcessInfo.processInfo.systemUptime)
+        }
         self.service = service
         self.rigIO = rigIO
         self.snapshot = LabStatusSnapshot(
@@ -82,14 +105,50 @@ final class AppState: ObservableObject {
             summaryLine: "—",
             refreshedAt: Date()
         )
+        if launch.opensRoom {
+            dest = .liveRoom
+        }
+    }
+
+    var roomMirror: RoomMemoryMirror {
+        if let room { return room.mirror }
+        return fixture?.mirror ?? RoomMemoryMirror()
+    }
+
+    var roomConnection: LiveRoomConnection {
+        if let room { return room.connection }
+        return fixture?.connection ?? .off
+    }
+
+    /// The bridge can publish, or a relay sink is installed. This job leaves the sink nil.
+    var requestPathExists: Bool {
+        if case .connected(let server) = room?.connection, server.canPublish { return true }
+        return room?.requestSyncSink != nil
+    }
+
+    func selectFixture(_ mode: LiveRoomFixture.Mode) {
+        guard launch.fixtureMode != nil else { return }
+        fixtureTimer?.invalidate()
+        fixtureTimer = nil
+        fixture = try? LiveRoomFixture.load(mode: mode, root: nil, now: ProcessInfo.processInfo.systemUptime)
+        if mode == .map { startFixtureClock() }
     }
 
     var health: RigConfidence { RigHealth.evaluate(rig) }
 
     func start() {
-        refresh(manual: true)
-        restartTimer()
-        setUpPointClouds()
+        if !launch.skipsProbes {
+            refresh(manual: true)
+            restartTimer()
+            setUpPointClouds()
+        }
+        if launch.startsClient {
+            room?.start()
+            roomDidStart = true
+        }
+        if launch.fixtureMode == .map {
+            startFixtureClock()
+        }
     }
 
     /// The 3D canvas opens no socket on its own: the sample PCD stands in until
@@ -163,10 +222,23 @@ final class AppState: ObservableObject {
     func stop() {
         slowTimer?.invalidate()
         fastTimer?.invalidate()
+        fixtureTimer?.invalidate()
         slowTimer = nil
         fastTimer = nil
+        fixtureTimer = nil
         task?.cancel()
+        room?.stop()
         live.shutdown()
+    }
+
+    private func startFixtureClock() {
+        fixtureTimer?.invalidate()
+        fixtureTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.fixture = self.fixture?.refreshed(at: ProcessInfo.processInfo.systemUptime)
+            }
+        }
     }
 
     func restartTimer() {
