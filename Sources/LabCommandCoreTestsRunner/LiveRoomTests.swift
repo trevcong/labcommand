@@ -497,6 +497,8 @@ func testLiveRoomEvents() {
     expect(mirror.eventsSeq == 4 && mirror.eventsState == .complete, "replay contiguous through 4: complete")
     expect(mirror.eventsById[1]?.event.state == .accepted && mirror.openEvents.map(\.event.eventId) == [2, 3], "replayed states apply")
     expect(mirror.events.last?.fromSync == true, "replayed messages are marked fromSync")
+    // The connect status named no event; a request is done only once a status agrees with the baseline.
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 4), at: 122)
     actions = mirror.tick(at: 200)
     expect(request(actions, .events, "after replay") == nil, "resolved: no repeat")
 
@@ -616,6 +618,7 @@ func testLiveRoomReplayAndFallbackEdges() {
     _ = fallback.tick(at: 114)
     expect(fallback.eventsSeq == 300 && fallback.eventsState != .complete, "settled fallback: baseline jumps to 300, incomplete")
     expect(fallback.eventsById[9]?.event.state == .confirmed, "the old open event from the fallback is kept")
+    _ = fallback.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 300), at: 115)
     expect(request(fallback.tick(at: 200), .events, "after fallback") == nil, "no endless retries after a fallback")
     _ = fallback.receive(topic: .events, payload: event(id: 1, seq: 301, state: .confirmed), at: 201)
     expect(fallback.eventsSeq == 301 && fallback.eventsState != .complete, "live events chain on; lost history stays flagged")
@@ -1082,6 +1085,85 @@ func testLiveRoomLowerSeqFromAnotherEventIsNoRestart() {
            "status seq reset: one cut, new generation, incomplete")
 }
 
+/// Codex P2: events 0–5 held, then the publisher restarts while the Mac is away and publishes no
+/// event. Its status seq has passed the old one, so only `events_seq` NONE tells. NONE is below any
+/// baseline: twice in a row it is a restart, once may be lag. The same holds against a mark a status
+/// named but no event delivered, and against an earlier status's mark.
+func testLiveRoomNoneEventsSeqIsRestartEvidence() {
+    var mirror = currentMirror()
+    for seq in UInt64(0)...5 { _ = mirror.receive(topic: .events, payload: event(id: seq + 1, seq: seq), at: 101) }
+    for seq in UInt64(0)...5 { _ = mirror.receive(topic: .syncEvents, payload: event(id: seq + 1, seq: seq), at: 101) }
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 50, eventsSeq: 5), at: 102)
+    _ = mirror.tick(at: 101 + Mirror.syncSettle + 1)
+    expect(mirror.eventsState == .complete && request(mirror.tick(at: 110), .events, "none setup") == nil,
+           "setup: 0–5 held, complete, nothing owed")
+    mirror.connectionClosed(at: 111)
+    let opened = mirror.connectionOpened(at: 120, canRequest: true)
+    expect(request(opened, .events, "none reconnect")?.since?.seq == 5, "reconnect asks for events since seq 5")
+
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 900), at: 121)
+    expect(mirror.eventsSeq == 5 && mirror.activity.historyCuts == 0, "one NONE status may be lag: baseline stays")
+    // A NONE status does not agree with the baseline: the owed request is not done.
+    expect(request(mirror.tick(at: 126), .events, "none retry")?.since?.seq == 5, "after one NONE the events request still retries")
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 901), at: 127)
+    expect(mirror.eventsSeq == nil && mirror.activity.historyCuts == 1, "two NONE statuses: new generation, one cut")
+    expect(mirror.eventsState != .complete, "two NONE statuses: old open events may be outdated, got \(mirror.eventsState)")
+    // The new generation published nothing: there is nothing to fetch.
+    expect(request(mirror.tick(at: 140), .events, "none restart") == nil, "restart with NONE: no events to request")
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 902), at: 141)
+    expect(mirror.activity.historyCuts == 1 && mirror.eventsState != .complete, "further NONE statuses: no second cut, still incomplete")
+
+    // Lag: the status was published before event 0 arrived. One NONE, then agreement: no cut.
+    var lag = currentMirror(canRequest: false)
+    _ = lag.receive(topic: .events, payload: event(id: 1, seq: 0), at: 101)
+    _ = lag.receive(topic: .status, payload: status(epoch: 5, seq: 2), at: 102)
+    _ = lag.receive(topic: .status, payload: status(epoch: 5, seq: 3, eventsSeq: 0), at: 103)
+    _ = lag.receive(topic: .status, payload: status(epoch: 5, seq: 4), at: 104)
+    _ = lag.receive(topic: .status, payload: status(epoch: 5, seq: 5, eventsSeq: 0), at: 105)
+    expect(lag.activity.historyCuts == 0 && lag.eventsSeq == 0 && lag.eventsState == .complete,
+           "NONE lag statuses between agreeing ones: no cut, complete")
+
+    // NONE then a mark below the baseline: both are low, so two in a row.
+    var mixed = currentMirror(canRequest: false)
+    for seq in UInt64(0)...5 { _ = mixed.receive(topic: .events, payload: event(id: 1, seq: seq), at: 101) }
+    _ = mixed.receive(topic: .status, payload: status(epoch: 5, seq: 900), at: 102)
+    _ = mixed.receive(topic: .status, payload: status(epoch: 5, seq: 901, eventsSeq: 1), at: 103)
+    expect(mixed.eventsSeq == nil && mixed.activity.historyCuts == 1 && mixed.eventsState != .complete,
+           "NONE then a low mark: new generation, incomplete")
+
+    // Named but never held: the old generation's events are unseen for good, even once the new
+    // generation reaches the old mark.
+    var named = currentMirror(canRequest: false)
+    _ = named.receive(topic: .status, payload: status(epoch: 5, seq: 50, eventsSeq: 5), at: 101)
+    named.connectionClosed(at: 102)
+    _ = named.connectionOpened(at: 120, canRequest: false)
+    _ = named.receive(topic: .status, payload: status(epoch: 5, seq: 900), at: 121)
+    expect(named.activity.historyCuts == 0, "one NONE after a named mark may be lag")
+    _ = named.receive(topic: .status, payload: status(epoch: 5, seq: 901), at: 122)
+    expect(named.activity.historyCuts == 1, "two NONE statuses after a named mark: cut")
+    for seq in UInt64(0)...5 { _ = named.receive(topic: .events, payload: event(id: 1, seq: seq), at: 123) }
+    _ = named.receive(topic: .status, payload: status(epoch: 5, seq: 902, eventsSeq: 5), at: 124)
+    expect(named.eventsState != .complete, "new generation 0–5 after the cut stays incomplete, got \(named.eventsState)")
+
+    // A mark below an earlier status's mark, twice, is a restart even when it is above the baseline.
+    var fell = currentMirror(canRequest: false)
+    for seq in UInt64(0)...3 { _ = fell.receive(topic: .events, payload: event(id: 1, seq: seq), at: 101) }
+    _ = fell.receive(topic: .status, payload: status(epoch: 5, seq: 50, eventsSeq: 8), at: 102)
+    _ = fell.receive(topic: .status, payload: status(epoch: 5, seq: 51, eventsSeq: 4), at: 103)
+    expect(fell.activity.historyCuts == 0, "one fallen mark may be lag")
+    _ = fell.receive(topic: .status, payload: status(epoch: 5, seq: 52, eventsSeq: 4), at: 104)
+    expect(fell.eventsSeq == nil && fell.activity.historyCuts == 1, "marks 8 then 4, 4: new generation")
+
+    // A cut with no baseline starts the next generation's count afresh: one fallen status after it is lag.
+    var unheld = currentMirror(canRequest: false)
+    _ = unheld.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 8), at: 101)
+    _ = unheld.receive(topic: .status, payload: status(epoch: 5, seq: 3, eventsSeq: 4), at: 102)
+    _ = unheld.receive(topic: .status, payload: status(epoch: 5, seq: 4, eventsSeq: 4), at: 103)
+    expect(unheld.activity.historyCuts == 1, "named marks 8 then 4, 4 with nothing held: cut")
+    _ = unheld.receive(topic: .status, payload: status(epoch: 5, seq: 5, eventsSeq: 3), at: 104)
+    expect(unheld.activity.historyCuts == 1, "one fallen mark after the cut may be lag: no second cut")
+}
+
 /// Random interleavings of live, sync and duplicate deliveries over several events, with statuses
 /// between them: the history is cut only on a status step that resets the status seq. No event
 /// message, at any seq or from any event id, cuts it or rolls an event back.
@@ -1229,6 +1311,8 @@ func runLiveRoomTests() {
     print("  LiveRoom: a partial replay then a lower live seq from another event: out-of-order, no cut; complete once a status confirms"); passed()
     testLiveRoomOnlyStatusCutsHistoryProperty()
     print("  LiveRoom: random multi-event live/sync/duplicate interleavings: only a status reset cuts the history, no event rolls back"); passed()
+    testLiveRoomNoneEventsSeqIsRestartEvidence()
+    print("  LiveRoom: events_seq NONE (or below what the generation reached) on two statuses in a row is a restart; once is lag"); passed()
 }
 
 /// `swift run LabCommandCoreTestsRunner live-room-probe [seconds] [ws://host:port]`: connects a read-only

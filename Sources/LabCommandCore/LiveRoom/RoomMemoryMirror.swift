@@ -188,8 +188,9 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     private var statusEpochMismatches = 0
     /// `events_seq` of the previous status, while it was above the baseline.
     private var eventsMark: UInt64?
-    /// `events_seq` of the previous status, while it was below the baseline (a restart, or lag by one).
-    private var eventsLowMark: UInt64?
+    /// The previous status named less than this generation reached: `events_seq` below the baseline
+    /// or an earlier status's mark, or none at all. A restart, or lag by one.
+    private var eventsLow = false
     /// A sync delta chained onto the mirror since it went stale: proof it can catch up.
     private var replayChained = false
 
@@ -259,7 +260,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         highestLiveEventsSeq = nil
         statusEpochMismatches = 0
         eventsMark = nil
-        eventsLowMark = nil
+        eventsLow = false
         replayChained = false
         needs = [:]
         lastSyncEventAt = nil
@@ -619,7 +620,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     }
 
     /// A new publisher generation, reached only from status evidence (a status seq reset, or
-    /// `events_seq` below the baseline twice): coverage starts again at nothing. If the old one held
+    /// `events_seq` below what this generation reached, or NONE, twice): coverage starts again at nothing. If the old one held
     /// or named any event, its unseen tail is lost for good.
     private mutating func cutHistory() {
         activity.historyCuts += 1
@@ -727,8 +728,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         }
         // A live event is no proof the history before it was fetched: the initial answer settles that.
         guard let base = eventsSeq, !eventsInitialSync, eventsAhead.isEmpty else { return }
-        // A status mark below the baseline is a restart (or lag by one); either way not done yet.
-        guard base >= (highestLiveEventsSeq ?? base), base == (status?.eventsSeq ?? base) else { return }
+        // A status mark below the baseline, or none, is a restart (or lag by one); either way not done yet.
+        guard base >= (highestLiveEventsSeq ?? base), status?.eventsSeq == base else { return }
         needs[.events] = nil
     }
 
@@ -762,36 +763,40 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             }
         }
 
-        // events_seq gap: a high-water mark the baseline still has not reached one status later.
-        if eventsSeq == nil, let mark = message.eventsSeq {
-            // Events exist but none is held (the first was lost, or none has arrived yet). The
-            // coverage already reads incomplete; this only decides whether to ask again.
-            if eventsMark != nil, canRequest, needs[.events] == nil {
-                activity.gaps += 1
-                eventsInitialSync = true
-                needEvents()
+        // Seqs only fall when the publisher restarts: a status naming less than this generation
+        // reached (the baseline or an earlier status's mark), NONE included, twice in a row is a
+        // restart (protocol §5, new generation). Once may be lag.
+        let reached = [eventsSeq, eventsHighWater].compactMap { $0 }.max()
+        if let reached, message.eventsSeq.map({ $0 < reached }) ?? true {
+            if eventsLow {
+                startEventsGeneration()
+            } else {
+                eventsLow = true
             }
-            eventsMark = mark
-        }
-        if let base = eventsSeq, let mark = message.eventsSeq {
-            if mark > base {
-                if let previous = eventsMark, base < previous, needs[.events] == nil, eventsAhead.isEmpty {
+            eventsMark = nil
+        } else {
+            eventsLow = false
+            // events_seq gap: a high-water mark the baseline still has not reached one status later.
+            if eventsSeq == nil, let mark = message.eventsSeq {
+                // Events exist but none is held (the first was lost, or none has arrived yet). The
+                // coverage already reads incomplete; this only decides whether to ask again.
+                if eventsMark != nil, canRequest, needs[.events] == nil {
                     activity.gaps += 1
+                    eventsInitialSync = true
                     needEvents()
                 }
                 eventsMark = mark
-                eventsLowMark = nil
-            } else if mark < base {
-                // Below the baseline twice in a row: the publisher restarted (protocol §5, new generation).
-                if eventsLowMark != nil {
-                    startEventsGeneration()
+            }
+            if let base = eventsSeq, let mark = message.eventsSeq {
+                if mark > base {
+                    if let previous = eventsMark, base < previous, needs[.events] == nil, eventsAhead.isEmpty {
+                        activity.gaps += 1
+                        needEvents()
+                    }
+                    eventsMark = mark
                 } else {
-                    eventsLowMark = mark
+                    eventsMark = nil
                 }
-                eventsMark = nil
-            } else {
-                eventsMark = nil
-                eventsLowMark = nil
             }
         }
         // After any generation change above, so a restart's mark starts the new high-water.
@@ -812,6 +817,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     /// Drops the events baseline for a new publisher generation and fetches what exists anew.
     private mutating func startEventsGeneration() {
         cutHistory()
+        // Even with no baseline: a leftover low status must not count toward the next generation.
+        eventsLow = false
         guard eventsSeq != nil else { return }
         eventsGeneration += 1
         eventsSeq = nil
@@ -819,7 +826,6 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         eventsAhead = [:]
         highestLiveEventsSeq = nil
         eventsMark = nil
-        eventsLowMark = nil
         if canRequest {
             eventsInitialSync = true
             needEvents()
