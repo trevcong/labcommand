@@ -131,6 +131,12 @@ but only while `isStatusFresh`. Otherwise "STALE · age".
   A `SINCE_NONE` answer, not the first live event, settles what exists. Seqs an answer could
   not fill (the bounded fallback) are skipped: the baseline jumps to the highest replayed seq and
   the history stays incomplete. A status `events_seq` with no events held triggers `SINCE_NONE`.
+- **Node restart.** A status `seq` lower than the last one, or `events_seq` below the events
+  baseline on 2 consecutive statuses, starts a new generation. The events baseline is dropped
+  (history incomplete) and refetched with `SINCE_NONE`; the map's live high-water mark resets.
+- **Partial first history.** A first event above seq 0 with no sync coming means earlier events
+  exist that the Mac never saw: the list reads incomplete.
+- **Unreadable map payload.** The bricks stay, the map goes STALE (`.rejected`) and resyncs.
 - **Sync topics** are read only while a request is outstanding on that topic. A request repeats
   after 5 s, then 10, 20 and 30 s, until resolved. At most one per topic per 5 s.
 - **On connect**, both topics are requested once `roomId` is known.

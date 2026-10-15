@@ -169,6 +169,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     private var statusEpochMismatches = 0
     /// `events_seq` of the previous status, while it was above the baseline.
     private var eventsMark: UInt64?
+    /// `events_seq` of the previous status, while it was below the baseline (a restart, or lag by one).
+    private var eventsLowMark: UInt64?
     /// A sync delta chained onto the mirror since it went stale: proof it can catch up.
     private var replayChained = false
 
@@ -216,6 +218,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         highestLiveEventsSeq = nil
         statusEpochMismatches = 0
         eventsMark = nil
+        eventsLowMark = nil
         replayChained = false
         needs = [:]
         lastSyncEventAt = nil
@@ -277,6 +280,11 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             }
         } catch {
             activity.rejected += 1
+            if topic == .mapBricks || topic == .syncMapBricks {
+                // An unreadable map update may be the next delta: nothing proves the bricks current now.
+                markStale(.rejected)
+                needMap()
+            }
         }
         refreshFreshness(at: now)
         return flushRequests(at: now)
@@ -457,6 +465,18 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             // First message after launch (or after a reset): it starts the baseline.
             record(message, at: now, fromSync: false)
             moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
+            if seq != 0, !eventsInitialSync {
+                // Seqs start at 0 per publisher: events before this one exist and are not held.
+                if canRequest {
+                    if eventsState == .complete {
+                        eventsState = .incomplete(since: nil)
+                    }
+                    eventsInitialSync = true
+                    needEvents()
+                } else {
+                    loseEventsHistory()
+                }
+            }
             resolveEventsIfDone()
             return
         }
@@ -632,7 +652,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         }
         // A live event is no proof the history before it was fetched: the initial answer settles that.
         guard let base = eventsSeq, !eventsInitialSync, eventsAhead.isEmpty else { return }
-        guard base >= (highestLiveEventsSeq ?? base), base >= (status?.eventsSeq ?? base) else { return }
+        // A status mark below the baseline is a restart (or lag by one); either way not done yet.
+        guard base >= (highestLiveEventsSeq ?? base), base == (status?.eventsSeq ?? base) else { return }
         needs[.events] = nil
         if !eventsHistoryLost, connected {
             eventsState = .complete
@@ -647,7 +668,12 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             activity.duplicates += 1
             return
         }
+        let previous = status
         status = LiveRoomStatus(message, receivedAt: now)
+        if let previous, message.header.seq < previous.seq {
+            // Status seq starts at 0 per publisher: the node restarted.
+            nodeRestarted()
+        }
 
         // D20: a lost trailing delta shows as the status epoch disagreeing twice in a row.
         if let epoch = mapEpoch, mapState != .empty {
@@ -695,11 +721,46 @@ public struct RoomMemoryMirror: Sendable, Equatable {
                     }
                 }
                 eventsMark = mark
+                eventsLowMark = nil
+            } else if mark < base {
+                // Below the baseline twice in a row: the publisher restarted (protocol §5, new generation).
+                if eventsLowMark != nil {
+                    startEventsGeneration()
+                } else {
+                    eventsLowMark = mark
+                }
+                eventsMark = nil
             } else {
                 eventsMark = nil
+                eventsLowMark = nil
             }
         }
         resolveEventsIfDone()
+    }
+
+    /// The node restarted: live seqs start again at 0 on every topic.
+    private mutating func nodeRestarted() {
+        // The old generation's live seqs prove nothing about the new one's snapshot. D20 catches
+        // a missed startup snapshot, and the answer to that request may then be current.
+        highestLiveMapSeq = nil
+        startEventsGeneration()
+    }
+
+    /// Drops the events baseline for a new publisher generation and fetches what exists anew.
+    private mutating func startEventsGeneration() {
+        guard eventsSeq != nil else { return }
+        eventsGeneration += 1
+        loseEventsHistory()
+        eventsSeq = nil
+        eventsEpoch = nil
+        eventsAhead = [:]
+        highestLiveEventsSeq = nil
+        eventsMark = nil
+        eventsLowMark = nil
+        if canRequest {
+            eventsInitialSync = true
+            needEvents()
+        }
     }
 
     // MARK: Requests
@@ -733,7 +794,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         case .mapBricks:
             since = mapEpoch.flatMap { epoch in mapSeq.map { .init(epoch: epoch, seq: $0) } }
         case .events:
-            since = eventsEpoch.flatMap { epoch in eventsSeq.map { .init(epoch: epoch, seq: $0) } }
+            // Until the initial answer settles, retries keep asking for everything.
+            since = eventsInitialSync ? nil : eventsEpoch.flatMap { epoch in eventsSeq.map { .init(epoch: epoch, seq: $0) } }
         }
         defer { requestCounter += 1 }
         return RoomMemory.RequestSync(

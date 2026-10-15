@@ -475,37 +475,37 @@ func testLiveRoomReconnect() {
 func testLiveRoomEvents() {
     var mirror = currentMirror()
     _ = mirror.tick(at: 100) // flush connect requests
-    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 40), at: 101)
-    expect(mirror.eventsSeq == 40 && mirror.eventsState == .complete, "first event starts the baseline")
-    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 41, state: .confirmed), at: 102)
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 0), at: 101)
+    expect(mirror.eventsSeq == 0 && mirror.eventsState == .complete, "first event starts the baseline")
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 1, state: .confirmed), at: 102)
     expect(mirror.eventsById[1]?.event.state == .confirmed && mirror.openEvents.count == 1, "transition applies by event_id")
-    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 41, state: .confirmed), at: 103)
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 1, state: .confirmed), at: 103)
     expect(mirror.activity.duplicates == 1 && mirror.events.count == 2, "duplicate event counted, not stored")
 
     // Gap: 44 after 41.
     let gapTime: TimeInterval = 120
-    var actions = mirror.receive(topic: .events, payload: event(id: 2, seq: 44), at: gapTime)
-    expect(mirror.eventsState == .incomplete(since: header(5, 41).stamp), "gap: incomplete since the last good stamp")
+    var actions = mirror.receive(topic: .events, payload: event(id: 2, seq: 4), at: gapTime)
+    expect(mirror.eventsState == .incomplete(since: header(5, 1).stamp), "gap: incomplete since the last good stamp")
     expect(mirror.eventsById[2] != nil, "the newer message still shows")
-    expect(mirror.eventsSeq == 41, "baseline holds so the replay can fill the gap")
+    expect(mirror.eventsSeq == 1, "baseline holds so the replay can fill the gap")
     let sent = request(actions, .events, "events gap")
-    expect(sent?.since == .init(epoch: 5, seq: 41), "events gap requests since (epoch, 41)")
+    expect(sent?.since == .init(epoch: 5, seq: 1), "events gap requests since (epoch, 1)")
 
     // Replay of 42, 43 on the sync topic closes it; the held 44 is absorbed.
-    _ = mirror.receive(topic: .syncEvents, payload: event(id: 1, seq: 42, state: .accepted), at: 121)
-    _ = mirror.receive(topic: .syncEvents, payload: event(id: 3, seq: 43), at: 121)
-    expect(mirror.eventsSeq == 44 && mirror.eventsState == .complete, "replay contiguous through 44: complete")
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 1, seq: 2, state: .accepted), at: 121)
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 3, seq: 3), at: 121)
+    expect(mirror.eventsSeq == 4 && mirror.eventsState == .complete, "replay contiguous through 4: complete")
     expect(mirror.eventsById[1]?.event.state == .accepted && mirror.openEvents.map(\.event.eventId) == [2, 3], "replayed states apply")
     expect(mirror.events.last?.fromSync == true, "replayed messages are marked fromSync")
     actions = mirror.tick(at: 200)
     expect(request(actions, .events, "after replay") == nil, "resolved: no repeat")
 
     // An event's state only moves on a newer seq: an old replayed copy goes to history only.
-    _ = mirror.receive(topic: .events, payload: event(id: 3, seq: 45, state: .confirmed), at: 201)
-    _ = mirror.receive(topic: .events, payload: event(id: 3, seq: 47, state: .expired), at: 202) // gap 46
-    _ = mirror.receive(topic: .syncEvents, payload: event(id: 3, seq: 46, state: .reverted), at: 203)
+    _ = mirror.receive(topic: .events, payload: event(id: 3, seq: 5, state: .confirmed), at: 201)
+    _ = mirror.receive(topic: .events, payload: event(id: 3, seq: 7, state: .expired), at: 202) // gap 6
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 3, seq: 6, state: .reverted), at: 203)
     expect(mirror.eventsById[3]?.event.state == .expired, "older replayed transition does not overwrite a newer one")
-    expect(mirror.eventsSeq == 47 && mirror.eventsState == .complete, "gap 46 replayed: complete")
+    expect(mirror.eventsSeq == 7 && mirror.eventsState == .complete, "gap 6 replayed: complete")
 
     // Node restart: seq drops. New generation, history incomplete for good.
     _ = mirror.receive(topic: .events, payload: event(id: 3, seq: 0, state: .candidate), at: 210)
@@ -531,38 +531,38 @@ func testLiveRoomEvents() {
 func testLiveRoomEventsSeqGap() {
     var mirror = currentMirror()
     _ = mirror.tick(at: 100)
-    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 10), at: 100)
-    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 10), at: 101)
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 0), at: 100)
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 0), at: 101)
     expect(mirror.eventsState == .complete, "status at the baseline: complete")
 
     // events_seq ahead once is a race with the event itself.
-    var actions = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 3, eventsSeq: 11), at: 102)
+    var actions = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 3, eventsSeq: 1), at: 102)
     expect(request(actions, .events, "one ahead") == nil, "one status ahead is not a gap yet")
-    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 11), at: 102.3)
-    actions = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 4, eventsSeq: 11), at: 103)
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 1), at: 102.3)
+    actions = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 4, eventsSeq: 1), at: 103)
     expect(request(actions, .events, "caught up") == nil && mirror.eventsState == .complete, "event arrived: no gap")
 
-    // The last events before a quiet period were lost: the next status still finds 13 unreached.
-    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 5, eventsSeq: 13), at: 104)
-    actions = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 6, eventsSeq: 13), at: 105)
-    expect(request(actions, .events, "events_seq gap")?.since == .init(epoch: 5, seq: 11), "events_seq gap requests since (5, 11)")
-    expect(mirror.eventsState == .incomplete(since: header(5, 11).stamp), "events_seq gap: incomplete")
+    // The last events before a quiet period were lost: the next status still finds 3 unreached.
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 5, eventsSeq: 3), at: 104)
+    actions = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 6, eventsSeq: 3), at: 105)
+    expect(request(actions, .events, "events_seq gap")?.since == .init(epoch: 5, seq: 1), "events_seq gap requests since (5, 1)")
+    expect(mirror.eventsState == .incomplete(since: header(5, 1).stamp), "events_seq gap: incomplete")
     expect(mirror.activity.gaps == 1, "events_seq gap counted once")
-    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 7, eventsSeq: 13), at: 106)
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 7, eventsSeq: 3), at: 106)
     expect(mirror.activity.gaps == 1, "a request already out is not a second gap")
 
-    // The replay of 12 and 13 reaches the mark: complete, resolved.
-    _ = mirror.receive(topic: .syncEvents, payload: event(id: 4, seq: 12), at: 107)
-    expect(mirror.eventsState != .complete, "12 is short of the mark 13")
-    _ = mirror.receive(topic: .syncEvents, payload: event(id: 4, seq: 13, state: .confirmed), at: 107.2)
-    expect(mirror.eventsSeq == 13 && mirror.eventsState == .complete, "replay reached the mark: complete")
+    // The replay of 2 and 3 reaches the mark: complete, resolved.
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 4, seq: 2), at: 107)
+    expect(mirror.eventsState != .complete, "2 is short of the mark 3")
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 4, seq: 3, state: .confirmed), at: 107.2)
+    expect(mirror.eventsSeq == 3 && mirror.eventsState == .complete, "replay reached the mark: complete")
     expect(request(mirror.tick(at: 300), .events, "resolved") == nil, "events request resolved")
 
     // A duplicated status copy does not count as a second status.
     var dup = currentMirror()
     _ = dup.tick(at: 100)
-    _ = dup.receive(topic: .events, payload: event(id: 1, seq: 10), at: 100)
-    let ahead = status(epoch: 5, seq: 9, eventsSeq: 12)
+    _ = dup.receive(topic: .events, payload: event(id: 1, seq: 0), at: 100)
+    let ahead = status(epoch: 5, seq: 9, eventsSeq: 2)
     _ = dup.receive(topic: .status, payload: ahead, at: 101)
     actions = dup.receive(topic: .status, payload: ahead, at: 101.1)
     expect(request(actions, .events, "status copy") == nil && dup.activity.duplicates == 1, "status copy is a duplicate, not a gap")
@@ -592,19 +592,20 @@ func testLiveRoomReplayAndFallbackEdges() {
     expect(cold.eventsById[10]?.event.state == .confirmed, "an old open event from the fallback is kept although a live event came first")
     _ = cold.tick(at: 4.5)
     expect(cold.eventsState != .complete, "a fallback with holes leaves the history incomplete")
-    expect(request(cold.tick(at: 60), .events, "settled") == nil, "settled fallback resolves the request")
+    _ = cold.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 101), at: 5)
+    expect(request(cold.tick(at: 60), .events, "settled") == nil, "settled fallback resolves once the status catches up")
 
     // A bounded fallback answering a baseline the Spark no longer keeps: jump to the highest replayed seq.
     var fallback = currentMirror()
     _ = fallback.tick(at: 100)
-    _ = fallback.receive(topic: .events, payload: event(id: 1, seq: 40), at: 101)
+    _ = fallback.receive(topic: .events, payload: event(id: 1, seq: 0), at: 101)
     let gap = fallback.receive(topic: .events, payload: event(id: 1, seq: 300), at: 110)
-    expect(request(gap, .events, "deep gap")?.since == .init(epoch: 5, seq: 40), "deep gap requests since (5, 40)")
+    expect(request(gap, .events, "deep gap")?.since == .init(epoch: 5, seq: 0), "deep gap requests since (5, 0)")
     _ = fallback.receive(topic: .syncEvents, payload: event(id: 9, seq: 20, state: .confirmed), at: 111)
     for seq in UInt64(201)...300 {
         _ = fallback.receive(topic: .syncEvents, payload: event(id: 1000 + seq, seq: seq, state: .reverted), at: 111)
     }
-    expect(fallback.eventsSeq == 40, "baseline holds while the answer is arriving")
+    expect(fallback.eventsSeq == 0, "baseline holds while the answer is arriving")
     _ = fallback.tick(at: 114)
     expect(fallback.eventsSeq == 300 && fallback.eventsState != .complete, "settled fallback: baseline jumps to 300, incomplete")
     expect(fallback.eventsById[9]?.event.state == .confirmed, "the old open event from the fallback is kept")
@@ -624,6 +625,67 @@ func testLiveRoomReplayAndFallbackEdges() {
     _ = lost.receive(topic: .syncEvents, payload: event(id: 7, seq: 0), at: 13)
     _ = lost.tick(at: 16)
     expect(lost.eventsSeq == 0 && lost.eventsState == .complete, "a replay from seq 0 with no hole: complete")
+}
+
+/// Reproductions from the second Codex review: generations, partial first history, unreadable maps.
+func testLiveRoomGenerationsAndPartialHistory() {
+    // Joining mid-stream with no request path: a first event above seq 0 means history is missing.
+    var joined = currentMirror(canRequest: false)
+    _ = joined.receive(topic: .events, payload: event(id: 1, seq: 101), at: 101)
+    _ = joined.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 101), at: 102)
+    expect(joined.eventsState != .complete, "first event at seq 101 without sync: incomplete")
+    var fromZero = currentMirror(canRequest: false)
+    _ = fromZero.receive(topic: .events, payload: event(id: 1, seq: 0), at: 101)
+    expect(fromZero.eventsState == .complete, "first event at seq 0: complete")
+
+    // Initial sync retries stay SINCE_NONE even after a live event set a baseline.
+    var retry = Mirror(roomId: "lab")
+    _ = retry.connectionOpened(at: 0, canRequest: true)
+    _ = retry.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 50), at: 0)
+    _ = retry.receive(topic: .events, payload: event(id: 51, seq: 51), at: 1)
+    expect(request(retry.tick(at: 5), .events, "initial retry") .map { $0.since == nil } == true,
+           "initial events retry keeps since NONE")
+
+    // Node restart while disconnected: status seq resets; the events baseline starts a new generation.
+    var away = currentMirror()
+    _ = away.tick(at: 100)
+    _ = away.receive(topic: .events, payload: event(id: 1, seq: 0), at: 101)
+    _ = away.receive(topic: .events, payload: event(id: 1, seq: 1, state: .confirmed), at: 102)
+    _ = away.receive(topic: .status, payload: status(epoch: 5, seq: 50, eventsSeq: 1), at: 103)
+    expect(away.eventsState == .complete, "setup: events complete")
+    away.connectionClosed(at: 104)
+    _ = away.connectionOpened(at: 120, canRequest: true)
+    let restarted = away.receive(topic: .status, payload: status(epoch: 1, seq: 0, eventsSeq: 0), at: 121)
+    expect(away.eventsSeq == nil && away.eventsState != .complete, "status seq reset: events baseline dropped, incomplete")
+    let restartRequest = request(restarted, .events, "restart") ?? request(away.tick(at: 130), .events, "restart retry")
+    expect(restartRequest != nil && restartRequest!.since == nil, "restart: events requested since NONE")
+
+    // events_seq below the baseline twice (status seq not reset, e.g. a long absence): new generation.
+    var low = currentMirror()
+    _ = low.tick(at: 100)
+    for seq in UInt64(0)...5 { _ = low.receive(topic: .events, payload: event(id: 1, seq: seq), at: 101) }
+    _ = low.receive(topic: .status, payload: status(epoch: 5, seq: 900, eventsSeq: 2), at: 102)
+    expect(low.eventsSeq == 5, "one low mark may be lag")
+    _ = low.receive(topic: .status, payload: status(epoch: 5, seq: 901, eventsSeq: 2), at: 103)
+    expect(low.eventsSeq == nil && low.eventsState != .complete, "two low marks: new generation, incomplete")
+
+    // Status seq reset: a replayed startup snapshot of the new generation is current once it agrees.
+    var map = currentMirror()
+    _ = map.receive(topic: .mapBricks, payload: delta(epoch: 6, seq: 11, base: 5, []), at: 101)
+    _ = map.receive(topic: .status, payload: status(epoch: 6, seq: 30), at: 102)
+    _ = map.receive(topic: .status, payload: status(epoch: 1, seq: 0), at: 110)
+    let d20 = map.receive(topic: .status, payload: status(epoch: 1, seq: 1), at: 111)
+    expect(map.mapState == .stale(.epochMismatch) && request(d20, .mapBricks, "restart D20") != nil,
+           "missed startup snapshot: D20 requests the map")
+    _ = map.receive(topic: .syncMapBricks, payload: snapshot(epoch: 1, seq: 0, [brick(6)]), at: 112)
+    expect(map.mapState == .current && map.mapEpoch == 1 && map.bricks.count == 1, "new generation's sync snapshot at seq 0 is current")
+
+    // An unreadable map payload: bricks kept, map stale, resync requested.
+    var bad = currentMirror()
+    let good = delta(epoch: 6, seq: 11, base: 5, [])
+    let truncated = bad.receive(topic: .mapBricks, payload: good.prefix(good.count - 3), at: 110)
+    expect(bad.mapState == .stale(.rejected) && bad.bricks.count == 3, "truncated map: stale(rejected), bricks kept")
+    expect(request(truncated, .mapBricks, "truncated")?.since == .init(epoch: 5, seq: 10), "truncated map requests since (5, 10)")
 }
 
 func runLiveRoomTests() {
@@ -647,6 +709,8 @@ func runLiveRoomTests() {
     print("  LiveRoom: status events_seq unreached on the next status → RequestSync(events); replay to the mark"); passed()
     testLiveRoomReplayAndFallbackEdges()
     print("  LiveRoom: replayed snapshot behind live stays stale until chained; initial + bounded fallbacks settle; lost first event"); passed()
+    testLiveRoomGenerationsAndPartialHistory()
+    print("  LiveRoom: partial first history, SINCE_NONE retries, node restart generations, unreadable map → resync"); passed()
 }
 
 /// `swift run LabCommandCoreTestsRunner live-room-probe [seconds] [ws://host:port]`: connects a read-only
