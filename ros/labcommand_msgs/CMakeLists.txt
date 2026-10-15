@@ -12,6 +12,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Epoch.msg"
   "msg/RequestSync.msg"
   "msg/Activity.msg"
+  "msg/OperatorAction.msg"
+  "msg/EventsFallback.msg"
   DEPENDENCIES builtin_interfaces
 )
 

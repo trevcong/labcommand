@@ -13,6 +13,6 @@ uint64 map_epoch                  # repeats since_epoch
 uint64 seq                        # this client's request counter, +1 per request, starts at 0
 builtin_interfaces/Time stamp     # when the Mac sent the request
 
-uint64 since_epoch                # map_epoch of the last message the Mac applied on the topic, or SINCE_NONE
+uint64 since_epoch                # map_epoch of the message at the Mac's baseline for the topic (section 5), or SINCE_NONE
 uint64 since_seq                  # seq of that message, or SINCE_NONE; both SINCE_NONE or neither
 uint8 topic                       # TOPIC_*
