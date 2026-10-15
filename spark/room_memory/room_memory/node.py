@@ -17,7 +17,7 @@ from labcommand_msgs.msg import MapBricks as MapBricksMsg
 from labcommand_msgs.msg import MemoryStatus as MemoryStatusMsg
 from labcommand_msgs.msg import RequestSync as RequestSyncMsg
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import PointCloud2
 
 from .memory import SENSORS, MemoryConfig, RoomMemory
@@ -83,7 +83,10 @@ class RoomMemoryNode(Node):
         reliable = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE)
         self.events = self.create_publisher(ChangeEventMsg, EVENTS_TOPIC, reliable)
         self.status = self.create_publisher(MemoryStatusMsg, STATUS_TOPIC, QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
-        self.activity = self.create_publisher(ActivityMsg, ACTIVITY_TOPIC, QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
+        # Activity is full state at 1 Hz, so a late subscriber gets the last one at once; a copy delivered
+        # again repeats its seq (protocol §2). Same QoS as the C++ node.
+        self.activity = self.create_publisher(ActivityMsg, ACTIVITY_TOPIC, QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._rejections = RejectionLog()
         maps = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self.map = self.create_publisher(MapBricksMsg, MAP_TOPIC, maps)

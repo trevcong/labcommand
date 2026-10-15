@@ -178,7 +178,7 @@ struct Epoch {
     static Epoch from_cdr(std::span<const std::uint8_t> data);
 };
 
-// Transient motion next to the rig, 1 Hz (protocol 3.6). Never a change: activity does not become a
+// Transient motion next to the rig, 1 Hz (protocol 3.7). Never a change: activity does not become a
 // ChangeEvent. `active` when a tracking window since the previous message had activity; the counts,
 // sensor mask and largest region describe the newest such window, the largest region in the frame
 // of `largest_sensor`. `since_s` counts from that newest activity window, empty (NaN) before the first.

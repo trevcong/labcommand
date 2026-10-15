@@ -98,7 +98,10 @@ public:
 
         events_ = create_generic_publisher(kEventsTopic, kEventType, rclcpp::QoS(100).reliable());
         status_ = create_generic_publisher(kStatusTopic, "labcommand_msgs/msg/MemoryStatus", rclcpp::QoS(1).reliable());
-        activity_ = create_generic_publisher(kActivityTopic, "labcommand_msgs/msg/Activity", rclcpp::QoS(1).reliable());
+        // Activity is full state at 1 Hz, so a late subscriber gets the last one at once; a copy delivered
+        // again repeats its seq (protocol §2). Same QoS as node.py.
+        activity_ = create_generic_publisher(
+            kActivityTopic, "labcommand_msgs/msg/Activity", rclcpp::QoS(1).reliable().transient_local());
         map_ = create_generic_publisher(kMapTopic, kMapType, rclcpp::QoS(10).reliable());
         sync_map_ = create_generic_publisher(kSyncMapTopic, kMapType, rclcpp::QoS(10).reliable());
         sync_events_ = create_generic_publisher(kSyncEventsTopic, kEventType, rclcpp::QoS(200).reliable());

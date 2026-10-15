@@ -1,7 +1,7 @@
 # labcommand_msgs/Activity: transient motion next to the rig (people, things being handled), 1 Hz.
 # Never a change: activity does not become a ChangeEvent. A ChangeEvent CANDIDATE needs a region to stay
 # settled for candidate_windows windows with no activity next to it.
-# Contract: docs/ROOM-MEMORY-PROTOCOL.md in the LabCommand repo (section 3.6, D28).
+# Contract: docs/ROOM-MEMORY-PROTOCOL.md in the LabCommand repo (section 3.7, D33).
 
 uint8 SENSOR_MID360=1             # bit 0 of sensors
 uint8 SENSOR_JT128=2              # bit 1 of sensors

@@ -7,9 +7,10 @@ import pytest
 rclpy = pytest.importorskip("rclpy")
 pytest.importorskip("labcommand_msgs.msg")
 
+from labcommand_msgs.msg import Activity as ActivityMsg  # noqa: E402
 from labcommand_msgs.msg import MemoryStatus as MemoryStatusMsg  # noqa: E402
 from rclpy.parameter import Parameter  # noqa: E402
-from rclpy.qos import QoSProfile, ReliabilityPolicy  # noqa: E402
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy  # noqa: E402
 
 from room_memory.memory import SENSORS  # noqa: E402
 from room_memory.messages import Activity, Header, MemoryState, MemoryStatus  # noqa: E402
@@ -60,6 +61,21 @@ def test_activity_goes_out_with_each_status(node, monkeypatch):
     messages = [Activity.from_cdr(data) for data in sent]
     assert [m.header.seq for m in messages] == [0, 1] and not any(m.active for m in messages)
     assert all(m.since_s is None and m.header.room_id == "lab" for m in messages)
+
+
+def test_activity_reaches_a_late_transient_local_subscriber(node):
+    node._publish_status()
+    received = []
+    node.create_subscription(
+        ActivityMsg, ACTIVITY_TOPIC, received.append,
+        QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        raw=True,
+    )
+    for _ in range(50):
+        rclpy.spin_once(node, timeout_sec=0.1)
+        if received:
+            break
+    assert [Activity.from_cdr(data).header.seq for data in received] == [0]
 
 
 def test_status_reports_the_last_published_event_seq(node, monkeypatch):

@@ -1,8 +1,8 @@
 # Room memory protocol, v1 (Spark `room_memory` → LabCommand Mac)
 
-Status: draft for PR 0.1. Codex has not signed it off. Trevor decided D5, D9 and D19 on 2026-10-14 (§8); he has not answered Q1–Q4 (end of this doc). Sources: `RESEARCH_BRIEF.md` §2.2–§2.5 (2026-10-14). The `.msg` files are in `ros/labcommand_msgs/msg/`. The Swift codecs are `Sources/LabCommandCore/RoomMemoryMessages.swift` and `RoomMemoryCDR.swift`.
+Status: draft for PR 0.1. Codex has not signed it off. Trevor decided D5, D9 and D19 on 2026-10-14 (§8); he has not answered Q1–Q5 (end of this doc). PR #14 (the Spark node) added D28–D33 and §3.7 (`Activity`); D23–D27 and §3.6 are PR #13's (Phase 3 design), which follows it. Sources: `RESEARCH_BRIEF.md` §2.2–§2.5 (2026-10-14). The `.msg` files are in `ros/labcommand_msgs/msg/`. The Swift codecs are `Sources/LabCommandCore/RoomMemoryMessages.swift` and `RoomMemoryCDR.swift`.
 
-The Spark does all perception and keeps the memory. The Mac mirrors the reference map, the event list and the timeline, and renders them. It never infers a change itself. Four Spark → Mac topics carry the state, two sync topics carry answers to the Mac's resync requests, and one Mac → Spark topic carries those requests. They reach the Mac through a dedicated foxglove_bridge in the room-memory container on :8767, which relays only `/room_memory/*` (§2, D23). The lidar containers' bridge on :8765 is not touched.
+The Spark does all perception and keeps the memory. The Mac mirrors the reference map, the event list and the timeline, and renders them. It never infers a change itself. Five Spark → Mac topics carry the state, two sync topics carry answers to the Mac's resync requests, and one Mac → Spark topic carries those requests. How they travel between the Spark and the Mac is open (§2, D28, Q5): a dedicated foxglove_bridge on :8767 in the room-memory container, or the existing foxglove_bridge on :8765 with the requests relayed over the ssh-authenticated command-center API on :8766.
 
 ## 1. Conventions
 
@@ -69,24 +69,30 @@ Decoders reject an out-of-range enum value as *invalid*, and the whole message i
 
 Topic names are a proposal for PR 2.4 (D18):
 
-| topic | direction | message | rate | QoS (proposal) |
+| topic | direction | message | rate | QoS (proposal): reliability, durability, history |
 |---|---|---|---|---|
-| `/room_memory/map_bricks` | Spark → Mac | `MapBricks` | snapshot when TRACKING starts and then every `keyframe_period_s` (60 s); deltas at least `delta_period_s` (5 s) apart, only when the reference changed (D24) | reliable, keep-last 10 |
-| `/room_memory/events` | Spark → Mac | `ChangeEvent` | one per lifecycle transition, typically < 1/min | reliable, keep-last 100 |
-| `/room_memory/status` | Spark → Mac | `MemoryStatus` | 1 Hz | reliable, keep-last 1 |
-| `/room_memory/activity` | Spark → Mac | `Activity` | 1 Hz, with each status (D28) | reliable, keep-last 1 |
-| `/room_memory/epoch` | Spark → Mac | `Epoch` | 0.2 Hz | reliable, keep-last 1 |
-| `/room_memory/request_sync` | Mac → Spark | `RequestSync` | on (re)connect and on a gap, ≤ 1 per topic per 5 s | reliable, keep-last 10 |
-| `/room_memory/sync/map_bricks` | Spark → Mac | `MapBricks` | answers to `TOPIC_MAP_BRICKS` requests | reliable, keep-last 10 |
-| `/room_memory/sync/events` | Spark → Mac | `ChangeEvent` | answers to `TOPIC_EVENTS` requests | reliable, keep-last 200 |
+| `/room_memory/map_bricks` | Spark → Mac | `MapBricks` | snapshot when TRACKING starts and then every `keyframe_period_s` (60 s); deltas at least `delta_period_s` (5 s) apart, only when the reference changed (D29) | reliable, volatile, keep-last 10 |
+| `/room_memory/events` | Spark → Mac | `ChangeEvent` | one per lifecycle transition, typically < 1/min | reliable, volatile, keep-last 100 |
+| `/room_memory/status` | Spark → Mac | `MemoryStatus` | 1 Hz | reliable, volatile, keep-last 1 |
+| `/room_memory/activity` | Spark → Mac | `Activity` | 1 Hz, with each status (D33) | reliable, **transient_local**, keep-last 1 |
+| `/room_memory/epoch` | Spark → Mac | `Epoch` | 0.2 Hz | reliable, volatile, keep-last 1 |
+| `/room_memory/request_sync` | Mac → Spark | `RequestSync` | on (re)connect and on a gap, ≤ 1 per topic per 5 s | reliable, volatile, keep-last 10 |
+| `/room_memory/sync/map_bricks` | Spark → Mac | `MapBricks` | answers to `TOPIC_MAP_BRICKS` requests | reliable, volatile, keep-last 10 |
+| `/room_memory/sync/events` | Spark → Mac | `ChangeEvent` | answers to `TOPIC_EVENTS` requests | reliable, volatile, keep-last 200 |
 
-**Transport (D23).** The room-memory container starts its own foxglove_bridge on :8767 (launch argument `foxglove_bridge`, default on), with `topic_whitelist` `^/room_memory/.*`, so the raw clouds never leave through it, and `labcommand_msgs` in its environment, so Foxglove and the Mac get the full message definitions. It is read-only by default (capabilities `connectionGraph` only). foxglove_bridge 3.4.1 parses `client_topic_whitelist` but does not enforce it, so turning on client publishing (`foxglove_client_publish:=true`) lets any client that reaches the port publish on any topic. The node answers whatever arrives on `/room_memory/request_sync`, so a relay that publishes the Mac's bytes there works the same way.
+**Durability.** Both nodes declare `activity` transient_local, depth 1. `Activity` is full state at 1 Hz, like `status`, so a subscriber that joins late (usually the bridge, when the first Mac subscribes) gets the last one at once instead of waiting up to 1 s. A copy delivered again repeats its `seq` and is ignored like any `seq` ≤ the last applied. Every other topic uses the ROS 2 default, volatile, in both nodes. `Epoch` is not published yet (§3.4). PR #13 proposes durability for every topic (its D24).
 
-**Keyframes are the (re)connect snapshot (D24).** The bridge shares one ROS subscription across its clients, so the node cannot see a Mac (re)connect. The periodic keyframe on the live topic plays that role: a Mac that (re)connects holds a current map within `keyframe_period_s` without sending anything, and `RequestSync` makes it immediate where it can be sent.
+**Transport (D28, open: Q5).** Two options are on the table, and Trevor has not chosen. Both carry the same CDR bytes, and the node answers whatever arrives on `/room_memory/request_sync`, so the protocol does not depend on the choice.
+- **A dedicated bridge on :8767** (implemented in PR #14's launch file, off with `foxglove_bridge:=false`). The Mac requests over the same bridge's client publishing, or over a relay.
+- **The existing bridge on :8765, with the requests relayed over the ssh-authenticated command-center API on :8766.** :8765 needs `labcommand_msgs` in its environment for the memory topics. PR #13's `docs/phase3-live-integration.md` (P11) designs the relay.
+
+The :8767 option as implemented: the room-memory container starts its own foxglove_bridge on :8767 (launch argument `foxglove_bridge`, default on), with `topic_whitelist` `^/room_memory/.*`, so the raw clouds never leave through it, and `labcommand_msgs` in its environment, so Foxglove and the Mac get the full message definitions. It is read-only by default (capabilities `connectionGraph` only). foxglove_bridge 3.4.1 parses `client_topic_whitelist` but does not enforce it, so turning on client publishing (`foxglove_client_publish:=true`) lets any client that reaches the port publish on any topic. The node answers whatever arrives on `/room_memory/request_sync`, so a relay that publishes the Mac's bytes there works the same way.
+
+**Keyframes are the (re)connect snapshot (D29).** The bridge shares one ROS subscription across its clients, so the node cannot see a Mac (re)connect. The periodic keyframe on the live topic plays that role: a Mac that (re)connects holds a current map within `keyframe_period_s` without sending anything, and `RequestSync` makes it immediate where it can be sent.
 
 ## 3. Messages
 
-The `.msg` text below is the legal ROS 2 version of §2.4. §8 (D1) lists every syntax change. Field names, types and order are as §2.4 gives them, except for `MapBricks`, whose brick arrays moved into a compressed payload (D9). §3.5 adds `RequestSync` (D19), §3.6 adds `Activity` (D28). The *missing* column says how "not available" travels on the wire, and the *rendering* column says what the Mac shows then. "Stale" is the message-level rendering of §5.
+The `.msg` text below is the legal ROS 2 version of §2.4. §8 (D1) lists every syntax change. Field names, types and order are as §2.4 gives them, except for `MapBricks`, whose brick arrays moved into a compressed payload (D9). §3.5 adds `RequestSync` (D19), §3.7 adds `Activity` (D33); §3.6 is PR #13's. The *missing* column says how "not available" travels on the wire, and the *rendering* column says what the Mac shows then. "Stale" is the message-level rendering of §5.
 
 ### 3.1 `MapBricks`: snapshot or delta
 
@@ -231,6 +237,7 @@ uint8 STATE_RIG_MOVED=2
 uint8 STATE_DEGRADED=3
 uint8 STATE_PAUSED=4
 uint16 HZ_UNAVAILABLE=65535
+uint64 EVENTS_SEQ_NONE=18446744073709551615
 string room_id
 uint64 map_epoch
 uint64 seq
@@ -243,26 +250,28 @@ float32 pose_residual_m
 float32 window_s
 uint16[2] per_sensor_hz
 uint32 dropped_windows
+uint64 events_seq
 ```
 
-`map_epoch` in §2.4's MemoryStatus is the common field and is not repeated (D2).
+`map_epoch` in §2.4's MemoryStatus is the common field and is not repeated (D2). `events_seq` is not in §2.4; it is PR #13's events high-water mark (its D26), already on the wire and in both nodes.
 
 | field | type | unit | valid | missing on the wire | rendering when missing / invalid |
 |---|---|---|---|---|---|
 | `state` | `uint8` | enum | `STATE_*` (§4.1) | cannot be missing | other value: message rejected; status stale after 3 s |
-| `n_bricks` | `uint32` | bricks | bricks in the published reference map, the one `map_bricks` carries (D25) | cannot be missing | stale: "—" |
+| `n_bricks` | `uint32` | bricks | bricks in the published reference map, the one `map_bricks` carries (D30) | cannot be missing | stale: "—" |
 | `n_open_events` | `uint32` | events | events in CANDIDATE or CONFIRMED | cannot be missing | stale: "—" |
 | `coverage_known_frac` | `float32` | fraction 0–1 | observed share of the room volume, defined below | NaN = room volume not yet known | "coverage —", never 0 % |
 | `pose_residual_m` | `float32` | m | finite, ≥ 0; the rig-pose estimate defined below | NaN = guard has not run | "guard not run", never "0 m" |
 | `window_s` | `float32` | s | finite, > 0 (0.5–1.0 expected) | NaN = not reported | "window —" |
 | `per_sensor_hz` | `uint16[2]` | Hz, frames received per second, rounded | `[0]` Mid-360, `[1]` JT128 (same order as `sensors`) | `65535` = not measured | "—". `0` renders "0 Hz", a measured zero |
 | `dropped_windows` | `uint32` | windows since node start | any | cannot be missing | stale: "—" |
+| `events_seq` | `uint64` | count | `seq` of the newest message published on live `events` since the node started: the events high-water mark | `EVENTS_SEQ_NONE` = no event published yet | — |
 
 **Definitions (v1, as the Spark computes them).**
-- **`coverage_known_frac`.** Of the published reference map (D25): the number of known voxels (occupied or free) inside the axis-aligned voxel-index box of its occupied voxels, divided by the number of voxels in that box. The box stands in for the room volume until one is configured; voxels inside walls and furniture are in it and can never be observed, so the value stays well below 1 (0.17–0.18 on the JT128 recording). NaN while the reference has no occupied voxel. It is computed during BUILDING too, from the reference built so far.
+- **`coverage_known_frac`.** Of the published reference map (D30): the number of known voxels (occupied or free) inside the axis-aligned voxel-index box of its occupied voxels, divided by the number of voxels in that box. The box stands in for the room volume until one is configured; voxels inside walls and furniture are in it and can never be observed, so the value stays well below 1 (0.17–0.18 on the JT128 recording). NaN while the reference has no occupied voxel. It is computed during BUILDING too, from the reference built so far.
 - **`pose_residual_m`.** The size of the translation that best registers the latest window onto the reference, per sensor, then the largest over sensors. For each axis separately, the window's occupied voxels are shifted by −4 … +4 voxels and counted where they land on reference-occupied voxels. The best shift is refined by the parabola through that count and its two neighbours, unless it is ±4. The value is the length of the three per-axis shifts, in meters. Walls normal to an axis register that axis, and floors and ceilings do not mask a horizontal move. On the static recording it is 2.8 mm median (3.4 mm max). A real (2, 2, 0) cm move of the JT128 reads 26 mm, (5, 5, 0) cm reads 74 mm and 3 cm vertical reads 35 mm. It saturates near 0.35 m. NaN while BUILDING and when no shift overlaps at all. The memory stops learning from a window whose estimate exceeds `learn_max_offset_m` (0.02 m). Acting on it (RIG_MOVED, §4.1) is not implemented yet.
 
-**Wire size.** `4 + C + 32` bytes: 68 B for "lab", 76 B for "lab-a".
+**Wire size.** `4 + C + 40` bytes: 76 B for "lab", 84 B for "lab-a".
 
 ### 3.4 `Epoch`: timeline tick, 0.2 Hz
 
@@ -319,7 +328,7 @@ Trevor's D19 gives `RequestSync{room_id, since_epoch, since_seq, stamp}`. The co
 
 **Wire size.** `4 + C + 17` bytes: 53 B for "lab".
 
-### 3.6 `Activity`: transient motion next to the rig, 1 Hz
+### 3.7 `Activity`: transient motion next to the rig, 1 Hz
 
 ```
 uint8 SENSOR_MID360=1
@@ -338,14 +347,14 @@ float32[6] aabb
 float32 since_s
 ```
 
-Activity is never a change: nothing in it becomes a `ChangeEvent`, and `MemoryStatus` and `ChangeEvent` are unchanged (D28). An *activity region* is a change region of one sensor's tracking window that the window's own evidence supports and that either appeared new in that window or lost its shape (§4.2). Regions matched to an open event are not activity. `active` false means no such region, not a motionless room: still people, motion below `min_voxels` and motion inside an open event do not show.
+Activity is never a change: nothing in it becomes a `ChangeEvent`, and `MemoryStatus` and `ChangeEvent` are unchanged (D33). An *activity region* is a change region of one sensor's tracking window that the window's own evidence supports and that either appeared new in that window or lost its shape (§4.2). Regions matched to an open event are not activity. `active` false means no such region, not a motionless room: still people, motion below `min_voxels` and motion inside an open event do not show.
 
 | field | type | unit | valid | missing on the wire | rendering when missing / invalid |
 |---|---|---|---|---|---|
 | `seq` | `uint64` | count | per-topic counter, +1 per message | cannot be missing | — |
 | `active` | `bool` | — | a tracking window since the previous `Activity` had activity | cannot be missing | other value than 0/1: message rejected |
 | `sensors` | `uint8` | bitmask | `SENSOR_*` with activity in the newest such window; 0 when inactive | cannot be missing | undefined bit: message rejected |
-| `largest_sensor` | `uint8` | enum | the `SENSOR_*` bit whose frame `centroid` and `aabb` are in (D25); one bit of `sensors`; 0 when inactive | cannot be missing | otherwise rejected |
+| `largest_sensor` | `uint8` | enum | the `SENSOR_*` bit whose frame `centroid` and `aabb` are in (D30); one bit of `sensors`; 0 when inactive | cannot be missing | otherwise rejected |
 | `n_regions` | `uint32` | count | activity regions in that window, all sensors; 0 when inactive | cannot be missing | — |
 | `voxel_count` | `uint32` | voxels | their voxels (a move counts its new pose); 0 when inactive | cannot be missing | — |
 | `centroid`, `aabb` | `float32[3]`, `float32[6]` | m | the largest activity region (most voxels; ties to the lower sensor bit), as a `ChangeEvent` would carry it | NaN ×3, NaN ×6 when inactive | partly NaN: rejected |
@@ -385,7 +394,7 @@ The Spark owns both machines. The Mac renders them, and it flags a transition th
 
 | from | to | trigger | Mac rendering of the new state |
 |---|---|---|---|
-| — | CANDIDATE | disagreement between the reference and recent layers where both have evidence that stays *settled* for `candidate_windows` (40) consecutive windows: each window's own evidence supports it (`fresh_min_voxels` 3 and `fresh_min_fraction` 0.5 of its voxels, both poses of a move), it keeps its shape (`stable_min_fraction` 0.9 of its voxels within `tolerance` of where they were when the count started, and back), and no activity region (§3.6) is within `activity_radius_m` (1.0 m). A stale window, a lost shape, nearby activity or a window without points starts the count again. Anything shorter sends nothing (D26, D28) | dashed outline, "candidate"; not counted as a change |
+| — | CANDIDATE | disagreement between the reference and recent layers where both have evidence that stays *settled* for `candidate_windows` (40) consecutive windows: each window's own evidence supports it (`fresh_min_voxels` 3 and `fresh_min_fraction` 0.5 of its voxels, both poses of a move), it keeps its shape (`stable_min_fraction` 0.9 of its voxels within `tolerance` of where they were when the count started, and back), and no activity region (§3.7) is within `activity_radius_m` (1.0 m). A stale window, a lost shape, nearby activity or a window without points starts the count again. Anything shorter sends nothing (D31, D33) | dashed outline, "candidate"; not counted as a change |
 | CANDIDATE | CONFIRMED | persists ≥ T_commit (start at 5 s; tuned in PR 2.3) | solid overlay; counted; arrow for MOVED |
 | CANDIDATE | EXPIRED | gone before T_commit (walk-through): no matching region for `expire_windows` (3) consecutive windows; superseded by a MOVED pairing; or memory left TRACKING for RIG_MOVED | removed from the overlay; history only |
 | CONFIRMED | ACCEPTED | operator accept; the reference absorbs it and `map_epoch` bumps | overlay removed; the map now shows the new state; history entry |
@@ -468,7 +477,7 @@ These extend the app's existing contract (missing ≠ zero, a running container 
 
 | stream | rate | message size ("lab", default zlib) | steady state |
 |---|---|---|---|
-| MemoryStatus | 1 Hz | 68 B (exact) | 0.07 KB/s |
+| MemoryStatus | 1 Hz | 76 B (exact) | 0.08 KB/s |
 | Activity | 1 Hz | 88 B (exact) | 0.09 KB/s |
 | Epoch | 0.2 Hz | 53 B (exact) | 0.01 KB/s |
 | ChangeEvent, no mask | per transition, < 1/min | 136 B (exact) | < 0.01 KB/s |
@@ -513,7 +522,7 @@ These extend the app's existing contract (missing ≠ zero, a running container 
 
 ## 8. Decisions for review
 
-Each item is a place where §2.4 was not legal ROS 2, was underspecified, or conflicted with the honest-state rules. Each states what this doc does and why. All need Codex review. Trevor decided D5, D9 and D19 on 2026-10-14; the parts of D19 marked below go beyond his decision and need his confirmation. D23–D26 come from the Spark implementation (Phase 2b) and the static recording.
+Each item is a place where §2.4 was not legal ROS 2, was underspecified, or conflicted with the honest-state rules. Each states what this doc does and why. All need Codex review. Trevor decided D5, D9 and D19 on 2026-10-14; the parts of D19 marked below go beyond his decision and need his confirmation. D28–D33 come from the Spark implementation (Phase 2b, PR #14) and the static recording. D23–D27 are PR #13's.
 
 - **D1. ROS 2 syntax.** §2.4's text was made legal ROS 2. Names, types and order are unchanged except in `MapBricks`, where D9 moved `compression` ahead of the brick arrays and packed those into `payload`. The syntax changes:
   - Constants go one per line (`KIND_SNAPSHOT=0, KIND_DELTA=1` became two lines).
@@ -593,12 +602,12 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
   - A missed trailing delta is caught by `MemoryStatus.map_epoch` disagreeing with the mirror twice in a row.
 - **D21. `package.xml` license** says `Proprietary` because the repo has no LICENSE file. Trevor should confirm.
 - **D22. Payload limit.** The uncompressed `MapBricks` payload, `134 × n_bricks + 4 × n_removed`, is at most 16 MiB (16,777,216 bytes), about 125,000 bricks or 8,000 m³ fully covered. Without a limit, a 2 MB zlib payload could declare and inflate to over 2 GB. The decoder rejects a larger declared size before inflating, and the encoder refuses to write one (D16). The measured room needs 547 KB.
-- **D23. A dedicated, read-only bridge on :8767** (§2). The memory topics need `labcommand_msgs` in the bridge's environment, which the lidar bridge on :8765 does not have, and a separate bridge leaves LIVE untouched. Read-only by default because foxglove_bridge 3.4.1 does not enforce `client_topic_whitelist`. `RequestSync` then needs `foxglove_client_publish:=true` or a relay.
-- **D24. Periodic keyframes.** §2.4's "snapshot on (re)connect" cannot be detected through the bridge, so the live topic carries a snapshot every `keyframe_period_s` (60 s). Changed bricks between keyframes go out as deltas at most every `delta_period_s` (5 s, the ≤ 0.2 Hz of §2). A snapshot replaces the next delta once the deltas since the last snapshot would exceed `keyframe_delta_ratio` (0.5) of its size. A keyframe of an unchanged map does not bump `map_epoch`; every delta does.
-- **D25. One published map.** There is no JT128↔Mid-360 extrinsic yet (brief R1), so the references stay per sensor and `map_bricks` carries one of them, `map_sensor` (default: the JT128 when configured; its repeating pattern gives the denser map). `n_bricks` and `coverage_known_frac` describe that map. Events of the other sensor are in that sensor's own frame.
-- **D26. A persistence gate before CANDIDATE (strengthened by D28).** On the static recording the node sent ~120 CANDIDATE/EXPIRED messages per minute. Most of them came from a reference built as the union of 5 windows of the Mid-360's sparse non-repetitive pattern; per-voxel window counts fix that (`spark/room_memory_cpp/PLAN.md`). As a second line, a region now has to persist `candidate_windows` windows before its CANDIDATE is sent. An open candidate expires only after `expire_windows` unmatched windows, so an intermittently seen change does not flicker. T_commit (CANDIDATE → CONFIRMED) is unchanged and still PR 2.3.
-- **D27. No events in the near field (superseded by D28: removed).** The rig stands about 1.3 m from where someone works. Live and in both static recordings, something low there (z up to ~0.8 m in the sensor frames) shifts every few seconds to minutes, seen by both lidars at once, and it was 100 % of the remaining events (live 2–18 per minute). A change region with a voxel center within `near_range_m` (2.0 m) of its sensor is not reported, whichever pose of a move it is. With it, the diff's `tolerance` 2 and `min_voxels` 8 remove the far fragments of the same motion. This is a blind zone, not noise removal: a real change within 2 m of either lidar is not reported. 0.3 m cubes from 2.2 m out are still detected at the same latency (`spark/room_memory_cpp/PLAN.md`, "False change events"). *Removed:* the "something low" was Trevor working at a desk (he confirmed it), real transient motion, and a blind zone also hid real changes next to the rig. `near_range_m` is gone; `tolerance` and `min_voxels` are back at 1 and 6. D28 replaces it.
-- **D28. Activity is not change.** Motion next to the rig (a person working) is reported on `/room_memory/activity` (§3.6), never as a `ChangeEvent`. A region becomes a CANDIDATE only after it has stayed settled for `candidate_windows` windows (§4.2): fresh, the same shape, and no activity within `activity_radius_m`; so a change made by a person is reported that long after they stop moving next to it. `candidate_windows` is 40 (40 s at `window_s` 1): on both static recordings, looped for 30 minutes, the longest settled run of anything Trevor left is 24 windows (the part of his BUILDING-time pose he moved away from). 0.3 m boxes 1.0–4.6 m from either lidar are CANDIDATEs 40–43 s after they appear, disappear or move. Tracking teaches the reference nothing (`learn_windows` 0): learning while he worked wrote his surroundings into the reference and produced a 45-window still residue. Limits: a person who stays perfectly still for longer than the gate after shifting is reported, and so is a reference built while someone sat in it once they leave; without the JT128↔Mid-360 extrinsic (D25) one sensor's activity cannot hold the other's regions. The Mac does not decode `Activity` yet.
+- **D28. A dedicated, read-only bridge on :8767** (§2; a proposal: the transport is open, Q5). The memory topics need `labcommand_msgs` in the bridge's environment, which the lidar bridge on :8765 does not have, and a separate bridge leaves LIVE untouched. Read-only by default because foxglove_bridge 3.4.1 does not enforce `client_topic_whitelist`. `RequestSync` then needs `foxglove_client_publish:=true` or a relay.
+- **D29. Periodic keyframes.** §2.4's "snapshot on (re)connect" cannot be detected through the bridge, so the live topic carries a snapshot every `keyframe_period_s` (60 s). Changed bricks between keyframes go out as deltas at most every `delta_period_s` (5 s, the ≤ 0.2 Hz of §2). A snapshot replaces the next delta once the deltas since the last snapshot would exceed `keyframe_delta_ratio` (0.5) of its size. A keyframe of an unchanged map does not bump `map_epoch`; every delta does.
+- **D30. One published map.** There is no JT128↔Mid-360 extrinsic yet (brief R1), so the references stay per sensor and `map_bricks` carries one of them, `map_sensor` (default: the JT128 when configured; its repeating pattern gives the denser map). `n_bricks` and `coverage_known_frac` describe that map. Events of the other sensor are in that sensor's own frame.
+- **D31. A persistence gate before CANDIDATE (strengthened by D33).** On the static recording the node sent ~120 CANDIDATE/EXPIRED messages per minute. Most of them came from a reference built as the union of 5 windows of the Mid-360's sparse non-repetitive pattern; per-voxel window counts fix that (`spark/room_memory_cpp/PLAN.md`). As a second line, a region now has to persist `candidate_windows` windows before its CANDIDATE is sent. An open candidate expires only after `expire_windows` unmatched windows, so an intermittently seen change does not flicker. T_commit (CANDIDATE → CONFIRMED) is unchanged and still PR 2.3.
+- **D32. No events in the near field (superseded by D33: removed).** The rig stands about 1.3 m from where someone works. Live and in both static recordings, something low there (z up to ~0.8 m in the sensor frames) shifts every few seconds to minutes, seen by both lidars at once, and it was 100 % of the remaining events (live 2–18 per minute). A change region with a voxel center within `near_range_m` (2.0 m) of its sensor is not reported, whichever pose of a move it is. With it, the diff's `tolerance` 2 and `min_voxels` 8 remove the far fragments of the same motion. This is a blind zone, not noise removal: a real change within 2 m of either lidar is not reported. 0.3 m cubes from 2.2 m out are still detected at the same latency (`spark/room_memory_cpp/PLAN.md`, "False change events"). *Removed:* the "something low" was Trevor working at a desk (he confirmed it), real transient motion, and a blind zone also hid real changes next to the rig. `near_range_m` is gone; `tolerance` and `min_voxels` are back at 1 and 6. D33 replaces it.
+- **D33. Activity is not change.** Motion next to the rig (a person working) is reported on `/room_memory/activity` (§3.7), never as a `ChangeEvent`. A region becomes a CANDIDATE only after it has stayed settled for `candidate_windows` windows (§4.2): fresh, the same shape, and no activity within `activity_radius_m`; so a change made by a person is reported that long after they stop moving next to it. `candidate_windows` is 40 (40 s at `window_s` 1): on both static recordings, looped for 30 minutes, the longest settled run of anything Trevor left is 24 windows (the part of his BUILDING-time pose he moved away from). 0.3 m boxes 1.0–4.6 m from either lidar are CANDIDATEs 40–43 s after they appear, disappear or move. Tracking teaches the reference nothing (`learn_windows` 0): learning while he worked wrote his surroundings into the reference and produced a 45-window still residue. Limits: a person who stays perfectly still for longer than the gate after shifting is reported, and so is a reference built while someone sat in it once they leave; without the JT128↔Mid-360 extrinsic (D30) one sensor's activity cannot hold the other's regions. The Mac does not decode `Activity` yet.
 
 ## 9. Verification status
 
@@ -619,11 +628,12 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **`colcon build` of `labcommand_msgs`: not run.** There is no ROS 2 on the Mac.
 - **The Spark side of §5 is implemented** in `spark/room_memory_cpp` (the node) and in the Python oracle `spark/room_memory`. The differential tests check the two byte for byte: the map log and replay, sync snapshots, event replay and the bounded fallback, the 100-message log and the room and decode checks. `RoomMemoryStore` (the Mac side) is PR 1.1. The bridge's client-publish path has not been tried against a live bridge.
 
-## 10. Open questions for Trevor (brief §5, Q1–Q4)
+## 10. Open questions for Trevor (brief §5, Q1–Q4, and Q5)
 
-These are copied from the brief and left unanswered.
+Q1–Q4 are copied from the brief and left unanswered. Q5 was added by PR #14.
 
 1. **Is the rig static for v1?** If it will move between sessions, relocalization (and place recognition) moves from optional to required.
 2. **Room and targets:** room size, smallest object that must be detected (5 cm? 10 cm?), acceptable latency (seconds vs minutes), acceptable false events per hour. These set voxel size, T_commit and the PR 3.2 bar.
 3. **HDC's role.** Your own record (exp119/122/123, exp113, D-33) says a superposed memory is not a cheaper map, and HDC is parked. Should the app be HDC-free with HDC kept only as an optional RT3 comparison, or do you want to reopen HDC? This brief assumes the former.
 4. **Fixtures:** may the 12 Oct box takes (`*ROBOT_box_*`, `*speedybee_box_*` on the Spark) be copied to the Mac as golden fixtures? This brief did not access the Spark.
+5. **Transport (D28).** A dedicated foxglove_bridge on :8767 in the room-memory container (requests through its client publishing or a relay), or the existing bridge on :8765 with requests relayed over the ssh-authenticated command-center API on :8766? Both stay in this doc until you choose (§2).

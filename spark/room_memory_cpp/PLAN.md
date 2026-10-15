@@ -1,6 +1,6 @@
 # room_memory_cpp: plan and results (Phase 2, production C++)
 
-The production room-memory core and node for the DGX Spark (aarch64, Ubuntu 24.04, ROS 2 Jazzy). `spark/room_memory` (Python) stays the reference oracle. It changes only where the semantics are shared (thresholds, persistence, message content), so every output here stays byte-identical to it, and through the shared goldens to the Swift `change-detect`. Contracts: `docs/CHANGE-DETECTION.md` (v2, unchanged: everything below is engine-side) and `docs/ROOM-MEMORY-PROTOCOL.md` (D23–D26 and the §3.3 definitions are this round's).
+The production room-memory core and node for the DGX Spark (aarch64, Ubuntu 24.04, ROS 2 Jazzy). `spark/room_memory` (Python) stays the reference oracle. It changes only where the semantics are shared (thresholds, persistence, message content), so every output here stays byte-identical to it, and through the shared goldens to the Swift `change-detect`. Contracts: `docs/CHANGE-DETECTION.md` (v2, unchanged: everything below is engine-side) and `docs/ROOM-MEMORY-PROTOCOL.md` (D28–D31 and the §3.3 definitions are this round's).
 
 ## Layout
 
@@ -102,9 +102,9 @@ The recent layer is the merge of the last `recent_windows` (3) window summaries.
 
 `RoomMemory::map_update(stamp)` runs after every `close_window` and returns the live `MapBricks` CDR, if one is due:
 - nothing while BUILDING;
-- the first call in TRACKING: a snapshot of the map sensor's reference (`map_sensor`, default the JT128 when configured, D25);
+- the first call in TRACKING: a snapshot of the map sensor's reference (`map_sensor`, default the JT128 when configured, D30);
 - afterwards, once `delta_period_s` (5) has passed since the last map message: voxels settled since join the references. If any did, `map_epoch` + 1, the references are saved, and the changed bricks go out as a delta (`base_epoch` = the last message's epoch; a brick that became all-unknown would be a removed index, which the grow-only reference never produces).
-- a snapshot instead when `keyframe_period_s` (60) has passed since the last one (an unchanged map keeps its epoch), or when the deltas since it would exceed `keyframe_delta_ratio` (0.5) of its size (D24).
+- a snapshot instead when `keyframe_period_s` (60) has passed since the last one (an unchanged map keeps its epoch), or when the deltas since it would exceed `keyframe_delta_ratio` (0.5) of its size (D29).
 
 The node logs every map message (`kMapLogDepth` 10) and every event message (`kEventLogDepth` 100), plus the latest message of each open event. `RoomMemory::sync(request, stamp)` answers by protocol §5:
 - maps: replay every logged message after `since` when it is logged with that epoch and something follows. Otherwise a fresh snapshot of the last live state under the latest live `seq`, not logged and not advancing `seq`. Nothing before the first live map message.
@@ -221,7 +221,7 @@ The regression test (`tests/recording/test_static_recording.py`) now runs on bot
 
 ### Third round: activity, not change
 
-**Ground truth.** Trevor confirms he sat at a desk about 1.3 m from the rig, working, in both recordings and live. The "something low" above is him: real, transient motion. The blind zone (`near_range_m`) is removed, `tolerance` and `min_voxels` are back at 1 and 6, and his motion is reported as *activity* on its own topic (`/room_memory/activity`, `labcommand_msgs/Activity`, protocol §3.6, D28), never as a `ChangeEvent`.
+**Ground truth.** Trevor confirms he sat at a desk about 1.3 m from the rig, working, in both recordings and live. The "something low" above is him: real, transient motion. The blind zone (`near_range_m`) is removed, `tolerance` and `min_voxels` are back at 1 and 6, and his motion is reported as *activity* on its own topic (`/room_memory/activity`, `labcommand_msgs/Activity`, protocol §3.7, D33), never as a `ChangeEvent`.
 
 **What separates him from a box.** Per-window region traces (each window's diff regions, chained by kind and shared voxels):
 - Injected 0.3 m cubes keep their voxels: every window within 1 voxel (Chebyshev, both ways) of their first window, ±5 % voxels, and this window's own evidence covers ≥ 0.8 of them (a move: new pose ~0.93 occupied, old pose 100 % traversed). A move alternates between one MOVED region and its two halves from window to window. At 4.6 m the Mid-360's sparse pattern lets 1–9 % of a cube's edge voxels come and go, and a 6-voxel fragment off its edge appears for single windows.
@@ -409,16 +409,16 @@ On the Spark itself the GB10's cores differ from the M5's; the code has no Apple
 - learning: `learn_max_offset_m` 0.02, `learn_windows` 0 (tracking windows that may still teach the reference);
 - the map stream: `map_sensor` (empty: the JT128 when configured), `delta_period_s` 5, `keyframe_period_s` 60, `keyframe_delta_ratio` 0.5.
 
-It subscribes to `/livox/lidar` and `/lidar_points` as generic (serialized) subscriptions with the sensor-data QoS, so the raw CDR goes through `decode_pointcloud2`. It publishes the codec bytes with generic publishers:
+It subscribes to `/livox/lidar` and `/lidar_points` as generic (serialized) subscriptions with the sensor-data QoS, so the raw CDR goes through `decode_pointcloud2`. It publishes the codec bytes with generic publishers, volatile unless stated:
 - `/room_memory/events`: reliable, depth 100;
 - `/room_memory/status`: reliable, depth 1, 1 Hz;
-- `/room_memory/activity` (`labcommand_msgs/msg/Activity`): reliable, depth 1, 1 Hz with each status;
+- `/room_memory/activity` (`labcommand_msgs/msg/Activity`): reliable, transient_local, depth 1, 1 Hz with each status;
 - `/room_memory/map_bricks`: reliable, depth 10, after each window when `map_update` returns a message;
 - `/room_memory/sync/map_bricks` and `/room_memory/sync/events`: reliable, depth 10 and 200.
 
 It answers each `/room_memory/request_sync` (reliable, depth 10) on the sync topic of its `topic`, and logs and drops requests that do not decode. Windows and status run on node-clock timers and log wall/CPU time per window and the map bytes. The type support for `sensor_msgs` and `labcommand_msgs` is needed only at run time. `Epoch` (0.2 Hz) is not published yet: with no CONFIRMED state its counts would always be 0.
 
-**Sidecar.** The launch file also starts `foxglove_bridge` (`ros-jazzy-foxglove-bridge`, added to the image) as node `room_memory_bridge`. Its launch arguments are `foxglove_bridge` (default `true`), `foxglove_port` (8767), `foxglove_address` (`0.0.0.0`) and `foxglove_client_publish` (`false`). Its parameters:
+**Sidecar.** Whether the Mac uses this bridge or the existing :8765 with requests relayed over :8766 is open (protocol D28, Q5); the sidecar is the :8767 option, and `foxglove_bridge:=false` leaves it out. The launch file also starts `foxglove_bridge` (`ros-jazzy-foxglove-bridge`, added to the image) as node `room_memory_bridge`. Its launch arguments are `foxglove_bridge` (default `true`), `foxglove_port` (8767), `foxglove_address` (`0.0.0.0`) and `foxglove_client_publish` (`false`). Its parameters:
 - `topic_whitelist` `['^/room_memory/.*']`: the raw clouds are never relayed;
 - `capabilities` `['connectionGraph']`, read-only. The list is not empty because ROS 2 parameter files cannot carry an empty list. With `foxglove_client_publish:=true` it adds `clientPublish`.
 - `client_topic_whitelist` `['^/room_memory/request_sync$']`. The Phase 3 design read of foxglove_bridge 3.4.1 (`docs/phase3-live-integration.md` on its branch, [F2]) found this parameter parsed but not enforced, which is why client publishing is off by default.
