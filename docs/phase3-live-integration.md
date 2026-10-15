@@ -32,7 +32,7 @@ No Spark, rig or app was touched to write this.
   - The bridge documents `client_topic_whitelist`, but at the deployed version and on `main` the parameter is parsed and never applied ([F2]).
   - With client publishing on, any peer that reaches the port could publish any known type on any topic, including a forged `/livox/lidar` cloud into the memory node.
 - **The budget is easy in steady state and hard on reconnects.**
-  - Steady state is about 0.24 KB/s down and 0.15 KB/s up, estimated with per-packet overhead (§3).
+  - Steady state is about 0.46 KB/s down and 0.27 KB/s up, estimated with per-packet overhead (§3).
   - A first connect costs about 110 KB. A reconnect that keeps its baseline costs at most about 75 KB: at most one snapshot plus the missed events, with no events fallback (§4.3).
   - The protocol's own retry rate allows about 22 KB/s during a resync storm, 4.5× the budget. Backoff on the Mac and a snapshot-answer cap on the Spark bound it (P3, P4).
   - A byte bucket on `map_bricks` caps the map's long-run rate at 3 KB/s. A snapshot up to protocol §7's 2 MB cap is delayed for a bounded time, never held indefinitely. A map that would exceed the cap is reported on `:8766`, not published (P15).
@@ -76,7 +76,7 @@ DGX Spark (ROS 2 Jazzy, --net=host)                                             
 ├───────────────────────────────┤             └────────────────────┘                    ├──────────────────────────────┤
 │ room-memory container         │                                                       │ MemoryClient (new, §5)        │
 │  room_memory_cpp ◀── lidar    │                                                       │  → MemoryMirror (Core, pure)  │
-│   │ /room_memory/* (6 topics) │ ──DDS──▶ foxglove_bridge :8767, read-only ◀═ ws:// ══▶│  → RoomMemoryStore (PR 1.1)   │
+│   │ /room_memory/* (8 topics) │ ──DDS──▶ foxglove_bridge :8767, read-only ◀═ ws:// ══▶│  → RoomMemoryStore (PR 1.1)   │
 │   ▲ /room_memory/request_sync │                                                       │  → brick renderer, timeline   │
 │   │ /room_memory/operator     │                                                       │                              │
 │  ~/room-memory/<room_id>/     │                                                       │                              │
@@ -97,14 +97,14 @@ DGX Spark (ROS 2 Jazzy, --net=host)                                             
   |---|---|
   | `port` | 8767 |
   | `address` | the Spark's tailnet IP (the default `0.0.0.0` listens on every interface) |
-  | `topic_whitelist` | `['^/room_memory/(map_bricks\|events\|status\|epoch\|sync/map_bricks\|sync/events\|sync/events_fallback)$']` |
+  | `topic_whitelist` | `['^/room_memory/(map_bricks\|events\|status\|activity\|epoch\|sync/map_bricks\|sync/events\|sync/events_fallback)$']` |
   | `capabilities` | `[]`: no `clientPublish`, `parameters`, `services`, `connectionGraph` or `assets` |
   | `message_backlog_size` | default |
 
 - **Benefits.**
   - LIVE is untouched.
   - No restart of the `:8765` bridge, which would interrupt LIVE.
-  - The advertise burst on connect covers seven channels, not the lidar topics too.
+  - The advertise burst on connect covers eight channels, not the lidar topics too.
   - Rollback is stopping one container.
 - **Version.** Pin 3.4.1 first, the same SDK the Mac client already talks to. An upgrade to the current 3.6.1 ([F3]) is a stage of its own, which reruns S1.
 
@@ -238,6 +238,7 @@ Message sizes are protocol §7's exact or measured figures, for `room_id` "lab" 
 | message | rate | message B | wire B (est.) | down B/s | up B/s (ACKs) |
 |---|---|---|---|---|---|
 | `MemoryStatus` | 1 Hz | 76 (exact) | 204 | 204 | 124 |
+| `Activity` | 1 Hz | 88 (exact) | 220 | 220 | 124 |
 | `Epoch` | 0.2 Hz | 53 (exact) | 188 | 38 | 25 |
 | `ChangeEvent`, no mask | per transition | 136 (exact) | 268 | — | — |
 | `ChangeEvent`, 25 cm box mask | per transition | 253 (measured) | 396 | — | — |
@@ -250,7 +251,7 @@ Small messages pay 2–3× their size in headers, which is why §3.2 counts wire
 
 | scenario | down | up | notes |
 |---|---|---|---|
-| **Steady, static room** (status + epoch only) | 0.24 KB/s | 0.15 KB/s | ~0.39 KB/s total; 13× under budget. With the `:8766` poll, ~0.8 KB/s |
+| **Steady, static room** (status, activity and epoch only) | 0.46 KB/s | 0.27 KB/s | ~0.73 KB/s total; ~7× under budget. With the `:8766` poll, ~1.1 KB/s |
 | **Quiet day** (60 changes/h; each 3 transitions with mask; each accepted with a 0.4 KB delta) | +0.04 KB/s | +0.01 KB/s | events and deltas are noise next to status |
 | **People walking through** (≈ 2 CANDIDATE/EXPIRED transitions per second while someone moves; no mask on CANDIDATE, P5) | +0.54 KB/s | +0.25 KB/s | ~1.2 KB/s total while active. Person-sized masks on CANDIDATE (est. 0.5–1 KB each) would make it 2–3 KB/s, hence P5 |
 | **First connect** (no baseline: app launch, or a new room or generation) | ~65 KB snapshot + ≤ ~48 KB event fallback (≤ 120 messages × 396 B) + advertise | ~6 KB ACKs, < 1 KB requests | ~110–120 KB; 6 % of the 2 MB cap |
@@ -260,10 +261,10 @@ Small messages pay 2–3× their size in headers, which is why §3.2 counts wire
 
 **Advertise burst: unmeasured.**
 - On connect the bridge sends `serverInfo` and one `advertise` listing each whitelisted channel with its full message definition ([F2]).
-- On the dedicated bridge that is seven channels. `ChangeEvent`'s definition includes `MapBricks` and `builtin_interfaces/Time`.
+- On the dedicated bridge that is eight channels. `ChangeEvent`'s definition includes `MapBricks` and `builtin_interfaces/Time`.
 - The estimate is under 10 KB. Stage S1 measures it.
 
-**Amortized reconnect limit.** At 0.39 KB/s steady and about 115 KB per first connect, the 5 KB/s mean holds only if reconnects average at most one per ~25 s. A reconnect with a baseline costs at most ~75 KB, so the bound is conservative. Hence P3's floor on the reconnect delay.
+**Amortized reconnect limit.** At 0.73 KB/s steady and about 115 KB per first connect, the 5 KB/s mean holds only if reconnects average at most one per ~27 s. A reconnect with a baseline costs at most ~75 KB, so the bound is conservative. Hence P3's floor on the reconnect delay.
 
 **Every snapshot figure scales with the map.** The rows above use the measured 53–59 KB snapshot. Protocol §7 targets ≤ 500 KB and caps at 2 MB. The first-connect, re-reference, storm and P1 figures grow in proportion. The `map_bricks` bucket (§3.3) keeps the map's long-run rate at 3 KB/s whatever the snapshot size, and delays messages instead.
 
@@ -333,7 +334,7 @@ The part this design adds is the explicit chain:
 **Mac.**
 1. Open the socket. Read `serverInfo` and `advertise`. A mirror kept from an earlier connection has been STALE, greyed, since that socket closed (§5.2). It cannot prove it is current across a gap of unknown length.
 2. Check the schema fingerprint of each memory channel (§4.10). On a mismatch, stop at INCOMPATIBLE.
-3. Subscribe to all seven S→M topics in one `subscribe` message.
+3. Subscribe to all eight S→M topics in one `subscribe` message.
    - The sync subscriptions stay up for the whole connection.
    - A subscription made only when a request goes out could miss its answer, because the Mac cannot observe when the bridge's ROS subscription has matched.
 4. Send one `RequestSync` per topic through `:8766` (P11), **immediately** (P8).
@@ -573,7 +574,7 @@ Change overlays are drawn only in CURRENT.
 | COMPLETE | contiguous `seq` across connections, since the first message after launch, with every gap closed by a replay | normal |
 | INCOMPLETE(since t) | a gap; a new generation; a fallback answer (protocol §5); or a socket close, until the reconnect's replay is done (§4.3: the baseline has reached the newest live `seq` and the request's mark, taken from `MemoryStatus.events_seq`) | history "incomplete since t"; open events "may be outdated" until their next transition |
 
-A fallback answer sets a new baseline, only through its header (protocol §5, P17), and the history it leaves stays INCOMPLETE. Only the replay that answers a reconnect clears the INCOMPLETE that the close set.
+A fallback answer sets a new baseline, only through its header (protocol §5, P17), and the history it leaves stays INCOMPLETE. Only the replay that answers a reconnect clears the INCOMPLETE that the close set. A request sent with `SINCE_NONE`, after a new generation or a reconnect without a restart signal, clears nothing (protocol §5).
 
 ### 5.4 Composite rendering
 
@@ -799,7 +800,7 @@ None of these is in effect until accepted. Each would change `ROOM-MEMORY-PROTOC
 3. **How many false alarms per hour are acceptable,** counted as false CONFIRMED events per hour in a static room? The brief proposes ≤ 1/h. The answer is the go/no-go threshold at S2 and S6.
 4. **May `command_center.py` relay requests and operator actions (P11)?** If not, the alternative is bridge `clientPublish`. At the deployed bridge version, the Tailscale grant would then be its only control (§8). This and P12 are protocol Q5 (D28), which keeps both transports, the dedicated bridge on :8767 and :8765 with the :8766 relay, until Trevor chooses.
 5. **What runs the `:8765` bridge, with which parameters?** In particular `address`, `capabilities` and `topic_whitelist`. If it uses the defaults, it accepts client publishing from the LAN and the tailnet today (§8).
-6. **Should memory mode be on at launch?** LIVE is off at launch by policy. Memory mode costs ~0.4 KB/s, so it could run whenever the app is open, or be opt-in like LIVE.
+6. **Should memory mode be on at launch?** LIVE is off at launch by policy. Memory mode costs ~0.7 KB/s, so it could run whenever the app is open, or be opt-in like LIVE.
 7. **How many Macs?** With one, the shared sync topics stay cheap. With several, P4 is necessary rather than prudent.
 8. **Is the full event history needed on the Mac,** beyond the last 100 messages? If so, it needs a paged read on `:8766` (§4.5) and a retention policy for the Spark's event log (brief R10).
 9. **Should a failed reference save (disk full) put the node in DEGRADED?** That changes protocol §4.1's DEGRADED trigger.
