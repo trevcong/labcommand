@@ -199,7 +199,15 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         var topStamp: RoomMemory.Time
     }
 
+    /// What each received seq carried, to tell a late copy from a restart reusing the seq.
+    private struct Transition: Sendable, Equatable {
+        var eventId: UInt64
+        var state: RoomMemory.ChangeEvent.State
+    }
+
     private var receivedSpans: [Span] = []
+    /// Bounded to `eventIdCapacity`; the lowest seqs go first.
+    private var transitions: [UInt64: Transition] = [:]
     /// The highest `events_seq` any status of this generation named.
     private var eventsHighWater: UInt64?
     /// A status arrived on the open connection: the high-water is not from before a disconnect.
@@ -516,14 +524,25 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             return
         }
         if seq <= base || eventsAhead[seq] != nil {
-            if let held = eventsById[message.eventId], held.event.state == message.state, held.seq >= seq {
+            // A seq this generation already carried, with the same transition, is a late copy (a
+            // replay overtook the live topic): never roll the event back. The same seq with another
+            // transition is a publisher restart reusing it.
+            let duplicate: Bool
+            if let seen = transitions[seq] {
+                duplicate = seen == Transition(eventId: message.eventId, state: message.state)
+            } else if let held = eventsById[message.eventId] {
+                duplicate = held.event.state == message.state && held.seq >= seq
+            } else {
+                duplicate = false
+            }
+            if duplicate {
                 activity.duplicates += 1
                 return
             }
         }
         activity.gaps += 1
         if seq <= base {
-            // A lower seq that is no duplicate: the node restarted. A new generation starts here.
+            // A lower seq that is no late copy: the node restarted. A new generation starts here.
             eventsGeneration += 1
             cutHistory()
         }
@@ -574,6 +593,10 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     private mutating func noteReceived(_ message: RoomMemory.ChangeEvent) {
         let seq = message.header.seq
         let stamp = message.header.stamp
+        transitions[seq] = Transition(eventId: message.eventId, state: message.state)
+        if transitions.count > Self.eventIdCapacity, let lowest = transitions.keys.min() {
+            transitions[lowest] = nil
+        }
         guard let index = receivedSpans.firstIndex(where: { seq <= $0.high || seq - $0.high == 1 }) else {
             receivedSpans.append(Span(low: seq, high: seq, topStamp: stamp))
             boundSpans()
@@ -618,6 +641,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         }
         receivedSpans = []
         eventsHighWater = nil
+        transitions = [:]
     }
 
     private mutating func moveBaseline(to seq: UInt64, epoch: UInt64, stamp: RoomMemory.Time) {

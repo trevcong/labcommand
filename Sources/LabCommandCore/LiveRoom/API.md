@@ -122,8 +122,11 @@ but only while `isStatusFresh`. Otherwise "STALE · age".
   requests `RequestSync{mapBricks, since: (mapEpoch, mapSeq)}`, or `since: nil` with no mirror.
   So does **epoch change**: `status.map_epoch ≠ mapEpoch` on 2 consecutive statuses with no map
   applied between them (D20). A duplicate (`seq ≤ mapSeq` and `epoch ≤ mapEpoch`) is counted and ignored.
-- **Events.** `seq == eventsSeq + 1` applies. A duplicate is counted. Any other seq is a gap: the
-  list goes incomplete and requests `RequestSync{events, since: (epoch, eventsSeq)}`. So does an
+- **Events.** `seq == eventsSeq + 1` applies. A duplicate is counted: a seq already received in this
+  generation with the same `event_id` and state (a live copy a replay overtook) never rolls the
+  event back. A live seq at or below the baseline that carries another transition is a restart.
+  Any other seq is a gap: the list goes incomplete and requests
+  `RequestSync{events, since: (epoch, eventsSeq)}`. So does an
   **events_seq gap**: a status `events_seq` above the baseline that the next status still finds
   unreached. An event's state changes only on a message with a higher seq than the last one applied to it.
 - **Answers.** A replayed snapshot stays stale until its seq reaches the newest live seq and its

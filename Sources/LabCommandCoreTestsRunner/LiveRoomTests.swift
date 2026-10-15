@@ -839,6 +839,46 @@ func testLiveRoomOutstandingSyncHidesNothing() {
     expect(request(mirror.tick(at: 60), .events, "P2 resolved") == nil, "events request resolved")
 }
 
+/// Codex P2: a replay overtakes the live topic. The delayed live copies of one event's transitions
+/// are duplicates, not a restart: the event keeps its newest state and the history completes.
+func testLiveRoomDelayedLiveTransitionIsDuplicate() {
+    var mirror = Mirror(roomId: "lab")
+    let opened = mirror.connectionOpened(at: 100, canRequest: true)
+    expect(request(opened, .events, "delayed live connect")?.since == nil, "connect asks for events since NONE")
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 1, seq: 0, state: .candidate), at: 101)
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 1, seq: 1, state: .confirmed), at: 101)
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 1, seq: 2, state: .accepted), at: 101)
+    expect(mirror.eventsSeq == 2 && mirror.eventsById[1]?.event.state == .accepted, "replay 0–2 applies: accepted")
+    let duplicates = mirror.activity.duplicates
+    let gaps = mirror.activity.gaps
+
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 1, state: .confirmed), at: 101.5)
+    expect(mirror.eventsById[1]?.event.state == .accepted, "delayed live confirmed at seq 1 does not roll back, got \(String(describing: mirror.eventsById[1]?.event.state))")
+    expect(mirror.eventsSeq == 2, "delayed live seq 1 keeps the baseline at 2")
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 2, state: .accepted), at: 101.6)
+    expect(mirror.eventsById[1]?.event.state == .accepted && mirror.eventsSeq == 2, "delayed live seq 2: still accepted at 2")
+    expect(mirror.activity.duplicates == duplicates + 2 && mirror.activity.gaps == gaps,
+           "both delayed copies count as duplicates, no gap: \(mirror.activity.duplicates - duplicates) dup, \(mirror.activity.gaps - gaps) gaps")
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 2), at: 102)
+    expect(mirror.eventsState == .complete, "0–2 held, status 2: complete, got \(mirror.eventsState)")
+    _ = mirror.tick(at: 104)
+    expect(request(mirror.tick(at: 200), .events, "delayed live resolved") == nil, "events request resolved")
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 3, state: .expired), at: 201)
+    expect(mirror.eventsSeq == 3 && mirror.eventsById[1]?.event.state == .expired && mirror.eventsState == .complete,
+           "live seq 3 chains on: complete")
+
+    // A seen seq with another transition is still a restart reusing it.
+    var restart = mirror
+    _ = restart.receive(topic: .events, payload: event(id: 1, seq: 1, state: .reverted), at: 202)
+    expect(restart.eventsSeq == 1 && restart.eventsById[1]?.event.state == .reverted, "another transition at seq 1: new generation applies")
+    expect(restart.eventsState != .complete, "restart at a reused seq leaves the history incomplete")
+
+    // And a status seq reset still starts a new generation.
+    var reset = mirror
+    _ = reset.receive(topic: .status, payload: status(epoch: 5, seq: 0, eventsSeq: 0), at: 202)
+    expect(reset.eventsState != .complete && reset.eventsSeq == nil, "status seq reset: new generation, incomplete")
+}
+
 /// Random interleavings of live, sync, status, reconnect and settle against one invariant: the
 /// mirror reads complete only when it holds every seq in [0, max(status events_seq, highest held)].
 /// Each run ends by reconnecting and replaying everything, which must then read complete.
@@ -1002,6 +1042,8 @@ func runLiveRoomTests() {
     print("  LiveRoom: partial first history, replay behind the status epoch, incomplete while a connect request is out, unreadable map → resync"); passed()
     testLiveRoomOutstandingSyncHidesNothing()
     print("  LiveRoom: an outstanding events request hides no missing seq; settle and retry stay incomplete until 1–2 arrive"); passed()
+    testLiveRoomDelayedLiveTransitionIsDuplicate()
+    print("  LiveRoom: a replay overtaking live delivery: delayed live transitions are duplicates, never roll back; reused seq or status reset still restarts"); passed()
     testLiveRoomHistoryInvariantProperty()
     print("  LiveRoom: random live/sync/status/reconnect/settle runs never read complete with a seq missing; full replay converges"); passed()
 }
