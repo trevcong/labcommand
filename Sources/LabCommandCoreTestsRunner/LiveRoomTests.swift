@@ -704,6 +704,22 @@ func testLiveRoomGenerationsAndPartialHistory() {
     expect(waiting.eventsState != .complete, "events advertised twice and none held: incomplete while the connect request is out")
     expect(waiting.activity.gaps == 0, "the connect request is not a second gap")
 
+    // Connect request out, status names 100, then live 101 before the replay: 0–100 are missing.
+    var early = Mirror(roomId: "lab")
+    _ = early.connectionOpened(at: 0, canRequest: true)
+    _ = early.receive(topic: .status, payload: status(epoch: 5, seq: 1, eventsSeq: 100), at: 0)
+    _ = early.receive(topic: .events, payload: event(id: 101, seq: 101), at: 1)
+    expect(early.eventsState == .incomplete(since: nil), "live 101 ahead of the replay: incomplete, got \(early.eventsState)")
+    _ = early.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 101), at: 2)
+    _ = early.tick(at: 2.2)
+    expect(early.eventsState != .complete, "a status matching the live baseline does not vouch for 0–100")
+    for seq in UInt64(0)...100 {
+        _ = early.receive(topic: .syncEvents, payload: event(id: seq, seq: seq, state: .reverted), at: 2.5)
+    }
+    _ = early.receive(topic: .status, payload: status(epoch: 5, seq: 3, eventsSeq: 101), at: 3)
+    _ = early.tick(at: 4.6)
+    expect(early.eventsSeq == 101 && early.eventsState == .complete, "the replay covers 0–100: complete, got \(early.eventsState)")
+
     // An unreadable map payload: bricks kept, map stale, resync requested.
     var bad = currentMirror()
     let good = delta(epoch: 6, seq: 11, base: 5, [])

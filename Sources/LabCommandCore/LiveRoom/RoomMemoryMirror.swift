@@ -469,14 +469,17 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             // First message after launch (or after a reset): it starts the baseline.
             record(message, at: now, fromSync: false)
             moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
-            if seq != 0, !eventsInitialSync {
+            if seq != 0 {
                 // Seqs start at 0 per publisher: events before this one exist and are not held.
+                // That holds whether or not the connect request is already out; its answer clears it.
                 if canRequest {
                     if eventsState == .complete {
                         eventsState = .incomplete(since: nil)
                     }
-                    eventsInitialSync = true
-                    needEvents()
+                    if !eventsInitialSync {
+                        eventsInitialSync = true
+                        needEvents()
+                    }
                 } else {
                     loseEventsHistory()
                 }
