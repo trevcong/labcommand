@@ -50,7 +50,10 @@ def load_generation(path):
     path = pathlib.Path(path)
     if not path.exists():
         return 0
-    data = path.read_bytes()
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise GenerationError(f"cannot read {path}: {error}") from None
     if not re.fullmatch(rb"[0-9]{1,20}\n", data) or int(data) > UINT64_MAX:
         raise GenerationError(f"{path} does not hold one publisher_generation; refusing to reset it")
     return int(data)

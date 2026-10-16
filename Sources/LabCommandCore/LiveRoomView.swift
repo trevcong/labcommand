@@ -801,6 +801,9 @@ private func baseBanner(
         let residual = status.poseResidualM.map { "\(twoDecimals($0)) m" } ?? "guard not run"
         return LiveRoomBanner(text: "Rig moved: changes suspended · \(residual)", tone: .bad)
     }
+    if mirror.mapState == .stale(.unverified) {
+        return LiveRoomBanner(text: "unverified · Spark node predates publisher generations", tone: .warn)
+    }
     if case .stale = mirror.mapState, !mirror.bricks.isEmpty {
         let epoch = mirror.mapEpoch.map(String.init) ?? "—"
         return LiveRoomBanner(text: "resyncing · as of epoch \(epoch)", tone: .warn)

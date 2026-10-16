@@ -308,6 +308,8 @@ func testLiveRoomRestartBanner() {
     expect(legacy.mirror.mapState == .stale(.unverified) && legacyScreen.markers.isEmpty, "legacy fixture: unverified, no overlays")
     expect(legacyScreen.historyLine == "history unverified (old Spark node)" && legacyScreen.restartBanner == nil, "legacy fixture lines")
     expect(legacyScreen.standaloneResync == nil, "legacy never asks for a resync")
+    expect(legacyScreen.banner?.text == "unverified · Spark node predates publisher generations",
+           "legacy banner, got \(String(describing: legacyScreen.banner?.text))")
 }
 
 func testLiveRoomVoxels() {

@@ -112,3 +112,10 @@ def test_write_failure_releases_the_lock(tmp_path, monkeypatch):
     monkeypatch.undo()
     allocation = allocate_generation(tmp_path, "lab", NOW)  # not blocked by a leaked lock
     allocation.release()
+
+
+def test_unreadable_file_fails_closed(tmp_path):
+    path = generation_path(tmp_path, "lab")
+    path.mkdir(parents=True)  # a directory where the file should be
+    with pytest.raises(GenerationError, match="cannot read"):
+        allocate_generation(tmp_path, "lab", NOW)
