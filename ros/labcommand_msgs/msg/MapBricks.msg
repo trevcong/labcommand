@@ -29,3 +29,5 @@ uint32 n_removed                  # removed brick indices in payload (delta only
 #   uint8  known_bits[64 * n_bricks]   per brick: bit = observed (occupied or free); absent bit = UNKNOWN
 #   uint32 removed_bricks_idx[n_removed]  indices into the base_epoch brick list of bricks that became all-unknown
 uint8[] payload
+uint64 publisher_generation      # the publishing process's generation (section 1.4), never 0. Inside ChangeEvent.mask it
+                                 # repeats the parent's. Saved reference files are written without it (legacy layout).

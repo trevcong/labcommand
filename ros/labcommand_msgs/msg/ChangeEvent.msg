@@ -33,4 +33,6 @@ float32 alpha                     # 0..1, calibrated false-alarm level if the re
 uint8 sensors                     # bitmask of SENSOR_*: which sensor(s) observed it
 builtin_interfaces/Time first_seen
 builtin_interfaces/Time last_seen
-MapBricks[<=1] mask               # optional: the region's voxels only (usually < 1 KB with zlib)
+MapBricks[<=1] mask               # optional: the region's voxels only (usually < 1 KB with zlib); copies room_id,
+                                  # map_epoch, stamp and publisher_generation, with seq 0
+uint64 publisher_generation       # the publishing process's generation (section 1.4), never 0
