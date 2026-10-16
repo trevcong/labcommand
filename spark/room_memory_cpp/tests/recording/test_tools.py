@@ -136,3 +136,40 @@ def test_a_run_that_passed_anything_is_not_reported_skipped(tmp_path):
                            environment={"ROOM_MEMORY_BAG": ""})
     assert code == 0, out
     assert "1 passed, 1 skipped" in out, out
+
+
+def without_mcap(tmp_path, error):
+    """The environment of a run in which `import mcap` raises `error` (a statement)."""
+    shadow = tmp_path / "shadow"
+    shadow.mkdir(exist_ok=True)
+    (shadow / "mcap.py").write_text(error + "\n")
+    path = os.pathsep.join(p for p in (str(shadow), os.environ.get("PYTHONPATH")) if p)
+    return {"PYTHONPATH": path, "ROOM_MEMORY_BAG": BAG or "room_memory_bag"}
+
+
+@pytest.mark.skipif(PROBE in os.environ, reason="inside a run_pytest run")
+def test_static_recording_reports_skipped_without_the_mcap_package(tmp_path):
+    """Codex P2: without mcap (the image has none) test_static_recording.py skips at collection,
+    nothing is collected and pytest exits 5, not 0, so CTest reported static_recording failed.
+    A run that collected nothing and skipped something exits 77 too."""
+    code, out = run_pytest(tmp_path, STATIC_RECORDING,
+                           environment=without_mcap(tmp_path, "raise ModuleNotFoundError(\"No module named 'mcap'\", name='mcap')"))
+    assert code == 77, out
+    assert "the mcap package reads the recording" in out, out
+
+
+@pytest.mark.skipif(PROBE in os.environ, reason="inside a run_pytest run")
+def test_static_recording_fails_when_mcap_is_broken(tmp_path):
+    """The other side: an mcap that is there but fails to import is a collection error, not a skip."""
+    code, out = run_pytest(tmp_path, STATIC_RECORDING,
+                           environment=without_mcap(tmp_path, "raise RuntimeError('mcap is broken')"))
+    assert code not in (0, 77), out
+    assert "mcap is broken" in out, out
+
+
+@pytest.mark.skipif(PROBE in os.environ, reason="inside a run_pytest run")
+def test_a_run_that_collected_and_skipped_nothing_still_fails(tmp_path):
+    """Exit 5 alone (every test deselected, none skipped) is not reported skipped. On this file:
+    test_static_recording.py skips at collection where mcap is missing, before -k deselects."""
+    code, out = run_pytest(tmp_path, str(HERE / "test_tools.py"), "-k", "no_such_test")
+    assert code == 5, out
