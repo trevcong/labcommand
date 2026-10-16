@@ -13,7 +13,7 @@ public enum RoomMemoryCDRError: Error, Sendable, Equatable {
     case unsupported(String)
 }
 
-// Wire format, shared by all five messages (classic CDR, as rmw_fastrtps writes it on Jazzy):
+// Wire format, shared by every room-memory message (classic CDR, as rmw_fastrtps writes it on Jazzy):
 // - 4-byte encapsulation header: `0x00 0x01` CDR little endian, `0x00 0x00` CDR big endian, 2 option bytes.
 // - Every primitive is aligned to its own size (1, 2, 4 or 8), measured from the byte after the header.
 // - string: uint32 length including the NUL, then the bytes and the NUL.
@@ -23,6 +23,12 @@ public enum RoomMemoryCDRError: Error, Sendable, Equatable {
 // - MapBricks carries its bricks as one `uint8[] payload`, packed little endian in either byte order
 //   and compressed as its `compression` field says (`RoomPayload`).
 // Encoders always write little endian with option bytes 0.
+//
+// Protocol v2 (layout detection, protocol §1.4): the new fields sit after the last legacy field.
+// There, at most 3 unread bytes is the legacy layout; padding to 8, then exactly the v2 fields
+// (8 bytes, 16 for a ChangeEvent with a mask, 24 for RequestSync), then at most 3, is v2; anything
+// else is invalid. With a mask, the nested MapBricks decides for both messages after its payload.
+// Pad bytes are not checked, as with every alignment. No schema text is needed.
 
 extension RoomMemory.MapBricks {
     /// Encodes the message as CDR little endian, including the encapsulation header.
@@ -60,6 +66,9 @@ extension RoomMemory.MapBricks {
         let payload = try RoomPayload.compress(packedPayload(), compression)
         writer.u32(UInt32(payload.count))
         writer.raw(payload)
+        if let publisherGeneration {
+            writer.u64(publisherGeneration)
+        }
     }
 
     /// The payload before compression, packed little endian whatever the CDR byte order:
@@ -82,8 +91,10 @@ extension RoomMemory.MapBricks {
     }
 
     /// Reads one MapBricks, top level (`path` empty) or nested (`path` such as `"mask[0]."`).
-    /// The caller validates the result.
-    static func read(from reader: inout RoomCDRReader, path: String) throws -> RoomMemory.MapBricks {
+    /// The caller validates the result. `v2Tail` is the size of the v2 fields that end the buffer
+    /// after the payload: 8 at the top level, 16 inside `ChangeEvent.mask` (its own generation,
+    /// then the parent's). The layout is decided there, once, for the whole buffer.
+    static func read(from reader: inout RoomCDRReader, path: String, v2Tail: Int = 8) throws -> RoomMemory.MapBricks {
         let header = try reader.header(path)
         let compressionValue = try reader.u8(path + "compression")
         guard let compression = Compression(rawValue: compressionValue) else {
@@ -114,6 +125,7 @@ extension RoomMemory.MapBricks {
             reader.slice(payloadStart, payloadLength), compression, expectedCount: rawSize, "MapBricks: \(path)payload"
         )
         let (bricks, removed) = RoomPayload.unpack(raw, brickCount: brickCount, removedCount: removedCount)
+        let generation = try reader.isV2(fields: v2Tail, after: path + "payload") ? try reader.u64(path + "publisher_generation") : nil
 
         return RoomMemory.MapBricks(
             header: header,
@@ -122,13 +134,15 @@ extension RoomMemory.MapBricks {
             baseEpoch: baseEpoch,
             voxelSize: voxelSize,
             bricks: bricks,
-            removedBrickIndices: removed
+            removedBrickIndices: removed,
+            publisherGeneration: generation
         )
     }
 
     /// Checks the contract invariants that both the encoder and the decoder enforce.
     func validate(_ context: String) throws {
         try header.validate(context)
+        try RoomCDR.requireGeneration(publisherGeneration, "\(context): publisher_generation")
         guard voxelSize.isFinite, voxelSize > 0 else {
             throw RoomMemoryCDRError.invalid("\(context): voxel_size \(voxelSize) must be finite and > 0 m")
         }
@@ -196,6 +210,9 @@ extension RoomMemory.ChangeEvent {
         } else {
             writer.u32(0)
         }
+        if let publisherGeneration {
+            writer.u64(publisherGeneration)
+        }
         return writer.data
     }
 
@@ -238,7 +255,10 @@ extension RoomMemory.ChangeEvent {
             guard maskCount <= 1 else {
                 throw RoomMemoryCDRError.invalid("ChangeEvent: mask holds \(maskCount) maps; the bound is 1")
             }
-            let mask = maskCount == 1 ? try RoomMemory.MapBricks.read(from: &reader, path: "mask[0].") : nil
+            let mask = maskCount == 1 ? try RoomMemory.MapBricks.read(from: &reader, path: "mask[0].", v2Tail: 16) : nil
+            // With a mask, the nested reader decided the layout for both messages after its payload.
+            let v2 = try mask.map { $0.publisherGeneration != nil } ?? reader.isV2(fields: 8, after: "mask length")
+            let generation = v2 ? try reader.u64("publisher_generation") : nil
 
             let event = RoomMemory.ChangeEvent(
                 header: header,
@@ -255,7 +275,8 @@ extension RoomMemory.ChangeEvent {
                 sensors: sensors,
                 firstSeen: firstSeen,
                 lastSeen: lastSeen,
-                mask: mask
+                mask: mask,
+                publisherGeneration: generation
             )
             try event.validate()
             return event
@@ -265,6 +286,7 @@ extension RoomMemory.ChangeEvent {
     func validate() throws {
         let context = "ChangeEvent"
         try header.validate(context)
+        try RoomCDR.requireGeneration(publisherGeneration, "\(context): publisher_generation")
         try RoomCDR.requireFinite(centroid, "\(context): centroid")
         try RoomCDR.requireFinite(aabb.min, "\(context): aabb min")
         try RoomCDR.requireFinite(aabb.max, "\(context): aabb max")
@@ -315,6 +337,12 @@ extension RoomMemory.ChangeEvent {
             guard mask.baseEpoch == 0 else {
                 throw RoomMemoryCDRError.invalid("\(context): mask base_epoch \(mask.baseEpoch) must be 0")
             }
+            // A legacy event has a legacy mask, a v2 event a v2 mask of the same generation.
+            guard mask.publisherGeneration == publisherGeneration else {
+                throw RoomMemoryCDRError.invalid(
+                    "\(context): mask publisher_generation \(String(describing: mask.publisherGeneration)) is not the event's \(String(describing: publisherGeneration))"
+                )
+            }
         }
     }
 }
@@ -337,6 +365,9 @@ extension RoomMemory.MemoryStatus {
         writer.u16(jt128Hz ?? RoomCDR.hzUnavailable)
         writer.u32(droppedWindows)
         writer.u64(eventsSeq ?? Self.eventsSeqNone)
+        if let publisherGeneration {
+            writer.u64(publisherGeneration)
+        }
         return writer.data
     }
 
@@ -358,6 +389,7 @@ extension RoomMemory.MemoryStatus {
             let jt128Hz = try reader.u16("per_sensor_hz[1]")
             let droppedWindows = try reader.u32("dropped_windows")
             let eventsSeq = try reader.u64("events_seq")
+            let generation = try reader.isV2(fields: 8, after: "events_seq") ? try reader.u64("publisher_generation") : nil
             let status = RoomMemory.MemoryStatus(
                 header: header,
                 state: state,
@@ -369,7 +401,8 @@ extension RoomMemory.MemoryStatus {
                 mid360Hz: mid360Hz == RoomCDR.hzUnavailable ? nil : mid360Hz,
                 jt128Hz: jt128Hz == RoomCDR.hzUnavailable ? nil : jt128Hz,
                 droppedWindows: droppedWindows,
-                eventsSeq: eventsSeq == Self.eventsSeqNone ? nil : eventsSeq
+                eventsSeq: eventsSeq == Self.eventsSeqNone ? nil : eventsSeq,
+                publisherGeneration: generation
             )
             try status.validate()
             return status
@@ -379,6 +412,7 @@ extension RoomMemory.MemoryStatus {
     func validate() throws {
         let context = "MemoryStatus"
         try header.validate(context)
+        try RoomCDR.requireGeneration(publisherGeneration, "\(context): publisher_generation")
         try RoomCDR.requireFraction(coverageKnownFraction, "\(context): coverage_known_frac")
         if let poseResidualM, !(poseResidualM.isFinite && poseResidualM >= 0) {
             throw RoomMemoryCDRError.invalid("\(context): pose_residual_m \(poseResidualM) must be finite and ≥ 0")
@@ -453,6 +487,10 @@ extension RoomMemory.RequestSync {
         writer.u64(since?.epoch ?? Self.sinceNone)
         writer.u64(since?.seq ?? Self.sinceNone)
         writer.u8(topic.rawValue)
+        if let expectedGeneration, let token {
+            writer.u64(expectedGeneration)
+            writer.raw(token.bytes)
+        }
         return writer.data
     }
 
@@ -477,7 +515,13 @@ extension RoomMemory.RequestSync {
             default:
                 throw RoomMemoryCDRError.invalid("RequestSync: since_epoch and since_seq must both be SINCE_NONE or neither")
             }
-            let request = RoomMemory.RequestSync(header: header, since: since, topic: topic)
+            var expected: UInt64?
+            var token: RoomMemory.RequestToken?
+            if try reader.isV2(fields: 8 + RoomMemory.RequestToken.count, after: "topic") {
+                expected = try reader.u64("expected_generation")
+                token = RoomMemory.RequestToken(uncheckedBytes: try reader.bytes(RoomMemory.RequestToken.count, "request_token"))
+            }
+            let request = RoomMemory.RequestSync(header: header, since: since, topic: topic, expectedGeneration: expected, token: token)
             try request.validate()
             return request
         }
@@ -492,6 +536,76 @@ extension RoomMemory.RequestSync {
         let sinceEpoch = since?.epoch ?? Self.sinceNone
         guard header.mapEpoch == sinceEpoch else {
             throw RoomMemoryCDRError.invalid("\(context): map_epoch \(header.mapEpoch) must repeat since_epoch \(sinceEpoch)")
+        }
+        guard (expectedGeneration == nil) == (token == nil) else {
+            throw RoomMemoryCDRError.invalid("\(context): expected_generation and request_token are both set (v2) or both absent (legacy)")
+        }
+        if let token, token.isZero {
+            throw RoomMemoryCDRError.invalid("\(context): an all-zero request_token is invalid in v2")
+        }
+    }
+}
+
+extension RoomMemory.SyncEnd {
+    /// Encodes the message as CDR little endian, including the encapsulation header.
+    ///
+    /// - Throws: `RoomMemoryCDRError.invalid` when the message breaks the protocol contract.
+    public func encodedCDR() throws -> Data {
+        try validate()
+        var writer = RoomCDRWriter()
+        writer.header(header)
+        writer.u64(publisherGeneration)
+        writer.raw(token.bytes)
+        writer.u8(topic.rawValue)
+        writer.u64(bound ?? Self.seqNone)
+        writer.ranges(delivered)
+        writer.ranges(unavailable)
+        return writer.data
+    }
+
+    /// Decodes a CDR `labcommand_msgs/SyncEnd`, including the encapsulation header.
+    ///
+    /// Accepts either byte order. The input may be a slice.
+    ///
+    /// - Throws: `RoomMemoryCDRError` on truncated or invalid input.
+    public static func decode(cdr data: Data) throws -> RoomMemory.SyncEnd {
+        try RoomCDR.decode(data, message: "SyncEnd") { reader in
+            let header = try reader.header("")
+            let generation = try reader.u64("publisher_generation")
+            let token = RoomMemory.RequestToken(uncheckedBytes: try reader.bytes(RoomMemory.RequestToken.count, "request_token"))
+            let topicValue = try reader.u8("topic")
+            guard let topic = RoomMemory.RequestSync.Topic(rawValue: topicValue) else {
+                throw RoomMemoryCDRError.invalid("SyncEnd: topic \(topicValue) is not a TOPIC_* value")
+            }
+            let bound = try reader.u64("bound")
+            let end = RoomMemory.SyncEnd(
+                header: header,
+                publisherGeneration: generation,
+                token: token,
+                topic: topic,
+                bound: bound == Self.seqNone ? nil : bound,
+                delivered: try reader.ranges("delivered"),
+                unavailable: try reader.ranges("unavailable")
+            )
+            try end.validate()
+            return end
+        }
+    }
+
+    func validate() throws {
+        let context = "SyncEnd"
+        try header.validate(context)
+        try RoomCDR.requireGeneration(publisherGeneration, "\(context): publisher_generation")
+        if bound == Self.seqNone {
+            throw RoomMemoryCDRError.invalid("\(context): \(Self.seqNone) is the SEQ_NONE sentinel; use a nil bound")
+        }
+        try RoomCDR.requireCanonical(delivered, bound: bound, "\(context): delivered")
+        try RoomCDR.requireCanonical(unavailable, bound: bound, "\(context): unavailable")
+        for range in delivered where unavailable.contains(where: { $0.overlaps(range) }) {
+            throw RoomMemoryCDRError.invalid("\(context): delivered and unavailable overlap at \(range)")
+        }
+        if topic == .mapBricks, !unavailable.isEmpty {
+            throw RoomMemoryCDRError.invalid("\(context): a map answer has no unavailable ranges")
         }
     }
 }
@@ -535,6 +649,25 @@ enum RoomCDR {
     static func requireFraction(_ value: Float?, _ what: String) throws {
         if let value, !(0...1).contains(value) {
             throw RoomMemoryCDRError.invalid("\(what) \(value) is outside 0...1")
+        }
+    }
+
+    /// Nil (legacy layout) passes; a present generation must not be `GENERATION_UNKNOWN`.
+    static func requireGeneration(_ value: UInt64?, _ what: String) throws {
+        if value == RoomMemory.generationUnknown {
+            throw RoomMemoryCDRError.invalid("\(what) 0 is GENERATION_UNKNOWN, invalid in a Spark message")
+        }
+    }
+
+    /// Increasing, non-adjacent ranges, each within `bound` (none when `bound` is nil).
+    static func requireCanonical(_ ranges: [ClosedRange<UInt64>], bound: UInt64?, _ what: String) throws {
+        for (index, range) in ranges.enumerated() {
+            if index > 0, range.lowerBound <= ranges[index - 1].upperBound || range.lowerBound - ranges[index - 1].upperBound == 1 {
+                throw RoomMemoryCDRError.invalid("\(what)[\(index)] is not after \(what)[\(index - 1)] with a gap (canonical ranges)")
+            }
+            guard let bound, range.upperBound <= bound else {
+                throw RoomMemoryCDRError.invalid("\(what)[\(index)] ends at \(range.upperBound), past the bound \(bound.map(String.init) ?? "SEQ_NONE")")
+            }
         }
     }
 
@@ -707,6 +840,15 @@ struct RoomCDRWriter {
         time(value.stamp)
     }
 
+    /// `SeqRange[]`: a uint32 count, then two uint64 per range.
+    mutating func ranges(_ values: [ClosedRange<UInt64>]) {
+        u32(UInt32(values.count))
+        for range in values {
+            u64(range.lowerBound)
+            u64(range.upperBound)
+        }
+    }
+
     private mutating func append<T: FixedWidthInteger>(_ value: T) {
         align(MemoryLayout<T>.size)
         withUnsafeBytes(of: value.littleEndian) { bytes.append(contentsOf: $0) }
@@ -835,6 +977,46 @@ struct RoomCDRReader {
             )
         }
         return count
+    }
+
+    /// `length` raw bytes (a `uint8[N]`), copied.
+    mutating func bytes(_ length: Int, _ what: @autoclosure () -> String) throws -> [UInt8] {
+        slice(try take(length, what()), length)
+    }
+
+    /// `SeqRange[]`. The count is checked against the bytes left before anything is reserved, and
+    /// the first element's uint64 does the alignment: an empty list aligns nothing.
+    mutating func ranges(_ what: @autoclosure () -> String) throws -> [ClosedRange<UInt64>] {
+        let count = Int(try u32(what() + " length"))
+        let available = max(0, bytes.count - offset)
+        guard count <= available / 16 else {
+            throw RoomMemoryCDRError.truncated("\(message) CDR: truncated \(what()) at byte \(offset) (\(count) ranges, have \(available) bytes)")
+        }
+        var ranges: [ClosedRange<UInt64>] = []
+        ranges.reserveCapacity(count)
+        for index in 0..<count {
+            let first = try u64(what() + "[\(index)].first")
+            let last = try u64(what() + "[\(index)].last")
+            guard first <= last else {
+                throw RoomMemoryCDRError.invalid("\(message): \(what())[\(index)] first \(first) is after last \(last)")
+            }
+            ranges.append(first...last)
+        }
+        return ranges
+    }
+
+    /// The layout after the last legacy field (`after`): false (legacy) when at most 3 bytes are
+    /// left; true (v2) when padding to 8 and then exactly `fields` bytes, and at most 3, are left.
+    /// Throws otherwise.
+    mutating func isV2(fields: Int, after what: @autoclosure () -> String) throws -> Bool {
+        let unread = bytes.count - offset
+        if unread <= RoomCDR.maxTrailingPadding { return false }
+        let misalignment = (offset - RoomCDR.encapsulationSize) % 8
+        let pad = misalignment == 0 ? 0 : 8 - misalignment
+        if (fields...(fields + RoomCDR.maxTrailingPadding)).contains(unread - pad) { return true }
+        throw RoomMemoryCDRError.invalid(
+            "\(message) CDR: \(unread) bytes after \(what()) are neither padding (at most \(RoomCDR.maxTrailingPadding)) nor the \(fields)-byte v2 fields"
+        )
     }
 
     /// Rejects unread bytes beyond the padding the rmw layer may add.

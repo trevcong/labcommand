@@ -147,6 +147,62 @@ private let goldenAppeared = Room.ChangeEvent(
     mask: nil
 )
 
+// MARK: Protocol v2 goldens: the legacy values plus the trailing fields, one generation throughout.
+
+private let goldenGeneration: UInt64 = 1_760_400_000_000
+private let tokenA = Room.RequestToken(bytes: [0x5a, 0x1e, 0x7c, 0x3d, 0x9b, 0x02, 0x4f, 0x61, 0x8e, 0x33, 0xc4, 0xd5, 0xe6, 0xf7, 0x08, 0x19])!
+private let tokenB = Room.RequestToken(bytes: [0xc1, 0x0f, 0xfe, 0xe0, 0x12, 0x34, 0x45, 0x67, 0xa9, 0x87, 0x65, 0x43, 0x21, 0x0f, 0xed, 0xcb])!
+private let tokenC = Room.RequestToken(bytes: [0x0e, 0x8a, 0x3b, 0x5c, 0x77, 0x21, 0x4d, 0x90, 0xb4, 0x06, 0x59, 0x13, 0xc2, 0xae, 0x6f, 0x01])!
+
+private func v2<M>(_ message: M, _ set: (inout M) -> Void) -> M {
+    var copy = message
+    set(&copy)
+    return copy
+}
+
+private let goldenStatusV2 = v2(goldenStatus) { $0.publisherGeneration = goldenGeneration }
+private let goldenDeltaV2 = v2(goldenDelta) { $0.publisherGeneration = goldenGeneration }
+private let goldenAppearedV2 = v2(goldenAppeared) { $0.publisherGeneration = goldenGeneration }
+private let goldenMovedV2 = v2(goldenMoved) {
+    $0.publisherGeneration = goldenGeneration
+    $0.mask?.publisherGeneration = goldenGeneration
+}
+private let goldenRequestNoneV2 = v2(goldenRequestNone) {
+    $0.expectedGeneration = Room.generationUnknown
+    $0.token = tokenA
+}
+private let goldenRequestMapV2 = Room.RequestSync(
+    header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 2, stamp: t10),
+    since: Room.RequestSync.Position(epoch: 43, seq: 10),
+    topic: .mapBricks,
+    expectedGeneration: goldenGeneration,
+    token: tokenC
+)
+private let goldenSyncEndEmpty = Room.SyncEnd(
+    header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 0, stamp: t10),
+    publisherGeneration: goldenGeneration, token: .zero, topic: .events, bound: nil
+)
+private let goldenSyncEndFallback = Room.SyncEnd(
+    header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 1, stamp: t10),
+    publisherGeneration: goldenGeneration, token: tokenB, topic: .events, bound: 120,
+    delivered: [10...10, 21...120], unavailable: [11...20]
+)
+private let goldenSyncEndMap = Room.SyncEnd(
+    header: Room.Header(roomId: "lab", mapEpoch: 45, seq: 2, stamp: t10),
+    publisherGeneration: goldenGeneration, token: tokenC, topic: .mapBricks, bound: 13, delivered: [11...13]
+)
+
+/// Each v2 golden that extends a legacy one, and the legacy file whose length it shares up to its new fields.
+private let v2LegacyTwin: [String: String] = [
+    "memory_status_v2_le": "memory_status_le",
+    "map_bricks_delta_v2_le": "map_bricks_delta_le",
+    "map_bricks_delta_v2_be": "map_bricks_delta_be",
+    "change_event_appeared_v2_le": "change_event_appeared_le",
+    "change_event_moved_mask_v2_le": "change_event_moved_mask_le",
+    "request_sync_events_v2_le": "request_sync_events_none_le",
+    "request_sync_map_v2_be": "request_sync_map_be",
+]
+
 /// Where a compressed golden keeps its payload, in stream positions (after the 4-byte header).
 private struct PayloadFraming {
     /// The `uint32` payload length; the encoder must match the golden up to here.
@@ -196,12 +252,22 @@ private let littleEndianGoldens: [Golden] = [
            framing: PayloadFraming(lengthPos: 64, verbatim: 76..<218, algorithm: .lzfse)),
     golden("request_sync_map_le", goldenRequestMap, decode: Room.RequestSync.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("request_sync_events_none_le", goldenRequestNone, decode: Room.RequestSync.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("memory_status_v2_le", goldenStatusV2, decode: Room.MemoryStatus.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("map_bricks_delta_v2_le", goldenDeltaV2, decode: Room.MapBricks.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("change_event_appeared_v2_le", goldenAppearedV2, decode: Room.ChangeEvent.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("change_event_moved_mask_v2_le", goldenMovedV2, decode: Room.ChangeEvent.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("request_sync_events_v2_le", goldenRequestNoneV2, decode: Room.RequestSync.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("sync_end_events_empty_le", goldenSyncEndEmpty, decode: Room.SyncEnd.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("sync_end_events_fallback_le", goldenSyncEndFallback, decode: Room.SyncEnd.decode(cdr:), encode: { try $0.encodedCDR() }),
 ]
 
 private let bigEndianGoldens: [Golden] = [
     golden("epoch_be", goldenEpoch, decode: Room.Epoch.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("map_bricks_delta_be", goldenDelta, decode: Room.MapBricks.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("request_sync_map_be", goldenRequestMap, decode: Room.RequestSync.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("map_bricks_delta_v2_be", goldenDeltaV2, decode: Room.MapBricks.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("request_sync_map_v2_be", goldenRequestMapV2, decode: Room.RequestSync.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("sync_end_map_replay_be", goldenSyncEndMap, decode: Room.SyncEnd.decode(cdr:), encode: { try $0.encodedCDR() }),
 ]
 
 private enum Outcome: Equatable {
@@ -285,6 +351,33 @@ func testRoomGoldenSemantics() {
            "MapBricks compresses with zlib unless told otherwise")
 }
 
+func testRoomLayoutDetection() {
+    do {
+        // Legacy goldens decode with no generation, v2 goldens with one; the prefix is shared byte for byte.
+        expect(try Room.MemoryStatus.decode(cdr: goldenBytes("memory_status_le")).publisherGeneration == nil, "legacy status: nil generation")
+        for (name, legacy) in v2LegacyTwin where !name.hasPrefix("request_sync_map") {
+            let bytes = goldenBytes(name)
+            let base = goldenBytes(legacy)
+            expect(bytes.prefix(base.count) == base, "\(name) starts with \(legacy) byte for byte")
+        }
+        // A v2 status with up to 3 bytes of rmw padding still decodes.
+        expect(try Room.MemoryStatus.decode(cdr: goldenBytes("memory_status_v2_le") + Data(count: 3)) == goldenStatusV2, "v2 + 3 pad bytes")
+        // MapBricks: 6 pad bytes after a 142-byte payload; ChangeEvent without a mask: 4 after the count.
+        expect(goldenBytes("map_bricks_delta_v2_le").count == goldenBytes("map_bricks_delta_le").count + 6 + 8, "delta v2 = legacy + 6 pad + 8")
+        expect(goldenBytes("change_event_appeared_v2_le").count == 148, "appeared v2 event is 148 bytes")
+        expect(goldenBytes("change_event_moved_mask_v2_le").count == 364, "masked v2 event is 364 bytes")
+        // SyncEnd: an empty list is followed by the next count at once; elements align to 8.
+        expect(try goldenSyncEndEmpty.encodedCDR().count == 84, "SyncEnd d=0 u=0 is 84 bytes")
+        expect(try v2(goldenSyncEndEmpty) { $0.bound = 5; $0.delivered = [0...5] }.encodedCDR().count == 88 + 16, "SyncEnd d=1 u=0")
+        expect(try v2(goldenSyncEndEmpty) { $0.bound = 5; $0.unavailable = [0...5] }.encodedCDR().count == 84 + 16, "SyncEnd d=0 u=1")
+        expect(try goldenSyncEndFallback.encodedCDR().count == 92 + 32 + 16, "SyncEnd d=2 u=1")
+        expect(try goldenRequestMapV2.encodedCDR().count == 84, "v2 RequestSync for lab is 84 bytes")
+        expect(goldenBytes("request_sync_map_v2_be").suffix(16) == Data(tokenC.bytes), "the token is never byte-swapped")
+    } catch {
+        expect(false, "layout detection: \(error)")
+    }
+}
+
 func testRoomEmptyPayloadEveryCompression() {
     // n_bricks 0 and n_removed 0: an empty payload stays empty under NONE, and zlib and lzfse still
     // send a complete (non-empty) stream, such as raw DEFLATE 03 00.
@@ -316,11 +409,29 @@ func testRoomSliceAndPadding() {
 func testRoomTruncationAlwaysThrows() {
     for golden in littleEndianGoldens + bigEndianGoldens {
         let bytes = goldenBytes(golden.name)
+        // A v2 message cut where its legacy layout ends is that legacy message; cut inside its new
+        // fields it is invalid. Neither is ever the golden.
+        let legacyLength = v2LegacyTwin[golden.name].map { goldenBytes($0).count } ?? bytes.count
         for length in 0..<bytes.count {
             let (result, text) = outcome { try golden.decodeMatches(bytes.prefix(length)) }
+            if length >= legacyLength {
+                expect(result == .otherError || result == .invalid, "\(golden.name) cut to \(length) bytes: \(result) \(text)")
+                continue
+            }
             expect(result == .truncated, "\(golden.name) cut to \(length) bytes: \(result) \(text)")
             expect(text.contains("CDR: truncated"), "\(golden.name) cut to \(length): message '\(text)'")
         }
+    }
+    // At the legacy length exactly, each one is the legacy layout: no generation, no token.
+    do {
+        expect(try Room.MemoryStatus.decode(cdr: goldenBytes("memory_status_v2_le").prefix(80 + 4)) == goldenStatus,
+               "v2 status cut at 80 bytes is the legacy golden")
+        expect(try Room.ChangeEvent.decode(cdr: goldenBytes("change_event_moved_mask_v2_le").prefix(338 + 4)) == goldenMoved,
+               "v2 masked event cut after its mask payload is the legacy golden")
+        expect(try Room.RequestSync.decode(cdr: goldenBytes("request_sync_events_v2_le").prefix(57 + 4)).token == nil,
+               "v2 request cut at its topic is a legacy request")
+    } catch {
+        expect(false, "v2 goldens cut at the legacy length decode: \(error)")
     }
 }
 
@@ -450,12 +561,51 @@ func testRoomMalformedInputRejected() {
         ("RequestSync since_epoch SINCE_NONE alone", .invalid, { try request(patched(patched(requestMap, at: 32, none64), at: 8, none64)) }),
         ("RequestSync since_epoch set, since_seq SINCE_NONE", .invalid, { try requestNoneMatches(patched(requestNone, at: 40, le64(0))) }),
         ("RequestSync map_epoch 0 with SINCE_NONE", .invalid, { try requestNoneMatches(patched(requestNone, at: 16, le64(0))) }),
-    ]
+    ] + v2MalformedCases()
     for (label, want, body) in cases {
         let (got, text) = outcome(body)
         expect(got == want, "malformed '\(label)': expected \(want), got \(got) (\(text))")
         expect(!text.isEmpty, "malformed '\(label)': error carries a description")
     }
+}
+
+/// Layout detection, the mask generation rule, request tokens and SyncEnd manifests.
+private func v2MalformedCases() -> [(String, Outcome, () throws -> Bool)] {
+    let status = { (data: Data) in try Room.MemoryStatus.decode(cdr: data) == goldenStatusV2 }
+    let moved = { (data: Data) in try Room.ChangeEvent.decode(cdr: data) == goldenMovedV2 }
+    let request = { (data: Data) in try Room.RequestSync.decode(cdr: data) == goldenRequestNoneV2 }
+    let fallback = { (data: Data) in try Room.SyncEnd.decode(cdr: data) == goldenSyncEndFallback }
+    let empty = { (data: Data) in try Room.SyncEnd.decode(cdr: data) == goldenSyncEndEmpty }
+    let legacyStatus = goldenBytes("memory_status_le")
+    let legacyRequest = goldenBytes("request_sync_events_none_le")
+    let end = "sync_end_events_fallback_le"
+    var cases: [(String, Outcome, () throws -> Bool)] = [
+        ("legacy status + 8 zero bytes (generation 0)", .invalid, { try status(legacyStatus + Data(count: 8)) }),
+        ("v2 status generation 0", .invalid, { try status(patched("memory_status_v2_le", at: 80, le64(0))) }),
+        ("v2 status + 4 trailing bytes", .invalid, { try status(goldenBytes("memory_status_v2_le") + Data(count: 4)) }),
+        ("masked event: mask generation not the parent's", .invalid,
+         { try moved(patched("change_event_moved_mask_v2_le", at: 344, le64(goldenGeneration + 1))) }),
+        ("masked event: only the mask's generation", .invalid,
+         { try moved(goldenBytes("change_event_moved_mask_v2_le").dropLast(8)) }),
+        ("RequestSync v2 all-zero token", .invalid, { try request(patched("request_sync_events_v2_le", at: 72, le64(0) + le64(0))) }),
+        ("legacy RequestSync + 31 zero bytes (zero token)", .invalid, { try request(legacyRequest + Data(count: 31)) }),
+        ("legacy RequestSync + 15 bytes (no token)", .invalid, { try request(legacyRequest + Data(count: 15)) }),
+        ("SyncEnd generation 0", .invalid, { try empty(patched("sync_end_events_empty_le", at: 32, le64(0))) }),
+        ("SyncEnd topic 2", .invalid, { try fallback(patched(end, at: 56, [2])) }),
+        ("SyncEnd bound below a delivered range", .invalid, { try fallback(patched(end, at: 64, le64(119))) }),
+        ("SyncEnd bound SEQ_NONE with ranges", .invalid, { try fallback(patched(end, at: 64, le64(.max))) }),
+        ("SyncEnd delivered range first after last", .invalid, { try fallback(patched(end, at: 80, le64(11))) }),
+        ("SyncEnd delivered ranges adjacent", .invalid, { try fallback(patched(end, at: 96, le64(11))) }),
+        ("SyncEnd delivered ranges out of order", .invalid, { try fallback(patched(end, at: 80, le64(30) + le64(30))) }),
+        ("SyncEnd unavailable overlaps delivered", .invalid, { try fallback(patched(end, at: 128, le64(21))) }),
+        ("SyncEnd map answer with unavailable ranges", .invalid, { try fallback(patched(end, at: 56, [0])) }),
+        ("SyncEnd delivered count past the end", .truncated, { try fallback(patched(end, at: 72, le32(0xFFFF_FFFF))) }),
+        ("SyncEnd unavailable count 2 for 1", .truncated, { try fallback(patched(end, at: 112, le32(2))) }),
+    ]
+    for extra in 4..<8 {
+        cases.append(("legacy status + \(extra) trailing bytes", .invalid, { try status(legacyStatus + Data(count: extra)) }))
+    }
+    return cases
 }
 
 func testRoomEncoderEnforcesContract() {
@@ -506,6 +656,21 @@ func testRoomEncoderEnforcesContract() {
     requestEpochMismatch.header.mapEpoch = 44
     var requestNoneWithEpoch = goldenRequestNone
     requestNoneWithEpoch.header.mapEpoch = 0
+    let statusGenerationZero = v2(goldenStatus) { $0.publisherGeneration = 0 }
+    let deltaGenerationZero = v2(goldenDelta) { $0.publisherGeneration = 0 }
+    let legacyMaskUnderV2 = v2(goldenMovedV2) { $0.mask?.publisherGeneration = nil }
+    let v2MaskUnderLegacy = v2(goldenMovedV2) { $0.publisherGeneration = nil }
+    let maskOtherGeneration = v2(goldenMovedV2) { $0.mask?.publisherGeneration = goldenGeneration + 1 }
+    let tokenWithoutExpected = v2(goldenRequestMapV2) { $0.expectedGeneration = nil }
+    let expectedWithoutToken = v2(goldenRequestMapV2) { $0.token = nil }
+    let zeroToken = v2(goldenRequestMapV2) { $0.token = .zero }
+    let endGenerationZero = v2(goldenSyncEndFallback) { $0.publisherGeneration = 0 }
+    let endPastBound = v2(goldenSyncEndFallback) { $0.bound = 100 }
+    let endNoneBound = v2(goldenSyncEndFallback) { $0.bound = nil }
+    let endSentinelBound = v2(goldenSyncEndEmpty) { $0.bound = Room.SyncEnd.seqNone }
+    let endAdjacent = v2(goldenSyncEndFallback) { $0.delivered = [10...20, 21...120]; $0.unavailable = [] }
+    let endOverlap = v2(goldenSyncEndFallback) { $0.unavailable = [11...21] }
+    let endMapUnavailable = v2(goldenSyncEndFallback) { $0.topic = .mapBricks }
 
     let cases: [(String, () throws -> Data)] = [
         ("duplicate brick", { try unsorted.encodedCDR() }),
@@ -531,6 +696,21 @@ func testRoomEncoderEnforcesContract() {
         ("RequestSync since_seq SINCE_NONE", { try requestSentinelSeq.encodedCDR() }),
         ("RequestSync map_epoch not since_epoch", { try requestEpochMismatch.encodedCDR() }),
         ("RequestSync map_epoch 0 with no since", { try requestNoneWithEpoch.encodedCDR() }),
+        ("MemoryStatus generation 0", { try statusGenerationZero.encodedCDR() }),
+        ("MapBricks generation 0", { try deltaGenerationZero.encodedCDR() }),
+        ("legacy mask under a v2 event", { try legacyMaskUnderV2.encodedCDR() }),
+        ("v2 mask under a legacy event", { try v2MaskUnderLegacy.encodedCDR() }),
+        ("mask generation not the event's", { try maskOtherGeneration.encodedCDR() }),
+        ("RequestSync token without expected_generation", { try tokenWithoutExpected.encodedCDR() }),
+        ("RequestSync expected_generation without token", { try expectedWithoutToken.encodedCDR() }),
+        ("RequestSync all-zero token", { try zeroToken.encodedCDR() }),
+        ("SyncEnd generation 0", { try endGenerationZero.encodedCDR() }),
+        ("SyncEnd range past the bound", { try endPastBound.encodedCDR() }),
+        ("SyncEnd ranges with a SEQ_NONE bound", { try endNoneBound.encodedCDR() }),
+        ("SyncEnd bound SEQ_NONE as a value", { try endSentinelBound.encodedCDR() }),
+        ("SyncEnd adjacent ranges", { try endAdjacent.encodedCDR() }),
+        ("SyncEnd delivered overlaps unavailable", { try endOverlap.encodedCDR() }),
+        ("SyncEnd map answer with unavailable", { try endMapUnavailable.encodedCDR() }),
     ]
     for (label, body) in cases {
         do {
@@ -558,6 +738,9 @@ private struct MessageFactory {
     mutating func time() -> Room.Time {
         Room.Time(sec: Int32(truncatingIfNeeded: random.next()), nanosec: UInt32(below(1_000_000_000)))
     }
+
+    /// Nil (the legacy layout) or a nonzero generation.
+    mutating func generation() -> UInt64? { coin() ? nil : random.next() | 1 }
 
     mutating func header() -> Room.Header {
         let names = ["lab", "lab-a", "bay 7", "räume", "x"]
@@ -604,7 +787,8 @@ private struct MessageFactory {
             baseEpoch: baseEpoch,
             voxelSize: [0.02, 0.05, 0.1][below(3)],
             bricks: coordinates.sorted().map { brick($0) },
-            removedBrickIndices: removed
+            removedBrickIndices: removed,
+            publisherGeneration: generation()
         )
     }
 
@@ -616,10 +800,12 @@ private struct MessageFactory {
         var last = first
         last.sec = first.sec == Int32.max ? first.sec : first.sec + Int32(below(100))
         var parent = header()
+        let parentGeneration = generation()
         var maskMap: Room.MapBricks?
         if coin() {
             var map = mapBricks(kind: .snapshot)
             map.header = Room.Header(roomId: parent.roomId, mapEpoch: parent.mapEpoch, seq: 0, stamp: parent.stamp)
+            map.publisherGeneration = parentGeneration
             maskMap = map
         }
         parent.seq = random.next()
@@ -638,7 +824,8 @@ private struct MessageFactory {
             sensors: Room.Sensors(rawValue: UInt8(below(4))),
             firstSeen: first,
             lastSeen: last,
-            mask: maskMap
+            mask: maskMap,
+            publisherGeneration: parentGeneration
         )
     }
 
@@ -654,7 +841,8 @@ private struct MessageFactory {
             mid360Hz: coin() ? UInt16(below(0xFFFF)) : nil,
             jt128Hz: coin() ? UInt16(below(0xFFFF)) : nil,
             droppedWindows: UInt32(truncatingIfNeeded: random.next()),
-            eventsSeq: coin() ? random.next() % Room.MemoryStatus.eventsSeqNone : nil
+            eventsSeq: coin() ? random.next() % Room.MemoryStatus.eventsSeqNone : nil,
+            publisherGeneration: generation()
         )
     }
 
@@ -664,7 +852,41 @@ private struct MessageFactory {
             request.since = Room.RequestSync.Position(epoch: random.next() >> 1, seq: random.next() >> 1)
         }
         request.header.mapEpoch = request.since?.epoch ?? Room.RequestSync.sinceNone
+        if coin() {
+            request.expectedGeneration = coin() ? Room.generationUnknown : random.next()
+            request.token = Room.RequestToken(using: &random)
+        }
         return request
+    }
+
+    /// Canonical ranges below `bound`, as a publisher writes them.
+    mutating func ranges(bound: UInt64, avoiding taken: [ClosedRange<UInt64>] = []) -> [ClosedRange<UInt64>] {
+        var ranges: [ClosedRange<UInt64>] = []
+        var next: UInt64 = UInt64(below(5))
+        for _ in 0..<below(4) {
+            let last = next + UInt64(below(20))
+            guard last <= bound else { break }
+            let range = next...last
+            if !taken.contains(where: { $0.overlaps(range) }) { ranges.append(range) }
+            next = last + 2 + UInt64(below(30))
+        }
+        return ranges
+    }
+
+    mutating func syncEnd() -> Room.SyncEnd {
+        let topic = Room.RequestSync.Topic.allCases[below(2)]
+        let bound: UInt64? = coin() ? nil : UInt64(below(400))
+        let delivered = bound.map { ranges(bound: $0) } ?? []
+        let unavailable = topic == .events ? bound.map { ranges(bound: $0, avoiding: delivered) } ?? [] : []
+        return Room.SyncEnd(
+            header: header(),
+            publisherGeneration: random.next() | 1,
+            token: coin() ? .zero : Room.RequestToken(using: &random),
+            topic: topic,
+            bound: bound,
+            delivered: delivered,
+            unavailable: unavailable
+        )
     }
 
     mutating func epoch() -> Room.Epoch {
@@ -691,7 +913,7 @@ private func roundTrip<M: Equatable>(_ message: M, encode: (M) throws -> Data, d
 }
 
 private let roundTripRounds = 300
-private let roundTripTypes = 5
+private let roundTripTypes = 6
 private let fuzzRoundsPerGolden = 1000
 
 func testRoomRandomRoundTrips() {
@@ -703,7 +925,13 @@ func testRoomRandomRoundTrips() {
         roundTrip(factory.memoryStatus(), encode: { try $0.encodedCDR() }, decode: Room.MemoryStatus.decode(cdr:), "MemoryStatus round trip \(index)")
         roundTrip(factory.epoch(), encode: { try $0.encodedCDR() }, decode: Room.Epoch.decode(cdr:), "Epoch round trip \(index)")
         roundTrip(factory.requestSync(), encode: { try $0.encodedCDR() }, decode: Room.RequestSync.decode(cdr:), "RequestSync round trip \(index)")
+        roundTrip(factory.syncEnd(), encode: { try $0.encodedCDR() }, decode: Room.SyncEnd.decode(cdr:), "SyncEnd round trip \(index)")
     }
+    // Tokens: UUID v4 bits, never zero, different on every draw.
+    var random = SplitMix64(seed: 7)
+    let tokens = (0..<64).map { _ in Room.RequestToken(using: &random) }
+    expect(Set(tokens).count == 64 && tokens.allSatisfy { !$0.isZero && $0.bytes[6] >> 4 == 4 && $0.bytes[8] >> 6 == 2 },
+           "random request tokens are distinct UUID v4 values")
 }
 
 func testRoomMutatedInputNeverCrashes() {
@@ -858,12 +1086,14 @@ func runRoomMemoryCDRTests() {
     print("  room memory CDR: \(littleEndianGoldens.count + bigEndianGoldens.count) hand-derived goldens decode (LE and BE); the encoder reproduces them (compressed: up to the payload, which inflates to the hand bytes)"); passed()
     testRoomGoldenSemantics()
     print("  room memory CDR: NaN/0xFFFF/SINCE_NONE decode to nil; brick bit order; UNKNOWN ≠ free; zlib by default"); passed()
+    testRoomLayoutDetection()
+    print("  room memory CDR v2: the trailing bytes decide legacy/v2/invalid; the mask decides for its event; SyncEnd lists align per element"); passed()
     testRoomEmptyPayloadEveryCompression()
     print("  room memory CDR: an empty payload round-trips under none, zlib and lzfse"); passed()
     testRoomSliceAndPadding()
     print("  room memory CDR: slices decode; ≤ 3 trailing pad bytes allowed, 4 rejected"); passed()
     testRoomTruncationAlwaysThrows()
-    print("  room memory CDR safety: every truncation of every golden throws truncated"); passed()
+    print("  room memory CDR safety: every truncation of every golden throws truncated; a v2 golden cut at its legacy length reads as legacy, never as itself"); passed()
     testRoomMalformedInputRejected()
     print("  room memory CDR safety: bad encapsulation, enums, invariants, counts, payload limit, and compressed streams rejected"); passed()
     testRoomEncoderEnforcesContract()
