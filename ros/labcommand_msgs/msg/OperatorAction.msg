@@ -2,6 +2,7 @@
 # Mac -> Spark on /room_memory/operator. No reply message: the outcome is the Spark's next
 # ChangeEvent, MapBricks or MemoryStatus.
 # Contract: docs/ROOM-MEMORY-PROTOCOL.md in the LabCommand repo (section 3.6).
+# A proposal, out of scope for protocol v2: no codec, golden or node handler yet (Phase 3 stage S5).
 
 uint8 ACTION_ACKNOWLEDGE=0        # event: the operator has seen it; logged, no state change
 uint8 ACTION_ACCEPT=1             # CONFIRMED event -> ACCEPTED; the reference absorbs it, map_epoch bumps
