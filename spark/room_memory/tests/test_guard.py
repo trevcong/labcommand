@@ -4,13 +4,16 @@ registration cloud, the solver pieces, and ICP on ray-cast rooms."""
 import math
 import pathlib
 import warnings
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pytest
 
 from room_memory import guard as g
 from room_memory.core import Config, decode_pointcloud2, occupancy_map
-from room_memory.memory import pose_shift
+from room_memory.memory import MemoryConfig, RoomMemory, pose_shift
+from room_memory.messages import (CAUSE_IMU_SHOCK, CAUSE_PERIODIC, CAUSE_POSE_OFFSET, CAUSE_STARTUP, EventKind,
+                                  EventState, ImuSample, MemoryState, RigChannel, RigOutcome, Time)
 
 import rooms
 
@@ -229,3 +232,217 @@ def test_rig_shifted_golden_is_a_5_cm_move():
     assert estimate.pose.t[0] == pytest.approx(0.05, abs=0.005)
     assert abs(estimate.pose.t[1]) < 0.005 and abs(estimate.pose.t[2]) < 0.005
     assert estimate.pose.angle_deg < 0.05
+
+
+# MARK: The engine with the guard on
+
+
+REFERENCE_WINDOWS = 10
+CUBE = ((2.0, -0.4, -1.2), (2.4, 0.0, -0.8))
+
+
+def guarded(state_dir=None, **changes):
+    config = MemoryConfig(sensors=("mid360",), state_dir=None if state_dir is None else str(state_dir),
+                          reference_windows=REFERENCE_WINDOWS, rig_guard=True)
+    return RoomMemory(replace(config, **changes), Time(0, 0))
+
+
+@dataclass
+class Window:
+    second: int
+    events: list
+    state: MemoryState
+    rig: object  # RigPose or None
+
+
+def drive(memory, poses, first, boxes=rooms.FURNITURE, imu=None, frames=1):
+    """One window per pose, at seconds ``first``, ``first + 1``, ..., of ``frames`` scans each;
+    ``imu(second)`` gives the samples received during the second before that window closes."""
+    trace = []
+    for second, pose in enumerate(poses, first):
+        for sample in (imu(second) if imu else ()):
+            memory.add_imu(sample.to_cdr(), sample.stamp)
+        for frame in range(frames):
+            memory.add_points("mid360", rooms.scan(pose, boxes=boxes, seed=second * frames + frame))
+        stamp = Time(second, 0)
+        events = memory.close_window(stamp)
+        rig = memory.rig_pose(stamp)
+        trace.append(Window(second, events, memory.status(stamp, 1.0).state, rig))
+    return trace
+
+
+def outcomes(trace):
+    """The RigPose outcomes in order, repeats collapsed."""
+    out = []
+    for window in trace:
+        if window.rig is not None and (not out or out[-1] != window.rig.outcome):
+            out.append(window.rig.outcome)
+    return out
+
+
+def candidates(trace):
+    return [event for window in trace for event in window.events if event.state == EventState.CANDIDATE]
+
+
+@pytest.fixture(scope="module")
+def moved_run():
+    """Astra's repro: the reference, then a 10 cm + 2 degree push, then a cube placed in the room."""
+    memory = guarded()
+    truth = rooms.rig(0.10, yaw_deg=2.0)
+    trace = drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 2), 1)
+    trace += drive(memory, [truth] * 20, len(trace) + 1)
+    pose_after_move = memory.channels["mid360"].pose
+    # A few frames per window, as a 10 Hz lidar gives: one sparse fan makes the cube's voxels flicker
+    # past the shape gate.
+    trace += drive(memory, [truth] * 50, len(trace) + 1, boxes=rooms.FURNITURE + (CUBE,), frames=4)
+    return memory, truth, trace, pose_after_move
+
+
+def test_a_pushed_rig_realigns_without_false_events(moved_run):
+    memory, truth, trace, pose = moved_run
+    before_cube = trace[:REFERENCE_WINDOWS + 22]
+    assert not [event for window in before_cube for event in window.events]
+    assert MemoryState.RIG_MOVED in [window.state for window in before_cube]
+    assert outcomes(before_cube)[-3:] == [RigOutcome.IN_PLACE, RigOutcome.MOVED, RigOutcome.REALIGNED]
+    moved = next(window.rig for window in before_cube if window.rig and window.rig.outcome == RigOutcome.MOVED)
+    assert moved.causes & CAUSE_POSE_OFFSET and moved.channel[0] == RigChannel.MOVED
+    error_m, error_deg = rooms.pose_error(pose, truth)
+    assert error_m <= 0.005 and error_deg <= 0.05
+    assert memory.rig_outcome in (RigOutcome.REALIGNED, RigOutcome.IN_PLACE, RigOutcome.CHECKING)
+    assert memory.map_epoch == 1  # re-alignment sends no map
+
+
+def test_a_cube_placed_after_the_realignment_is_found(moved_run):
+    _, _, trace, _ = moved_run
+    [found] = candidates(trace)
+    assert found.kind == EventKind.APPEARED
+    center = [(low + high) / 2 for low, high in zip(*CUBE)]
+    assert math.dist(found.centroid, center) <= 0.25
+
+
+def test_without_the_guard_the_push_floods_candidates():
+    memory = guarded(rig_guard=False)
+    drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 2), 1)
+    trace = drive(memory, [rooms.rig(0.10, yaw_deg=2.0)] * 45, REFERENCE_WINDOWS + 3)
+    assert candidates(trace)
+    assert all(window.rig is None for window in trace)
+
+
+def test_a_yaw_alone_realigns_before_the_candidate_gate():
+    memory = guarded()
+    truth = rooms.rig(yaw_deg=3.0)
+    drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 2), 1)
+    trace = drive(memory, [truth] * 45, REFERENCE_WINDOWS + 3)
+    assert not candidates(trace)
+    assert RigOutcome.REALIGNED in outcomes(trace)
+    error_m, error_deg = rooms.pose_error(memory.channels["mid360"].pose, truth)
+    assert error_m <= 0.005 and error_deg <= 0.05
+
+
+def test_a_static_rig_checks_periodically_and_stays_in_place():
+    memory = guarded()
+    trace = drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 70), 1)
+    assert not [event for window in trace for event in window.events]
+    assert {window.state for window in trace} == {MemoryState.BUILDING, MemoryState.TRACKING}
+    assert set(outcomes(trace)) == {RigOutcome.IN_PLACE, RigOutcome.CHECKING}
+    # Ten synthetic reference windows read a few centimetres of pose_offset, so that trigger fires too.
+    checks = [w.rig for w in trace if w.rig and w.rig.outcome == RigOutcome.CHECKING]
+    assert any(rig.causes & CAUSE_PERIODIC for rig in checks)
+    assert memory.channels["mid360"].pose.is_identity
+
+
+def imu_stream(shock_at=None, yaw_deg=0.0, rate=50):
+    """Quiet samples at ``rate`` Hz, and with ``shock_at`` a 0.2 s jolt that turns the sensor by
+    ``yaw_deg`` about its z axis."""
+    yaw_rate = math.radians(yaw_deg) / 0.2
+
+    def samples(second):
+        out = []
+        for n in range(rate):
+            t = (second - 1) + n / rate
+            a, w = (0.0, 0.0, -1.0), (0.0, 0.0, 0.0)
+            if shock_at is not None and shock_at <= t < shock_at + 0.2:
+                a, w = (0.3, 0.0, -1.2), (0.0, 0.0, yaw_rate)
+            ns = int(round(t * 1e9))
+            out.append(ImuSample(Time(ns // 1_000_000_000, ns % 1_000_000_000), "livox_frame", w, a))
+        return out
+    return samples
+
+
+def test_an_imu_shock_with_a_move_realigns_from_the_gyro_prior():
+    memory = guarded()
+    truth = rooms.rig(0.05, yaw_deg=2.0)
+    shock = REFERENCE_WINDOWS + 2.5
+    imu = imu_stream(shock, 2.0)
+    poses = [rooms.Pose()] * (REFERENCE_WINDOWS + 3) + [truth] * 20
+    trace = drive(memory, poses, 1, imu=imu)
+    assert not [event for window in trace for event in window.events]
+    assert outcomes(trace)[-3:] == [RigOutcome.CHECKING, RigOutcome.MOVED, RigOutcome.REALIGNED]
+    checking = next(w.rig for w in trace if w.rig and w.rig.outcome == RigOutcome.CHECKING)
+    assert checking.causes & CAUSE_IMU_SHOCK and checking.imu_ok
+    error_m, error_deg = rooms.pose_error(memory.channels["mid360"].pose, truth)
+    assert error_m <= 0.005 and error_deg <= 0.05
+
+
+def test_an_imu_shock_alone_checks_and_stays_in_place():
+    memory = guarded()
+    trace = drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 15), 1, imu=imu_stream(REFERENCE_WINDOWS + 2.5))
+    assert outcomes(trace)[-2:] == [RigOutcome.CHECKING, RigOutcome.IN_PLACE]
+    assert MemoryState.RIG_MOVED not in [window.state for window in trace]
+    assert memory.channels["mid360"].pose.is_identity
+
+
+def test_the_rig_state_round_trips_and_a_restart_checks_the_pose(tmp_path):
+    memory = guarded(tmp_path)
+    truth = rooms.rig(0.10, yaw_deg=2.0)
+    drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 2), 1)
+    drive(memory, [truth] * 10, REFERENCE_WINDOWS + 3)
+    pose = memory.channels["mid360"].pose
+    assert not pose.is_identity
+    room = tmp_path / "lab"
+    assert (room / "rig_state").exists() and (room / "registration-mid360.bin").exists()
+    restarted = guarded(tmp_path)
+    channel = restarted.channels["mid360"]
+    assert channel.pose == pose and len(channel.cloud) == len(memory.channels["mid360"].cloud)
+    assert restarted.rig_outcome == RigOutcome.CHECKING
+    trace = drive(restarted, [truth] * 5, 1)
+    assert outcomes(trace)[-1] == RigOutcome.IN_PLACE and not candidates(trace)
+    assert trace[0].rig.causes == CAUSE_STARTUP
+
+
+def test_a_rig_state_that_does_not_match_its_files_is_refused(tmp_path):
+    memory = guarded(tmp_path)
+    drive(memory, [rooms.Pose()] * REFERENCE_WINDOWS, 1)
+    cloud = tmp_path / "lab" / "registration-mid360.bin"
+    data = bytearray(cloud.read_bytes())
+    data[-5] ^= 1
+    cloud.write_bytes(bytes(data))
+    with pytest.raises(ValueError, match="does not match"):
+        guarded(tmp_path)
+    cloud.unlink()
+    with pytest.raises(ValueError, match="does not match"):
+        guarded(tmp_path)
+    with pytest.raises(ValueError, match="rig_guard"):
+        guarded(tmp_path, rig_guard=False)
+
+
+def test_legacy_state_is_archived_and_rebuilt(tmp_path):
+    drive(guarded(tmp_path, rig_guard=False), [rooms.Pose()] * REFERENCE_WINDOWS, 1)
+    memory = guarded(tmp_path)
+    assert memory.state == MemoryState.BUILDING and memory.rig_outcome == RigOutcome.RELEARNING
+    [archive] = (tmp_path / "lab" / "prev").iterdir()
+    assert sorted(path.name for path in archive.iterdir()) == ["map_epoch", "reference-mid360.cdr"]
+    assert not (tmp_path / "lab" / "reference-mid360.cdr").exists()
+    drive(memory, [rooms.Pose()] * REFERENCE_WINDOWS, 1)
+    assert memory.state == MemoryState.TRACKING and (tmp_path / "lab" / "rig_state").exists()
+    assert memory.map_epoch > 1
+
+
+@pytest.mark.parametrize("changes", [
+    dict(align_inlier_ratio=1.5), dict(align_stable_windows=0), dict(align_max_deg=91.0), dict(check_max_s=0.0),
+    dict(guard_check_period_s=-1.0), dict(guard_check_period_s=34.0), dict(imu_quiet_s=math.nan),
+])
+def test_guard_config_rejections(changes):
+    with pytest.raises(ValueError):
+        guarded(**changes)
+    guarded(rig_guard=False, **changes)  # only checked with the guard on
