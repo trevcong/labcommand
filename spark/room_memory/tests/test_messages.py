@@ -87,6 +87,24 @@ def activity_idle():
     return m.Activity(head("lab", 1, 0), False, 0, 0, 0, 0, None, None, None, None)
 
 
+def rig_pose():
+    return m.RigPose(head("lab", 43, 22), m.RigOutcome.REALIGNED, m.CAUSE_IMU_SHOCK | m.CAUSE_PERIODIC,
+                     m.SENSOR_MID360 | m.SENSOR_JT128, (m.RigChannel.MOVED, m.RigChannel.IN_PLACE), 40, 16909060,
+                     (0.03125, -0.0625, 0.0, 0.5, 0.5, 0.5, 0.5), (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+                     (0.03125, None), (0.5, None), (0.75, 0.875), (0.0078125, 0.00390625), (0.25, 0.125), 0.25, True,
+                     m.Time(1760400005, 500000000))
+
+
+def imu():
+    return m.ImuSample(T10, "livox_frame", (0.015625, -0.03125, 0.5), (0.0078125, -0.0, -1.0))
+
+
+class Imu:
+    """``decode_imu`` in the ``from_cdr`` shape of the message classes."""
+
+    from_cdr = staticmethod(m.decode_imu)
+
+
 def request_map():
     return m.RequestSync(head("lab", 43, 2), (43, 12), m.SyncTopic.MAP_BRICKS)
 
@@ -148,9 +166,13 @@ GOLDENS = {
     "epoch_v2_le.hex": (m.Epoch, lambda: replace(epoch(), publisher_generation=G), True),
     "epoch_v2_be.hex": (m.Epoch, lambda: replace(epoch(), publisher_generation=G), False),
     "activity_v2_le.hex": (m.Activity, lambda: replace(activity(), publisher_generation=G), True),
+    "rig_pose_le.hex": (m.RigPose, rig_pose, True),
+    "imu_le.hex": (Imu, imu, True),
 }
 # v2 goldens whose cut at the legacy length (+ up to 3 bytes) is a valid legacy message.
 V2_EXTENDS_LEGACY = {name for name in GOLDENS if "_v2_" in name}
+# Derived on rig-guard; the Swift suite decodes neither RigPose nor Imu, so it has no copy (PROVENANCE.md).
+NOT_IN_SWIFT = {"rig_pose_le.hex", "imu_le.hex"}
 
 
 def test_provenance_hashes():
@@ -162,8 +184,9 @@ def test_provenance_hashes():
 
 @pytest.mark.skipif(not SWIFT_HAND.is_dir(), reason=f"Swift hand goldens not found at {SWIFT_HAND}")
 def test_hand_goldens_match_the_swift_copies():
-    assert sorted(path.name for path in SWIFT_HAND.glob("*.hex")) == sorted(GOLDENS)
-    for name in GOLDENS:
+    shared = sorted(set(GOLDENS) - NOT_IN_SWIFT)
+    assert sorted(path.name for path in SWIFT_HAND.glob("*.hex")) == shared
+    for name in shared:
         assert hexfile(name, SWIFT_HAND) == hexfile(name), name
     assert memory_status().to_cdr() == hexfile("memory_status_le.hex", SWIFT_HAND)
 
@@ -250,6 +273,55 @@ def test_activity_rejects_inconsistent_fields():
         replace(activity_idle(), since_s=-1.0).to_cdr()
     with pytest.raises(m.Invalid):
         replace(activity(), since_s=None).to_cdr()
+
+
+def test_rig_pose_is_168_bytes_for_lab():
+    assert len(rig_pose().to_cdr()) == 168
+
+
+@pytest.mark.parametrize("offset, value", [
+    (32, 6),  # outcome past INCONCLUSIVE
+    (33, 64),  # an undefined cause bit
+    (34, 4),  # an undefined sensor bit
+    (35, 5),  # channel past UNAVAILABLE
+    (152, 2),  # imu_ok is a bool
+])
+def test_rig_pose_rejects_bad_codes(offset, value):
+    data = bytearray(hexfile("rig_pose_le.hex"))
+    data[4 + offset] = value
+    with pytest.raises(m.Invalid):
+        m.RigPose.from_cdr(bytes(data))
+
+
+def test_rig_pose_rejects_inconsistent_fields():
+    data = bytearray(hexfile("rig_pose_le.hex"))
+    data[4 + 34] = m.SENSOR_JT128  # the Mid-360 is outside sensors but has a MOVED result
+    with pytest.raises(m.Invalid):
+        m.RigPose.from_cdr(bytes(data))
+    data[4 + 35] = m.RigChannel.UNAVAILABLE  # UNAVAILABLE is allowed for it
+    assert m.RigPose.from_cdr(bytes(data)).channel == (m.RigChannel.UNAVAILABLE, m.RigChannel.IN_PLACE)
+    data = bytearray(hexfile("rig_pose_le.hex"))
+    data[4 + 52:4 + 56] = b"\x00\x00\xc0\x7f"  # mid360 tx NaN, the rest finite
+    with pytest.raises(m.Invalid):
+        m.RigPose.from_cdr(bytes(data))
+    data = bytearray(hexfile("rig_pose_le.hex"))
+    data[4 + 52:4 + 80] = b"\x00\x00\xc0\x7f" * 7  # NaN x 7: not configured
+    assert m.RigPose.from_cdr(bytes(data)).mid360_pose is None
+    data = bytearray(hexfile("rig_pose_le.hex"))
+    data[4 + 124:4 + 128] = struct.pack("<f", math.inf)  # inlier_frac[0] infinite
+    with pytest.raises(m.Invalid):
+        m.RigPose.from_cdr(bytes(data))
+    for change in ({"mid360_pose": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.01)}, {"inlier_frac": (1.5, None)},
+                   {"tilt_deg": -1.0}, {"delta_m": (math.inf, None)}, {"channel": (1,)}, {"imu_ok": 1}):
+        with pytest.raises(m.Invalid):
+            replace(rig_pose(), **change).to_cdr()
+
+
+def test_decode_imu_rejects_non_finite_values():
+    data = bytearray(hexfile("imu_le.hex"))
+    data[4 + 128:4 + 136] = struct.pack("<d", math.nan)
+    with pytest.raises(m.Invalid):
+        m.decode_imu(bytes(data))
 
 
 def test_encapsulation_and_strings():

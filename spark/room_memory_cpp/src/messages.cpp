@@ -5,6 +5,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <tuple>
 
 #if defined(ROOM_MEMORY_APPLE_LZFSE)
 #include <compression.h>
@@ -113,6 +114,7 @@ public:
     void floats(const std::array<float, 3>& values) {
         for (const float value : values) f32(value);
     }
+    void f64(double value) { u64(std::bit_cast<std::uint64_t>(value)); }
     void string(const std::string& text) {
         u32(text.size() + 1);
         data_.insert(data_.end(), text.begin(), text.end());
@@ -198,6 +200,7 @@ public:
     std::int32_t i32(const std::string& what) { return static_cast<std::int32_t>(u32(what)); }
     std::uint64_t u64(const std::string& what) { return get(8, what); }
     float f32(const std::string& what) { return std::bit_cast<float>(u32(what)); }
+    double f64(const std::string& what) { return std::bit_cast<double>(u64(what)); }
 
     std::array<float, 3> floats(const std::string& what) {
         std::array<float, 3> out{};
@@ -519,6 +522,29 @@ const char* name(MemoryState state) {
         case MemoryState::rig_moved: return "RIG_MOVED";
         case MemoryState::degraded: return "DEGRADED";
         case MemoryState::paused: return "PAUSED";
+    }
+    return "UNKNOWN";
+}
+
+const char* name(RigOutcome outcome) {
+    switch (outcome) {
+        case RigOutcome::in_place: return "IN_PLACE";
+        case RigOutcome::checking: return "CHECKING";
+        case RigOutcome::moved: return "MOVED";
+        case RigOutcome::realigned: return "REALIGNED";
+        case RigOutcome::relearning: return "RELEARNING";
+        case RigOutcome::inconclusive: return "INCONCLUSIVE";
+    }
+    return "UNKNOWN";
+}
+
+const char* name(RigChannel channel) {
+    switch (channel) {
+        case RigChannel::none: return "NONE";
+        case RigChannel::in_place: return "IN_PLACE";
+        case RigChannel::moved: return "MOVED";
+        case RigChannel::rejected: return "REJECTED";
+        case RigChannel::unavailable: return "UNAVAILABLE";
     }
     return "UNKNOWN";
 }
@@ -893,6 +919,147 @@ Activity Activity::from_cdr(std::span<const std::uint8_t> data) {
         if (reader.is_v2(8, "since_s")) a.publisher_generation = reader.u64("publisher_generation");
         a.validate();
         return a;
+    });
+}
+
+void RigPose::validate() const {
+    const std::string context = "RigPose";
+    header.validate(context);
+    require_enum(outcome, 6, context + ": outcome");
+    require_int(causes, 0, 0xFF, context + ": causes");
+    if (causes & ~kCausesAll) throw Invalid(context + ": causes sets an undefined bit");
+    require_int(sensors, 0, 0xFF, context + ": sensors");
+    if (sensors & ~kSensorsAll) throw Invalid(context + ": sensors sets an undefined bit");
+    const std::int64_t bits[2] = {kSensorMid360, kSensorJT128};
+    for (int n = 0; n < 2; ++n) {
+        require_enum(channel[n], 5, context + ": channel[" + str(std::int64_t{n}) + "]");
+        if (!(sensors & bits[n]) && channel[n] != RigChannel::none && channel[n] != RigChannel::unavailable) {
+            throw Invalid(context + ": channel[" + str(std::int64_t{n}) + "] " + name(channel[n]) +
+                          " for a sensor outside sensors");
+        }
+    }
+    require_int(n_realigned, 0, (std::int64_t{1} << 32) - 1, context + ": n_realigned");
+    for (const auto& [pose, what] : {std::pair{&mid360_pose, "mid360_pose"}, std::pair{&jt128_pose, "jt128_pose"}}) {
+        if (!*pose) continue;
+        double norm = 0.0;
+        for (std::size_t n = 0; n < 7; ++n) {
+            const float value = (**pose)[n];
+            if (!std::isfinite(value)) throw Invalid(context + ": " + what + " is not finite");
+            if (n >= 3) norm += static_cast<double>(value) * static_cast<double>(value);
+        }
+        if (std::fabs(std::sqrt(norm) - 1.0) > 1e-3) throw Invalid(context + ": " + what + " quaternion is not unit length");
+    }
+    const std::tuple<const Pair*, const char*, double> pairs[] = {
+        {&delta_m, "delta_m", INFINITY}, {&delta_deg, "delta_deg", 180.0}, {&inlier_frac, "inlier_frac", 1.0},
+        {&rms_m, "rms_m", INFINITY}, {&observe, "observe", INFINITY}};
+    for (const auto& [pair, what, high] : pairs) {
+        for (const auto& value : *pair) {
+            if (value && !(std::isfinite(*value) && *value >= 0 && *value <= high)) {
+                throw Invalid(context + ": " + what + " must be finite and in range, or NaN");
+            }
+        }
+    }
+    if (tilt_deg && !(std::isfinite(*tilt_deg) && *tilt_deg >= 0 && *tilt_deg <= 180)) {
+        throw Invalid(context + ": tilt_deg must be finite and in [0, 180], or NaN");
+    }
+    moved_at.validate(context + ": moved_at");
+}
+
+Bytes RigPose::to_cdr() const {
+    validate();
+    Writer writer;
+    writer.header(header);
+    writer.u8(static_cast<std::uint8_t>(outcome));
+    writer.u8(static_cast<std::uint8_t>(causes));
+    writer.u8(static_cast<std::uint8_t>(sensors));
+    for (const RigChannel value : channel) writer.u8(static_cast<std::uint8_t>(value));
+    writer.u64(frame_epoch);
+    writer.u32(static_cast<std::uint64_t>(n_realigned));
+    for (const auto* pose : {&mid360_pose, &jt128_pose}) {
+        for (std::size_t n = 0; n < 7; ++n) writer.f32(*pose ? std::optional<float>((**pose)[n]) : std::nullopt);
+    }
+    for (const Pair* pair : {&delta_m, &delta_deg, &inlier_frac, &rms_m, &observe}) {
+        for (const auto& value : *pair) writer.f32(value);
+    }
+    writer.f32(tilt_deg);
+    writer.u8(imu_ok ? 1 : 0);
+    writer.time(moved_at);
+    return writer.take();
+}
+
+RigPose RigPose::from_cdr(std::span<const std::uint8_t> data) {
+    return decode<RigPose>(data, "RigPose", [](Reader& reader) {
+        RigPose p;
+        p.header = reader.header("");
+        p.outcome = read_enum<RigOutcome>(reader.u8("outcome"), 6, "RigPose: outcome");
+        p.causes = reader.u8("causes");
+        p.sensors = reader.u8("sensors");
+        p.channel[0] = read_enum<RigChannel>(reader.u8("channel[0]"), 5, "RigPose: channel[0]");
+        p.channel[1] = read_enum<RigChannel>(reader.u8("channel[1]"), 5, "RigPose: channel[1]");
+        p.frame_epoch = reader.u64("frame_epoch");
+        p.n_realigned = reader.u32("n_realigned");
+        for (const auto& [pose, what] : {std::pair{&p.mid360_pose, "mid360_pose"}, std::pair{&p.jt128_pose, "jt128_pose"}}) {
+            std::array<float, 7> values{};
+            int nans = 0;
+            for (std::size_t n = 0; n < 7; ++n) {
+                values[n] = reader.f32(what);
+                nans += std::isnan(values[n]) ? 1 : 0;
+            }
+            if (nans != 0 && nans != 7) throw Invalid(std::string("RigPose: ") + what + " is partly NaN");
+            if (nans == 0) *pose = values;
+        }
+        for (Pair* pair : {&p.delta_m, &p.delta_deg, &p.inlier_frac, &p.rms_m, &p.observe}) {
+            for (auto& value : *pair) value = maybe(reader.f32("pair"));
+        }
+        p.tilt_deg = maybe(reader.f32("tilt_deg"));
+        const std::uint8_t imu_ok = reader.u8("imu_ok");
+        if (imu_ok > 1) throw Invalid("RigPose: imu_ok " + str(std::uint64_t{imu_ok}) + " is not a bool");
+        p.imu_ok = imu_ok == 1;
+        p.moved_at = reader.time("moved_at");
+        p.validate();
+        return p;
+    });
+}
+
+void ImuSample::validate() const {
+    stamp.validate("Imu: stamp");
+    for (const double value : angular_velocity) {
+        if (!std::isfinite(value)) throw Invalid("Imu: angular_velocity is not finite");
+    }
+    for (const double value : linear_acceleration) {
+        if (!std::isfinite(value)) throw Invalid("Imu: linear_acceleration is not finite");
+    }
+}
+
+Bytes ImuSample::to_cdr() const {
+    validate();
+    Writer writer;
+    writer.time(stamp);
+    writer.string(frame_id);
+    for (const double value : {0.0, 0.0, 0.0, 1.0}) writer.f64(value);
+    const auto covariance = [&] {
+        for (int n = 0; n < 9; ++n) writer.f64(0.0);
+    };
+    covariance();
+    for (const double value : angular_velocity) writer.f64(value);
+    covariance();
+    for (const double value : linear_acceleration) writer.f64(value);
+    covariance();
+    return writer.take();
+}
+
+ImuSample decode_imu(std::span<const std::uint8_t> data) {
+    return decode<ImuSample>(data, "Imu", [](Reader& reader) {
+        ImuSample s;
+        s.stamp = reader.time("header.stamp");
+        s.frame_id = reader.string("header.frame_id");
+        for (int n = 0; n < 4 + 9; ++n) reader.f64("orientation");
+        for (double& value : s.angular_velocity) value = reader.f64("angular_velocity");
+        for (int n = 0; n < 9; ++n) reader.f64("angular_velocity_covariance");
+        for (double& value : s.linear_acceleration) value = reader.f64("linear_acceleration");
+        for (int n = 0; n < 9; ++n) reader.f64("linear_acceleration_covariance");
+        s.validate();
+        return s;
     });
 }
 
