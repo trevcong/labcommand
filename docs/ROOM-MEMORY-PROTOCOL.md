@@ -1,6 +1,6 @@
 # Room memory protocol, v1 (Spark `room_memory` → LabCommand Mac)
 
-Status: draft for PR 0.1. Codex has not signed it off. Trevor decided D5, D9 and D19 on 2026-10-14 (§8); he has not answered Q1–Q5 (end of this doc). PR #13 added D23–D24 (the `seq` rule and durability), D25 (`OperatorAction`), D26 (the events high-water mark, `MemoryStatus.events_seq`) and D27 (the events fallback header, `EventsFallback`) as proposals. PR #14 (the Spark node, merged before it) added D28–D33 and §3.7 (`Activity`). Sources: `RESEARCH_BRIEF.md` §2.2–§2.5 (2026-10-14). The `.msg` files are in `ros/labcommand_msgs/msg/`. The Swift codecs are `Sources/LabCommandCore/RoomMemoryMessages.swift` and `RoomMemoryCDR.swift`.
+Status: draft for PR 0.1. Codex has not signed it off. Trevor decided D5, D9 and D19 on 2026-10-14 (§8); he has not answered Q1–Q5 (end of this doc). PR #13 added D23–D24 (the `seq` rule and durability), D25 (`OperatorAction`), D26 (the events high-water mark, `MemoryStatus.events_seq`) and D27 (the events fallback header, `EventsFallback`) as proposals. PR #14 (the Spark node, merged before it) added D28–D33 and §3.7 (`Activity`). `pubgen` (PLAN-PUBGEN, approved by Astra) adds protocol v2: D34 (publisher generations), D35 (`RequestSync` token and expected generation), D36 (`SyncEnd`, which supersedes D27 and D26's request mark) and D37 (the generation-scoped mirror, which supersedes D23's restart cases). §5 is the single normative statement of the resync rules. Sources: `RESEARCH_BRIEF.md` §2.2–§2.5 (2026-10-14). The `.msg` files are in `ros/labcommand_msgs/msg/`. The Swift codecs are `Sources/LabCommandCore/RoomMemoryMessages.swift` and `RoomMemoryCDR.swift`.
 
 The Spark does all perception and keeps the memory. The Mac mirrors the reference map, the event list and the timeline, and renders them. It never infers a change itself. Five Spark → Mac topics carry the state, three sync topics carry answers to the Mac's resync requests, and two Mac → Spark topics carry those requests and the operator's actions. How they travel between the Spark and the Mac is open (§2, D28, Q5): a dedicated foxglove_bridge on :8767 in the room-memory container, or the existing foxglove_bridge on :8765 with the requests relayed over the ssh-authenticated command-center API on :8766.
 
@@ -16,6 +16,13 @@ The Spark does all perception and keeps the memory. The Mac mirrors the referenc
 - **Trailing bytes.** The rmw layer may add up to 3 bytes of padding after the message, and decoders accept that. Four or more unread bytes make the message *invalid*.
 - **Encoders.** The Mac's encoders always write little endian with option bytes 0. They refuse any message the decoder would reject.
 - **One exception to the byte order.** `MapBricks.payload` is a `uint8[]` whose contents are packed little endian in either CDR byte order (§3.1).
+- **Protocol v2 fields and layout detection (D34).** The v2 fields sit at the end of each message, after its last legacy field, so every legacy byte offset is unchanged. A decoder decides the layout from what is left there, never from a schema:
+  - at most 3 unread bytes: the **legacy** layout;
+  - padding to 8, then exactly the v2 fields (8 bytes for `MemoryStatus` and `MapBricks`, 16 for a `ChangeEvent` with a mask, 8 without, 24 for `RequestSync`), then at most 3: **v2**;
+  - anything else: *invalid*. Pad bytes are not checked, as with every alignment.
+  - A `ChangeEvent` with a mask: the nested `MapBricks` is not at the end, so the outer decoder decides once, after the nested payload, for both messages (16 bytes: the mask's generation, then the parent's). A legacy event has a legacy mask and a v2 event a v2 mask; nothing else can be encoded.
+  - A v2 message cut inside its v2 fields can read as a valid legacy message. The Mac fixes the layout per connection (§5), so such a message is a wire mismatch there, and a map one marks the map stale like a rejected one.
+  - `SyncEnd` exists only in v2.
 - **Not yet confirmed.** The 8-byte alignment of `uint64` is the XCDR1 rule, but no Spark-produced bytes with a 64-bit field have been checked yet. That is what the Spark goldens (§9) confirm.
 
 ### 1.2 Frames, units, time
@@ -50,10 +57,12 @@ Every message starts with these four fields, in the order the brief lists them:
 |---|---|---|---|---|
 | `room_id` | `string` | — | non-empty UTF-8, no NUL | message rejected |
 | `map_epoch` | `uint64` | epoch | bumped on every reference-map change and on every node start that loads saved references; in `RequestSync`, repeats `since_epoch` | always present; a stale message renders "—" |
-| `seq` | `uint64` | count | +1 per message on that topic, starts at 0 per publisher; `0` inside `ChangeEvent.mask`; in `RequestSync` and `OperatorAction`, +1 per request or action from that client | duplicates, gaps and restarts follow §5's `seq` rule |
+| `seq` | `uint64` | count | +1 per message on that topic, starts at 0 per publisher generation; `0` inside `ChangeEvent.mask`; in `RequestSync` and `OperatorAction`, +1 per request or action from that client | ordered per (generation, topic) only (§5) |
 | `stamp` | `builtin_interfaces/Time` | s, ns | `nanosec` < 10⁹ | `{0, 0}` renders "time —" |
 
 A message whose `room_id` differs from the room being viewed is ignored.
+
+**Publisher generation (D34).** Every stateful Spark → Mac message (`MemoryStatus`, `MapBricks` including the `ChangeEvent.mask`, `ChangeEvent`, `SyncEnd`) ends with `uint64 publisher_generation`: the generation of the node process that published it. It is durable and increasing per room (§5), the same for every message of one process, and never `GENERATION_UNKNOWN` (0). `seq` orders messages only within one (generation, topic). A replay resends the original bytes, so it carries the original generation, which is the answering process's: the logs live in memory for one process. `map_epoch` stays a map revision, independent of the generation. "Publisher generation" is not Phase 3's `room_id` generation (P9, `lab` → `lab~2`); this doc always says "publisher generation" in full. `Activity` and `Epoch` carry none (unchanged); saved reference files are `MapBricks` in the legacy layout (§5).
 
 ### 1.5 Missing values
 
@@ -62,8 +71,10 @@ Every field has one of three "missing" encodings:
 - **float32 measurements:** NaN means *not available*. ±Inf is *invalid*. In Swift these are Optionals, so a missing value cannot be read as 0.
 - **Integers that can be unmeasured or absent:** a named sentinel. v1 has five:
   - `HZ_UNAVAILABLE = 65535` in `per_sensor_hz`, where `0` is a measured zero.
-  - `SINCE_NONE = 2⁶⁴ − 1` in `RequestSync`, and copied into `EventsFallback`, where `0` is a real epoch or seq.
+  - `SINCE_NONE = 2⁶⁴ − 1` in `RequestSync`, where `0` is a real epoch or seq.
   - `EVENTS_SEQ_NONE = 2⁶⁴ − 1` in `MemoryStatus.events_seq`, where `0` is a real seq.
+  - `SEQ_NONE = 2⁶⁴ − 1` in `SyncEnd.bound`: nothing published on the topic in this generation (known empty).
+  - `GENERATION_UNKNOWN = 0` in `RequestSync.expected_generation`: the Mac's `since` belongs to no known generation. It is *invalid* as the `publisher_generation` of any Spark → Mac message, which is what rejects a legacy message with 8 zero bytes appended.
   - In `OperatorAction`, `EVENT_NONE = 2⁶⁴ − 1` and `STATE_NONE = 255`, the room-level target and its expected state.
 - **Counters, epochs, enums, ids:** they cannot be missing inside a valid message. If the message itself is missing or stale (§5), they render "—".
 
@@ -84,15 +95,15 @@ Topic names are a proposal for PR 2.4 (D18):
 | `/room_memory/operator` | Mac → Spark | `OperatorAction` | one per operator action | reliable, **volatile**, keep-last 10 |
 | `/room_memory/sync/map_bricks` | Spark → Mac | `MapBricks` | answers to `TOPIC_MAP_BRICKS` requests | reliable, **volatile**, keep-last 10 |
 | `/room_memory/sync/events` | Spark → Mac | `ChangeEvent` | answers to `TOPIC_EVENTS` requests | reliable, **volatile**, keep-last 200 |
-| `/room_memory/sync/events_fallback` | Spark → Mac | `EventsFallback` | one header per events fallback (§5, D27) | reliable, **volatile**, keep-last 10 |
+| `/room_memory/sync/end` | Spark → Mac | `SyncEnd` | one manifest per answered `RequestSync`, after the answer's messages (§5, D36) | reliable, **volatile**, keep-last 10 |
 
 **Who publishes.** The room-memory node publishes the eight Spark → Mac topics and is the only subscriber of the two Mac → Spark topics. The Mac originates `RequestSync` and `OperatorAction`. How they reach the node is part of the open transport question (D28, Q5, below): foxglove_bridge's client-publish path, which has not been checked against the deployed bridge (D19), or an ssh-authenticated relay on the command-center API (`docs/phase3-live-integration.md`, P11). Either path carries the CDR bytes unchanged.
 
 **Durability (D24).** Every publisher and subscriber declares durability explicitly.
 - **`status`, `activity` and `epoch` are transient_local, depth 1.** A subscriber that joins late gets the last message published, then the live stream. That subscriber may be foxglove_bridge when the first Mac subscribes. All three are full-state messages, so a copy delivered twice is harmless: §5's `seq` rule ignores it.
 - **Every other topic is volatile.** A late joiner gets nothing published before it subscribed.
-  - `map_bricks` and `events`: the Mac gets the map and the recent events by `RequestSync` (§5). A cached old message would also break §5's restart detection, which relies on live `seq` only rising.
-  - The sync topics, fallback headers included: an answer is for the requests outstanding when it is sent, not for a later subscriber.
+  - `map_bricks` and `events`: the Mac gets the map and the recent events by `RequestSync` (§5).
+  - The sync topics, `sync/end` included: an answer is for the requests outstanding when it is sent, not for a later subscriber.
   - `request_sync` and `operator`: a restarted node must not receive a stored request or action again. A replayed `OperatorAction` would act twice.
 - **The nodes match this only for `activity`.** The Python node (`spark/room_memory`) and the C++ node (`spark/room_memory_cpp`) declare `activity` transient_local (PR #14). They publish `status` volatile, leave every other topic at the ROS 2 default (volatile) without declaring it, and have no `epoch` topic. The change is planned in `docs/phase3-live-integration.md` §2.5.
 - In ROS 2 a volatile subscriber still receives from a transient_local publisher. A transient_local subscriber receives nothing from a volatile one.
@@ -108,7 +119,7 @@ The :8767 option as implemented: the room-memory container starts its own foxglo
 
 ## 3. Messages
 
-The `.msg` text below is the legal ROS 2 version of §2.4. §8 (D1) lists every syntax change. Field names, types and order are as §2.4 gives them, except for `MapBricks`, whose brick arrays moved into a compressed payload (D9). §3.5 adds `RequestSync` (D19), §3.6 adds `OperatorAction` (D25), §3.7 adds `Activity` (D33), and §3.8 adds `EventsFallback` (D27). The *missing* column says how "not available" travels on the wire, and the *rendering* column says what the Mac shows then. "Stale" is the message-level rendering of §5.
+The `.msg` text below is the legal ROS 2 version of §2.4. §8 (D1) lists every syntax change. Field names, types and order are as §2.4 gives them, except for `MapBricks`, whose brick arrays moved into a compressed payload (D9). §3.5 adds `RequestSync` (D19, D35), §3.6 adds `OperatorAction` (D25), §3.7 adds `Activity` (D33), and §3.8 adds `SyncEnd` and `SeqRange` (D36). Protocol v2 appends `publisher_generation` (D34) to §3.1–§3.3. The *missing* column says how "not available" travels on the wire, and the *rendering* column says what the Mac shows then. "Stale" is the message-level rendering of §5.
 
 ### 3.1 `MapBricks`: snapshot or delta
 
@@ -130,6 +141,7 @@ uint8 brick_dim
 uint32 n_bricks
 uint32 n_removed
 uint8[] payload
+uint64 publisher_generation
 ```
 
 | field | type | unit | valid | missing on the wire | rendering when missing / invalid |
@@ -142,6 +154,7 @@ uint8[] payload
 | `n_bricks` | `uint32` | bricks | bricks in `payload` | cannot be missing | a payload of another size: message rejected |
 | `n_removed` | `uint32` | indices | removed indices in `payload`; 0 in a snapshot | cannot be missing | as `n_bricks` |
 | `payload` | `uint8[]` | bytes | `compression` applied to the packed arrays below | — | does not decompress to exactly their size: message rejected |
+| `publisher_generation` | `uint64` | generation | §1.4; ≠ 0; after the payload, padded to 8. Inside `ChangeEvent.mask` it repeats the parent's | absent: the legacy layout (§1.1) | 0: *invalid* |
 
 The payload, before compression, is exactly `134 × n_bricks + 4 × n_removed` bytes. Its arrays are packed little endian in either CDR byte order, back to back with no padding:
 
@@ -180,17 +193,19 @@ The payload, before compression, is exactly `134 × n_bricks + 4 × n_removed` b
 - Why there are no compressed byte goldens. DEFLATE and LZFSE output is not canonical: Apple's level 5 and Python's level 6 emit different bytes for the same input. So compressed messages are compared by decoded value, never by bytes (§9).
 
 **Applying a message.**
-- **Snapshot.** Replaces the mirror: bricks, `map_epoch`, and the `seq` baseline.
+- **Snapshot.** Replaces the mirror: bricks, `map_epoch`, and the applied `seq` (§5.3).
 - **Delta.** Applies only when the mirror holds exactly `base_epoch` and `seq` is the next one. It removes the bricks at `removed_bricks_idx` first (indices into the `base_epoch` list), then replaces or inserts each listed brick at its coordinate. The mirror's epoch then becomes `map_epoch`. A delta that removes and re-sends the same brick is *invalid*; `RoomMemoryStore` checks that (PR 1.1).
 
 **Wire size.**
 
 ```
-4 + C + 36 + P   bytes
+4 + align8(C + 36 + P) + 8   bytes (v2)
+4 + C + 36 + P               bytes (legacy)
 ```
 
 - P is the payload length: `134n + 4r` uncompressed, with n bricks and r removed indices.
-- C is the common-field size `align8(4 + L) + 24`, where L is the `room_id` UTF-8 length + 1. C = 32 for "lab", so a message for "lab" is 72 + P bytes.
+- C is the common-field size `align8(4 + L) + 24`, where L is the `room_id` UTF-8 length + 1. C = 32 for "lab", so a v2 message for "lab" is `4 + align8(68 + P) + 8` bytes (legacy 72 + P).
+- **Saved references stay legacy.** `<state_dir>/<room_id>/reference-<sensor>.cdr` is a `MapBricks` snapshot. Both nodes write it in the legacy layout and read both layouts: a rolled-back image must still load it, and a generation in a file on disk means nothing.
 
 ### 3.2 `ChangeEvent`: one lifecycle transition
 
@@ -223,6 +238,7 @@ uint8 sensors
 builtin_interfaces/Time first_seen
 builtin_interfaces/Time last_seen
 MapBricks[<=1] mask
+uint64 publisher_generation
 ```
 
 | field | type | unit | valid | missing on the wire | rendering when missing / invalid |
@@ -240,9 +256,10 @@ MapBricks[<=1] mask
 | `sensors` | `uint8` | bitmask | bit 0 Mid-360, bit 1 JT128; other bits *invalid* | 0 = no attribution | "sensor —" |
 | `first_seen` | `builtin_interfaces/Time` | s, ns | ≤ `last_seen` | `{0, 0}` | "first seen —" |
 | `last_seen` | `builtin_interfaces/Time` | s, ns | ≥ `first_seen` | `{0, 0}` | "last seen —" |
-| `mask` | `MapBricks[<=1]` | — | 0 or 1 map, `KIND_SNAPSHOT`, any `compression`. `occupied` = voxel in the region; `known` = voxel had evidence; header copies the parent's `room_id`, `map_epoch` and `stamp`, with `seq` 0 (D14) | count 0 | the region is drawn from `aabb` only, labelled "no mask" |
+| `mask` | `MapBricks[<=1]` | — | 0 or 1 map, `KIND_SNAPSHOT`, any `compression`. `occupied` = voxel in the region; `known` = voxel had evidence; header copies the parent's `room_id`, `map_epoch` and `stamp`, with `seq` 0, and its `publisher_generation` equals the parent's (D14) | count 0 | the region is drawn from `aabb` only, labelled "no mask" |
+| `publisher_generation` | `uint64` | generation | §1.4; ≠ 0; after the mask (count or nested map), padded to 8 | absent: the legacy layout (§1.1) | 0, or not the mask's: *invalid* |
 
-**Wire size.** Without a mask, `4 + C + 100` bytes: 136 B for "lab". A mask adds its nested `MapBricks`, which starts 4-aligned, so its `map_epoch` may take 4 bytes of padding. The 25 cm box event in §7 is 253 B with its 2-brick mask zlib-compressed.
+**Wire size.** Without a mask, `4 + C + 112` bytes: 148 B for "lab" (legacy `4 + C + 100`, 136 B). A mask adds its nested `MapBricks`, which starts 4-aligned, so its `map_epoch` may take 4 bytes of padding; in v2 its payload is followed by up to 7 pad bytes and the two generations. The 25 cm box event in §7 is 253 B legacy (measured) and 276 B v2 with its 2-brick mask zlib-compressed.
 
 ### 3.3 `MemoryStatus`: health, 1 Hz
 
@@ -267,9 +284,10 @@ float32 window_s
 uint16[2] per_sensor_hz
 uint32 dropped_windows
 uint64 events_seq
+uint64 publisher_generation
 ```
 
-`map_epoch` in §2.4's MemoryStatus is the common field and is not repeated (D2). `events_seq` is not in §2.4; D26 adds it.
+`map_epoch` in §2.4's MemoryStatus is the common field and is not repeated (D2). `events_seq` is not in §2.4; D26 adds it, and D34 scopes it to the generation.
 
 | field | type | unit | valid | missing on the wire | rendering when missing / invalid |
 |---|---|---|---|---|---|
@@ -281,13 +299,14 @@ uint64 events_seq
 | `window_s` | `float32` | s | finite, > 0 (0.5–1.0 expected) | NaN = not reported | "window —" |
 | `per_sensor_hz` | `uint16[2]` | Hz, frames received per second, rounded | `[0]` Mid-360, `[1]` JT128 (same order as `sensors`) | `65535` = not measured | "—". `0` renders "0 Hz", a measured zero |
 | `dropped_windows` | `uint32` | windows since node start | any | cannot be missing | stale: "—" |
-| `events_seq` | `uint64` | count | `seq` of the newest message published on live `events` in this generation: the events high-water mark (§5) | `EVENTS_SEQ_NONE` = no event published yet | — |
+| `events_seq` | `uint64` | count | `seq` of the newest message published on live `events` in this generation (§5). A v2 status with `EVENTS_SEQ_NONE` is the publisher's witness that this generation's event history is empty | `EVENTS_SEQ_NONE` = no event published yet in this generation | — |
+| `publisher_generation` | `uint64` | generation | §1.4; ≠ 0; right after `events_seq`, already 8-aligned | absent: the legacy layout (§1.1) | 0: *invalid* |
 
 **Definitions (v1, as the Spark computes them).**
 - **`coverage_known_frac`.** Of the published reference map (D30): the number of known voxels (occupied or free) inside the axis-aligned voxel-index box of its occupied voxels, divided by the number of voxels in that box. The box stands in for the room volume until one is configured; voxels inside walls and furniture are in it and can never be observed, so the value stays well below 1 (0.17–0.18 on the JT128 recording). NaN while the reference has no occupied voxel. It is computed during BUILDING too, from the reference built so far.
 - **`pose_residual_m`.** The size of the translation that best registers the latest window onto the reference, per sensor, then the largest over sensors. For each axis separately, the window's occupied voxels are shifted by −4 … +4 voxels and counted where they land on reference-occupied voxels. The best shift is refined by the parabola through that count and its two neighbours, unless it is ±4. The value is the length of the three per-axis shifts, in meters. Walls normal to an axis register that axis, and floors and ceilings do not mask a horizontal move. On the static recording it is 2.8 mm median (3.4 mm max). A real (2, 2, 0) cm move of the JT128 reads 26 mm, (5, 5, 0) cm reads 74 mm and 3 cm vertical reads 35 mm. It saturates near 0.35 m. NaN while BUILDING and when no shift overlaps at all. The memory stops learning from a window whose estimate exceeds `learn_max_offset_m` (0.02 m). Acting on it (RIG_MOVED, §4.1) is not implemented yet.
 
-**Wire size.** `4 + C + 40` bytes: 76 B for "lab", 84 B for "lab-a".
+**Wire size.** `4 + C + 48` bytes: 84 B for "lab", 92 B for "lab-a" (legacy `4 + C + 40`: 76 B, 84 B).
 
 ### 3.4 `Epoch`: timeline tick, 0.2 Hz
 
@@ -321,6 +340,7 @@ uint8 state
 uint8 TOPIC_MAP_BRICKS=0
 uint8 TOPIC_EVENTS=1
 uint64 SINCE_NONE=18446744073709551615
+uint64 GENERATION_UNKNOWN=0
 string room_id
 uint64 map_epoch
 uint64 seq
@@ -328,6 +348,8 @@ builtin_interfaces/Time stamp
 uint64 since_epoch
 uint64 since_seq
 uint8 topic
+uint64 expected_generation
+uint8[16] request_token
 ```
 
 Trevor's D19 gives `RequestSync{room_id, since_epoch, since_seq, stamp}`. The common fields of §1.4 add `map_epoch` and `seq`, and `topic` says which topic's `seq` `since_seq` counts (D19).
@@ -336,13 +358,15 @@ Trevor's D19 gives `RequestSync{room_id, since_epoch, since_seq, stamp}`. The co
 |---|---|---|---|---|---|
 | `map_epoch` | `uint64` | epoch | equal to `since_epoch` | cannot be missing | otherwise *invalid*; the Spark drops the request |
 | `seq` | `uint64` | count | this client's request counter, +1 per request, from 0 | cannot be missing | — |
-| `since_epoch` | `uint64` | epoch | `map_epoch` of the message at the Mac's baseline for `topic` (§5's `seq` rule); for `TOPIC_MAP_BRICKS` the epoch the mirror holds | `SINCE_NONE` = the Mac holds no usable baseline for `topic` (§5) | `SINCE_NONE` in only one of `since_epoch`, `since_seq`: *invalid* |
+| `since_epoch` | `uint64` | epoch | `map_epoch` of the Mac's position on `topic` (§5.3): for `TOPIC_EVENTS` the message at the top of the run of received `seq`s from 0, for `TOPIC_MAP_BRICKS` the epoch the mirror holds | `SINCE_NONE` = the Mac holds no usable baseline for `topic` (§5) | `SINCE_NONE` in only one of `since_epoch`, `since_seq`: *invalid* |
 | `since_seq` | `uint64` | count | `seq` of that message | `SINCE_NONE`, together with `since_epoch` | as above |
 | `topic` | `uint8` | enum | `TOPIC_*` | cannot be missing | other value: *invalid* |
+| `expected_generation` | `uint64` | generation | the publisher generation `since` belongs to; `GENERATION_UNKNOWN` (0) = none. The node honours `since` only when it equals its own (§5) | absent with the token: the legacy layout | — |
+| `request_token` | `uint8[16]` | — | a random 128-bit token (UUID v4 bytes), new for every send, retries included; copied into the `SyncEnd` (D35). Not byte-swapped in big endian | absent with `expected_generation`: legacy | all zero in v2: *invalid*; only one of the two v2 fields: *invalid* |
 
-`SINCE_NONE` is 2⁶⁴ − 1, not 0, because epoch 0 and seq 0 are real values. In Swift `since` is an Optional `Position`. The Spark answers by the rules in §5.
+`SINCE_NONE` is 2⁶⁴ − 1, not 0, because epoch 0 and seq 0 are real values. In Swift `since` is an Optional `Position`. The Spark answers by the rules in §5. A v2 node treats a legacy request (an old app) as `expected_generation` 0 with an all-zero token. A legacy node rejects a v2 request (≥ 4 trailing bytes), which is why the Mac sends no request on a legacy wire (§5).
 
-**Wire size.** `4 + C + 17` bytes: 53 B for "lab".
+**Wire size.** `4 + C + 48` bytes: 84 B for "lab" (legacy `4 + C + 17`, 53 B).
 
 ### 3.6 `OperatorAction`: one operator action, Mac → Spark
 
@@ -436,46 +460,53 @@ Activity is never a change: nothing in it becomes a `ChangeEvent`, and `MemorySt
 
 **Wire size.** `4 + C + 52` bytes: 88 B for "lab".
 
-### 3.8 `EventsFallback`: header of an events fallback, Spark → Mac
+### 3.8 `SyncEnd` and `SeqRange`: the end-of-answer manifest, Spark → Mac
 
-Proposed in PR #13 (D27). The Spark publishes one on `/room_memory/sync/events_fallback` (§2) with each events fallback (§5), right before the fallback's messages. It is the only way the Mac learns that an answer is a fallback, and the only thing that lets it give up a gap. Its `.msg` is `ros/labcommand_msgs/msg/EventsFallback.msg`.
+Added by D36. The node publishes one `SyncEnd` on `/room_memory/sync/end` (§2) for every `RequestSync` it answers, after the answer's messages. It travels on its own topic, so it can arrive before them: receiving it proves nothing about receiving them (§5). Its `.msg` files are `ros/labcommand_msgs/msg/SyncEnd.msg` and `SeqRange.msg`. It replaces PR #13's `EventsFallback` header (D27), which no language implemented and no node published.
 
 ```
+uint64 SEQ_NONE=18446744073709551615
 string room_id
 uint64 map_epoch
 uint64 seq
 builtin_interfaces/Time stamp
-uint64 since_epoch
-uint64 since_seq
-uint64 kept_first_seq
-uint64 kept_last_seq
-uint64[] resent_seqs
+uint64 publisher_generation
+uint8[16] request_token
+uint8 topic
+uint64 bound
+SeqRange[] delivered
+SeqRange[] unavailable
 ```
+
+`SeqRange` is `uint64 first`, `uint64 last`, inclusive, `first ≤ last`.
 
 | field | type | unit | valid | missing on the wire | rendering when missing / invalid |
 |---|---|---|---|---|---|
-| `map_epoch` | `uint64` | epoch | the node's published epoch when the fallback is sent | cannot be missing | — |
-| `seq` | `uint64` | count | +1 per header on this topic, from 0. The Mac keeps no baseline for it, and a gap here triggers nothing | cannot be missing | — |
-| `since_epoch` | `uint64` | epoch | copied from the `RequestSync` this fallback answers | 2⁶⁴ − 1, the value of `RequestSync.SINCE_NONE`, copied from a request that had none | 2⁶⁴ − 1 in only one of `since_epoch`, `since_seq`: *invalid* |
-| `since_seq` | `uint64` | count | copied likewise | as above | as above |
-| `kept_first_seq` | `uint64` | count | `seq` of the oldest kept `events` message | cannot be missing | above `kept_last_seq`: *invalid* |
-| `kept_last_seq` | `uint64` | count | `seq` of the newest kept `events` message. The fallback sends every `seq` from `kept_first_seq` to here | cannot be missing | — |
-| `resent_seqs` | `uint64[]` | count | the `seq`s of the open events' latest messages that the fallback sends before the kept ones, strictly increasing, each below `kept_first_seq` | `[]` = none | out of order, or not below `kept_first_seq`: *invalid* |
+| `map_epoch` | `uint64` | epoch | the node's published epoch when the answer was computed | cannot be missing | — |
+| `seq` | `uint64` | count | +1 per `SyncEnd`, from 0 per generation | cannot be missing | — |
+| `publisher_generation` | `uint64` | generation | the answering generation, which every message of the answer carries; ≠ 0 | cannot be missing | 0: *invalid* |
+| `request_token` | `uint8[16]` | — | copied from the `RequestSync`; all zero for a legacy request | cannot be missing | — |
+| `topic` | `uint8` | enum | `RequestSync.TOPIC_*`, copied | cannot be missing | other value: *invalid* |
+| `bound` | `uint64` | count | the topic's newest live `seq` in this generation when the answer was computed | `SEQ_NONE` = nothing published on the topic in this generation (known empty) | — |
+| `delivered` | `SeqRange[]` | seqs | the `seq`s this answer published, before this `SyncEnd`, on the topic's sync topic | `[]` | not canonical: *invalid* |
+| `unavailable` | `SeqRange[]` | seqs | requested `seq`s the publisher no longer holds (events fallback only) | `[]` | not canonical, overlapping `delivered`, or on a map answer: *invalid* |
 
-- **What it states.** Every `events` `seq` up to `kept_last_seq` that it does not name was, when it was sent, neither kept nor the latest message of an open event. The kept messages only move forward, and an event's latest message only gets newer, so no later answer can hold such a `seq` either. The header describes the Spark's kept messages, not the requester, so it holds for every Mac that sent the same `since`.
-- **What it does not state.** An answer published *before* the header can still be in flight, carrying a `seq` the header omits. Such a `seq` left the kept messages, or stopped being its event's latest, only because later events were published, so `kept_last_seq` is newer than everything in that earlier answer. `/room_memory/sync/events` has one publisher and arrives in publish order, losing messages but never reordering them, as §5's `seq` rule assumes for live topics. So once the Mac has received a copy of `kept_last_seq` on that topic, every earlier answer has arrived or been lost. §5 waits for that copy.
-- **No header without events.** If no event has been published in this generation, a fallback has nothing to send, and the Spark publishes neither it nor a header. The request is then done by its mark, `EVENTS_SEQ_NONE` (§5).
-- **Invalid is lost.** The Mac drops an *invalid* header and logs it. Like a lost header, that gives up nothing, and the 5 s repeat recovers (§5).
+- **Validation (D16, symmetric).** Each list is canonical: ranges strictly increasing and non-adjacent (`next.first > prev.last + 1`), each `last ≤ bound`. `bound = SEQ_NONE` ⇒ both lists empty. The two lists are disjoint. `topic = TOPIC_MAP_BRICKS` ⇒ `unavailable` empty.
+- **`unavailable` is permanent within a generation.** The node's log only moves forward, and an event's latest message only gets newer. A `seq` that was neither logged nor an open event's latest when the answer was computed can never be served later. So every Mac may record `unavailable` from any `SyncEnd` of the generation, whoever asked.
+- **Layout.** A `SeqRange` count is a `uint32`; the first element's `uint64` does the alignment, so an empty list is followed at once by the next count.
 
-**Wire size.** 72 B for "lab" with no resent `seq`, and 76 + 8n B with n ≥ 1. Computed by hand from §1.1, not encoded.
-string room_id
-uint64 map_epoch
-uint64 seq
-builtin_interfaces/Time stamp
+**Wire size** for "lab", with d delivered and u unavailable ranges:
+
+| d | u | size |
+|---|---|---|
+| 0 | 0 | 84 B |
+| ≥ 1 | 0 | 88 + 16d B |
+| 0 | ≥ 1 | 84 + 16u B |
+| ≥ 1 | ≥ 1 | 92 + 16d + 16u B |
 
 ## 4. State machines
 
-The Spark owns both machines. The Mac renders them, and it flags a transition that is not in these tables as a protocol violation. It keeps the last legal state and logs the violation; it does not render the illegal state. Event transitions are judged in `seq` order: only a message newer than the last one applied to an event changes its state. An older one, filled in later by a replay, goes to the event's history only (§5's per-event order), and is not a violation.
+The Spark owns both machines. The Mac renders them. Event transitions are judged in `seq` order within one publisher generation: each event shows its highest-`seq` transition received, whatever the arrival order or transport (§5.3). An older one, filled in later by a replay, goes to the event's history only, and is not a violation.
 
 ### 4.1 Memory state (`MemoryStatus.state`, `Epoch.state`)
 
@@ -520,112 +551,77 @@ The Spark owns both machines. The Mac renders them, and it flags a transition th
 
 From §2.4: *if the Mac sees a `seq` gap, or holds `map_epoch ≠ base_epoch` for a delta, it discards local state, renders "stale", and requests a `KIND_SNAPSHOT`. It never patches a map it cannot prove is current.*
 
-`RequestSync` (§3.5, D19) is that request. Its answer is either a snapshot or the deltas the Mac missed. A replayed delta is provably current, because it chains from the epoch the Mac holds and passes the same `seq` and `base_epoch` checks as a live one. So the Mac keeps its last good mirror while STALE instead of discarding it. It never shows that mirror as current.
+`RequestSync` (§3.5) is that request. Its answer is the messages the Mac missed or a snapshot, then a `SyncEnd` (§3.8). A replayed delta is provably current, because it chains from the epoch the Mac holds and passes the same `seq` and `base_epoch` checks as a live one. So the Mac keeps its last good mirror while STALE instead of discarding it, and never shows it as current.
 
-**The `seq` rule (D23).** This is the only statement of how `seq` orders messages. The per-topic rules after it say only what a gap does on each topic.
-- **Generation and baseline.** A *generation* is one run of the Spark node. Within a generation, each topic's `seq` starts at 0 and rises by 1 per message (§1.4).
-  - For each topic the Mac keeps a **baseline**, the `seq` up to which it has applied every message. On `map_bricks`, `status` and `epoch` that is the last message applied. On `events` it can be lower (below).
-  - A live topic and its sync topic share one baseline.
-  - Separately, the Mac keeps the highest `seq` received on each live topic.
-  - On `events` it also keeps, per `event_id`, the `seq` of the last message applied to that event's state (per-event order, below).
-- **Duplicates and older messages are ignored.** A message with `seq` ≤ the baseline is ignored and counted. It is not applied, and it is not a gap. This holds on live and sync topics alike, with two exceptions for `KIND_SNAPSHOT`. One with `seq` equal to the baseline is applied: a snapshot answer carries the latest live `seq` (below), which is the baseline itself when the Mac missed nothing. And snapshots are ordered by `map_epoch` first: one above the mirror's epoch applies at any `seq`, and one below it is ignored at any `seq`. Within one generation an answer below the baseline never carries a higher epoch, because epochs only rise with `seq`, so this cannot rewind a mirror. It lets the new generation's snapshot replace an old one still in flight after a restart (below).
-- **Next.** A message with `seq` = baseline + 1 is applied under its topic's rules.
-- **Gap.** A message with `seq` > baseline + 1 is a gap, handled per topic below. A snapshot is not a gap: it applies at any `seq` ≥ the baseline, and at any `seq` when its `map_epoch` is above the mirror's. It is ignored when its `map_epoch` is below the mirror's (above). It sets the baseline to its own `seq`.
-- **New generation.** After a restart, `seq` starts again at 0, and the rules above would ignore the new node. The Mac recognizes a new generation in these three cases and no others:
-  1. On live `map_bricks` or live `events`, a `seq` ≤ the highest `seq` already received on that live topic. Both topics are volatile (§2) and reach the Mac in publish order, so within one generation their live `seq` only rises, across reconnects too.
-  2. On `status`, two consecutive messages with `seq` ≤ the baseline, the second exactly 1 above the first. The bridge can deliver its transient_local copy of the latest message again (§2), possibly more than once in a row when several clients subscribe. Those copies repeat one `seq`, so they never match. A restarted node counts up from 0, so it does. `status` runs at 1 Hz, so this catches a restart within about 2 s, even in a static room where `map_bricks` and `events` are silent.
-  3. A restart signal from outside this protocol, where the deployment provides one. Phase 3 proposes `node_started_at` on the command-center API.
+This section replaces the PR #13 rules (D23's restart cases 1–3, D26's request mark, D27's fallback header), which inferred restarts from counters and completeness from request flags and silence. With today's wire no client could tell "the publisher continued while I was away" from "it restarted and counted past my old counters". Protocol v2 makes identity explicit (D34), ties answers to requests (D35) and ends every answer with a manifest (D36); the Mac scopes all state to one generation (D37). PLAN-PUBGEN §4 gives the reducer's full state machine and invariants.
 
-  On a new generation the Mac clears every topic's baseline and highest live `seq`, and every event's per-event `seq`. A kept per-event `seq` would make every message of the restarted node look older than the event's state.
-  - The map goes STALE, with its last good mirror kept.
-  - The event list becomes "incomplete since \<stamp of the last good message\>".
-  - Both requests go out with `since = SINCE_NONE`.
-  - The message that revealed the generation is then handled as the first message after a (re)connect.
-  - **Messages of the old generation still in flight.** The old node's messages can still be queued in the bridge or on the network, and messages carry no generation id. The Mac does not fence them out; two properties keep them from blocking recovery.
-    - **Snapshots are ordered by `map_epoch` first** (above). The node raises its epoch at every restart: it keeps the room's last `map_epoch` on disk, a node that loads saved references takes the next one at start and saves it at once, and BUILDING publishes no map or event until TRACKING bumps it (map answers, below). So the new generation's snapshots carry a higher epoch than anything the old node published. An old snapshot answer at `seq` 100 that sets the cleared baseline to 100 is replaced by the next new snapshot at any `seq`, and an old one arriving after a new one is ignored. This needs the node's state directory (`state_dir`, launch default `~/room-memory`). Without one the epoch restarts at 0, and the node must not be deployed that way.
-    - **An old message that sets a baseline or a highest live `seq` above the new generation's makes the next new message match case 1 or 2 again.** The Mac then starts one more, spurious, new generation and resyncs again. There are finitely many old messages in flight, so this ends.
-    - **Residual (open, D23).** An old `events` message that arrives on a sync topic after the reset is applied as an old transition the Mac missed. Its `seq` is remembered, and the new generation's message with the same `seq` can then be ignored as a duplicate. Closing that needs a generation id on the wire.
-- **Across a disconnect.** Cases 1 and 2 cannot see a restart that happened while the Mac was disconnected.
-  - The new generation's `seq` may already be above the old baseline.
-  - The restarted node's kept messages may even include one with the saved `since_seq` and the same `map_epoch`. That is likely on `events`, which do not bump the epoch. A replay from there would continue the old history with new-generation messages.
-  - So after a (re)connect the Mac keeps a baseline only if case 3 confirms that the node did not restart meanwhile. Otherwise it clears all baselines as for a new generation. Without a case-3 signal, every (re)connect requests with `SINCE_NONE`.
+### 5.1 Publisher generations (D34)
 
-Applied per topic:
+- **The `seq` rule.** Within one publisher generation, each topic's `seq` starts at 0 and rises by 1 per message. Across generations, `seq`s say nothing about each other. A restart is a higher generation; nothing is ever inferred from counters.
+- **Allocation.** Before it creates any publisher, a node computes `g = max(stored + 1, now_ms)`, where `stored` is `<state_dir>/<room_id>/publisher_generation` (decimal ASCII and a newline, next to `map_epoch`; 0 when absent) and `now_ms` the wall clock in ms. It writes `g` with a temp file, fsync and rename, fsyncs the directory, and only then publishes. Both nodes fsync the directory for `map_epoch` too. The file is separate from `map_epoch`, which does not bump on a start without saved references.
+- **The wall-clock floor** keeps generations rising if the file is lost or the volume wiped. The residual is a lost file *and* a clock that went backwards past the old value.
+- **Fail closed.** The node refuses to start, and logs why, when `state_dir` is empty or does not already exist (the allocator may create `<state_dir>/<room_id>`, never `state_dir`), the file is malformed (never silently reset), the value would overflow, the write or an fsync fails, or another live process holds `<state_dir>/<room_id>/publisher.lock` (`flock(LOCK_EX|LOCK_NB)`, held for the process lifetime: one authoritative publisher per room).
+- **No in-process counter resets.** The seq counters are set only at construction; re-reference and rebuild do not reset them. A future in-process reset would need a new generation.
+- **Injectable.** `RoomMemory` takes the generation as a constructor argument; only the ROS nodes call the allocator. The offline tools, the differential replay driver and the tests pass a fixed value.
 
-**`map_bricks`.** A message with `seq` ≤ the baseline is ignored under the `seq` rule. Within one generation it was published before the message the mirror last applied, so it never holds a newer state.
+### 5.2 How the Spark answers (D35, D36; both nodes, identical bytes)
 
-Any one of these makes the map STALE:
-- A gap under the `seq` rule, or a new generation.
-- A delta whose `base_epoch` ≠ the mirror's epoch.
-- A delta as the first message after (re)connect.
-- `MemoryStatus.map_epoch` ≠ the mirror's epoch in 2 consecutive status messages. This catches a lost delta that no later delta exposes (D20).
+Let `g` be the node's generation. `since` is honoured only when `expected_generation == g`; otherwise (0, older, unknown, or a legacy request) the request is answered as `SINCE_NONE` in `g`, and the `SyncEnd` tells the Mac the actual `g`. A request for another `room_id`, or one that does not decode, gets no answer and is logged.
 
-While STALE, the Mac behaves as follows.
-- It renders the map greyed, labelled "resyncing", with no change overlays drawn as current.
-- It sends `RequestSync{TOPIC_MAP_BRICKS, since = (mirror epoch, baseline)}`, or `since` = `SINCE_NONE` if it holds no mirror or no usable baseline (the `seq` rule). The node cannot see a (re)connect through the bridge, so the Mac does not wait for a snapshot first; a keyframe on the live topic (D29) that arrives before the answer serves as well.
-- It applies, from the live topic or the sync topic, only what the live rules allow:
-  - A snapshot is accepted at any `seq` ≥ the baseline, at any `seq` once the baseline is cleared, or at any `seq` with a `map_epoch` above the mirror's; never with one below it (the `seq` rule). It sets the baseline and the epoch.
-  - A delta must have `seq` = last + 1 and `base_epoch` = the mirror's epoch.
-- The map is current again once the mirror has applied every `seq` up to the highest seen on the live topic, and its epoch equals the newest `MemoryStatus.map_epoch`.
-- Live messages that arrive while STALE may be buffered (at most 10, the topic's depth) and applied in `seq` order once they chain. Otherwise they are dropped.
-- If a request has not ended STALE within 5 s, the Mac sends it again with its current `since`.
+**Map** (`bound` = the newest live map `seq`, or `SEQ_NONE` before the first live map message). The node keeps its last 10 map messages.
 
-The Spark keeps its last 10 `map_bricks` messages. It answers a `TOPIC_MAP_BRICKS` request on `/room_memory/sync/map_bricks`:
-1. **Replay** when all of these hold:
-   - `since` is not `SINCE_NONE`.
-   - The kept messages include the one with `seq = since_seq`, and that message has `map_epoch = since_epoch`.
-   - At least one message follows it.
+| case | `sync/map_bricks` | `SyncEnd` |
+|---|---|---|
+| no map yet (BUILDING) | nothing | `bound` NONE, `delivered` [] |
+| `since` = (epoch, seq) of the newest logged message | nothing ("nothing missed") | `delivered` [] |
+| `since` found in the log, older than `bound` | every later logged message, unchanged | `delivered` [[since + 1, bound]] |
+| otherwise | one fresh snapshot of the last live state, `seq = bound` | `delivered` [[bound, bound]] |
 
-   It republishes every message after `since_seq` unchanged (same `seq`, same bytes), in `seq` order.
-2. **Snapshot** otherwise. That covers no `since`, a `since_seq` older than the kept messages, a `since_seq` newer than the latest (the node restarted), an epoch that does not match, and nothing missed. The Spark publishes a new snapshot of the current map. Its `seq` is the latest `seq` published on the live topic, so the next live delta chains from it.
-3. **No answer** before the first live map message (BUILDING): there is no map yet, and the live snapshot that starts TRACKING ends the Mac's STALE state.
+**Events** (`bound` = `events_seq`). The node keeps its last 100 event messages and the latest message of each open event.
 
-A request whose `room_id` is not the node's room gets no answer, and one that does not decode is dropped and logged. `seq` restarts at 0 with the node, so a node that loads saved references takes the next `map_epoch` (and saves it at once): a `since` from before a restart never names a message after it. The room's last epoch is kept apart from the references (`<state_dir>/<room_id>/map_epoch`), so this holds whichever sensors each run had.
+| case | `sync/events` | `SyncEnd` |
+|---|---|---|
+| `bound` NONE | nothing | `bound` NONE, both lists [] (known empty) |
+| `since` found in the log | the later logged messages, unchanged (possibly none) | `delivered` [[since + 1, bound]], or [] |
+| otherwise (fallback) | the latest message of each open event older than the log, then the whole log | `delivered` = those `seq`s as canonical ranges; `unavailable` = R ∖ `delivered`, with R = [since + 1, bound], or [0, bound] for `SINCE_NONE` or a mismatch |
 
-**`events`.** Duplicates and older messages are ignored under the `seq` rule. A gap, or a new generation, marks the event list "incomplete since \<stamp of the last good message\>". Open events show "may be outdated". Missed transitions are never invented.
-- A message after a gap is still applied: §4.2 accepts the first state seen for an `event_id` after a gap. The Mac remembers its `seq`. The baseline stays below the gap, so a replay can fill it; the baseline then moves past the remembered messages, and a replay that sends one again is ignored.
-- **Per-event order.** A message above the baseline whose `seq` is below its event's per-event `seq` is older than the state the Mac shows. That is what a replay sends when it fills a gap below a message applied after it.
-  - The Mac adds it to the event's history in `seq` order, and it counts toward the baseline.
-  - It does not change the event's state, and it is not a protocol violation.
-  - Only a message above the per-event `seq` changes the state. §4.2's transition check compares it with the state the per-event `seq` belongs to, subject to §4.2's rule for the first message about an event after a gap.
-  - Example: CONFIRMED at `seq` 11 is lost, and ACCEPTED at 12 is applied after the gap, with the baseline left at 10. The replay's 11 goes into the history and the baseline moves to 12. The event stays ACCEPTED.
-- **High-water mark (D26).** `MemoryStatus.events_seq` is the `seq` of the newest live `events` message. While no events request is outstanding, `events_seq` above the baseline in 2 status messages with rising `seq` is a gap. A status copy delivered twice repeats its `seq` (case 2 of the `seq` rule), so it does not count. This catches a lost event that no later event exposes, as D20 does for the map.
-- The Mac sends `RequestSync{TOPIC_EVENTS, since = (map_epoch, seq) of the message at the baseline}`, or `SINCE_NONE` when it holds no usable baseline. It does the same on every (re)connect, and it repeats the request after 5 s like the map request.
+**Publish order.** The answer's messages go out first, then the `SyncEnd`, on its own topic. `unavailable` is permanent within the generation (§3.8).
 
-The Spark keeps its last 100 `ChangeEvent` messages. It answers a `TOPIC_EVENTS` request in one of two ways:
-1. **Replay** when the kept messages include the one with `seq = since_seq` and `map_epoch = since_epoch`. It republishes every message after it on `/room_memory/sync/events`, unchanged, in `seq` order: none if nothing was missed.
-2. **Bounded fallback** otherwise. The Spark first publishes an `EventsFallback` header (§3.8) on `/room_memory/sync/events_fallback`. It copies the request's `since` and names every `seq` the fallback sends. Then, unchanged, in `seq` order, it publishes on `/room_memory/sync/events`:
-   - the latest message of each open event (CANDIDATE or CONFIRMED) that is older than the kept messages;
-   - then all kept messages.
+### 5.3 The Mac: one generation-scoped reducer (D37)
 
-   That is at most (open events + 100) messages after the header.
+`RoomMemoryMirror` (`Sources/LabCommandCore/LiveRoom/`) holds one **active** generation state, the only state that renders as current, an archive of the newest 2 retired generations (display only), the highest generation ever installed, and one retrieval per topic. Validation (decode, `room_id`, the D16 rules) comes first; a rejected message changes nothing except the counters and, for a map message, the map's STALE state.
 
-**How the Mac uses a fallback.** It applies a fallback's messages as it applies any message: those above its baseline by `event_id`, under the per-event order above, accepting the first message per `event_id` as in §4.2. Nothing in a `ChangeEvent` says which answer it belongs to, and nothing needs to, because only the header can give up a gap.
-- **Giving up a gap.** The Mac moves its baseline across a `seq` it has not received only when all of these hold:
-  - It has received, while its events request was outstanding, a header whose `since` is one it sent for that request, the first time or in a repeat.
-  - It has received every `seq` that header names above its baseline: `resent_seqs`, and `kept_first_seq` to `kept_last_seq`, from either topic.
-  - It has received a copy of `kept_last_seq` on `/room_memory/sync/events`, from any answer. The live copy does not count.
+**Wire.** The layout (§1.1) of the first room-memory message decoded on a connection fixes it. A later message of the other layout on that connection is dropped and counted (`wireMismatch`); a map one also marks the map stale. Every reconnect re-decides.
 
-  The baseline then moves up to `kept_last_seq`, then past the messages remembered above it, as after any gap. The `seq`s it crossed without receiving them are given up, not filled. §3.8 says why no later answer can bring them, and why the sync copy of `kept_last_seq` shows that no earlier answer is still bringing them.
-- **Re-checked on every arrival.** The header, the fallback's messages and the mark travel on different topics, in no fixed order. So the Mac re-checks whenever any of them arrives.
-- **Nothing else gives up a gap.** It does not matter which answer arrives first, or how far the live topic or the mark has moved. Without a matching header, or before every `seq` it names and the sync copy of `kept_last_seq` have arrived, the baseline stays below the gap. The request stays open, and the 5 s repeat brings a new answer. A lost header or fallback message therefore only delays completion.
-- **Example: another Mac's replay first.** A Mac at baseline 10 receives another Mac's replay starting at 12 before its own replay. It applies 12 onward after the gap and remembers them. No header matches its `since`, so 11 is not given up, and its own replay fills it (Codex, PR #13).
-- **Example: a fallback still in flight.** A Mac receives the header and a fallback's first message, then live 201 and a mark of 201. The header's other `seq`s have not all arrived, so the baseline stays put and the request stays open until they do (Codex, PR #13).
-- Events published after the answer arrive live, so a fallback ends even while events keep coming.
-- The history stays "incomplete since \<stamp\>", because transitions older than the kept messages are gone. Events the Mac held open that were not re-sent keep "may be outdated" until a later transition for them arrives: their closing transition may be among the lost ones.
+**Generations.**
+- A v2 message of a generation above the highest installed **installs** it: the active state is archived (its tail is unknown: a retired generation has no final bound on the wire), a fresh empty state is created, and every retrieval goes idle. The message is then handled in it. Generations are durable and wall-clock floored, so a newer value always belongs to a later process; installing on the first validated message loses nothing and needs no buffer, and coverage cannot be complete or empty without a witness of that generation.
+- A message below the highest generation changes nothing but a counter (`olderGeneration`), and never reactivates an archive.
+- The highest generation again after a legacy connection archived it starts a fresh, empty state; the archive is never reactivated.
 
-**When an events request is done.** The baseline has reached both the highest `seq` received on live `events` and the request's **mark**. The mark is the `events_seq` of the first status message received while the request is outstanding whose `seq` is above that of an earlier status also received during the request. A mark of `EVENTS_SEQ_NONE` is reached by any baseline, a cleared one included. If the baseline moved by a header during the request, the answer was a fallback, and the history stays incomplete. A request sent with `SINCE_NONE` never clears "incomplete" either: the Mac then holds no baseline that ties its history to the node's kept messages, and after a new generation the old node's missed transitions are in none of them. That includes a restarted node with no events yet, which reports `EVENTS_SEQ_NONE` and sends no header: the request is done, the history stays "incomplete since \<stamp\>", and events held open from before keep "may be outdated" until a later transition for them arrives. A Mac with no history before the request has nothing marked incomplete. Otherwise the gap is then closed and "incomplete" clears.
-- **Why `events_seq`, not the live `seq`.** A Mac that disconnects at `seq` 10 and misses 11–12 may reconnect after events stop. Its highest live `seq` is still 10, equal to its baseline, so the request would seem done at once, and the Mac would stop reading the sync topic before 11–12 arrive. `events_seq` = 12 keeps the request open until they are applied.
-- **Why a second, newer status.** The first status received can be the copy the bridge cached before the Mac subscribed (§2), possibly delivered more than once, so its `events_seq` may miss events published since. A status with a higher `seq` was published after that copy, so after the Mac subscribed to live `events`. Every event the Mac missed is then at or below the mark, and every later one reaches the Mac live.
-- **No answer boundaries.** Neither condition depends on where an answer ends, or on which Mac it was meant for. A lost sync message leaves the baseline below the mark, so the request stays open and the 5 s repeat recovers it. Example: a Mac applies 10 from a replay, the rest of that replay is lost, and it misses live 11–12. Another Mac's replay that starts at 10 then arrives. Its 10 is ignored under the `seq` rule, and the request stays open until 11–12 are applied.
+**Status.** A status of the active generation with `seq` above the held one replaces it, raises the events witness H (`events_seq`, or "empty" for `EVENTS_SEQ_NONE`) and, arriving on this connection, moves the connection to *observing* that generation. A `seq` not above the held one is a duplicate or a delayed copy (transient_local), never a generation signal. `status` is fresh for 3 s on the connection it arrived on.
 
-The map's high-water mark is `MemoryStatus.map_epoch`: a mirror that missed deltas holds an older epoch than `status` reports, and `status` reaches a connecting Mac at once (transient_local). So the map stays STALE until the missed deltas are applied (the condition for a current map above).
+**Events.** C is the set of `seq`s actually received, live or sync, from any Mac's answer; U the `seq`s any `SyncEnd` of the generation declared unavailable; H the highest witnessed `seq` (statuses, `SyncEnd` bounds). With top = max(H, max C) and missing = [0, top] ∖ C:
+- *empty*: a v2 witness says nothing was published and C = ∅; *completeThrough(top)*: missing = ∅; *missing(pending, lost)*: pending = missing ∖ U, lost = missing ∩ U; *unknown*: no witness and C = ∅, or C outgrew its bound (then it never becomes more complete), or a legacy wire.
+- A `seq` already in C with the same payload is a duplicate; with another payload a contract violation, counted, the first kept. Neither is a restart signal.
+- Each event shows its highest-`seq` transition received, whatever the arrival order or transport.
+- *caughtUp*: coverage is empty or complete, and a fresh status of the generation on this connection names an `events_seq` covering max C. It is an as-of observation.
 
-**Sync topics are shared.** Every Mac subscribed to a sync topic receives every answer. A Mac reads a sync topic only while it has a request outstanding on that topic; `/room_memory/sync/events_fallback` belongs to `TOPIC_EVENTS`. It applies only what the rules above allow. An answer meant for another Mac is therefore either one it can use or one it ignores. A header whose `since` the Mac did not send is ignored.
+**Map.** A snapshot of the active generation applies when the chain is empty or its `seq` ≥ the applied one (an older answer, possibly another Mac's, is ignored). A delta applies when `seq` = applied + 1 and `base_epoch` = the chain's epoch; at or below the applied `seq` it is a duplicate; otherwise the chain is broken (gap, wrong base). Within one generation a delta that chains after a reconnect is valid: its seqs are contiguous. The map is **current** when the chain is held in the active generation, it has applied every map `seq` the generation is known to have published (live or sync messages, `SyncEnd` bounds), no undecodable map message arrived since the last snapshot or completed retrieval, a status of the generation arrived on this connection with `map_epoch` equal to the chain's (two consecutive mismatches make it stale, D20), and the socket is open. Overlays are drawn only while it is current and the status is fresh. A newer generation with no map yet shows the earlier run's bricks greyed (`newGeneration`).
 
-**Older transitions on a sync topic.** A sync message with `seq` ≤ the baseline is ignored under the `seq` rule. That includes an older snapshot answer meant for another Mac. A message above the baseline but older than its event's state, in a replay or a fallback, goes to history only under the per-event order above. Neither counts as a protocol violation.
+**Retrieval.** One per topic: idle, waiting(token), or receiving(manifest).
+- **When to request.** Only while observing a generation on a v2 wire with a request path. Events: pending ≠ ∅, `since` = (`map_epoch`, `seq`) of the top of the run of C from 0, or `SINCE_NONE` when that run is empty or its epoch was evicted. Map: not current for a reason a request can fix (no chain unless a `SyncEnd` said there is no map yet, a broken chain, a rejected message, D20 once per mismatch run); `since` = (epoch, applied `seq`), or `SINCE_NONE` on a retry. `expected_generation` is always the observed generation; every send, retries included, takes a fresh random token. At most one request per topic per 5 s.
+- **Completion.** A `SyncEnd` with the outstanding token moves the retrieval to receiving; the manifest applies to its own generation (installed first if newer). It is done only once every `delivered` range is in C (events), or the chain has applied `max(delivered)` in that generation, or `delivered` is empty and the chain is at or above `bound` (map; `bound` NONE completes at once). Nothing else completes a retrieval: no timer, request flag or silence.
+- **Facts.** Every `SyncEnd` of the active generation, whatever its token, raises H (events) or the known map `seq` (map) to its `bound` and adds its `unavailable` to U. A foreign or old token changes nothing else.
+- **Timeouts.** 5, 10, 20, then 30 s per attempt in waiting or receiving: a fresh token if the need remains, idle otherwise. A request a client could not send is counted (`requestsUnsent`); the retrieval stays waiting for its timeout.
+- **Connections.** Opening keeps the active and archived state (stale display) and kills every token; closing makes the map stale and leaves coverage untouched.
 
-**`status`, `activity`, `epoch`.** These are full-state messages, so a gap is only counted, and the message is applied. All three are transient_local (§2, D24). When any client subscribes, the bridge may deliver its stored copy of the latest message again, also to a Mac that already has it. The `seq` rule ignores that copy. Copies repeat one `seq`, and case 2 needs two low messages counting up by 1, so copies never look like a restart. Each is stale when its newest message is older than 3 periods: 3 s for `status` (inside PR 3.1's "stale within 5 s") and `activity`, and 15 s for `epoch`.
+**Continuity.** *broken(since g_old)* once the mirror has archived a generation in which it observed anything; *verified* while it has observed only the active generation since launch; *unknown* on a legacy wire. A retired generation has no final bound, so the protocol never claims whole-history continuity across generations.
+
+**Legacy wire (an old node, or a rolled-back image).** The active generation is archived and one legacy state shows bricks and events with identity unverified. The map is never current (`unverified`), coverage and continuity are unknown, caughtUp is false, and no request is sent (a legacy node rejects a v2 `RequestSync`). A legacy delta chains only on the connection whose snapshot started the chain; the map arrives with the 60 s keyframe (D29). No generation is ever synthesized from counters.
+
+**No request path.** Without client publishing or a relay, retrieval cannot run: coverage typically reads `missing(pending: …)` after a mid-stream connect, the map becomes current from the next keyframe, and the UI says "no request path" instead of retrying.
+
+**`status`, `activity`, `epoch`.** These are full-state messages, so a gap is only counted, and the message is applied. All three are transient_local (§2, D24); a stored copy delivered again repeats its `seq` and is ignored. Each is stale when its newest message is older than 3 periods: 3 s for `status` and `activity`, and 15 s for `epoch`.
 
 ## 6. Honest-state rendering rules
 
@@ -648,18 +644,18 @@ These extend the app's existing contract (missing ≠ zero, a running container 
 
 | stream | rate | message size ("lab", default zlib) | steady state |
 |---|---|---|---|
-| MemoryStatus | 1 Hz | 76 B (exact) | 0.08 KB/s |
+| MemoryStatus | 1 Hz | 84 B (exact; legacy 76 B) | 0.08 KB/s |
 | Activity | 1 Hz | 88 B (exact) | 0.09 KB/s |
 | Epoch | 0.2 Hz | 53 B (exact) | 0.01 KB/s |
-| ChangeEvent, no mask | per transition, < 1/min | 136 B (exact) | < 0.01 KB/s |
-| ChangeEvent with a 25 cm box mask | per transition | 253 B (measured) | < 0.01 KB/s |
-| MapBricks delta, 25 cm box added | ≤ 0.2 Hz, on reference change | 367 B (measured) | < 0.1 KB/s |
-| MapBricks snapshot | TRACKING start, every `keyframe_period_s` (D29), and the answer to a request that cannot be replayed | 52,863–59,024 B (measured, see below) | — |
-| RequestSync (Mac → Spark) | on (re)connect and on a gap | 53 B (exact) | — |
+| ChangeEvent, no mask | per transition, < 1/min | 148 B (exact; legacy 136 B) | < 0.01 KB/s |
+| ChangeEvent with a 25 cm box mask | per transition | 276 B (v2, from the measured 253 B legacy size) | < 0.01 KB/s |
+| MapBricks delta, 25 cm box added | ≤ 0.2 Hz, on reference change | 380 B (v2, from the measured 367 B legacy size) | < 0.1 KB/s |
+| MapBricks snapshot | TRACKING start, every `keyframe_period_s` (D29), and the answer to a request that cannot be replayed | 52,863–59,024 B (measured legacy, see below; v2 adds 8–15 B) | — |
+| RequestSync (Mac → Spark) | on (re)connect and on a gap | 84 B (exact; legacy 53 B) | — |
 | OperatorAction (Mac → Spark) | per operator action | 117 B (exact, for the §3.6 example) | — |
-| EventsFallback | one per events fallback | 72 B with no resent `seq`, 76 + 8n B with n ≥ 1 (computed, §3.8) | — |
+| SyncEnd | one per answered request | 84 B with no ranges, + 16 B per range (+ 4 B padding per non-empty list; §3.8) | — |
 
-**Measured on the real 5-minute static recording** `static5m` (`spark/room_memory_cpp/PLAN.md`), both lidars, node defaults, the JT128's reference as the map: 0.89 KB/s mean over all room-memory topics. Tracking teaches the reference nothing (`learn_windows` 0), so there are no deltas, and Trevor's motion next to the rig is activity, not events.
+**Measured on the real 5-minute static recording** `static5m` (`spark/room_memory_cpp/PLAN.md`), both lidars, node defaults, the JT128's reference as the map, before protocol v2 (v2 adds 8 B per status and up to 15 B per map message): 0.89 KB/s mean over all room-memory topics. Tracking teaches the reference nothing (`learn_windows` 0), so there are no deltas, and Trevor's motion next to the rig is activity, not events.
 
 | stream | messages | bytes | mean |
 |---|---|---|---|
@@ -691,7 +687,7 @@ These extend the app's existing contract (missing ≠ zero, a running container 
   - With the floor and two walls exactly on brick boundaries, ±1 cm noise splits their hits across two brick layers: 4,081 bricks, **547 KB, over the 500 KB target**.
   - With the room off the grid it is 3,412 bricks and 457 KB.
   - So `COMPRESSION_NONE` is for goldens and debugging only.
-- A (re)connect costs one snapshot plus the latest status and epoch, about 0.06 MB with zlib. The 2 MB per-(re)connect budget leaves room for the events fallback (§5), at most (open events + 100) × a few hundred bytes plus its header.
+- A (re)connect costs one snapshot plus the latest status and epoch, about 0.06 MB with zlib. The 2 MB per-(re)connect budget leaves room for the events fallback (§5.2), at most (open events + 100) × a few hundred bytes plus its `SyncEnd`.
 
 ## 8. Decisions for review
 
@@ -763,8 +759,8 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
   - **Common fields.** `map_epoch` and `seq` were added because §1.4 puts the four common fields first in every message. `map_epoch` repeats `since_epoch`, and both directions validate that. `seq` counts the client's requests.
   - **`topic`.** `seq` is per topic, so one `since_seq` cannot describe both `map_bricks` and `events`. The Mac sends one request per stale topic.
   - **`SINCE_NONE` = 2⁶⁴ − 1** means "holds nothing". It is not 0, because epoch 0 and seq 0 are real values (§1.5).
-  - **Answers go out on separate sync topics** (`/room_memory/sync/map_bricks`, `/room_memory/sync/events`, and D27's `/room_memory/sync/events_fallback` for fallback headers), not on the live topics. Replays keep their original `seq`.
-    - On a live topic, other Macs would see `seq` go backwards. They could not tell a replay from a node restart, which §5 treats as a new generation (the `seq` rule, case 1).
+  - **Answers go out on separate sync topics** (`/room_memory/sync/map_bricks`, `/room_memory/sync/events`, and D36's `/room_memory/sync/end` for the manifests, which replaced D27's `sync/events_fallback`), not on the live topics. Replays keep their original `seq`.
+    - On a live topic, other Macs would see `seq` go backwards, and the live topics would stop being in publish order.
     - With separate topics the live rules stay strict, and a Mac reads a sync topic only while its own request is outstanding.
   - **The answer is bounded.**
     - Maps: at most 9 replayed deltas, else one snapshot.
@@ -776,7 +772,7 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
   - A missed trailing delta is caught by `MemoryStatus.map_epoch` disagreeing with the mirror twice in a row.
 - **D21. `package.xml` license** says `Proprietary` because the repo has no LICENSE file. Trevor should confirm.
 - **D22. Payload limit.** The uncompressed `MapBricks` payload, `134 × n_bricks + 4 × n_removed`, is at most 16 MiB (16,777,216 bytes), about 125,000 bricks or 8,000 m³ fully covered. Without a limit, a 2 MB zlib payload could declare and inflate to over 2 GB. The decoder rejects a larger declared size before inflating, and the encoder refuses to write one (D16). The measured room needs 547 KB.
-- **D23. One `seq` rule, with generations** (PR #13; Phase 3's P13). §5 states it once. It needs Trevor's and Codex's review.
+- **D23. One `seq` rule, with generations** (PR #13; Phase 3's P13). **Superseded by D34 and D37:** its restart cases 1–3 and the open residual below are gone; `seq` is ordered per (generation, topic). Kept as design history.
   - **The conflict it removes.** §5 said both "a snapshot is always accepted" and "a sync message with `seq` ≤ the last applied is ignored". After a node restart, `seq` starts again at 0 and the two collide. A Mac holding the old, higher `seq` could ignore every answer and stay STALE.
   - **Why not "accept any snapshot".** The first Phase 3 draft applied a snapshot answer whatever its `seq`. On the shared sync topic, that lets an older snapshot meant for another Mac rewind a Mac that is current. So "`seq` ≤ baseline is ignored" now holds everywhere. The only exception is a snapshot at exactly the baseline, which is the "nothing missed" answer. A restart is handled as a new generation instead.
   - **How a restart is recognized.** The live `seq` of `map_bricks` or `events` goes down (this relies on those topics staying volatile, D24). Or `status` comes in low twice in a row, counting up by 1. That works in a static room, and repeated transient_local copies cannot match it, because they repeat one `seq`. Or a signal from outside the protocol.
@@ -795,11 +791,11 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
   - `operator_id` is self-asserted. Neither the bridge's client-publish path nor Phase 3's ssh relay can tell which person sent an action.
   - **ACCEPTED follows its map message** (§4.2). If ACCEPTED went out first, every Mac would remove the overlay while its map still lacked the change. A delta can wait 5 s for the 0.2 Hz slot (§2), and longer behind Phase 3's byte bucket (`docs/phase3-live-integration.md` §3.3). So the node publishes ACCEPTED right after the message that carries the change. The Mac also removes the overlay only once its mirror's epoch is ≥ the event's `map_epoch`. `expected_state` is compared with the node's own state, so an accept still waiting for its map message cannot also be dismissed.
   - Open: re-referencing outside RIG_MOVED, and showing labels and acknowledgements on other Macs. Both would change §4.1 or `ChangeEvent`.
-- **D26. Events high-water mark** (PR #13; Phase 3's P16). It needs Trevor's and Codex's review. §5 defines it, and §3.3 adds `uint64 events_seq` to `MemoryStatus`. That changes `MemoryStatus` bytes: 8 more per message.
+- **D26. Events high-water mark** (PR #13; Phase 3's P16). **Partly superseded by D36:** `events_seq` stays (scoped to the generation by D34) as a witness of H, but the request "mark" no longer decides completion; the `SyncEnd` manifest does. §5 defines it, and §3.3 adds `uint64 events_seq` to `MemoryStatus`. That changes `MemoryStatus` bytes: 8 more per message.
   - **`events_seq` is the newest events `seq`.** Before this, a replay was complete once it reached the highest live `seq` the Mac had seen. A Mac that missed the last events before a quiet period has seen none of them on the live topic, so its request was done at once and the history stayed wrongly complete. The map already had its high-water mark in `map_epoch`.
   - **Not an in-band end marker.** An earlier draft ended every answer with its last message sent again. Sync topics are shared, and the repeat was an ordinary `ChangeEvent`. So after a lost marker, another answer starting at the same `seq` read as the marker, and the request closed before the missed events arrived (Codex, PR #13). `events_seq` is not part of any answer. A lost message only delays completion.
   - **The mark decides when a request is done, not whether a gap is given up.** That takes the fallback header (D27).
-- **D27. Events fallback header** (PR #13, after Codex's review of it; Phase 3's P17). It needs Trevor's and Codex's review. §3.8 defines `EventsFallback` and its topic, with `ros/labcommand_msgs/msg/EventsFallback.msg`,, and §5 the rule. It adds one message type and one topic.
+- **D27. Events fallback header** (PR #13, after Codex's review of it; Phase 3's P17). **Superseded by D36:** `EventsFallback`, its `.msg` and `/room_memory/sync/events_fallback` are deleted; no language had a codec for it and no node published it. Kept as design history: it defined `EventsFallback` and its topic, and the rule that only the header could give up a gap.
   - **Why an explicit header.** The previous draft recognized a fallback by its first message not being the `since` message, which a replay re-sent first. On the shared sync topic, another Mac's replay can arrive first, and the `since` message can be lost. Either read as a fallback, and the Mac gave up messages that its own replay was still bringing (Codex, PR #13). The `since` message is no longer re-sent.
   - **Why it names the `seq`s.** A fallback's contents are sparse: open events older than the kept messages, then the kept range. Reaching the mark on the live topic does not show they have arrived. The previous draft closed a fallback while its messages were still in flight, and ignored them afterwards (Codex, PR #13). With the list, the Mac gives up only `seq`s the Spark no longer holds, and only after receiving every one it does.
   - **Why it also waits for `kept_last_seq` on the sync topic.** Headers travel on their own topic, so another Mac's header can arrive while the Mac's own earlier answer is still in flight with a `seq` that header omits. The sync topic keeps publish order, so its copy of `kept_last_seq` arrives after that earlier answer (§3.8).
@@ -814,16 +810,21 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **D32. No events in the near field (superseded by D33: removed).** The rig stands about 1.3 m from where someone works. Live and in both static recordings, something low there (z up to ~0.8 m in the sensor frames) shifts every few seconds to minutes, seen by both lidars at once, and it was 100 % of the remaining events (live 2–18 per minute). A change region with a voxel center within `near_range_m` (2.0 m) of its sensor is not reported, whichever pose of a move it is. With it, the diff's `tolerance` 2 and `min_voxels` 8 remove the far fragments of the same motion. This is a blind zone, not noise removal: a real change within 2 m of either lidar is not reported. 0.3 m cubes from 2.2 m out are still detected at the same latency (`spark/room_memory_cpp/PLAN.md`, "False change events"). *Removed:* the "something low" was Trevor working at a desk (he confirmed it), real transient motion, and a blind zone also hid real changes next to the rig. `near_range_m` is gone; `tolerance` and `min_voxels` are back at 1 and 6. D33 replaces it.
 - **D33. Activity is not change.** Motion next to the rig (a person working) is reported on `/room_memory/activity` (§3.7), never as a `ChangeEvent`. A region becomes a CANDIDATE only after it has stayed settled for `candidate_windows` windows (§4.2): fresh, the same shape, and no activity within `activity_radius_m`; so a change made by a person is reported that long after they stop moving next to it. `candidate_windows` is 40 (40 s at `window_s` 1): on both static recordings, looped for 30 minutes, the longest settled run of anything Trevor left is 24 windows (the part of his BUILDING-time pose he moved away from). 0.3 m boxes 1.0–4.6 m from either lidar are CANDIDATEs 40–43 s after they appear, disappear or move. Tracking teaches the reference nothing (`learn_windows` 0): learning while he worked wrote his surroundings into the reference and produced a 45-window still residue. Limits: a person who stays perfectly still for longer than the gate after shifting is reported, and so is a reference built while someone sat in it once they leave; without the JT128↔Mid-360 extrinsic (D30) one sensor's activity cannot hold the other's regions. The Mac does not decode `Activity` yet.
 
+- **D34. Publisher generations** (`pubgen`, PLAN-PUBGEN §2–§3). Every stateful Spark → Mac message ends with `uint64 publisher_generation`, durable and increasing per room (`max(stored + 1, now_ms)`, written and fsynced before the first publish, under a per-room `flock`, fail closed), the same for every message of one process. `seq` is ordered per (generation, topic). The v2 fields are appended after each message's last legacy field, so every legacy offset and golden prefix is unchanged, and the layout is detected from the trailing bytes (§1.1): the Mac needs no schema text, and `FoxgloveProtocol.Channel` carries none. Generation 0 is reserved (`GENERATION_UNKNOWN`). Saved references stay legacy. Rollout: the Mac app first (it reads both layouts and runs an old node in legacy mode), then the room-memory container; rolling back is safe both ways (PLAN-PUBGEN §8).
+- **D35. `RequestSync` token and expected generation.** A v2 request appends `expected_generation` (the generation its `since` belongs to) and a random 16-byte token, new for every send. The node honours `since` only in its own generation, and copies the token into the `SyncEnd`. A legacy request is answered as generation 0 with an all-zero token. A legacy node rejects a v2 request, so the Mac sends none on a legacy wire.
+- **D36. `SyncEnd`, the end-of-answer manifest** (supersedes D27 and D26's request mark). One per answered request, on `/room_memory/sync/end`, after the answer: the generation, the token, the topic's bound, and the `seq`s delivered and (events fallback) unavailable (§3.8). It states what was sent, never what a Mac received. Every Mac may record its bound and unavailable `seq`s; only the requester's token moves a retrieval, and only receipt of what it names completes it.
+- **D37. The generation-scoped mirror** (supersedes D23's restart cases and its residual). One active generation state, installed on the first validated message of a higher generation (a deviation from Astra's table, which quarantined messages until the generation's status: installing early loses nothing, PLAN-PUBGEN §4.5), retrieval by token and manifest, and the `EventHistory` projection (coverage, freshness, continuity, caughtUp). Legacy wire: shown, unverified, never current, no requests. PLAN-PUBGEN §4.4 lists the invariants; the Swift runner checks them after every input of 2,000 seeded traces against an independent reference model, with the ten Codex findings and Astra's pair as regression seeds (PLAN-PUBGEN §6).
+
 ## 9. Verification status
 
-- **Hand goldens.** `Tests/Fixtures/room/golden/hand/*.hex` were written byte by byte from these rules, with every span annotated. There are 12: 9 little endian and 3 big endian, covering the five messages of §3.1–§3.5 (`OperatorAction` and `EventsFallback` have none yet). `spark/room_memory/tests/fixtures/hand` adds two `Activity` goldens (active, and idle with NaN geometry), checked by the Python and C++ codecs only; the Swift suite does not decode `Activity` yet. The tests check:
+- **Hand goldens.** `Tests/Fixtures/room/golden/hand/*.hex` were written byte by byte from these rules, with every span annotated. There are 22: the 12 legacy ones (9 little endian and 3 big endian, covering the five messages of §3.1–§3.5), and 10 protocol v2 ones (7 little endian, 3 big endian: `MemoryStatus`, `MapBricks` LE/BE, `ChangeEvent` with and without a mask, `RequestSync` LE/BE, and three `SyncEnd`s), each v2 one repeating its legacy twin's values with the new fields appended and one publisher generation throughout. `OperatorAction` has none yet. `scripts/check-shared-goldens.sh` requires every shared file to be identical in both fixture directories. `spark/room_memory/tests/fixtures/hand` adds two `Activity` goldens (active, and idle with NaN geometry), checked by the Python and C++ codecs only; the Swift suite does not decode `Activity` yet. The tests check:
   - The Swift decoder reads all 12 to the expected values. The big-endian `MapBricks` golden has a little-endian payload inside a big-endian message.
   - The encoder reproduces the 7 uncompressed little-endian goldens exactly.
   - For the zlib and LZFSE goldens, which hold a hand-built stored block and an uncompressed LZFSE block:
     - the encoder matches the bytes up to the payload length;
     - its own compressed stream, inflated through Foundation rather than the codec, equals the hand payload;
     - that stream decodes back to the value.
-  - Every truncation throws.
+  - Every truncation throws, except that a v2 golden cut at its legacy length is that legacy message (with no generation), never the golden.
 - **Compression interop, checked once by hand.** The test runner has no Python, so these checks are not in the suite.
   - Python 3.9 `zlib.decompress(payload, -15)` inflates Apple's `.zlib` output of a 547 KB payload. Plain `zlib.decompress(payload)` rejects it.
   - Apple inflates Python's `zlib.compressobj(6, zlib.DEFLATED, -15)` output of the same payload.
@@ -832,8 +833,8 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **Spark goldens: not produced.** `scripts/spark/make_room_memory_goldens.py` serializes the 9 little-endian values with `rclpy` after a `colcon build` of `labcommand_msgs` in the Jazzy container. Running it is a Spark task. The follow-up test then requires each Spark file to decode to the same value as its hand golden, which confirms D4.
 - **`colcon build` of `labcommand_msgs`: not run.** There is no ROS 2 on the Mac.
 - **`OperatorAction` (§3.6, D25): the `.msg` only.** There is no Swift codec and no hand golden yet. The 117 B wire size was computed by hand from §1.1, not encoded. Codecs and goldens are Phase 3 stage S5.
-- **`EventsFallback` (§3.8, D27): the `.msg` only.** There is no Swift codec, hand golden or node support yet. The wire size was computed by hand from §1.1, not encoded.
-- **The Spark side of §5 is implemented, except PR #13's additions to it,** in `spark/room_memory_cpp` (the node) and in the Python oracle `spark/room_memory`. The differential tests check the two byte for byte: the map log and replay, sync snapshots, event replay and the bounded fallback, the 100-message log and the room and decode checks. Not implemented: the `EventsFallback` header before a fallback (D27), and `status` and `epoch` as transient_local (D24); `docs/phase3-live-integration.md` plans both. `RoomMemoryStore` (the Mac side) is PR 1.1. The bridge's client-publish path has not been tried against a live bridge.
+- **Protocol v2 (D34–D37): implemented** in the Python oracle, the C++ node and the Swift codec and mirror. The Python, C++ and Swift codecs decode every v2 golden and reproduce the little-endian ones. The differential tests compare Python and C++ byte for byte, `SyncEnd`s included, on every §5.2 answer case, a session across two generations, and the legacy `RequestSync` answer. The ROS node wiring (`node.py`, `room_memory_node.cpp`) needs ROS 2 and was not run on the Mac.
+- **The Spark side of §5 is implemented** in `spark/room_memory_cpp` (the node) and in the Python oracle `spark/room_memory`. Not implemented: `status` and `epoch` as transient_local (D24); `docs/phase3-live-integration.md` plans it. The bridge's client-publish path has not been tried against a live bridge, and the Mac has no request path in the deployed setup (§5.3).
 
 ## 10. Open questions for Trevor (brief §5, Q1–Q4, and Q5)
 
