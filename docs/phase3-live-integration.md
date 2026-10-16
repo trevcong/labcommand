@@ -2,12 +2,14 @@
 
 Status: design for review, 2026-10-14. Nothing here is built.
 
-This doc changes the bytes of one v1 message only: P16 adds `events_seq` to `MemoryStatus`. It also adds one new message, P17's `EventsFallback`. Where Phase 3 needs a change to a decided rule, the change is listed as a numbered proposal (§10) for Trevor and Codex. `docs/ROOM-MEMORY-PROTOCOL.md` stays authoritative. This PR writes five proposals into the protocol draft, still subject to that review:
+**Amended 2026-10-16 (protocol v2, `PLAN-PUBGEN.md`, protocol §5, D34–D37).** Restart detection is now the publisher generation carried in every stateful message, not `seq` counters or `node_started_at`. Every `RequestSync` answer ends with a `SyncEnd` manifest on `/room_memory/sync/end`, which replaces P17's `EventsFallback`. P13, P16 and P17 are revised in place below. Superseded text is marked as such, and the protocol's D23, D26 and D27 keep the old rules as history.
+
+This doc changes the bytes of one v1 message only: P16 adds `events_seq` to `MemoryStatus`. It also adds one new message, P17's `EventsFallback` (superseded by D36's `SyncEnd`; protocol v2 also appends `publisher_generation`, D34). Where Phase 3 needs a change to a decided rule, the change is listed as a numbered proposal (§10) for Trevor and Codex. `docs/ROOM-MEMORY-PROTOCOL.md` stays authoritative. This PR writes five proposals into the protocol draft, still subject to that review:
 - P2, durability: protocol §2 and D24.
-- P13, the `seq` rule: protocol §5 and D23.
+- P13, the `seq` rule: protocol §5 and D23. Its restart cases are superseded by D34 and D37.
 - P6, `OperatorAction`: protocol §3.6 and D25, with `ros/labcommand_msgs/msg/OperatorAction.msg`.
-- P16, the events high-water mark: protocol §3.3, §5 and D26. `MemoryStatus.events_seq` itself (the `.msg`, the Swift codec, the hand golden and both nodes) is already on main and in PR #14.
-- P17, the events fallback header: protocol §2, §3.8, §5 and D27, with `ros/labcommand_msgs/msg/EventsFallback.msg`. It has no codec, golden or node support yet.
+- P16, the events high-water mark: protocol §3.3, §5 and D26. `MemoryStatus.events_seq` itself (the `.msg`, the Swift codec, the hand golden and both nodes) is already on main and in PR #14. It stays, scoped to one publisher generation; D26's request mark is superseded by D36.
+- P17, the events fallback header: protocol §2, §3.8, §5 and D27, with `ros/labcommand_msgs/msg/EventsFallback.msg`. **Superseded by D36:** `SyncEnd` and `SeqRange` (protocol §3.8) on `/room_memory/sync/end`, with codecs, goldens and both nodes; `EventsFallback.msg` is deleted.
 
 The rest are proposals only.
 
@@ -41,12 +43,12 @@ No Spark, rig or app was touched to write this.
   - DDS QoS governs only the same-host hop from node to bridge.
   - Across the tailnet the hop is one TCP stream. Messages are lost in only two places: the bridge's per-client backlog, which drops the oldest message on overflow ([F1]), and disconnects.
   - Either loss shows up as a `seq` gap or an epoch mismatch, which protocol §5 already turns into STALE and a resync.
-  - `map_bricks` and `events` therefore stay volatile. A latched copy replayed by the bridge would look like a node restart to every Mac already connected, and send each of them into a resync (§4.3).
+  - `map_bricks` and `events` therefore stay volatile. A latched copy replayed by the bridge would make each connect pay for the map twice, and the request is the one connect mechanism (§4.3). (Under D23 it would also have looked like a node restart to every connected Mac; under D37 a lower `seq` is never a restart signal.)
   - `status` and `epoch` become transient_local (protocol §2, D24), so a Mac shows the memory state on connect. The nodes need a small change for that (§2.5).
 - **The governing invariant: the mirror is never shown as current while it is wrong.** It may be stale, incomplete or empty, and it says so. Every test in §7 checks this under faults.
 - **The Spark side is not ready for live integration yet.**
   - Both nodes (Python oracle, C++ production, PR #14) publish `map_bricks` with 60 s keyframes, `events`, `status`, `activity` and the sync topics, and answer `RequestSync`.
-  - They have no `epoch`, no `EventsFallback` header, no RIG_MOVED, and never emit CONFIRMED. Those are PR 2.3 and 2.4.
+  - They have no `epoch`, no RIG_MOVED, and never emit CONFIRMED. Those are PR 2.3 and 2.4. (Both now allocate a publisher generation at start and end every answer with a `SyncEnd`, PLAN-PUBGEN §2–§3.)
   - They keep each sensor's points in that sensor's own frame, so they have no room frame yet (P14).
   - The rollout (§9) gates on them.
 
@@ -56,8 +58,8 @@ No Spark, rig or app was touched to write this.
 |---|---|---|
 | Wire contract (protocol §1–§8) | merged in #10; Swift codecs and hand goldens; Spark-produced goldens not yet made (protocol §9) | Spark goldens (confirm D4's `uint64` alignment) before stage S3 |
 | Mac `RoomMemoryStore` (PR 1.1) | not built | the mirror's data model; §5 adds the connection layer around it |
-| Python node `spark/room_memory` | reference oracle (main, PR #11; extended by PR #14): `map_bricks` (keyframes and deltas, protocol D29), `events`, `status` with `events_seq`, `activity`, the two sync topics and the `RequestSync` handler with the bounded fallback; all reliable, only `activity` declares durability (transient_local); states BUILDING, TRACKING, DEGRADED | stays the oracle; not deployed; `epoch`, the durability change (§2.5) and the `EventsFallback` header (P17) |
-| C++ node `spark/room_memory_cpp` | PR #14: byte-identical to Python (differential tests); 6.4–16.5 ms per 1 s window on an M5 Max (target < 200 ms); same topics, same QoS; its launch file also starts the :8767 bridge (protocol D28, still open) | production node; must add `epoch` and the `EventsFallback` header (PR 2.4, P17), CONFIRMED, moved supersession and RIG_MOVED (PR 2.3), the room-frame transform (P14), the durability change (§2.5) and an `OperatorAction` handler (S5) |
+| Python node `spark/room_memory` | reference oracle (main, PR #11; extended by PR #14): `map_bricks` (keyframes and deltas, protocol D29), `events`, `status` with `events_seq`, `activity`, the two sync topics and the `RequestSync` handler with the bounded fallback; all reliable, only `activity` declares durability (transient_local); states BUILDING, TRACKING, DEGRADED | stays the oracle; not deployed; `epoch` and the durability change (§2.5). P17's manifest is done as `SyncEnd` (D36), with the publisher generation (D34) |
+| C++ node `spark/room_memory_cpp` | PR #14: byte-identical to Python (differential tests); 6.4–16.5 ms per 1 s window on an M5 Max (target < 200 ms); same topics, same QoS; its launch file also starts the :8767 bridge (protocol D28, still open) | production node; must add `epoch` (PR 2.4; P17's manifest is done as `SyncEnd`, D36, with the publisher generation, D34), CONFIRMED, moved supersession and RIG_MOVED (PR 2.3), the room-frame transform (P14), the durability change (§2.5) and an `OperatorAction` handler (S5) |
 | foxglove_bridge on `:8765` | built on foxglove-sdk-cpp v0.25.1 (`FoxgloveProtocol.swift`), which is bridge release 3.4.1, inferred from the changelog's SDK pin ([F3]); ROS 2 Jazzy; subprotocol `foxglove.sdk.v1`; its parameters and container are not known from the Mac | unchanged (P12) |
 | Mac live client | per-sensor sockets, direct `ws://<tailnet IP>:8765`, ATS exception for the 100.x IP, backoff 1 s … 30 s | a memory socket with its own state machine (§5); advertise parsing that keeps `schemaEncoding` and `schema`, which `Channel` drops today |
 | Command-center API on `:8766` | polled every 5 s over the ssh tunnel, ~0.4 KB/s measured | a `room_memory` block (§2.4) and a request relay (P11); both are changes to Trevor's `command_center.py` |
@@ -97,7 +99,7 @@ DGX Spark (ROS 2 Jazzy, --net=host)                                             
   |---|---|
   | `port` | 8767 |
   | `address` | the Spark's tailnet IP (the default `0.0.0.0` listens on every interface) |
-  | `topic_whitelist` | `['^/room_memory/(map_bricks\|events\|status\|activity\|epoch\|sync/map_bricks\|sync/events\|sync/events_fallback)$']` |
+  | `topic_whitelist` | `['^/room_memory/(map_bricks\|events\|status\|activity\|epoch\|sync/map_bricks\|sync/events\|sync/end)$']` (`sync/end` replaced `sync/events_fallback`, D36) |
   | `capabilities` | `[]`: no `clientPublish`, `parameters`, `services`, `connectionGraph` or `assets` |
   | `message_backlog_size` | default |
 
@@ -132,7 +134,7 @@ The topic set, QoS and durability are protocol §2 (D18, D24), including the ope
 | `/room_memory/epoch` | S→M | `Epoch` | 0.2 Hz | reliable, transient_local, keep-last 1 | not published yet (PR 2.4, §2.5) |
 | `/room_memory/sync/map_bricks` | S→M | `MapBricks` | answers | reliable, volatile, keep-last 10 | — |
 | `/room_memory/sync/events` | S→M | `ChangeEvent` | answers | reliable, volatile, keep-last 200 | — |
-| `/room_memory/sync/events_fallback` | S→M | `EventsFallback` (protocol §3.8) | one header per events fallback | reliable, volatile, keep-last 10 | new with P17; `.msg` only, not published by the nodes yet |
+| `/room_memory/sync/end` | S→M | `SyncEnd` (protocol §3.8) | one per `RequestSync` answer, after its messages | reliable, volatile, keep-last 10 | P17 as revised by D36; replaces `/room_memory/sync/events_fallback` and `EventsFallback`; published by both nodes |
 | `/room_memory/request_sync` | M→S | `RequestSync` | on connect and on a gap | reliable, volatile, keep-last 10 | carried as CDR bytes over `:8766` and relayed on the Spark (P11); not on the bridge |
 | `/room_memory/operator` | M→S | `OperatorAction` (protocol §3.6) | operator actions | reliable, volatile, keep-last 10 | same relay (P11) |
 
@@ -153,7 +155,7 @@ Each memory topic has one publisher, so the bridge follows the node's choices. I
   - The node loads a reference only if it was saved under the same transforms.
   - A changed `T_room←frame_sensor`, or a different frame sensor, moves the room frame. It starts a new `room_id` generation, as P9 does.
   - Adding or recalibrating the other sensor's transform keeps the frame. The node rebuilds the reference (BUILDING), and the new reference bumps `map_epoch` and goes out as a snapshot (P7).
-  - `map_epoch` and `event_id` survive a restart.
+  - `map_epoch` and `event_id` survive a restart. The publisher generation does not: every start allocates a higher one in `<state_dir>/<room_id>/publisher_generation` (PLAN-PUBGEN §3, D34).
   - `event_id` is seeded from the node start time in ms << 20. It stays unique only while the Spark clock does not step back (F11).
 - **Ring buffers.** The node keeps its last 10 `map_bricks` and last 100 `events` messages as published bytes, for replay (protocol §5).
 
@@ -166,14 +168,14 @@ This is the out-of-band identity and health channel. It is already polled every 
 | `room_id` | the room the node serves | memory mode "not configured" |
 | `protocol` | wire-protocol majors the node publishes, e.g. `[1]` | "protocol —"; the Mac does not subscribe |
 | `node` | `room_memory_cpp` git sha and image digest; bridge version | "—" |
-| `node_started_at` | node start time (Unix s); changes on every restart | "—" |
+| `node_started_at` | node start time (Unix s); changes on every restart; diagnostics only (D34) | "—" |
 | `map_epoch`, `map_digest` | current epoch, and SHA-256 of the canonical *uncompressed* snapshot payload at that epoch (protocol §3.1) | "—" |
 | `state` | `MemoryStatus.state` name | "—" |
 | `publishing` | true when the node's publishers exist | false renders "node down", never "empty room" |
 
 **`map_digest` is an end-to-end consistency check that needs no wire change.** When the mirror's epoch equals `map_epoch`, the Mac hashes its own canonical payload and compares. A mismatch is a protocol violation and forces a snapshot. It is the soak test's main oracle (§7.5).
 
-**`node_started_at`** is case 3 of protocol §5's `seq` rule. A Mac may reuse a baseline across a disconnect only if this value is unchanged (§4.3). It also labels diagnostics.
+**`node_started_at`** labels diagnostics only. It was case 3 of D23's `seq` rule, which let a Mac reuse a baseline across a disconnect only while this value was unchanged. That case is superseded: the publisher generation in every stateful message tells the Mac whether the node restarted (protocol §5, D34, D37), so the Mac no longer reads `:8766` before a request.
 
 ### 2.5 Node durability change
 
@@ -254,8 +256,8 @@ Small messages pay 2–3× their size in headers, which is why §3.2 counts wire
 | **Steady, static room** (status, activity, epoch and the 60 s keyframe) | ~1.5 KB/s | ~0.3 KB/s | ~1.8 KB/s total; ~2.8× under budget. Without the keyframe ~0.73 KB/s. With the `:8766` poll, ~2.2 KB/s |
 | **Quiet day** (60 changes/h; each 3 transitions with mask; each accepted with a 0.4 KB delta) | +0.04 KB/s | +0.01 KB/s | events and deltas are noise next to status |
 | **People walking through** (≈ 2 CANDIDATE/EXPIRED transitions per second while someone moves; no mask on CANDIDATE, P5) | +0.54 KB/s | +0.25 KB/s | ~1.2 KB/s total while active. Person-sized masks on CANDIDATE (est. 0.5–1 KB each) would make it 2–3 KB/s, hence P5 |
-| **First connect** (no baseline: app launch, or a new room or generation) | ~65 KB snapshot + ≤ ~48 KB event fallback (≤ 120 messages × 396 B) + advertise | ~6 KB ACKs, < 1 KB requests | ~110–120 KB; 6 % of the 2 MB cap |
-| **Reconnect with a baseline** (§4.3) | map: a replay of the 1–9 missed deltas (~0.5 KB each), else one ~65 KB snapshot; events: the missed messages only, ≤ 100 × 396 B; + advertise | ≤ ~6 KB ACKs, < 1 KB requests | ≤ ~75 KB; a snapshot whenever no delta was missed (protocol §5) |
+| **First connect** (no baseline: app launch, or a new room, `room_id` generation or publisher generation) | ~65 KB snapshot + ≤ ~48 KB event fallback (≤ 120 messages × 396 B) + advertise | ~6 KB ACKs, < 1 KB requests | ~110–120 KB; 6 % of the 2 MB cap |
+| **Reconnect with a baseline** (§4.3) | map: a replay of the 1–9 missed deltas (~0.5 KB each), else one ~65 KB snapshot; events: the missed messages only, ≤ 100 × 396 B; + advertise | ≤ ~6 KB ACKs, < 1 KB requests | ≤ ~75 KB; nothing on the map topic when no delta was missed, only the `SyncEnd` (protocol §5, D36) |
 | **Re-reference or large accept** (the whole map changes) | one snapshot, 58–65 KB | — | P7: snapshot instead of a delta larger than half a snapshot |
 | **Resync storm at protocol §5's limit** (one request per topic per 5 s, unanswerable by replay) | 12.9 KB/s map + 9.5 KB/s events ≈ 22 KB/s | ~0.2 KB/s | **4.5× over budget**; P3 and P4 bound it |
 
@@ -271,7 +273,7 @@ Small messages pay 2–3× their size in headers, which is why §3.2 counts wire
 ### 3.3 Spark-side shaping (PR 2.4)
 
 - **Delta coalescing.** Deltas are capped at 0.2 Hz (protocol §2). Reference changes within one 5 s slot merge into one delta. That is legal: a delta's `map_epoch` must only exceed its `base_epoch` (D8), so epochs may skip.
-- **Byte bucket on `events` answers (P4).** One bucket covers `sync/events` and `sync/events_fallback`, not live `events`, which stays under 1/min. It refills at 3 KB/s up to 48 KB, one full fallback (≤ 120 messages × 396 B). An answer is admitted whole at a balance ≥ 0 and debits its full size, so it never waits for its own size and is never split. Answers wait in arrival order. Without it, ten Macs each requesting a 99-event replay every 30 s would send about 13 KB/s on the shared sync topic (Codex, PR #13).
+- **Byte bucket on `events` answers (P4).** One bucket covers `sync/events` and the events `SyncEnd`s on `sync/end` (which replaced `sync/events_fallback`), not live `events`, which stays under 1/min. It refills at 3 KB/s up to 48 KB, one full fallback (≤ 120 messages × 396 B). An answer is admitted whole at a balance ≥ 0 and debits its full size, so it never waits for its own size and is never split. Answers wait in arrival order. Without it, ten Macs each requesting a 99-event replay every 30 s would send about 13 KB/s on the shared sync topic (Codex, PR #13).
 - **Byte bucket on `map_bricks` (P15).** One bucket covers the live topic and `sync/map_bricks`. It refills at 3 KB/s up to 180 KB.
   - **Admission.** A message may go out whenever the balance is ≥ 0 and its other limits allow (0.2 Hz for deltas, P4 for snapshot answers). It debits its full size, even if that takes the balance negative.
   - **Debt is bounded.** P15 makes protocol §7's 2 MB snapshot cap a node rule: the node never publishes a `MapBricks` larger than 2 MB on the wire. The protocol's own validity limit is D22's 16 MiB uncompressed payload, which is larger, so this rule is P15's, not the protocol's.
@@ -296,7 +298,7 @@ Small messages pay 2–3× their size in headers, which is why §3.2 counts wire
     - the state of an accepted event. Its ACCEPTED transition is held with the delta that carries the change, and published right after that delta, with its `map_epoch` (protocol §4.2). Until then the event is CONFIRMED on the wire and counts in `n_open_events`.
 
     Three failures are avoided this way.
-    - If status reported the working epoch, D20 would mark every Mac STALE 2 s into each hold. Each Mac would then request, and get a "nothing missed" snapshot that the bucket also gates.
+    - If status reported the working epoch, D20 would mark every Mac STALE 2 s into each hold. Each Mac would then request, and get a "nothing missed" answer (a snapshot under D23, an empty `SyncEnd` under D36) that the bucket also gates.
     - If a snapshot answer carried the working map, the held delta, whose base is the published epoch, would no longer chain from it, and every Mac would resync again.
     - If ACCEPTED went out at once, every Mac would remove the change's overlay while its map still lacked the change. It would look CURRENT with the old geometry and no overlay for the whole hold, up to ~10 min.
   - **Live snapshots.** A live snapshot, under P7 or a keyframe (protocol D29), publishes the working reference. It supersedes any held delta, which is discarded unpublished. The ACCEPTED transitions held with that delta are published right after the snapshot.
@@ -324,9 +326,9 @@ The part this design adds is the explicit chain:
 
 ### 4.2 Recap of the rules Phase 3 relies on
 
-- **`seq`.** Protocol §5's `seq` rule (D23) is the only statement of how `seq` orders messages, how duplicates are ignored, and how a node restart starts a new generation. This doc does not restate it. Its terms (baseline, generation, cases 1–3) are used as defined there.
+- **`seq`.** Protocol §5 is the only statement of how `seq` orders messages within a publisher generation, how duplicates are ignored, and how a node restart starts a new publisher generation (D34, D37). This doc does not restate it. D23's restart cases 1–3, which this doc used to cite, are superseded.
 - **`map_epoch`.** It only grows along a delta chain. A delta applies only on `base_epoch` = the mirror's epoch and `seq` = baseline + 1 (protocol §3.1).
-- **Not chaining.** A gap, a wrong base or a new generation makes the map STALE (protocol §5).
+- **Not chaining.** A gap, a wrong base or a new publisher generation makes the map STALE (protocol §5).
 - **STALE.** While STALE, the Mac keeps its last good mirror greyed and labelled "resyncing", and never shows it as current. This is protocol §5's rule. It replaces the brief's older "discard local state".
 - **Lost trailing delta.** `MemoryStatus.map_epoch` ≠ the mirror's epoch on 2 consecutive status messages catches it (D20).
 
@@ -334,28 +336,18 @@ The part this design adds is the explicit chain:
 
 **Mac.**
 1. Open the socket. Read `serverInfo` and `advertise`. A mirror kept from an earlier connection has been STALE, greyed, since that socket closed (§5.2). It cannot prove it is current across a gap of unknown length.
-2. Check the schema fingerprint of each memory channel (§4.10). On a mismatch, stop at INCOMPATIBLE.
+2. Check the schema fingerprint of each memory channel (§4.10). On a mismatch, stop at INCOMPATIBLE. (Not for the publisher-generation fields: they were appended without a new major, and the decoder tells legacy from v2 by trailing bytes, §4.10 note.)
 3. Subscribe to all eight S→M topics in one `subscribe` message.
    - The sync subscriptions stay up for the whole connection.
    - A subscription made only when a request goes out could miss its answer, because the Mac cannot observe when the bridge's ROS subscription has matched.
-4. Send one `RequestSync` per topic through `:8766` (P11), **immediately** (P8).
-   - **`since` is the topic's saved baseline** (protocol §5's `seq` rule). For `TOPIC_MAP_BRICKS` it is the retained mirror's epoch and baseline. For `TOPIC_EVENTS` it is the (`map_epoch`, `seq`) of the message at the events baseline. The two topics' baselines are independent: a Mac may hold one and not the other.
-   - **`SINCE_NONE` only without a usable baseline.** A baseline is usable when all of these hold:
-     - it was taken on the same `room_id` and protocol major;
-     - no new generation has cleared it;
-     - case 3 of the `seq` rule confirms the node did not restart while the Mac was away. On reconnect, before this step, the Mac reads `node_started_at` from `:8766` (P10) once. If it differs from the value saved with the baseline, or cannot be read, the baseline is not usable.
-
-     Protocol §5 explains why a baseline cannot cross a disconnect without that check.
-
-     Nothing is persisted (§2.1), so every app launch starts with `SINCE_NONE`.
-   - **What the Spark answers** (protocol §5).
-     - Events: a replay of the missed messages (protocol §5). The bounded fallback, announced by its `EventsFallback` header (P17), and its INCOMPLETE marking are used only when the baseline is not among the 100 kept messages.
-     - Map: a replay when 1–9 deltas were missed. With none missed, protocol §5's replay rule needs "at least one message follows", so the answer is a snapshot. A short blip therefore still costs one snapshot on the map topic. What a saved baseline always saves is the events fallback.
-   - **When a request is done,** for P3's backoff and protocol §5's 5 s repeat:
-     - Map: when the map is CURRENT. `MemoryStatus.map_epoch` is the map's high-water mark, so a Mac that missed deltas stays STALE until it has applied them, even if no later delta arrives.
-     - Events, replay: when the baseline has reached both the newest live `seq` seen and the request's mark: the `events_seq` of the first `MemoryStatus` received during the request whose `seq` is above that of an earlier one received during it (protocol §5). A cached status copy delivered twice repeats its `seq`, so it cannot set the mark. `events_seq` is the events high-water mark, as `map_epoch` is the map's. Example: a Mac that disconnects at 10 and misses 11–12 may reconnect after events stop, so its newest live `seq` is still 10, equal to its baseline. The request would then be done at once, and 11–12 would be ignored as answers to no request. `events_seq` = 12 keeps it open until they are applied. Nothing depends on where an answer ends or which Mac it was for, so a lost or foreign sync message cannot close a request early.
-     - Events, fallback: by the same condition. The baseline crosses the `seq`s a fallback cannot fill only once the Mac holds an `EventsFallback` header for a `since` it sent, has received every `seq` that header names, and has received the header's last kept `seq` on the sync topic itself (protocol §5, P17). That sync copy shows no earlier answer is still in flight. It then moves up to the header's last kept `seq` and past the messages remembered above it, and the history stays INCOMPLETE. Neither another Mac's answer arriving first nor live progress nor the mark gives up a gap. Events published after the answer arrive live, so a fallback ends even while events keep coming.
-     - An answer that has not arrived within 5 s is repeated, as protocol §5 says. A lost answer message or header is recovered the same way, because it leaves the baseline below the mark.
+4. Send one `RequestSync` per topic through `:8766` (P11), as soon as the connection's first `MemoryStatus` names the publisher generation (P8 as revised by D37; `status` is transient_local, so that is near-immediate).
+   - **`expected_generation` is that generation, and each send carries a fresh `request_token`** (D35). The Spark honours `since` only when `expected_generation` equals its own generation; otherwise it answers as for `SINCE_NONE` in its generation.
+   - **`since`** is the top of what the Mac holds in that generation: for `TOPIC_MAP_BRICKS` the mirror's epoch and applied `seq`, for `TOPIC_EVENTS` the (`map_epoch`, `seq`) of the top of the contiguous received run. `SINCE_NONE` when it holds nothing there (protocol §5). The two topics are independent.
+     - Nothing is persisted (§2.1), so every app launch starts with `SINCE_NONE`.
+     - *Superseded:* the usable-baseline check, which read `node_started_at` from `:8766` before this step (D23's case 3). The generation in every message replaces it, and `node_started_at` (P10) is diagnostics only.
+   - **What the Spark answers** (protocol §5, PLAN-PUBGEN §2.3). Events: a replay of the missed messages, or the bounded fallback when `since` is not among the 100 kept messages. Map: a replay when 1–9 deltas were missed, nothing when none were (no longer a snapshot), else a snapshot. Every answer, including an empty one, is followed by one `SyncEnd` on `/room_memory/sync/end` (D36). It names the `bound`, the `delivered` ranges and, for an events fallback, the `unavailable` ones. It travels on its own topic and can arrive before the answer's messages.
+   - **When a request is done** (P3's backoff): only once the Mac has received what the `SyncEnd` for its own token names: every `delivered` event `seq`, or a map chain at or past the manifest (protocol §5, D36). No timer, request flag, quiet period or live progress completes it. A retrieval that times out (5, 10, 20, 30 s) is sent again with a fresh token. A `SyncEnd`'s `bound` and `unavailable` ranges are publisher facts, recorded from any `SyncEnd` of the generation, whoever asked; a foreign token changes no retrieval.
+     - *Superseded:* the three completion rules that stood here: map done at CURRENT, events done at D26's request mark, and a fallback given up only on a matching `EventsFallback` header whose last kept `seq` had arrived on the sync topic (D27). Protocol D26 and D27 keep them as history.
    - Protocol §5 says to wait up to 5 s for the Spark's own snapshot first.
    - The node cannot see a connect through a bridge: the bridge holds one ROS subscription per channel for all clients, created by the first ([F2]). So only the first client ever triggers the node's "matched" event ([R1]).
 5. The map is CURRENT when protocol §5's condition holds.
@@ -363,12 +355,12 @@ The part this design adds is the explicit chain:
 **Why `map_bricks` and `events` stay volatile.**
 - For transient_local topics, the bridge caches the last N messages per publisher, with N the publisher's depth. It replays them when a later client subscribes ([F2]).
 - The replay is logged to the WebSocket server's sink, not to one connection. Whether clients that are already subscribed receive it too is not settled (V2).
-- If they do, a cached old message would reach a Mac that is already CURRENT on the live topic, with a `seq` below the highest it has received. Protocol §5's `seq` rule reads that as a new generation (case 1), because it relies on live `map_bricks` and `events` being volatile. Every connected Mac would drop to STALE and resync whenever another client subscribed. (Under the old "a snapshot is always accepted" it was worse: the cached snapshot would have rewound the Mac and shown the old map as current.)
+- If they do, a cached old message would reach a Mac that is already CURRENT on the live topic, with a `seq` below the highest it has received. Under D37 it carries the same publisher generation and is ignored as a duplicate or an older message, never a restart signal. (Under D23's case 1 it read as a new generation, and every connected Mac would have dropped to STALE and resynced whenever another client subscribed. Under the old "a snapshot is always accepted" it was worse: the cached snapshot would have rewound the Mac and shown the old map as current.)
 - A latched burst plus a request answer would also make each connect pay for the map twice.
 
 So the request is the one connect mechanism.
 
-**Status and epoch (P2, now protocol §2 and D24).** `status` and `epoch` are full-state messages with depth 1, and they are transient_local, so a new client shows the memory state on connect instead of after up to 5 s. A copy delivered twice is harmless. The `seq` rule ignores it, case 2 of that rule (protocol §5) cannot mistake it for a restart, and D20's epoch check needs two consecutive disagreeing messages. §2.5 is the node change.
+**Status and epoch (P2, now protocol §2 and D24).** `status` and `epoch` are full-state messages with depth 1, and they are transient_local, so a new client shows the memory state on connect instead of after up to 5 s. A copy delivered twice is harmless. A status with a `seq` at or below the one held is a duplicate, never a generation signal (protocol §5, D37), and D20's epoch check needs two consecutive disagreeing messages. §2.5 is the node change.
 
 **Keyframes (P1, now protocol D29 in PR #14).** The node publishes a live snapshot every `keyframe_period_s` (60 s), whatever the requests do.
 - A Mac whose request path fails still gets a current map within 60 s. That includes a failure the Spark cannot see, such as one Mac's ssh tunnel down while the relay serves the others. So the keyframes stay on when the relay works.
@@ -392,8 +384,9 @@ Compared with the bridge's `clientPublish`:
 `OperatorAction` (protocol §3.6) uses the same relay.
 
 **Answers** follow protocol §5:
-- **Replay**, if the requested `seq` is in the ring buffer and the epoch matches.
-- Otherwise a **snapshot** for maps, or the **bounded fallback** for events, preceded by its `EventsFallback` header (P17).
+- **Replay**, if `expected_generation` is the node's generation (D35), the requested `seq` is in the ring buffer and the epoch matches. Nothing, if the map `since` is already the newest.
+- Otherwise a **snapshot** for maps, or the **bounded fallback** for events.
+- Every answer is followed by its `SyncEnd` on `/room_memory/sync/end` (D36), which names what was delivered and what is unavailable. (It replaces P17's `EventsFallback` header, which preceded a fallback.)
 
 **Validation on the Spark.** A request is dropped and logged unless all of these hold:
 - `room_id` is the served room.
@@ -404,21 +397,24 @@ This is symmetric with the Mac's validation (D16).
 
 **Rate limits.**
 - **Mac (P3).** At most one request per topic per 5 s (protocol §5). While consecutive requests end without CURRENT, the interval backs off 5 → 10 → 20 → 30 s.
-- **Spark (P4).** At most one *snapshot* answer per topic per 15 s across all clients. A request inside the window is served in the next slot. Map replays (≤ 9 deltas) are not capped by P4; the `map_bricks` bucket (§3.3) covers them. Every `events` answer, replay or fallback with its header, goes through the events bucket (§3.3), shared by all clients. A request repeated with the same `since` while its answer still waits is answered once.
+- **Spark (P4).** At most one *snapshot* answer per topic per 15 s across all clients. A request inside the window is served in the next slot. Map replays (≤ 9 deltas) are not capped by P4; the `map_bricks` bucket (§3.3) covers them. Every `events` answer, replay or fallback with its `SyncEnd`, goes through the events bucket (§3.3), shared by all clients. A request repeated with the same `since` while its answer still waits is answered once.
 - **Together** these bound a storm at 65 KB + 48 KB per 15 s, about 7.5 KB/s. Once their bursts are spent, the `map_bricks` bucket and the events bucket (§3.3) hold the two shares to 3 KB/s each, so a long storm runs at about 6 KB/s, however many Macs request. For larger maps the map bucket, not P4, is the binding limit.
   - That is still over 5 KB/s while the storm lasts.
   - The hourly mean stays in budget unless there are more than ~40 storms an hour.
   - The soak (§7.5) reports both figures.
 
-**Node restart (P13, now protocol §5's `seq` rule, D23).** After a restart the node's `seq` starts again at 0. The protocol used to say both that a snapshot "is always accepted" and that a sync message "with `seq` ≤ the last applied is ignored", and those two rules collided after a restart. Protocol §5 now states one `seq` rule with generations, and this doc only says where Phase 3 plugs into it:
-- **While connected,** the Mac sees a restart through cases 1 and 2 of the rule, within about 2 s even in a static room.
-- **Across a disconnect,** `node_started_at` (P10) is the rule's case 3. It decides whether a saved baseline is usable (§4.3).
-- **A fallback** is recognized only by its `EventsFallback` header, matched on the request's `since` (protocol §5, P17; §4.3).
+**Node restart (P13, now protocol §5, D34 and D37; D23's restart cases superseded).** After a restart the node's `seq` starts again at 0. The protocol used to say both that a snapshot "is always accepted" and that a sync message "with `seq` ≤ the last applied is ignored", and those two rules collided after a restart. Protocol §5 now scopes every `seq` to a publisher generation, and this doc only says where Phase 3 plugs into it:
+- **Every start allocates a higher publisher generation** (durable, wall-clock floored, PLAN-PUBGEN §3), and every stateful message carries it (D34). The Mac's mirror is scoped to one generation: a higher one is installed on its first validated message and the old one archived, a lower one is ignored (D37). This holds the same while connected and across a disconnect, and it still tells a restart from a continuation when the new run's counters have passed the old ones.
+- **Nothing is inferred from counters.** A lower `seq`, an `events_seq` of `EVENTS_SEQ_NONE`, or a changed `node_started_at` is not a restart signal. `node_started_at` (P10) is diagnostics only.
+- **A fallback** is no longer recognized by a header. The answer's `SyncEnd` (D36) names its delivered and unavailable ranges, and a retrieval completes only by receipt of what the manifest names (§4.3).
+- **A publisher generation is not a `room_id` generation.** P9's `lab` → `lab~2` renames the room when its frame moves; a publisher generation numbers the node processes that publish one `room_id`.
+- *Superseded:* D23's cases 1 and 2 (a lower `seq` while connected, seen within about 2 s) and case 3 (`node_started_at` across a disconnect), and P17's `EventsFallback` header matched on the request's `since`.
 
 ### 4.5 Event history across a disconnect
 
 - The Spark keeps 100 event messages. Older history reaches a reconnecting Mac only through the bounded fallback: the latest message of each open event, then the 100 kept (protocol §5).
-- Older closed history is not resent. The Mac marks it "incomplete since \<stamp\>" and never invents transitions.
+- Older closed history is not resent. The fallback's `SyncEnd` names those `seq`s `unavailable`, and the Mac shows them as lost ("history incomplete: n missing (k lost on the Spark)", PLAN-PUBGEN §4.8). It never invents transitions.
+- Across a node restart, the earlier run's history is archived, not merged: "Spark node restarted · events from the earlier run may be missing", with its open events listed as "earlier run · may be outdated" (D37).
 - A full history read is not a streaming concern. If it is wanted (Q8), it belongs on `:8766` as a paged HTTP read of the event log, outside the 5 KB/s, on demand.
 
 ### 4.6 Compression (D9)
@@ -442,15 +438,15 @@ This is symmetric with the Mac's validation (D16).
 | event | what the Mac sees | recovery | wrong-current possible? |
 |---|---|---|---|
 | Wi-Fi blip shorter than the TCP timeout | late messages, nothing lost | none | no |
-| Socket drop and reconnect; node did not restart | the mirror goes STALE, greyed, on close; the first live `map_bricks` may be a delta | per-topic requests with the saved `since = (epoch, seq)` (§4.3): map replay if 1–9 deltas behind, else a snapshot (including when none were missed); events replay, so the history stays COMPLETE if the baseline is among the 100 kept | no |
-| Dedicated bridge restarts; node keeps running | close; on return `seq` continues | as above; replay usually succeeds | no |
-| Node restarts; bridge keeps running | `seq` starts again at 0: case 1 or 2 of protocol §5's `seq` rule | new generation (protocol §5's `seq` rule): baselines cleared (an old message still in flight can cause one more, spurious, new generation; snapshots are ordered by epoch first), map STALE, both requests with `SINCE_NONE`; snapshot answer | no |
-| Node restarted while the Mac was away | `node_started_at` on `:8766` differs from the baseline's | both requests use `SINCE_NONE` (§4.3): the snapshot, applied on the cleared baseline, and the events fallback; the greyed mirror stays until the snapshot | no |
+| Socket drop and reconnect; node did not restart | the mirror goes STALE, greyed, on close; the first live `map_bricks` may be a delta | per-topic requests in the same publisher generation with `since = (epoch, seq)` (§4.3): map replay if 1–9 deltas behind, nothing if none were missed, else a snapshot; events replay, so the history stays complete if `since` is among the 100 kept; each answer ends with its `SyncEnd` | no |
+| Dedicated bridge restarts; node keeps running | close; on return the publisher generation is unchanged and `seq` continues | as above; replay usually succeeds | no |
+| Node restarts; bridge keeps running | the next message carries a higher publisher generation | the mirror installs the new publisher generation and archives the old one (D37); old-generation messages still in flight are ignored; restart notice; map STALE (the earlier run's bricks greyed) until a snapshot of the new generation; requests with the new `expected_generation` | no |
+| Node restarted while the Mac was away | the first message after the reconnect carries a higher publisher generation, even if its counters passed the old ones | as the row above; nothing is read from `:8766` (`node_started_at` is diagnostics only) | no |
 | Bridge backlog overflow (> 1024 queued messages for this client) | the oldest messages are dropped → `seq` gap | replay or snapshot; overflow counted (§7.5) | no |
 | Mac sleep/wake | TCP looks open; nothing arrives | status stale at 3 s; socket closed and redialled after 10 s of silence | no |
 | Lost trailing delta | nothing until status disagrees | `MemoryStatus.map_epoch` ≠ mirror twice → STALE → request (D20) | no |
 | Mac decode backlog | messages queue in the app | decode off the main thread, as LIVE does; freshness uses the Mac's receive time, so a backlog shows as stale | no |
-| A second Mac connects while the first is CURRENT | snapshot answers on the shared sync topic; possibly the bridge's stored `status`/`epoch` copy again (V2) | the first Mac has no request outstanding and ignores the answers; the `seq` rule ignores the copy (protocol §5) | no |
+| A second Mac connects while the first is CURRENT | snapshot answers on the shared sync topic; possibly the bridge's stored `status`/`epoch` copy again (V2) | the answers apply to the first Mac as any message of the generation would (duplicates ignored); a foreign `SyncEnd` adds only publisher facts (`bound`, `unavailable`, D36); the `seq` rule ignores the copy (protocol §5) | no |
 
 §7 tests the last column. Every row must stay "no" under fault injection.
 
@@ -495,6 +491,8 @@ The rig-pose guard is PR 2.3 and not built yet. Phase 3 defines what crosses the
 ### 4.10 Versioning
 
 XCDR1 has no extensibility. Decoders reject 4 or more unread trailing bytes and unknown enum values (protocol §1.1, D3). So **every field or enum change is a breaking change**, and the scheme is built around that.
+
+*Note (2026-10-16).* The publisher-generation change (D34–D36) did not use this scheme. Its fields are appended at the end of each message, a decoder tells the legacy layout from the v2 one by the trailing bytes, the topic names are unchanged, and a Mac facing an old node runs in legacy mode, not INCOMPATIBLE (PLAN-PUBGEN §2.1, §4.6). The client needs no schema text for it: `FoxgloveProtocol.Channel` carries none today. The scheme below still applies to any other breaking change.
 
 1. **Schema fingerprint at advertise time** (no wire cost).
    - Each advertised channel carries `schemaName` (e.g. `labcommand_msgs/msg/MapBricks`), `schemaEncoding` and the definition text ([F2]).
@@ -548,7 +546,7 @@ Everything below is in `MemoryMirror`, so it is testable without a socket.
   EMPTY ──────────────────▶ CURRENT ◀──────────────────────────────────┐
     │                          │  ─────────────────────────────────────┘
     │ delta first after connect│ socket closed · seq gap · wrong base · delta first after connect ·
-    ▼                          │ status epoch ≠ mirror ×2 · map_digest mismatch · new generation (protocol §5)
+    ▼                          │ status epoch ≠ mirror ×2 · map_digest mismatch · new publisher generation (D37)
   STALE(no mirror) ◀───────────┴──────────────▶ STALE(last good mirror, greyed)
     │  RequestSync since=NONE            │  RequestSync since=(epoch, seq) or NONE; P3 backoff
     └──────── snapshot ─────▶ CURRENT ◀──┴── snapshot (seq ≥ baseline), or a replay that chains to the newest live seq and status epoch
@@ -565,9 +563,9 @@ Change overlays are drawn only in CURRENT.
 
 **Socket closed.** A CURRENT map goes STALE with its mirror kept, and the mirror's epoch and `seq` become the next connection's `since` (§4.3).
 - Without this step, `status` would be fresh the moment the socket reopens (transient_local, protocol §2). A mirror that missed deltas would then render as current for up to 2 s, until D20 caught it.
-- The next map request uses `SINCE_NONE` only when the baseline stops being usable (§4.3).
+- The next map request uses `SINCE_NONE` only when the Mac holds nothing in the current publisher generation (§4.3).
   - On a `room_id` or protocol-major change, the old mirror is dropped and the map is EMPTY.
-  - On a new generation (protocol §5's `seq` rule), the mirror stays greyed as the last good map until the snapshot replaces it.
+  - On a new publisher generation (D37), the earlier run's map stays greyed as the last good map until a snapshot of the new generation replaces it.
 
 ### 5.3 Events
 
@@ -576,7 +574,7 @@ Change overlays are drawn only in CURRENT.
 | COMPLETE | contiguous `seq` across connections, since the first message after launch, with every gap closed by a replay | normal |
 | INCOMPLETE(since t) | a gap; a new generation; a fallback answer (protocol §5); or a socket close, until the reconnect's replay is done (§4.3: the baseline has reached the newest live `seq` and the request's mark, taken from `MemoryStatus.events_seq`) | history "incomplete since t"; open events "may be outdated" until their next transition |
 
-A fallback answer sets a new baseline, only through its header (protocol §5, P17), and the history it leaves stays INCOMPLETE. Only the replay that answers a reconnect clears the INCOMPLETE that the close set. A request sent with `SINCE_NONE`, after a new generation or a reconnect without a restart signal, clears nothing (protocol §5).
+*Superseded by D37.* The two states above, the header-driven fallback baseline (P17) and the mark-driven close (D26) are replaced by `EventHistory` (PLAN-PUBGEN §4.2, §4.4; protocol §5). Per publisher generation it reports coverage (`unknown`, `empty`, `completeThrough(n)`, or `missing` with pending and lost ranges), continuity across generations (`verified`, `broken`, `unknown` in legacy mode) and `caughtUp`. Coverage grows only by receipt, and a `seq` is lost only when a `SyncEnd` names it `unavailable` (D36).
 
 ### 5.4 Composite rendering
 
@@ -601,10 +599,10 @@ When several conditions hold at once, the banner shows the first that applies:
 3. No message is partly applied (protocol §6 rule 9).
 4. Only CONFIRMED renders as a change (protocol §6 rule 7). An ACCEPTED event's overlay is removed only once the mirror's epoch is ≥ that event's `map_epoch` (protocol §4.2).
 5. An event's state changes only on a message newer, in `seq`, than the last one applied to it, and only by a legal transition. An older message filled in by a replay goes to history only (protocol §5's per-event order). A violation keeps the last legal state (protocol §4).
-6. The events baseline crosses a `seq` the Mac has not received only by a matching `EventsFallback` header, once every `seq` it names has arrived and its last kept `seq` has arrived on `/room_memory/sync/events` (protocol §5).
+6. Event coverage grows only by receipt of a message of the active publisher generation. A retrieval completes only once everything its own `SyncEnd` names has arrived, and a `seq` reads as lost only when a `SyncEnd` of that generation names it `unavailable` (protocol §5, D36, D37). (This replaces the earlier `EventsFallback` header invariant, D27.)
 7. The mirror's memory is bounded:
    - one map, ≤ 16 MiB raw (D22);
-   - an event list capped at 10,000 events, with older ones dropped and the history marked incomplete.
+   - an event list capped at 10,000 events, with older ones dropped. Dropping a display entry never changes coverage; coverage reads `unknown` only once the received-`seq` set outgrows its interval cap (PLAN-PUBGEN §4.4 invariant 11).
 
 ## 6. Failure modes
 
@@ -613,7 +611,7 @@ When several conditions hold at once, the banner shows the first that applies:
 | F1 | Tailscale path falls back from direct to a DERP relay, "a last resort" ([T3]) | higher RTT; no protocol signal | none at 5 KB/s; a snapshot takes longer | none needed; soak logs the path type (`tailscale status`) |
 | F2 | Tailnet down or Spark offline | socket and `:8766` fail | "connection lost"; map greyed STALE | P3 backoff |
 | F3 | Dedicated bridge crashed or restarted | socket close | as F2, for seconds | §4.8 row 3 |
-| F4 | `room_memory_cpp` crashed or restarted | topics unadvertised (UNAVAILABLE), then `seq` drops | "Room memory not running on Spark", then STALE → snapshot | new generation (protocol §5's `seq` rule); reference and epoch reload from disk |
+| F4 | `room_memory_cpp` crashed or restarted | topics unadvertised (UNAVAILABLE), then messages with a higher publisher generation (D34) | "Room memory not running on Spark", then the restart notice and STALE → snapshot | the mirror installs the new publisher generation (protocol §5, D37); reference and epoch reload from disk, the generation is allocated anew |
 | F5 | Bridge backlog overflow on the memory socket | `seq` gap | STALE briefly | replay or snapshot. At ~1.2 messages/s, 1024 queued messages means ~14 min of the Mac not reading, so recurrence means a stuck client, not load |
 | F6 | Lost trailing delta | status epoch mismatch ×2 (D20) | STALE within 2 s | request |
 | F7 | Malformed or out-of-contract message | decoder throws | diagnostics count; STALE if it was on `map_bricks` | resync. Any non-zero count in a soak fails the stage |
@@ -634,13 +632,15 @@ When several conditions hold at once, the banner shows the first that applies:
 
 | fixture | source | used by |
 |---|---|---|
-| 12 hand CDR goldens | `Tests/Fixtures/room/golden/hand/` (protocol §9) | codec tests (exist) |
+| hand CDR goldens, legacy and v2 (incl. `SyncEnd`) | `Tests/Fixtures/room/golden/hand/` (protocol §9) | codec tests (exist) |
 | Spark CDR goldens | `scripts/spark/make_room_memory_goldens.py` with `rclpy` in the Jazzy container (Trevor runs it) | confirm D4; gate for S3 |
 | Session traces | the C++ `tools/replay.cpp` (or the Python oracle) runs scripted `RoomMemory` sessions over the Phase 0 scenes: box added, removed and moved; walk-through; rig shifted. It writes every published message with topic, `seq` and bytes, as length-prefixed records under `Tests/Fixtures/room/sessions/` | `MemoryMirror` replay and fault tests |
 | Bridge transcript | `serverInfo`, `advertise` and a few binary frames from the pinned 3.4.1 bridge, captured at S1 | fingerprint constants, advertise parsing, byte accounting |
 | Lidar MCAP bags | `ros2 bag record` of both lidar topics on the rig, including the 12 Oct box takes (brief Q4). MCAP is the default storage on Jazzy ([B1]) | S1/S2 replay with `ros2 bag play` |
 
 ### 7.2 Mac unit and property tests (`LabCommandCoreTestsRunner`)
+
+*Superseded in part.* The request-mark, fallback-header and spurious-new-generation cases below were written for D26, D27 and D23's restart cases. PLAN-PUBGEN §6 replaces them with a reference model, seeded traces and regression seeds for the generation-scoped mirror (D37). They are kept as the record of what each Codex round found.
 
 - **Table tests.** One per row of §4.8, and each §5 transition. Also:
   - A reconnect sends each topic's saved `since`, not `SINCE_NONE`, and a replay that closes the gap leaves the events COMPLETE.
@@ -656,7 +656,7 @@ When several conditions hold at once, the banner shows the first that applies:
   - ACCEPT while the bucket holds a delta: the event stays CONFIRMED with its overlay until the delta arrives, then ACCEPTED removes the overlay. An ACCEPTED that arrives before its delta keeps the region outlined "accepted · map updating".
 - **Fault-injection property test.**
   - Take a session trace.
-  - Apply a seeded random schedule of: drop; duplicate; reorder within 10; truncate one message; reconnect with `seq` continuing; node restart (`seq` reset, `map_epoch` + 1, as the node does with its state directory, protocol §5); an old snapshot answer arriving after a restart was recognized (the new snapshot must replace it, epoch first); an old `status` or live message arriving after the reset (one more, spurious, new generation that recovers); epoch jump; wrong `room_id`; fallback answers; lost, late or foreign fallback headers; snapshot answers meant for another Mac; a relay that fails.
+  - Apply a seeded random schedule of: drop; duplicate; reorder within 10; truncate one message; reconnect with `seq` continuing; node restart (`seq` reset, `map_epoch` + 1, as the node does with its state directory, protocol §5); an old snapshot answer arriving after a restart was recognized (the new snapshot must replace it, epoch first); an old `status` or live message arriving after the reset (one more, spurious, new generation that recovers); epoch jump; wrong `room_id`; fallback answers; lost, late or foreign `SyncEnd`s (formerly fallback headers); snapshot answers meant for another Mac; a relay that fails.
   - Run 10,000 schedules, and assert §5.5's invariants 1–6 after every step.
   - Once faults stop, assert the mirror reaches CURRENT within a bounded number of requests.
   - The oracle is the trace's own state at each `seq`.
@@ -764,11 +764,11 @@ Each stage has an owner, go/no-go criteria and a rollback.
 
 **Spark data rollback.**
 - Before a re-reference, the node renames the current `reference.cdr` (§2.3) to `reference.<epoch>.cdr`, keeping the last 5. Until the migration of §2.3, the per-sensor `reference-<sensor>.cdr` files are renamed together, to `reference-<sensor>.<epoch>.cdr`.
-- Restoring one is a rename and a node restart. The room's `map_epoch` file is not rolled back, so the restored reference loads under the next epoch (protocol §5). The restart is a new generation, so every Mac resyncs (protocol §5's `seq` rule).
+- Restoring one is a rename and a node restart. The room's `map_epoch` file is not rolled back, so the restored reference loads under the next epoch (protocol §5). The restart allocates a new publisher generation, so every Mac installs it and resyncs (D34, D37).
 
 ## 10. Proposed amendments (for Trevor and Codex)
 
-None of these is in effect until accepted. Each would change `ROOM-MEMORY-PROTOCOL.md`, `command_center.py` or the deployment in its own PR. There is one exception: P2, P6, P13, P16 and P17 are written into the protocol draft by this PR, as D24, D25, D23, D26 and D27, still for review. No node code changes with them.
+None of these is in effect until accepted. Each would change `ROOM-MEMORY-PROTOCOL.md`, `command_center.py` or the deployment in its own PR. There is one exception: P2, P6, P13, P16 and P17 are written into the protocol draft by this PR, as D24, D25, D23, D26 and D27, still for review. No node code changes with them. **Since superseded in part by protocol v2 (PLAN-PUBGEN, D34–D37):** P13's restart cases, P16's request mark and P17 as a whole; see each row.
 
 | id | change | where | why |
 |---|---|---|---|
@@ -779,16 +779,16 @@ None of these is in effect until accepted. Each would change `ROOM-MEMORY-PROTOC
 | P5 | No `mask` on CANDIDATE transitions | protocol §3.2 (allowed; this makes it the rule) | walk-throughs would otherwise cost 2–3 KB/s |
 | P6 | New `OperatorAction` message and `/room_memory/operator` topic (§4.11). **Written into protocol §3.6 and `OperatorAction.msg` by PR #13 (D25).** Codecs, goldens and the node handler remain (S5) | protocol §2, §3.6 (D25) | acknowledge, accept, dismiss, label, ground truth, pause, resume, re-reference |
 | P7 | A snapshot instead of a delta whose payload would exceed half a snapshot's | protocol §3.1 | a large delta costs more than a snapshot and cannot be replayed cheaply |
-| P8 | The Mac requests right after subscribing, without the 5 s wait, with each topic's saved `since` (`SINCE_NONE` only without a usable baseline, §4.3) | protocol §5 | the node cannot see a later client's connect through a shared bridge subscription (§4.3) |
+| P8 | The Mac requests right after subscribing, without the 5 s wait, with each topic's saved `since` (`SINCE_NONE` only without a usable baseline, §4.3). **Revised by D37:** right after the connection's first status names the publisher generation, with `expected_generation` and a fresh token (D35) | protocol §5 | the node cannot see a later client's connect through a shared bridge subscription (§4.3) |
 | P9 | Re-referencing after RIG_MOVED without alignment starts a new `room_id` generation | protocol §1.2, §4.1 | pre-move events are in a different frame (§4.9) |
-| P10 | `:8766` `room_memory` block with `node_started_at` and `map_digest` (§2.4) | `command_center.py` | identity, versions and an end-to-end consistency check at no stream cost |
+| P10 | `:8766` `room_memory` block with `node_started_at` and `map_digest` (§2.4). **`node_started_at` is diagnostics only since D34** | `command_center.py` | identity, versions and an end-to-end consistency check at no stream cost |
 | P11 | `RequestSync` and `OperatorAction` carried over `:8766` and relayed on the Spark, instead of bridge `clientPublish` | protocol D19, `command_center.py` | `client_topic_whitelist` is not enforced, so the bridge stays read-only; ssh authenticates the caller |
 | P12 | A dedicated read-only foxglove_bridge in the room-memory container on its own port | protocol §2, D28 (open: Q5) | the bridge needs `labcommand_msgs`; LIVE untouched; tight whitelist; one-container rollback |
-| P13 | One `seq` rule with publisher generations, replacing the two rules that collided; `node_started_at` (P10) is its out-of-band restart signal. **Written into protocol §5 by PR #13 (D23), and stated only there** | protocol §5, D23 | after a node restart the old "always accepted" and "`seq` ≤ last applied is ignored" rules collided and left the Mac STALE. Accepting any snapshot instead would let another Mac's older answer rewind a current Mac |
+| P13 | One `seq` rule with publisher generations, replacing the two rules that collided; `node_started_at` (P10) is its out-of-band restart signal. **Written into protocol §5 by PR #13 (D23), and stated only there.** **Superseded in part by D34 and D37:** restart detection is the publisher generation in every stateful message; `node_started_at` is diagnostics only, no longer case 3 | protocol §5, D23, D34, D37 | after a node restart the old "always accepted" and "`seq` ≤ last applied is ignored" rules collided and left the Mac STALE. Accepting any snapshot instead would let another Mac's older answer rewind a current Mac |
 | P14 | One fixed room frame per `room_id`. Each sensor's points and ray origin are transformed by a stored `T_room←sensor` before integration, and every published coordinate is in that frame. Until the JT128↔Mid-360 extrinsic exists, only `frame_sensor` contributes geometry. A changed `T_room←frame_sensor` is a new `room_id` generation, and a changed transform for the other sensor rebuilds the reference | protocol §1.2, D17; PR 2.2, 2.4 | both sensors otherwise publish in their own frames, which `MapBricks` cannot tell apart (§4.9). Needs no wire change |
 | P15 | `map_bricks` byte bucket: 3 KB/s, 180 KB burst. A message is admitted at balance ≥ 0 and debits its full size. The node never publishes a `MapBricks` over 2 MB (protocol §7's cap made a node rule), so debt stays under 2 MB. A larger map is reported on `:8766`, not published. Held deltas are coalesced. `map_epoch`, `map_digest`, snapshot answers and the `OperatorAction` epoch check use the *published* reference while a delta is held. An ACCEPTED transition is held with the delta that carries its change and published right after it (protocol §4.2) | protocol §1.4, §3.3, §5, §7, D20; PR 2.4 | a snapshot larger than the bucket would otherwise never go out (§3.3); reporting the working epoch during a hold would trip D20 and cause resyncs; an ACCEPTED sent ahead of its delta would remove the overlay from a map that does not show the change yet |
-| P16 | Events high-water mark. `MemoryStatus` gains `uint64 events_seq`, the newest live events `seq`. An events request is done once the baseline reaches it, so completion never depends on where an answer ends. **Written into protocol §3.3 and §5 by PR #13 (D26)** | protocol §3.3, §5, D26 | without a high-water mark, a Mac that missed the last events before a quiet period would close its request at once and show a wrongly COMPLETE history (§4.3). An in-band end marker (the last message sent again) fails on the shared sync topic: after a lost marker, another Mac's answer starting at the same `seq` reads as the marker (Codex, PR #13) |
-| P17 | Events fallback header. A new `EventsFallback` message on a new `/room_memory/sync/events_fallback` topic precedes every events fallback. It copies the request's `since` and names the `seq`s the fallback sends. The Mac gives up an events gap only on a header for a `since` it sent, once every named `seq` has arrived and the last one has also arrived on the sync topic. A replay no longer re-sends the `since` message. **Written into protocol §2, §3.8 and §5 by PR #13 (D27), with `ros/labcommand_msgs/msg/EventsFallback.msg`**; the codecs and golden are not written yet: the Mac codec with `MemoryMirror` (S0), the node publisher with the `RequestSync` handler (PR 2.4) | protocol §2, §3.8, §5, D27 | inferring a fallback from an answer's first message fails on the shared sync topic: another Mac's replay arriving first, or a lost `since` message, gave up messages a replay was still bringing. Live progress up to the mark does not show a fallback has arrived, so it closed with messages in flight (Codex, PR #13) |
+| P16 | Events high-water mark. `MemoryStatus` gains `uint64 events_seq`, the newest live events `seq`. An events request is done once the baseline reaches it, so completion never depends on where an answer ends. **Written into protocol §3.3 and §5 by PR #13 (D26).** `events_seq` stays, scoped to a publisher generation; **the request mark is superseded by D36**: a request completes by receipt of what its `SyncEnd` names | protocol §3.3, §5, D26, D36 | without a high-water mark, a Mac that missed the last events before a quiet period would close its request at once and show a wrongly COMPLETE history (§4.3). An in-band end marker (the last message sent again) fails on the shared sync topic: after a lost marker, another Mac's answer starting at the same `seq` reads as the marker (Codex, PR #13) |
+| P17 | Events fallback header. A new `EventsFallback` message on a new `/room_memory/sync/events_fallback` topic precedes every events fallback. It copies the request's `since` and names the `seq`s the fallback sends. The Mac gives up an events gap only on a header for a `since` it sent, once every named `seq` has arrived and the last one has also arrived on the sync topic. A replay no longer re-sends the `since` message. **Written into protocol §2, §3.8 and §5 by PR #13 (D27), with `ros/labcommand_msgs/msg/EventsFallback.msg`**; the codecs and golden are not written yet: the Mac codec with `MemoryMirror` (S0), the node publisher with the `RequestSync` handler (PR 2.4). **Superseded by D36:** `SyncEnd` (with `SeqRange`) on `/room_memory/sync/end` follows every answer, names its delivered and unavailable ranges, and carries the request's token (D35); `EventsFallback.msg` and `/room_memory/sync/events_fallback` are deleted; codecs, goldens and both nodes are done | protocol §2, §3.8, §5, D27, D36 | inferring a fallback from an answer's first message fails on the shared sync topic: another Mac's replay arriving first, or a lost `since` message, gave up messages a replay was still bringing. Live progress up to the mark does not show a fallback has arrived, so it closed with messages in flight (Codex, PR #13) |
 
 ## 11. Open questions for Trevor
 

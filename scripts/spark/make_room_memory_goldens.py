@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
 """Serialize the hand-golden room-memory values with rclpy, so the Mac can compare real ROS 2 bytes.
 
-Status: written for PR 0.2, never run. It needs ROS 2 Jazzy and a built labcommand_msgs, so it
-runs on the Spark (inside a Jazzy container), by Trevor or an agent he authorizes:
+Status: written for PR 0.2, extended for protocol v2 (publisher generations, RequestSync token,
+SyncEnd; docs/ROOM-MEMORY-PROTOCOL.md section 5, D34-D36), never run. It needs ROS 2 Jazzy and a
+built labcommand_msgs, so it runs on the Spark (inside a Jazzy container), by Trevor or an agent
+he authorizes:
 
     cd <labcommand checkout>/ros && colcon build --packages-select labcommand_msgs
     source install/setup.bash
     python3 ../scripts/spark/make_room_memory_goldens.py <out_dir>
 
-It writes <out_dir>/<name>.bin for each little-endian golden in Tests/Fixtures/room/golden/hand/
-(ROS 2 serializes in host byte order, so there are no big-endian Spark goldens). Copy them to
-Tests/Fixtures/room/golden/spark/ on the Mac. The follow-up test decodes each one with the Swift
-codec and requires the value of the matching hand golden ("decode identically").
+It writes <out_dir>/<name>.bin for each little-endian golden in GOLDENS, one per .hex file of the
+same name in Tests/Fixtures/room/golden/hand/ (ROS 2 serializes in host byte order, so there are no
+big-endian Spark goldens). Copy them to Tests/Fixtures/room/golden/spark/ on the Mac. The follow-up
+test decodes each one with the Swift codec and requires the value of the matching hand golden
+("decode identically").
+
+Legacy layout. A current labcommand_msgs build always serializes publisher_generation (and
+RequestSync's expected_generation and request_token), so rclpy can no longer produce the
+legacy-layout goldens from the v2 .msg files: built against them, the legacy builders below give
+v2-layout bytes with generation 0, which is invalid. They stay, in LEGACY_GOLDENS, as the record of
+the legacy values and as the base the v2 builders extend; main() does not write them. Producing
+them again needs a labcommand_msgs built from the pre-v2 .msg files. epoch_le is unaffected (Epoch
+has no generation). The compressed MapBricks goldens (lzfse, zlib snapshot) have no v2 twin, so
+no Spark-produced compressed golden remains.
 
 The bytes should also match the .hex files, except for up to 3 bytes of trailing padding the rmw
 layer may add. That holds for the compressed goldens too, because their payloads are built by
@@ -28,11 +40,14 @@ import sys
 import zlib
 
 from builtin_interfaces.msg import Time
-from labcommand_msgs.msg import ChangeEvent, Epoch, MapBricks, MemoryStatus, RequestSync
+from labcommand_msgs.msg import (ChangeEvent, Epoch, MapBricks, MemoryStatus, RequestSync, SeqRange,
+                                 SyncEnd)
 from rclpy.serialization import serialize_message
 
 NAN = float("nan")
 T10 = (1760400010, 250000000)
+# The one publisher generation of every v2 hand golden: a start time in ms (protocol section 1.4).
+GENERATION = 1760400000000
 
 
 def stamp(sec, nanosec):
@@ -185,9 +200,79 @@ def request_sync_events_none_le():
     return msg
 
 
+# Protocol v2: the legacy values plus the trailing fields, as in the *_v2_le.hex files.
+
+
+def memory_status_v2_le():
+    msg = memory_status_le()
+    msg.publisher_generation = GENERATION
+    return msg
+
+
+def map_bricks_delta_v2_le():
+    msg = map_bricks_delta_le()
+    msg.publisher_generation = GENERATION
+    return msg
+
+
+def change_event_appeared_v2_le():
+    msg = change_event_appeared_le()
+    msg.publisher_generation = GENERATION
+    return msg
+
+
+def change_event_moved_mask_v2_le():
+    msg = change_event_moved_mask_le()
+    msg.mask[0].publisher_generation = GENERATION  # the mask repeats the parent's generation (D14)
+    msg.publisher_generation = GENERATION
+    return msg
+
+
+def request_sync_events_v2_le():
+    msg = request_sync_events_none_le()
+    msg.expected_generation = RequestSync.GENERATION_UNKNOWN
+    msg.request_token = list(bytes.fromhex("5a1e7c3d9b024f61" "8e33c4d5e6f70819"))
+    return msg
+
+
+def sync_end(seq, token, topic, bound, delivered, unavailable):
+    msg = common(SyncEnd(), "lab", 43, seq, *T10)
+    msg.publisher_generation = GENERATION
+    msg.request_token = list(token)
+    msg.topic = topic
+    msg.bound = bound
+    msg.delivered = [SeqRange(first=first, last=last) for first, last in delivered]
+    msg.unavailable = [SeqRange(first=first, last=last) for first, last in unavailable]
+    return msg
+
+
+def sync_end_events_empty_le():
+    """The answer to a legacy RequestSync (all-zero token) when nothing was published: bound SEQ_NONE."""
+    return sync_end(0, bytes(16), RequestSync.TOPIC_EVENTS, SyncEnd.SEQ_NONE, [], [])
+
+
+def sync_end_events_fallback_le():
+    """An events fallback for since (43, 9): delivered [10, 10] and [21, 120], unavailable [11, 20]."""
+    token = bytes.fromhex("c10ffee012344567" "a9876543210fedcb")
+    return sync_end(1, token, RequestSync.TOPIC_EVENTS, 120, [(10, 10), (21, 120)], [(11, 20)])
+
+
 GOLDENS = [
-    memory_status_le,
     epoch_le,
+    memory_status_v2_le,
+    map_bricks_delta_v2_le,
+    change_event_appeared_v2_le,
+    change_event_moved_mask_v2_le,
+    request_sync_events_v2_le,
+    sync_end_events_empty_le,
+    sync_end_events_fallback_le,
+]
+
+# Legacy layout (no publisher_generation, no request token): not producible from the v2 .msg files
+# (see the module docstring), so main() skips them. Kept, not deleted: the legacy .hex goldens stay
+# as decode fixtures, and the v2 builders above extend these values.
+LEGACY_GOLDENS = [
+    memory_status_le,
     map_bricks_delta_le,
     map_bricks_delta_lzfse_le,
     map_bricks_snapshot_zlib_le,

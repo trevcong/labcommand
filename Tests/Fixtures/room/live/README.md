@@ -13,3 +13,9 @@ read-only subscriber: it never advertised a channel or published. foxglove-bridg
 
 Both statuses are 76 bytes: they carry Phase 3's `events_seq`, which main's Phase 0 codec rejected
 as 8 trailing bytes. `LiveRoomTests.swift` decodes them all.
+
+**Legacy layout.** The four captures predate publisher generations (protocol §5, D34): no message
+carries `publisher_generation`. They stay as legacy decode fixtures, and are not re-captured. The
+Mac decodes them in legacy mode (PLAN-PUBGEN §4.6): identity unverified, the map never current,
+event history `unknown`, and no `RequestSync` sent. `status.bin`'s `EVENTS_SEQ_NONE` is not
+restart evidence (D37).

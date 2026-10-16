@@ -2,6 +2,8 @@
 
 Status: plan, revised after the Codex re-review `VERDICT: REVISE` (`~/Developer/lc-tasks/liveroom/PLAN.review2.md`). The first review (`PLAN.review.md`) stays answered in the table below. Branch `live-room-ui` in `~/Developer/labcommand-liveroom-b`. No app code in this revision commit.
 
+**Amended 2026-10-16 (branch `pubgen`).** Event-history completeness and publisher restarts are no longer this plan's or the mirror's inference. They follow `PLAN-PUBGEN.md` §4 and protocol §5 (D34–D37): one generation-scoped reducer, an `EventHistory` projection (coverage, continuity, `caughtUp`), and a legacy mode for a Spark node that predates publisher generations. The sections below that touched history or restarts (status bar, banners, event adaptation, resync line, tests, decisions 8 and 12) are revised to match. Where this plan and those disagree, they win.
+
 The first thing an implementer produces is a running app whose Room page is bound to `LiveRoomClient` and has drawn a map and a status bar from `ws://100.118.187.99:8767`. Markers, the event list, and the offline fixture follow that screenshot. They are still part of done.
 
 ## Review disposition
@@ -124,15 +126,16 @@ Nothing on this page comes from `ChangeDetection`. Markers come from `RoomMemory
 
 ## Status bar
 
-One line, `LabTheme.mono(11)`, color `LabTheme.dim`. The events field is `mirror.status?.eventsSeq`, the server high-water mark copied onto `LiveRoomStatus`. It is not `mirror.eventsSeq` (that is the contiguous baseline). It is not `ChangeEvent.header.seq`. Nil, including a wire `EVENTS_SEQ_NONE`, renders `events —`. A baseline of 4 with a status high-water mark of 12 renders `events 12`.
+One line, `LabTheme.mono(11)`, color `LabTheme.dim`. The events field is `mirror.status?.eventsSeq`, the server high-water mark copied onto `LiveRoomStatus`. It is not `mirror.eventHistory.contiguousThrough` (the top of the received run from 0, which replaces the old mutable `mirror.eventsSeq`). It is not `ChangeEvent.header.seq`. Nil, including a wire `EVENTS_SEQ_NONE`, renders `events —`. A contiguous run through 4 with a status high-water mark of 12 renders `events 12`.
 
 Order, after the prefix below:
 
-`epoch <n> · coverage <p> · events <n> · <state> · cell <cm>`
+`epoch <n> · run …<gggg> · coverage <p> · events <n> · <state> · cell <cm>`
 
 | Field | Source | Text |
 |---|---|---|
 | epoch | `mirror.mapEpoch`, else `status?.mapEpoch`, else none | `epoch 43` or `epoch —`. Decimal, no grouping separator |
+| run | `mirror.activeGeneration` (PLAN-PUBGEN §4.8) | `run …0000`, the last 4 digits of the publisher generation. Omitted in legacy mode and before the first v2 message |
 | coverage | `status?.coverageKnownFraction` | `coverage —`, or one decimal percent (`coverage 75.0%`, `coverage 0.0%` for a real zero) |
 | events | `status?.eventsSeq` | `events —` or `events 12` |
 | state | `status?.state`, and only while `mirror.isStatusFresh` | `Building` / `Tracking` / `Rig moved` / `Degraded` / `Paused`. Omitted when the status is missing or not fresh |
@@ -148,7 +151,7 @@ Prefix, first match:
 
 The numbers after a prefix are the last held values. The prefix is what keeps them from reading as live.
 
-`memory_status_le.hex` after `65122d2` is room `lab-a`, epoch 42, coverage 0.75, state tracking, `events_seq` 12. Its status line is `epoch 42 · coverage 75.0% · events 12 · Tracking` with no cell clause.
+`memory_status_le.hex` after `65122d2` is room `lab-a`, epoch 42, coverage 0.75, state tracking, `events_seq` 12. Its status line is `epoch 42 · coverage 75.0% · events 12 · Tracking` with no cell clause. It is a legacy-layout golden, so there is no run tag. `memory_status_v2_le.hex` (generation 1760400000000) renders `epoch 42 · run …0000 · coverage 75.0% · events 12 · Tracking`.
 
 ## Activity pip
 
@@ -179,7 +182,12 @@ At most one line, 13pt, above the canvas. This is Phase 3 §5.4, on the states t
 
 No match (fresh tracking, map current): no banner.
 
-`eventsState` is not a banner. Incomplete history is a line on the event list, specified below. `{sec: 0, nanosec: 0}` renders `time —`. Other stamps render `HH:mm:ss` UTC.
+Event history is not a banner. It is the history line on the event list, specified below. Two notices come from the generation-scoped mirror (PLAN-PUBGEN §4.6, §4.8):
+
+- **Restart.** While `continuity` is `broken`, a second line under the banner: `Spark node restarted · events from the earlier run may be missing` (`LabTheme.warn`). It never heals within the launch, because a retired generation has no final bound on the wire. The earlier run's open events are listed as `earlier run · may be outdated`, never drawn on the map.
+- **Legacy.** A Spark node without publisher generations renders the map `stale(.unverified)`: banner `unverified · Spark node predates publisher generations` (`LabTheme.warn`), after rig-moved and before the map-stale line. Bricks draw dimmed, markers never draw, and no request is sent.
+
+ `{sec: 0, nanosec: 0}` renders `time —`. Other stamps render `HH:mm:ss` UTC.
 
 Bricks, whenever `!isMapCurrent` and the dictionary is not empty, draw at 35% opacity. That covers a stale status while `mapState` is still `.current`, and a `.stale` map. Markers do not draw in either case. When the map is current, bricks are full opacity even if the state is building or rig-moved; the marker rule is what hides the overlays.
 
@@ -272,16 +280,17 @@ The mirror keeps three collections. The view uses them for different jobs.
 
 History rows are the ring entries whose state is `.accepted`, `.reverted`, or `.expired`. One row per message. The row id is `\(seq)-\(event.eventId)`, not `eventId` alone, so two transitions of one change do not collapse. An older candidate that remains in the ring after a confirmed message is not a second Events row and not a second marker.
 
-`eventsState` is an enum. Keep it as an enum all the way into the formatter. A `Time?` cannot tell `.complete` apart from `.incomplete(since: nil)`.
+The history line comes from `mirror.eventHistory` (PLAN-PUBGEN §4.2, §4.8; the meanings are protocol §5's). It replaces `eventsState` and its `.incomplete(since:)` cases, which are gone.
 
-| `eventsState` | Event-list line | Open rows |
-|---|---|---|
-| `.complete` | no incomplete line | no outdated suffix |
-| `.incomplete(since: nil)` | `incomplete` | `· may be outdated` |
-| `.incomplete(since: {0, 0})` | `incomplete since time —` | `· may be outdated` |
-| `.incomplete(since: t)` | `incomplete since HH:mm:ss` | `· may be outdated` |
+| `EventHistory` | Event-list line |
+|---|---|
+| legacy mode | `history unverified (old Spark node)` |
+| coverage `unknown` | no line |
+| coverage `empty` | `no events this run` |
+| coverage `completeThrough(n)` | `history complete through #n` |
+| coverage `missing(pending, lost)` | `history incomplete: <m> missing`, then ` (<k> lost on the Spark)` when k > 0, then ` · no request path` when no path exists and something is still pending |
 
-There is no `outdatedEventIds` set on the client. The suffix comes only from `eventsState != .complete`.
+Open rows carry `· may be outdated` while `eventHistory.caughtUp` is false. There is no `outdatedEventIds` set on the client. Coverage grows only by receipt, and lost ranges are only those the Spark declared in a `SyncEnd` (D36), so no timer, request flag or quiet period can make the line read complete.
 
 The non-resurrection test drives the public mirror API (`connectionOpened`, `receive`, `tick`) with encoded messages, then reads the marker helper:
 
@@ -290,7 +299,7 @@ The non-resurrection test drives the public mirror API (`connectionOpened`, `rec
 3. Same `eventId`, confirmed, seq 2 → one filled marker. The ring length is 2. Marker count stays 1.
 4. Same `eventId`, accepted, seq 3, `header.mapEpoch` 44, mirror epoch still 43, status still fresh → one unfilled outline, caption does not count a change, history text contains `accepted · map updating`.
 5. A later snapshot at epoch 44 → zero markers.
-6. Step 3's mirror, queried again, still has one marker after the ring has both transitions. Do not feed a lower live seq to simulate this; the client treats that as a new generation.
+6. Step 3's mirror, queried again, still has one marker after the ring has both transitions. Query the same mirror; do not feed a lower live seq to simulate this. (A lower seq is never a restart signal: a restart is a higher publisher generation, D37.)
 
 ## Event list
 
@@ -333,19 +342,18 @@ Three filter chips, mono 11, on by default: Appeared, Disappeared, Moved. Off hi
 
 This bridge cannot carry `RequestSync` (`canPublish` is false). With `requestSyncSink == nil` the mirror never queues a request, so `activity.requestsUnsent` stays 0 even while the map is stale. The counter moves only when the mirror emits a request and the client cannot carry it (`noteRequestUnsent`).
 
-Show `cannot request resync` when recovery is needed and no path exists.
+Show `cannot request resync` when the map needs recovery and no path exists. Events say it on the history line itself (` · no request path`, above), so this line is about the map only (PLAN-PUBGEN §4.7).
 
-- Recovery is needed when `mapState` is `.stale`, or `eventsState` is `.incomplete`.
+- Recovery is needed when `mapState` is `.stale`, except `stale(.unverified)`: a legacy node is never sent a request, so there is nothing to report.
 - A path exists when `requestPathExists` is true (computed by `AppState`, above).
 - Also show the line when `activity.requestsUnsent > 0`, whether or not the flag is set, because the client already counted a request that did not leave the machine.
 
 When the count is non-zero the text is `cannot request resync · <n> unsent`. Otherwise it is `cannot request resync`. One placement, first match. The text appears once.
 
 1. The visible banner is the map-stale line (`resyncing · as of epoch N`). Append ` · cannot request resync`, and ` · <n> unsent` when the count is non-zero, to that banner.
-2. The event list has an incomplete-history line (`eventsState != .complete`) and rule 1 did not fire. That line gains the same suffix.
-3. Standalone fallback. History is `.complete`, so the incomplete-history line is absent, and the visible banner is not the map-stale line. The text is its own line in the event column, above the sections, 11pt mono, `LabTheme.warn`. This covers a higher banner winning (connection lost, empty topics, stale status, rig moved, degraded, paused, building), the `Waiting for map` banner (a stale map with no bricks is not the map-stale line), no banner, and `requestsUnsent > 0` with a current map and complete history.
+2. Standalone fallback, whenever rule 1 did not fire. The text is its own line in the event column, above the sections, 11pt mono, `LabTheme.warn`. This covers a higher banner winning (connection lost, empty topics, stale status, rig moved, degraded, paused, building), the `Waiting for map` banner (a stale map with no bricks is not the map-stale line), no banner, and `requestsUnsent > 0` with a current map.
 
-The standalone line does not replace the winning banner. It does not outrank connection loss, an empty topic list, or a stale status. The column stays on screen while the line is present, including when Events and History are both empty. Rules 1 and 2 suppress the standalone line.
+The standalone line does not replace the winning banner. It does not outrank connection loss, an empty topic list, or a stale status. The column stays on screen while the line is present, including when Events and History are both empty. Rule 1 suppresses the standalone line.
 
 The view does not set `requestSyncSink`, does not open `:8766`, and does not speak Foxglove. The relay (Phase 3 P11, the owner of the existing `RigService` tunnel) sets the sink before `start()`. Until that owner lands, the sink stays nil and this line is how the operator sees it.
 
@@ -360,6 +368,8 @@ Hex parsing matches `RoomMemoryCDRTests.goldenBytes` (skip `#` comments). Load o
 3. `Tests/Fixtures/room/golden/hand/<name>.hex` relative to that root
 
 Unit tests pass the repo root. They do not depend on the process cwd. `build.sh` copies `Tests/Fixtures/room/golden/hand/` into `LabCommand.app/Contents/Resources/fixtures/room/golden/hand/`. Today it copies `fixtures/api` and one PCD only, which is why a bundled app cannot see the goldens.
+
+The mode table below and the fixture rows of the screenshot table predate protocol v2. The fixture now feeds the v2 hand goldens (one publisher generation, so status lines gain `run …0000`) and a `SyncEnd`, and gains three modes for the history and identity states: `lost` (lost ranges), `restart` (the restart notice and earlier-run rows) and `legacy` (unverified). `Sources/LabCommandCore/LiveRoomView.swift` is authoritative for every mode's contents; PLAN-PUBGEN §7 step 6 is the screenshot check.
 
 | Mode | What the mirror holds | Screen |
 |---|---|---|
@@ -439,18 +449,18 @@ Not edited after slice 0: `PointCloudRenderer.swift`, `FoxgloveLiveClient.swift`
 
 `swift run LabCommandCoreTestsRunner` from the repo root, after slice 0 so the client's own tests run too. New cases:
 
-- Decode `memory_status_le.hex`, assert `eventsSeq == 12`, `receive` it on a mirror, and assert the status line contains `events 12`. A nil `eventsSeq` renders `events —`. A mirror with baseline `eventsSeq == 4` and `status.eventsSeq == 12` renders `events 12`.
+- Decode `memory_status_le.hex`, assert `eventsSeq == 12`, `receive` it on a mirror, and assert the status line contains `events 12`. A nil `eventsSeq` renders `events —`. A mirror whose `eventHistory.contiguousThrough` is 4 with `status.eventsSeq == 12` renders `events 12`.
 - Coverage `0.75` → `coverage 75.0%`, coverage `0` → `coverage 0.0%`, stale age `4.2` → `STALE · 4s`, cell `0.05` → `cell 5.0 cm`. The state word is absent when `isStatusFresh` is false.
 - `alpha` nil → `uncalibrated`. Evidence nil → `evidence —`.
-- `.complete` prints no incomplete line. `.incomplete(since: nil)` prints `incomplete` and not `incomplete since`. `.incomplete(since: a stamp)` prints `incomplete since HH:mm:ss`.
+- Each `EventHistory` row of the history-line table prints its line: `history complete through #n`, `no events this run`, `history incomplete: <m> missing (<k> lost on the Spark)`, `history unverified (old Spark node)`. `continuity = broken` shows the restart notice. Legacy mode shows the unverified banner and sends no request. The trace and view tests are PLAN-PUBGEN §6.
 - Voxel samples for the decoded zlib snapshot: exactly the two centers above, one frame, the all-free brick silent.
 - The candidate → confirmed → accepted sequence in "Event adaptation", including one marker while the ring holds two transitions, and the accepted outline until the snapshot epoch catches up.
 - Building, rig-moved, a stale status, and `mapState == .stale` each produce zero boxes. A confirmed event still produces a box when the fresh state is `.degraded` and the map is current. A selected candidate is dashed and has fill alpha 0.
 - Kind filter off removes that kind from the marker set and from the caption. Caption on the map fixture is `2 changes · 1 candidate on map`.
 - `LiveRoomLaunch` maps the env table above. The fixture cases do not construct a client.
 - Banner priority: a stale status wins over a remembered `.rigMoved`. An empty `memoryTopics` wins over `Waiting for map`. `cannot request resync` appears for a stale map with `requestPathExists == false` and a zero unsent count, and the unsent count is included when `noteRequestUnsent` has run.
-- Resync placement, one line each. Map stale, path absent, unsent 0, events `.complete`, no higher banner: the warning is on the resync banner, and the standalone line is absent. The same recovery while the winning banner is `connection lost` and `eventsState` is `.complete`: the banner stays `connection lost`, and the standalone line is `cannot request resync`. The same with `.incomplete(since: nil)`: the incomplete line is suffixed, and the standalone line is absent. `requestsUnsent == 2` with a current map and `.complete` history: the standalone line is `cannot request resync · 2 unsent`. A stale map with no bricks and `.complete` history uses the standalone line, because the banner is `Waiting for map`.
-- Fixture `map` and `status` do not share a `roomId`. Fixture `status` has `status.eventsSeq == 12`. Fixture `map` has `status.eventsSeq == nil`.
+- Resync placement, one line each. Map stale, path absent, unsent 0, no higher banner: the warning is on the resync banner, and the standalone line is absent. The same recovery while the winning banner is `connection lost`: the banner stays `connection lost`, and the standalone line is `cannot request resync`. `requestsUnsent == 2` with a current map: the standalone line is `cannot request resync · 2 unsent`. A stale map with no bricks uses the standalone line, because the banner is `Waiting for map`. Missing events with no path put ` · no request path` on the history line, not on the resync line.
+- Fixture `map` and `status` do not share a `roomId`. Fixture `status` has `status.eventsSeq == 12`. (Fixture `map`'s status values are the code's since v2, above.)
 
 No new golden hex files. The default test run opens no socket and no SSH.
 
@@ -472,12 +482,12 @@ No new golden hex files. The default test run opens no socket and no SSH.
 4. The status bar's events number is `mirror.status?.eventsSeq`. The hand status golden's value is 12.
 5. Markers draw only while `isMapCurrent`, and not during building or rig-moved. Bricks that are held while the map is not current stay on screen at 35% opacity.
 6. Connection, status freshness, and map freshness are separate. A connected socket is not a green pip and is not a live memory state.
-7. Banner order is the Phase 3 order: topics absent, connection lost, stale status, then rig-moved, map stale, degraded, paused, building. Empty and stale-without-bricks say `Waiting for map`.
-8. Open rows and their markers come from `openEvents`. History rows come from the ring and are keyed by seq and event id. `.incomplete(since: nil)` stays a distinct case.
+7. Banner order is the Phase 3 order: topics absent, connection lost, stale status, then rig-moved, legacy `unverified`, map stale, degraded, paused, building. The restart notice is a separate line under the banner. Empty and stale-without-bricks say `Waiting for map`.
+8. Open rows and their markers come from `openEvents`. History rows come from the ring and are keyed by seq and event id. The history line and the restart notice come from `EventHistory` (PLAN-PUBGEN §4.2, §4.8; protocol §5), never from request state or timers.
 9. An accepted event whose `mapEpoch` the mirror has not reached draws an uncounted outline until a current map catches up. The client is not modified for that.
 10. Unknown voxels are a wireframe of any brick that still has an unknown cell. Free cells are undrawn. Occupied cells are grey points. Centers use `(index + 0.5) × voxelSize`.
 11. `mapRevision` and `voxelSize` gate voxel uploads. The camera auto-fits only until the user orbits or zooms, and the fit includes drawn boxes and arrow points.
-12. This bridge has no `clientPublish`. The view reports `cannot request resync` and does not grow a request path. The relay owner sets `requestSyncSink`. When history is complete and the banner is not the map-stale line, that report is a standalone line in the event column.
+12. This bridge has no `clientPublish`. The view reports `cannot request resync` and does not grow a request path. The relay owner sets `requestSyncSink`. When the banner is not the map-stale line, that report is a standalone line in the event column. Missing events report ` · no request path` on the history line.
 13. The change-overlay branch contributes colors, box topology, fill alphas, and the arrow. It is not merged.
 14. Selected candidates stay dashed and unfilled. The caption counts drawn markers. Event rows wrap on two lines inside 280pt.
 15. `65122d2` is on this branch, and its decode-and-test gate has passed, before any `LiveRoom` client file is added. Marker colors are counted inside the sidecar's canvas rect. Row readability is read off the PNG.
