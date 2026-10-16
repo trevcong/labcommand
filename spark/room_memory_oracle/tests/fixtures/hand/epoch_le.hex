@@ -1,0 +1,15 @@
+# labcommand_msgs/Epoch, CDR little endian. Derived by hand; see memory_status_le.hex for conventions.
+# Covers: 3-char room_id -> no pad before the uint64; a uint64 above 2^32; byte order of a uint32
+# (0x01020304); NaN coverage; the message ends on a uint8 (49 bytes after the header).
+00 01 00 00                 # encapsulation CDR_LE, options 0
+04 00 00 00                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   "lab\0"
+02 00 00 00 01 00 00 00     # pos 8   map_epoch 4294967298 (0x1_0000_0002)
+e8 03 00 00 00 00 00 00     # pos 16  seq 1000
+85 92 ed 68                 # pos 24  stamp.sec 1760400005
+00 00 00 00                 # pos 28  stamp.nanosec 0
+05 00 00 00                 # pos 32  n_appeared 5
+01 00 00 00                 # pos 36  n_disappeared 1
+04 03 02 01                 # pos 40  n_moved 16909060 (0x01020304)
+00 00 c0 7f                 # pos 44  coverage_known_frac NaN (room volume not yet known)
+02                          # pos 48  state RIG_MOVED

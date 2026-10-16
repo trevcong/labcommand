@@ -4,7 +4,7 @@ Log each lidar's occupied fraction per region once a minute, for a later fit of 
 
 ## Where
 
-Python reference: `spark/room_memory` here (no pose residual). C++ node, CTest, live image, and Python oracle: `/Users/tconf/Developer/labcommand-spark/spark/room_memory_cpp`. Hook all three. Do not vendor C++.
+Python reference: `spark/room_memory` here (no pose residual). C++ node, CTest, and the live image: `spark/room_memory_cpp` in this checkout. Python oracle for that image: `spark/room_memory_oracle` (the spark engine, with the same rhythm hook). The labcommand-spark worktree is not edited; this branch carries the engine plus the hook.
 
 Mac `close_window` without the logger is ~16.5 ms per 1 s window (one thread, both sensors). No SSH. Clouds and status share that thread, so the callback only enqueues. One writer does `write`, `fsync`, rotate, and prune.
 
@@ -84,7 +84,7 @@ Sum `rhythm-*.rhy`, `*.superseded-*`, and `*.bad-*` (both sensors) before every 
 
 ## Deploy (room-memory container only)
 
-From `labcommand-spark`, replace the C++ room-memory image only:
+From this checkout, replace the C++ room-memory image only:
 
 ```sh
 docker build -f spark/room_memory_cpp/Dockerfile -t labcommand/room-memory-cpp:jazzy .

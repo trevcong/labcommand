@@ -1,0 +1,26 @@
+# labcommand_msgs/Activity, CDR little endian, no activity since the previous message and none ever.
+# Derived by hand from ros/labcommand_msgs/msg/Activity.msg; see memory_status_le.hex for conventions.
+# Covers: active false with zero counts and sensor bits; NaN x9 geometry and NaN since_s.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+04 00 00 00                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   "lab\0"
+01 00 00 00 00 00 00 00     # pos 8   map_epoch 1
+00 00 00 00 00 00 00 00     # pos 16  seq 0
+8a 92 ed 68                 # pos 24  stamp.sec 1760400010
+80 b2 e6 0e                 # pos 28  stamp.nanosec 250000000
+00                          # pos 32  active false
+00                          # pos 33  sensors none
+00                          # pos 34  largest_sensor none
+00                          # pos 35  pad to 4
+00 00 00 00                 # pos 36  n_regions 0
+00 00 00 00                 # pos 40  voxel_count 0
+00 00 c0 7f                 # pos 44  centroid.x NaN
+00 00 c0 7f                 # pos 48  centroid.y NaN
+00 00 c0 7f                 # pos 52  centroid.z NaN
+00 00 c0 7f                 # pos 56  aabb min_x NaN
+00 00 c0 7f                 # pos 60  aabb min_y NaN
+00 00 c0 7f                 # pos 64  aabb min_z NaN
+00 00 c0 7f                 # pos 68  aabb max_x NaN
+00 00 c0 7f                 # pos 72  aabb max_y NaN
+00 00 c0 7f                 # pos 76  aabb max_z NaN
+00 00 c0 7f                 # pos 80  since_s NaN (no activity since the node started)
