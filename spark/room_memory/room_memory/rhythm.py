@@ -347,11 +347,13 @@ class _Table:
         self._cached = 0
 
     def insert_window(self, ix, iy, iz, counts):
-        """Insert in signed order. The first miss returns how many regions were not stored.
+        """Insert unique cells in signed order. The first miss returns how many were not stored.
 
         A miss stops the window: later regions, including ones already in the table, are
         counted and not updated. An identical cell list reuses the slots from the last
-        complete insert and does not probe again.
+        complete insert and does not probe again. That update writes each slot from one
+        row, and a repeated index does not accumulate, so the cell list has to be
+        unique. ``_cells`` has already summed each cell into one row.
         """
         total = len(ix)
         if total == 0:
@@ -595,12 +597,15 @@ class RhythmAccumulator:
         self.finished.append(Fragment(sensor, opened.minute, opened.map_epoch, flags, data))
 
     def _cells(self, keys):
-        """Group occupied voxel keys into region cells.
+        """Group occupied voxel keys into unique region cells.
 
-        ``close_window`` passes a sorted unique run. Packed ``(i, j, k)`` order matches
-        ``floor`` of each lane, so that run is already grouped and is not sorted again.
-        An unsorted caller is sorted once. Clipped cells leave the run; the 4096 slots
-        are not grown here.
+        ``close_window`` passes a sorted unique run, and an unsorted caller is sorted
+        once. Packed ``(i, j, k)`` order is not coarse-cell order. Floor division of
+        ``(0, 0, 0), (0, 10, 0), (1, 0, 0)`` by 10 voxels per cell yields A, B, A, and
+        an adjacent run would insert A twice in one window. Sort the coarse
+        coordinates and sum each run so the window inserts every cell once, in signed
+        ``(ix, iy, iz)`` order. Clipped cells leave the run. The 4096 slots are not
+        grown here.
         """
         keys = np.asarray(keys, dtype=np.int64).reshape(-1)
         if len(keys) == 0:
@@ -621,20 +626,24 @@ class RhythmAccumulator:
         clipped = int(np.count_nonzero(~ok))
         if not bool(np.all(ok)):
             ix, iy, iz = ix[ok], iy[ok], iz[ok]
-        if len(ix) == 0:
+        count = len(ix)
+        if count == 0:
             empty = np.zeros(0, dtype=np.int16)
             return clipped, empty, empty, empty, empty
-        if len(ix) == 1:
+        if count > 1:
+            order = np.lexsort((iz, iy, ix))
+            ix, iy, iz = ix[order], iy[order], iz[order]
+        if count == 1:
             one = np.ones(1, dtype=np.int64)
             return (
                 clipped, ix.astype(np.int16, copy=False), iy.astype(np.int16, copy=False),
                 iz.astype(np.int16, copy=False), one,
             )
-        change = np.empty(len(ix), dtype=bool)
+        change = np.empty(count, dtype=bool)
         change[0] = True
         change[1:] = (ix[1:] != ix[:-1]) | (iy[1:] != iy[:-1]) | (iz[1:] != iz[:-1])
         starts = np.flatnonzero(change)
-        counts = np.diff(np.append(starts, len(ix)))
+        counts = np.diff(np.append(starts, count))
         return (
             clipped, ix[starts].astype(np.int16, copy=False), iy[starts].astype(np.int16, copy=False),
             iz[starts].astype(np.int16, copy=False), counts,

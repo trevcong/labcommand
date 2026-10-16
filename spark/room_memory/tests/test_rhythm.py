@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 import scenes
-from room_memory.core.change_detection import pack, splitmix64
+from room_memory.core.change_detection import occupancy_map, pack, splitmix64
 from room_memory.memory import MemoryConfig, RoomMemory, reference_path
 from room_memory.messages import CDRError, Invalid, RhythmMinute, Time
 from room_memory.rhythm import (
@@ -256,6 +256,118 @@ def test_floor_pins_dims_and_the_mean_pin():
     deep = RhythmAccumulator(["mid360"], 10, 3, 60, 60)
     deep.add("mid360", 60, both, 1)
     assert parse_record(deep.flush()[0].data)["regions"] == ((0, 0, 0, 1, 1), (0, 0, 1, 1, 1))
+
+
+def _slot_of(table, ix, iy, iz):
+    mask = (table.used == 1) & (table.ix == ix) & (table.iy == iy) & (table.iz == iz)
+    found = np.flatnonzero(mask)
+    assert len(found) == 1
+    return int(found[0])
+
+
+def test_a_coarse_cell_split_by_floor_counts_once_on_insert_and_on_the_cache():
+    """Sorted voxels do not stay grouped after floor division.
+
+    With 10 voxels per cell, ``(0, 0, 0), (0, 10, 0), (1, 0, 0)`` become A, B, A.
+    An adjacent run inserts A twice on the first window. The cached slot list then
+    repeats A, and that vectorized update does not accumulate a repeated index.
+    Negatives use the same split, and one index outside int16 stays clipped.
+    """
+    voxels = [
+        (0, 0, 0), (0, 10, 0), (1, 0, 0), (1, 1, 0), (1, 2, 0),
+        (-10, 0, 0), (-10, 10, 0), (-1, 0, 0),
+        (327680, 0, 0),
+    ]
+    keys = np.array([pack(*voxel) for voxel in reversed(voxels)], dtype=np.int64)
+    expected = ((-1, 0, 0, 2), (-1, 1, 0, 1), (0, 0, 0, 4), (0, 1, 0, 1))
+
+    for dims in (2, 3):
+        acc = RhythmAccumulator(["mid360"], 10, dims, 60, 60)
+        clipped, ix, iy, iz, counts = acc._cells(keys)
+        assert clipped == 1
+        assert [
+            (int(ix[n]), int(iy[n]), int(iz[n]), int(counts[n])) for n in range(len(ix))
+        ] == list(expected)
+
+        acc.add("mid360", 60, keys, 1)
+        table = acc._sensors["mid360"]["table"]
+        assert table._cached == len(expected)
+        assert len(np.unique(table._cslot[:table._cached])) == table._cached
+        for cell_ix, cell_iy, cell_iz, count in expected:
+            slot = _slot_of(table, cell_ix, cell_iy, cell_iz)
+            assert int(table.hits[slot]) == 1 and int(table.sums[slot]) == count
+
+        def refuse_probe(*_args):
+            raise AssertionError("cached window probed the table")
+
+        table._slot = refuse_probe
+        acc.add("mid360", 61, keys, 1)
+        for cell_ix, cell_iy, cell_iz, count in expected:
+            slot = _slot_of(table, cell_ix, cell_iy, cell_iz)
+            assert int(table.hits[slot]) == 2 and int(table.sums[slot]) == count * 2
+        record = parse_record(acc.flush()[0].data)
+        assert record["with_points"] == 2 and record["clipped"] == 2
+        assert record["regions"] == tuple(
+            (cell_ix, cell_iy, cell_iz, 2, count) for cell_ix, cell_iy, cell_iz, count in expected
+        )
+
+    # k is the fast-changing lane, so these three keys are already sorted. Dims 3 still
+    # sees A, B, A. Dims 2 stores iz 0 and the three voxels are one cell.
+    k_split = np.array([pack(0, 0, 0), pack(0, 0, 10), pack(0, 1, 0)], dtype=np.int64)
+    flat = RhythmAccumulator(["mid360"], 10, 2, 60, 60)
+    _, ix, iy, iz, counts = flat._cells(k_split)
+    assert [(int(ix[n]), int(iy[n]), int(iz[n]), int(counts[n])) for n in range(len(ix))] == [(0, 0, 0, 3)]
+    deep = RhythmAccumulator(["mid360"], 10, 3, 60, 60)
+    _, ix, iy, iz, counts = deep._cells(k_split)
+    assert [
+        (int(ix[n]), int(iy[n]), int(iz[n]), int(counts[n])) for n in range(len(ix))
+    ] == [(0, 0, 0, 2), (0, 0, 1, 1)]
+
+
+def test_room_shell_minute_counts_each_cell_once_and_keeps_every_voxel():
+    """18,724 occupied voxels in 64 cells. Identical windows keep one hit each.
+
+    The summed means stay the occupied-voxel count, which is what a published
+    ``RhythmMinute`` checks against ``windows_with_points``.
+    """
+    keys = occupancy_map(scenes.room_shell(), MemoryConfig(state_dir=None).change_config()).occupied
+    assert len(keys) == 18724
+    acc = RhythmAccumulator(["mid360"], 10, 2, 60, 60)
+    acc.add("mid360", 60, keys, 1)
+    table = acc._sensors["mid360"]["table"]
+    used = table.used == 1
+    assert table._cached == 64 and int(used.sum()) == 64
+    assert len(np.unique(table._cslot[:table._cached])) == 64
+    assert int(table.hits[used].sum()) == 64
+    assert int(table.sums[used].sum()) == 18724
+
+    def refuse_probe(*_args):
+        raise AssertionError("cached window probed the table")
+
+    table._slot = refuse_probe
+    for sec in range(61, 120):
+        acc.add("mid360", sec, keys, 1)
+    used = table.used == 1
+    assert int(table.hits[used].sum()) == 64 * 60
+    assert int(table.sums[used].sum()) == 18724 * 60
+    record = parse_record(acc.flush()[0].data)
+    assert (record["closed"], record["with_points"], record["unavailable"]) == (60, 60, 0)
+    assert record["clipped"] == 0 and record["regions_dropped"] == 0 and record["flags"] == 0
+    assert len(record["regions"]) == 64
+    assert all(hits == 60 for _ix, _iy, _iz, hits, _mean in record["regions"])
+    assert sum(mean for _ix, _iy, _iz, _hits, mean in record["regions"]) == 18724
+    regions = record["regions"]
+    message = RhythmMinute(
+        "lab", 1, record["map_epoch"], 1, Time(record["minute"], 0),
+        record["closed"], record["with_points"], record["unavailable"],
+        record["clipped"], record["regions_dropped"], record["pose_ok"], record["flags"],
+        tuple(region[0] for region in regions),
+        tuple(region[1] for region in regions),
+        tuple(region[2] for region in regions),
+        tuple(region[3] for region in regions),
+        tuple(region[4] for region in regions),
+    )
+    assert RhythmMinute.from_cdr(message.to_cdr()) == message
 
 
 def test_clipped_indices_are_dropped_and_zeros_are_omitted():
