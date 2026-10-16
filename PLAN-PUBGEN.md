@@ -1,6 +1,6 @@
 # PLAN-PUBGEN: publisher generations and a generation-scoped room-memory mirror
 
-Status: plan only (step 1). Trevor approved Astra's root-cause redesign (`lc-tasks/liveroom/astra-mirror.md`). This plan turns it into a wire contract, a state machine, and a file-by-file change list. Nothing below is implemented yet.
+Status: implemented on `pubgen` (commits after e211f7c); the body below is the approved plan, unchanged. Trevor approved Astra's root-cause redesign (`lc-tasks/liveroom/astra-mirror.md`). This plan turns it into a wire contract, a state machine, and a file-by-file change list.
 
 **The problem.** The Live Room mirror (`RoomMemoryMirror.swift`, PR #17) infers publisher restarts from counters. It also infers history completeness from request flags and a 2 s quiet period. Ten Codex rounds (`code-review2..10.md`) each closed one trace and opened the next. Astra's diagnosis: identity, received history and retrieval progress compete as sources of truth. With today's wire, no client can tell "the publisher continued while I was away" from "it restarted and counted past my old counters". The fix needs a protocol change:
 
