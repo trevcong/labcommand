@@ -37,12 +37,22 @@ from room_memory.messages import (
     MemoryStatus,
     RequestSync,
     SENSOR_MID360,
+    SyncEnd,
     SyncTopic,
     Time,
+    ZERO_TOKEN,
 )
-from test_messages import DELTA_BRICKS
+from test_messages import DELTA_BRICKS, TOKEN_A
 
 START = Time(1760400000, 0)
+GENERATION = 1760400000000
+NONE = (1 << 64) - 1
+
+
+def sync_request(since, topic, expected=GENERATION, room_id="lab", token=TOKEN_A):
+    """A v2 request; ``expected=None`` makes a legacy one."""
+    epoch = NONE if since is None else since[0]
+    return RequestSync(Header(room_id, epoch, 0, START), since, topic, expected, None if expected is None else token)
 
 
 def layer(occupied, known):
@@ -115,7 +125,7 @@ SINGLE_WINDOW = dict(recent_windows=1, occupied_min_hits=1, occupied_min_ratio=0
 def mid360_memory(tmp_path, **changes):
     values = dict(sensors=("mid360",), max_range=None, reference_windows=3, state_dir=str(tmp_path), **SINGLE_WINDOW)
     values.update(changes)
-    return RoomMemory(MemoryConfig(**values), START)
+    return RoomMemory(MemoryConfig(**values), START, GENERATION)
 
 
 def stamp(second):
@@ -228,15 +238,18 @@ def test_sync_cursor_from_before_a_restart_names_nothing_after_it(tmp_path):
     (old,) = memory.close_window(stamp(second))
     assert (old.header.map_epoch, old.header.seq) == (1, 0)
     config = memory.config
-    restarted = RoomMemory(config, stamp(100))
-    assert restarted.map_epoch == 2 and RoomMemory(config, stamp(200)).map_epoch == 3
-    restarted = RoomMemory(config, stamp(300))
+    restarted = RoomMemory(config, stamp(100), GENERATION + 1)
+    assert restarted.map_epoch == 2 and RoomMemory(config, stamp(200), GENERATION + 2).map_epoch == 3
+    restarted = RoomMemory(config, stamp(300), GENERATION + 3)
     restarted.add_points("mid360", np.concatenate([room, box]))
     (new,) = restarted.close_window(stamp(301))
     assert new.event_id != old.event_id and (new.header.map_epoch, new.header.seq) == (4, 0)
-    since = RequestSync(Header("lab", old.header.map_epoch, 0, START), (old.header.map_epoch, old.header.seq),
-                        SyncTopic.EVENTS)
-    assert restarted.sync(since, stamp(302)) == [new.to_cdr()]
+    # The old generation's cursor (and a legacy request) is answered as SINCE_NONE in the new one.
+    since = (old.header.map_epoch, old.header.seq)
+    for request in (sync_request(since, SyncTopic.EVENTS), sync_request(since, SyncTopic.EVENTS, expected=None)):
+        messages, end = restarted.sync(request, stamp(302))
+        assert messages == [new.to_cdr()]
+        assert end.publisher_generation == GENERATION + 3 and end.delivered == ((0, 0),) and end.unavailable == ()
 
 
 def test_a_sensor_subset_run_keeps_the_room_loadable(tmp_path):
@@ -246,7 +259,7 @@ def test_a_sensor_subset_run_keeps_the_room_loadable(tmp_path):
     # New coverage joins the references while tracking (learn_windows).
     both = MemoryConfig(sensors=("mid360", "jt128"), max_range=None, reference_windows=3, state_dir=str(tmp_path),
                         learn_windows=30, **SINGLE_WINDOW)
-    memory = RoomMemory(both, START)
+    memory = RoomMemory(both, START, GENERATION)
     for second in range(3):
         memory.add_points("mid360", partial)
         memory.add_points("jt128", partial)
@@ -262,10 +275,10 @@ def test_a_sensor_subset_run_keeps_the_room_loadable(tmp_path):
     epochs = {name: load_reference(reference_path(tmp_path, "lab", name))[0].header.map_epoch
               for name in ("mid360", "jt128")}
     assert epochs == {"mid360": 3, "jt128": 1}
-    restarted = RoomMemory(both, stamp(20))
+    restarted = RoomMemory(both, stamp(20), GENERATION)
     assert restarted.state == MemoryState.TRACKING and restarted.map_epoch == 4
     assert restarted.channels["mid360"].reference.to_bricks() == subset.channels["mid360"].reference.to_bricks()
-    assert RoomMemory(both, stamp(30)).map_epoch == 5 and epoch_path(tmp_path, "lab").read_bytes() == b"5\n"
+    assert RoomMemory(both, stamp(30), GENERATION).map_epoch == 5 and epoch_path(tmp_path, "lab").read_bytes() == b"5\n"
 
 
 def test_a_sensor_subset_build_continues_the_room_epoch(tmp_path):
@@ -275,19 +288,19 @@ def test_a_sensor_subset_build_continues_the_room_epoch(tmp_path):
         jt128.add_points("jt128", scenes.room_shell())
         jt128.close_window(stamp(second))
     assert jt128.state == MemoryState.TRACKING and jt128.map_epoch == 1
-    assert RoomMemory(jt128.config, stamp(10)).map_epoch == 2
+    assert RoomMemory(jt128.config, stamp(10), GENERATION).map_epoch == 2
     mid360 = mid360_memory(tmp_path)
     assert mid360.state == MemoryState.BUILDING and mid360.map_epoch == 2
     build_reference(mid360, scenes.room_shell())
     assert mid360.state == MemoryState.TRACKING and mid360.map_epoch == 3
-    assert RoomMemory(replace(mid360.config, sensors=("mid360", "jt128")), stamp(20)).map_epoch == 4
+    assert RoomMemory(replace(mid360.config, sensors=("mid360", "jt128")), stamp(20), GENERATION).map_epoch == 4
 
 
 def test_inconsistent_saved_state_is_refused(tmp_path):
     memory = mid360_memory(tmp_path)
     build_reference(memory, scenes.room_shell())
     with pytest.raises(ValueError, match="incomplete"):
-        RoomMemory(MemoryConfig(sensors=("mid360", "jt128"), state_dir=str(tmp_path)), START)
+        RoomMemory(MemoryConfig(sensors=("mid360", "jt128"), state_dir=str(tmp_path)), START, GENERATION)
     with pytest.raises(ValueError, match="voxel_size"):
         mid360_memory(tmp_path, voxel_size=0.1)
     for data in (b"", b"3", b"-3\n", b" 3\n", b"18446744073709551616\n"):
@@ -298,7 +311,7 @@ def test_inconsistent_saved_state_is_refused(tmp_path):
 
 def test_degraded_and_dropped_windows(tmp_path):
     # One window settles occupancy, so each sensor's reference is ready after its first window.
-    memory = RoomMemory(MemoryConfig(state_dir=None, reference_windows=1, occupied_min_hits=1), START)
+    memory = RoomMemory(MemoryConfig(state_dir=None, reference_windows=1, occupied_min_hits=1), START, GENERATION)
     memory.add_points("mid360", scenes.room_shell())
     assert memory.add_cdr("jt128", b"\x00\x01\x00\x00") is False
     memory.close_window(stamp(0))
@@ -338,7 +351,7 @@ def test_windows_without_usable_points_do_not_build_the_reference(tmp_path):
 def test_each_sensor_reference_freezes_at_its_own_window_count():
     room = scenes.room_shell()
     box = scenes.box_shell((0.3, 1.2, 0.3))
-    memory = RoomMemory(MemoryConfig(state_dir=None, max_range=None, reference_windows=1, **SINGLE_WINDOW), START)
+    memory = RoomMemory(MemoryConfig(state_dir=None, max_range=None, reference_windows=1, **SINGLE_WINDOW), START, GENERATION)
     memory.add_points("mid360", room)
     memory.close_window(stamp(0))
     assert memory.state == MemoryState.BUILDING
@@ -361,7 +374,7 @@ def test_tracking_waits_for_settled_reference_occupancy():
     window could ever teach. The reference keeps building until it has occupancy."""
     room = scenes.room_shell()
     memory = RoomMemory(MemoryConfig(sensors=("mid360",), state_dir=None, max_range=None, reference_windows=1,
-                                     candidate_windows=3), START)
+                                     candidate_windows=3), START, GENERATION)
     memory.add_points("mid360", room)
     memory.close_window(stamp(0))
     assert memory.state == MemoryState.BUILDING and memory.map_epoch == 0
@@ -532,17 +545,17 @@ def test_recent_observations_age_through_missing_windows(tmp_path):
 
 def test_config_rejections():
     with pytest.raises(ValueError):
-        RoomMemory(MemoryConfig(sensors=("velodyne",)), START)
+        RoomMemory(MemoryConfig(sensors=("velodyne",)), START, GENERATION)
     with pytest.raises(ValueError):
-        RoomMemory(MemoryConfig(sensors=()), START)
+        RoomMemory(MemoryConfig(sensors=()), START, GENERATION)
     with pytest.raises(ValueError):
-        RoomMemory(MemoryConfig(window_s=0, state_dir=None), START)
+        RoomMemory(MemoryConfig(window_s=0, state_dir=None), START, GENERATION)
 
 
 def test_window_s_must_be_finite_and_positive():
     for bad in (0.0, -1.0, float("inf"), float("nan")):
         with pytest.raises(ValueError, match="window_s"):
-            RoomMemory(MemoryConfig(window_s=bad, state_dir=None), Time(0, 0))
+            RoomMemory(MemoryConfig(window_s=bad, state_dir=None), Time(0, 0), GENERATION)
 
 
 def test_any_decode_failure_is_a_rejected_frame(monkeypatch):
@@ -552,7 +565,7 @@ def test_any_decode_failure_is_a_rejected_frame(monkeypatch):
         raise MemoryError("decoder ran out of memory")
 
     monkeypatch.setattr(memory_module, "decode_pointcloud2", explode)
-    memory = RoomMemory(MemoryConfig(state_dir=None), Time(0, 0))
+    memory = RoomMemory(MemoryConfig(state_dir=None), Time(0, 0), GENERATION)
     assert memory.add_cdr("mid360", b"\x00\x01\x00\x00") is False
     channel = memory.channels["mid360"]
     assert (channel.received, channel.failed) == (1, 1)
@@ -633,11 +646,9 @@ def test_sync_replays_or_snapshots_maps_and_replays_events():
     boxed = np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))])
     memory = mid360_memory(None, state_dir=None, delta_period_s=1.0, keyframe_period_s=1.0)
 
-    def request(since, topic, room_id="lab"):
-        epoch = (1 << 64) - 1 if since is None else since[0]
-        return RequestSync(Header(room_id, epoch, 0, START), since, topic)
-
-    assert memory.sync(request(None, SyncTopic.MAP_BRICKS), stamp(0)) == []
+    # BUILDING: no map yet, an empty answer that says so (bound SEQ_NONE).
+    messages, end = memory.sync(sync_request(None, SyncTopic.MAP_BRICKS), stamp(0))
+    assert messages == [] and end.bound is None and end.delivered == () and end.token == TOKEN_A
     second = build_reference(memory, room)
     live = []
     for n in range(3):
@@ -646,18 +657,44 @@ def test_sync_replays_or_snapshots_maps_and_replays_events():
         live.append(memory.map_update(stamp(second + n)))
     now = stamp(second + 3)
     epoch = MapBricks.from_cdr(live[0]).header.map_epoch
-    assert memory.sync(request((epoch, 0), SyncTopic.MAP_BRICKS), now) == live[1:]
-    for since in (None, (epoch, 2), (epoch + 7, 0), (epoch, 40)):
-        (answer,) = memory.sync(request(since, SyncTopic.MAP_BRICKS), now)
+    newest = MapBricks.from_cdr(live[2]).header
+    assert newest.seq == 2
+    # since in the log, older than the bound: the later logged messages, unchanged.
+    messages, end = memory.sync(sync_request((epoch, 0), SyncTopic.MAP_BRICKS), now)
+    assert messages == live[1:] and end.bound == 2 and end.delivered == ((1, 2),)
+    # since is the newest message: nothing missed, nothing sent (no snapshot).
+    messages, end = memory.sync(sync_request((newest.map_epoch, 2), SyncTopic.MAP_BRICKS), now)
+    assert messages == [] and end.bound == 2 and end.delivered == ()
+    # since not in the log, of another generation, or a legacy request: one fresh snapshot.
+    for request in (sync_request(None, SyncTopic.MAP_BRICKS), sync_request((newest.map_epoch + 1, 2), SyncTopic.MAP_BRICKS),
+                    sync_request((epoch + 7, 0), SyncTopic.MAP_BRICKS), sync_request((epoch, 40), SyncTopic.MAP_BRICKS),
+                    sync_request((epoch, 0), SyncTopic.MAP_BRICKS, expected=GENERATION - 1),
+                    sync_request((epoch, 0), SyncTopic.MAP_BRICKS, expected=0),
+                    sync_request((newest.map_epoch, 2), SyncTopic.MAP_BRICKS, expected=None)):
+        (answer,), end = memory.sync(request, now)
         snapshot = MapBricks.from_cdr(answer)
         assert snapshot.kind == MapKind.SNAPSHOT and snapshot.header.seq == 2
+        assert snapshot.publisher_generation == GENERATION
         assert snapshot.bricks == MapBricks.from_cdr(live[2]).bricks
-    assert memory.sync(request(None, SyncTopic.MAP_BRICKS, "other"), now) == []
-    opened, closed = memory.sync(request(None, SyncTopic.EVENTS), now)
+        assert end.delivered == ((2, 2),) and end.token == (ZERO_TOKEN if request.token is None else TOKEN_A)
+    assert memory.sync(sync_request(None, SyncTopic.MAP_BRICKS, room_id="other"), now) == ([], None)
+    (opened, closed), end = memory.sync(sync_request(None, SyncTopic.EVENTS), now)
+    assert end.bound == 1 and end.delivered == ((0, 1),) and end.unavailable == ()
     first = ChangeEvent.from_cdr(opened)
     assert first.state == EventState.CANDIDATE and ChangeEvent.from_cdr(closed).state == EventState.EXPIRED
-    assert memory.sync(request((first.header.map_epoch, first.header.seq), SyncTopic.EVENTS), now) == [closed]
-    assert memory.sync(request((first.header.map_epoch, 1), SyncTopic.EVENTS), now) == []
+    assert memory.sync(sync_request((first.header.map_epoch, first.header.seq), SyncTopic.EVENTS), now)[0] == [closed]
+    messages, end = memory.sync(sync_request((first.header.map_epoch, 1), SyncTopic.EVENTS), now)
+    assert messages == [] and end.bound == 1 and end.delivered == ()
+    # One SyncEnd per answer, numbered from 0 in this generation; each one encodes.
+    assert end.header.seq == memory.sync_end_seq - 1 and SyncEnd.from_cdr(end.to_cdr()) == end
+
+
+def test_events_answer_with_no_events_is_known_empty():
+    memory = mid360_memory(None, state_dir=None)
+    build_reference(memory, scenes.room_shell())
+    messages, end = memory.sync(sync_request(None, SyncTopic.EVENTS), stamp(10))
+    assert messages == [] and end.bound is None and end.delivered == end.unavailable == ()
+    assert memory.status(stamp(10), 1.0).events_seq is None
 
 
 def test_event_fallback_resends_open_events_older_than_the_log():
@@ -668,12 +705,53 @@ def test_event_fallback_resends_open_events_older_than_the_log():
     memory.add_points("mid360", np.concatenate([room, box]))
     (opened,) = memory.close_window(stamp(second))
     transitions = 0
-    while transitions < EVENT_LOG_DEPTH:
+    unavailable = []
+    while transitions < EVENT_LOG_DEPTH + 20:
         second += 1
         memory.add_points("mid360", np.concatenate([room, box] if transitions % 2 else [room, box, speck]))
         transitions += len(memory.close_window(stamp(second)))
-    answer = memory.sync(RequestSync(Header("lab", (1 << 64) - 1, 0, START), None, SyncTopic.EVENTS), stamp(second))
-    assert len(answer) == EVENT_LOG_DEPTH + 1 and answer[0] == opened.to_cdr()
+        unavailable.append(memory.sync(sync_request(None, SyncTopic.EVENTS), stamp(second))[1].unavailable)
+    legacy = RequestSync(Header("lab", NONE, 0, START), None, SyncTopic.EVENTS)
+    messages, end = memory.sync(legacy, stamp(second))
+    assert len(messages) == EVENT_LOG_DEPTH + 1 and messages[0] == opened.to_cdr()
+    bound = memory.event_seq - 1
+    oldest = bound - EVENT_LOG_DEPTH + 1
+    assert end.token == ZERO_TOKEN and end.bound == bound
+    assert end.delivered == ((0, 0), (oldest, bound)) and end.unavailable == ((1, oldest - 1),)
+    # Within one generation a seq once unavailable stays unavailable.
+    seen = set()
+    for ranges in unavailable:
+        now = {seq for first, last in ranges for seq in range(first, last + 1)}
+        assert seen <= now
+        seen = now
+    # A since the log no longer holds limits the requested range to what follows it.
+    epoch = ChangeEvent.from_cdr(messages[1]).header.map_epoch
+    _, end = memory.sync(sync_request((epoch, 5), SyncTopic.EVENTS), stamp(second))
+    assert end.unavailable == ((6, oldest - 1),) and end.delivered == ((0, 0), (oldest, bound))
+
+
+def test_messages_carry_the_generation_and_references_stay_legacy(tmp_path):
+    room, box = scenes.room_shell(), scenes.box_shell((0.3, 1.2, 0.3))
+    memory = mid360_memory(tmp_path)
+    second = build_reference(memory, room)
+    memory.add_points("mid360", np.concatenate([room, box]))
+    (event,) = memory.close_window(stamp(second))
+    decoded = ChangeEvent.from_cdr(event.to_cdr())
+    assert decoded.publisher_generation == decoded.mask.publisher_generation == GENERATION
+    assert MapBricks.from_cdr(memory.map_update(stamp(second))).publisher_generation == GENERATION
+    assert MemoryStatus.from_cdr(memory.status(stamp(second), 1.0).to_cdr()).publisher_generation == GENERATION
+    assert Activity.from_cdr(memory.activity(stamp(second)).to_cdr()).header.room_id == "lab"  # unchanged message
+    saved, _ = load_reference(reference_path(tmp_path, "lab", "mid360"))
+    assert saved.publisher_generation is None
+    data = reference_path(tmp_path, "lab", "mid360").read_bytes()
+    assert MapBricks.from_cdr(data).to_cdr() == data  # the legacy layout, byte for byte
+    # A v2 reference (written by hand) still loads.
+    path = reference_path(tmp_path, "lab", "mid360")
+    path.write_bytes(replace(saved, publisher_generation=7).to_cdr())
+    assert mid360_memory(tmp_path, ).channels["mid360"].reference.to_bricks() == saved.bricks
+    for bad in (0, -1, 1 << 64, None, 1.5):
+        with pytest.raises(ValueError, match="publisher_generation"):
+            RoomMemory(MemoryConfig(state_dir=None), START, bad)
 
 
 def test_coverage_and_pose_residual():
@@ -802,7 +880,7 @@ def test_a_reload_with_learn_windows_zero_does_not_learn(tmp_path):
     assert memory.close_window(stamp(0)) == []
     assert memory.state == MemoryState.TRACKING and memory.map_epoch == 1
     bricks = memory.channels["mid360"].reference.to_bricks()
-    restarted = RoomMemory(memory.config, stamp(10))
+    restarted = RoomMemory(memory.config, stamp(10), GENERATION)
     opening = MapBricks.from_cdr(restarted.map_update(stamp(10)))
     assert restarted.map_epoch == 2 and opening.header.map_epoch == 2 and opening.bricks == bricks
     restarted.add_points("mid360", room)
@@ -1046,4 +1124,4 @@ def test_activity_reports_the_newest_window_with_motion():
 ])
 def test_gate_config_rejections(changes):
     with pytest.raises(ValueError):
-        RoomMemory(MemoryConfig(state_dir=None, **changes), START)
+        RoomMemory(MemoryConfig(state_dir=None, **changes), START, GENERATION)

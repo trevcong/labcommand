@@ -24,7 +24,7 @@ def open_log():
 
 
 def room():
-    return RoomMemory(MemoryConfig(state_dir=None), Time(0, 0))
+    return RoomMemory(MemoryConfig(state_dir=None), Time(0, 0), 1)
 
 
 def test_first_line():
