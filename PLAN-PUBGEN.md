@@ -151,7 +151,7 @@ Wire sizes for "lab", with d delivered and u unavailable ranges:
 - Every range ≤ `bound`. `bound = SEQ_NONE` ⇒ both lists empty.
 - `topic = TOPIC_MAP_BRICKS` ⇒ `unavailable` empty.
 
-**Unchanged:** `Activity`, `Epoch` (not published), `OperatorAction`. **Deleted:** `EventsFallback.msg`, protocol §3.8, D27 and the `/room_memory/sync/events_fallback` topic. No language has a codec for it and no node publishes it, so `SyncEnd` supersedes it with nothing to migrate.
+**Unchanged:** `Activity`, `Epoch` (not published), `OperatorAction`. (Superseded for `Activity` and `Epoch` by protocol D38, the PR #18 follow-up: both now end with `publisher_generation` too.) **Deleted:** `EventsFallback.msg`, protocol §3.8, D27 and the `/room_memory/sync/events_fallback` topic. No language has a codec for it and no node publishes it, so `SyncEnd` supersedes it with nothing to migrate.
 
 ### 2.3 How the Spark answers `RequestSync` (both nodes, identical bytes)
 

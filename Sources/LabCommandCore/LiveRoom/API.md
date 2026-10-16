@@ -12,8 +12,7 @@ invariants.
 
 Live bridge facts (probed 2026-10-15, `ws://100.118.187.99:8767`, foxglove-bridge 3.6.0):
 - Topics: `/room_memory/{map_bricks,events,status,sync/map_bricks,sync/events}`; a v2 node adds
-  `/room_memory/sync/end`, and the room-memory node publishes `/room_memory/activity`. No
-  `/room_memory/epoch` yet (no node publishes it; the client subscribes when one does).
+  `/room_memory/sync/end`. No `/room_memory/epoch` yet.
 - `capabilities: ["connectionGraph"]` only. **No `clientPublish`**, so the client cannot send
   `RequestSync` over this socket. It advertises its client channel only when the server offers
   `clientPublish`. Otherwise it hands requests to `requestSyncSink` (for the `:8766` relay, Phase 3
@@ -38,7 +37,8 @@ room.mirror.mapRevision // bumps on every brick change: re-upload bricks only wh
 `LiveRoomClient` is `@MainActor final class: ObservableObject`. Every `@Published` property
 changes on the main actor. It republishes `mirror` on each applied message and on a 1 s tick,
 so time-based staleness re-renders without help from the view. It subscribes to every
-`LiveRoomTopic` the bridge advertises with a matching schema, `sync/end` included, stamps each
+`LiveRoomTopic` the bridge advertises with a matching schema, `sync/end` included (and `activity` and
+`epoch` when advertised: the node publishes `activity`, and no node publishes `epoch` yet), stamps each
 `Action.requestSync` with the wall clock, and sends it.
 
 ### `LiveRoomClient`
