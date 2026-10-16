@@ -9,6 +9,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MapBricks.msg"
   "msg/ChangeEvent.msg"
   "msg/MemoryStatus.msg"
+  "msg/Activity.msg"
   "msg/Epoch.msg"
   "msg/RequestSync.msg"
   "msg/Activity.msg"

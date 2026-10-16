@@ -16,7 +16,9 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <span>

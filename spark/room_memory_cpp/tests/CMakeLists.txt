@@ -107,6 +107,15 @@ foreach(threads IN LISTS DIFFERENTIAL_THREADS)
   list(APPEND PYTHON_TESTS differential_omp${threads})
 endforeach()
 list(APPEND PYTHON_TESTS recording_tools static_recording)
+# Full process startup, including the Activity publisher, when this build has the rclcpp node.
+# rhythm_publish stays false: that is the path that still creates Activity. Registered before the
+# Python block's return(), so a configure without ROOM_MEMORY_PYTHON still runs it.
+if(ROOM_MEMORY_BUILD_NODE)
+  add_executable(test_node_startup test_node_startup.cpp)
+  target_compile_options(test_node_startup PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME node_startup COMMAND test_node_startup $<TARGET_FILE:room_memory_node>)
+  set_tests_properties(node_startup PROPERTIES TIMEOUT 60)
+endif()
 if(NOT ROOM_MEMORY_PYTHON)
   foreach(name IN LISTS PYTHON_TESTS)
     add_test(NAME ${name} COMMAND ${CMAKE_COMMAND} -E echo
