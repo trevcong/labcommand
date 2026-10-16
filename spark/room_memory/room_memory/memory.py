@@ -237,15 +237,15 @@ def _coverage(reference):
     return int(np.count_nonzero(inside)) / cells
 
 
-def pose_offset(recent, reference_occupied, voxel_size):
-    """The translation (meters) that best registers ``recent`` (occupied keys) onto the reference
-    occupancy, as one number: per axis, the shift of -POSE_SEARCH_VOXELS .. POSE_SEARCH_VOXELS
-    voxels that maximizes the count of recent voxels landing on reference-occupied ones, refined
-    by the parabola through that count and its two neighbours (not at the ends of the range);
-    the norm of the three per-axis shifts. None when no shift overlaps at all."""
+def pose_shift(recent, reference_occupied, voxel_size):
+    """The translation (meters, per axis) that best registers ``recent`` (occupied keys) onto the
+    reference occupancy: per axis, the shift of -POSE_SEARCH_VOXELS .. POSE_SEARCH_VOXELS voxels that
+    maximizes the count of recent voxels landing on reference-occupied ones, refined by the parabola
+    through that count and its two neighbours (not at the ends of the range). Adding it to the
+    recent points moves them onto the reference. None when no shift overlaps at all."""
     r = POSE_SEARCH_VOXELS
     lanes = unpack(recent)
-    squared = 0.0
+    shifts = []
     for axis in range(3):
         counts = []
         for shift in range(-r, r + 1):
@@ -266,9 +266,23 @@ def pose_offset(recent, reference_occupied, voxel_size):
             curvature = low - 2.0 * mid + high
             if curvature < 0.0:
                 shift += (low - high) / (2.0 * curvature)
-        meters = shift * voxel_size
+        shifts.append(shift * voxel_size)
+    return tuple(shifts)
+
+
+def shift_norm(shift):
+    """The norm of a ``pose_shift`` in binary64, summed in axis order (``pose_residual_m``)."""
+    squared = 0.0
+    for meters in shift:
         squared += meters * meters
     return math.sqrt(squared)
+
+
+def pose_offset(recent, reference_occupied, voxel_size):
+    """``pose_shift`` as one number: the norm of the three per-axis shifts. None when no shift
+    overlaps at all."""
+    shift = pose_shift(recent, reference_occupied, voxel_size)
+    return None if shift is None else shift_norm(shift)
 
 
 # MARK: Persistence
