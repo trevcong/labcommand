@@ -1,0 +1,32 @@
+# labcommand_msgs/MapBricks v2 KIND_DELTA, CDR big endian: map_bricks_delta_v2_le.hex with every
+# multi-byte CDR value reversed (the payload stays little endian). Decode-only. Derived by hand.
+00 00 00 00                 # encapsulation CDR_BE, options 0
+00 00 00 04                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   "lab\0"
+00 00 00 00 00 00 00 2b     # pos 8   map_epoch 43
+00 00 00 00 00 00 00 0c     # pos 16  seq 12
+68 ed 92 8a                 # pos 24  stamp.sec 1760400010
+0e e6 b2 80                 # pos 28  stamp.nanosec 250000000
+00                          # pos 32  compression COMPRESSION_NONE
+01                          # pos 33  kind KIND_DELTA
+00 00 00 00 00 00           # pos 34  pad to 8
+00 00 00 00 00 00 00 2a     # pos 40  base_epoch 42
+3d 4c cc cd                 # pos 48  voxel_size 0.05
+08                          # pos 52  brick_dim 8
+00 00 00                    # pos 53  pad to 4
+00 00 00 01                 # pos 56  n_bricks 1
+00 00 00 02                 # pos 60  n_removed 2
+00 00 00 8e                 # pos 64  payload length 142
+ff ff 02 00 fd ff           # pos 68  payload brick_ijk (-1, 2, -3), little endian
+01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 74
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 90
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 106
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80   # pos 122
+03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 138
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 154
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 170
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80   # pos 186
+00 00 00 00                 # pos 202 removed_bricks_idx[0] 0, little endian
+05 00 00 00                 # pos 206 removed_bricks_idx[1] 5, little endian
+00 00 00 00 00 00           # pos 210 pad to 8
+00 00 01 99 e0 04 44 00     # pos 216 publisher_generation 1760400000000

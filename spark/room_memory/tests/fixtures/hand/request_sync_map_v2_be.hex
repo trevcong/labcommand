@@ -1,0 +1,18 @@
+# labcommand_msgs/RequestSync v2 TOPIC_MAP_BRICKS, CDR big endian: request_sync_map_be.hex (legacy,
+# kept) with since (43, 10), plus the two v2 fields. Decode-only. Derived by hand.
+# Covers: topic ends at pos 49, 7 pad bytes; expected_generation reversed; the token is uint8[16]
+# and is not reversed. 84 bytes on the wire. sync_end_map_replay_be.hex answers it.
+00 00 00 00                 # encapsulation CDR_BE, options 0
+00 00 00 04                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   "lab\0"
+00 00 00 00 00 00 00 2b     # pos 8   map_epoch 43
+00 00 00 00 00 00 00 02     # pos 16  seq 2
+68 ed 92 8a                 # pos 24  stamp.sec 1760400010
+0e e6 b2 80                 # pos 28  stamp.nanosec 250000000
+00 00 00 00 00 00 00 2b     # pos 32  since_epoch 43
+00 00 00 00 00 00 00 0a     # pos 40  since_seq 10
+00                          # pos 48  topic TOPIC_MAP_BRICKS
+00 00 00 00 00 00 00        # pos 49  pad to 8
+00 00 01 99 e0 04 44 00     # pos 56  expected_generation 1760400000000
+0e 8a 3b 5c 77 21 4d 90     # pos 64  request_token[0..7]
+b4 06 59 13 c2 ae 6f 01     # pos 72  request_token[8..15]

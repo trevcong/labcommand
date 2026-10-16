@@ -1,0 +1,19 @@
+# labcommand_msgs/SyncEnd TOPIC_EVENTS, nothing published in this generation, CDR little endian.
+# Derived by hand from SyncEnd.msg. Covers: the answer to a legacy RequestSync (all-zero token
+# copied); bound SEQ_NONE (known empty); topic -> uint64 pad (7 bytes); two empty SeqRange[]
+# counts back to back with no pad between them (an empty sequence aligns nothing). 84 bytes.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+04 00 00 00                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   "lab\0"
+2b 00 00 00 00 00 00 00     # pos 8   map_epoch 43
+00 00 00 00 00 00 00 00     # pos 16  seq 0 (first SyncEnd of this generation)
+8a 92 ed 68                 # pos 24  stamp.sec 1760400010
+80 b2 e6 0e                 # pos 28  stamp.nanosec 250000000
+00 44 04 e0 99 01 00 00     # pos 32  publisher_generation 1760400000000
+00 00 00 00 00 00 00 00     # pos 40  request_token[0..7] (legacy request: all zero)
+00 00 00 00 00 00 00 00     # pos 48  request_token[8..15]
+01                          # pos 56  topic TOPIC_EVENTS
+00 00 00 00 00 00 00        # pos 57  pad to 8
+ff ff ff ff ff ff ff ff     # pos 64  bound SEQ_NONE
+00 00 00 00                 # pos 72  delivered length 0
+00 00 00 00                 # pos 76  unavailable length 0
