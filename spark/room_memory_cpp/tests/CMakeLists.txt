@@ -106,7 +106,7 @@ set(PYTHON_TESTS)
 foreach(threads IN LISTS DIFFERENTIAL_THREADS)
   list(APPEND PYTHON_TESTS differential_omp${threads})
 endforeach()
-list(APPEND PYTHON_TESTS static_recording)
+list(APPEND PYTHON_TESTS recording_tools static_recording)
 if(NOT ROOM_MEMORY_PYTHON)
   foreach(name IN LISTS PYTHON_TESTS)
     add_test(NAME ${name} COMMAND ${CMAKE_COMMAND} -E echo
@@ -122,13 +122,23 @@ foreach(threads IN LISTS DIFFERENTIAL_THREADS)
     ENVIRONMENT "OMP_NUM_THREADS=${threads};ROOM_MEMORY_PYTHON_PACKAGE=${ROOM_MEMORY_PYTHON_PACKAGE};ROOM_MEMORY_OFFLINE=$<TARGET_FILE:room_memory_offline>;ROOM_MEMORY_REPLAY=$<TARGET_FILE:room_memory_replay>;ROOM_MEMORY_SNAPSHOTS=${ROOM_MEMORY_SNAPSHOTS};ROOM_MEMORY_PHASE0_FIXTURES=${ROOM_MEMORY_PHASE0_FIXTURES}"
     TIMEOUT 1800)
 endforeach()
-# The real static recording (not in git; skipped with the reason printed when absent). Its tools
-# import the oracle's decoder, from wherever the oracle is (/oracle/room_memory in the image).
-# pytest exits 0 when every test skipped; its summary then has no "passed", and ctest reports the
-# test skipped instead of passed.
+# The recording tools on synthetic input: no recording needed, so they pass or fail on every machine.
+# The recording tests import the oracle's decoder, from wherever the oracle is (/oracle/room_memory
+# in the image).
+set(STATIC_RECORDING_TEST ${CMAKE_CURRENT_SOURCE_DIR}/recording/test_static_recording.py)
+set(RECORDING_ENVIRONMENT "ROOM_MEMORY_BAG=$<TARGET_FILE:room_memory_bag>;ROOM_MEMORY_PYTHON_PACKAGE=${ROOM_MEMORY_PYTHON_PACKAGE};PYTHONPATH=${ROOM_MEMORY_PYTHON_PACKAGE}")
+add_test(NAME recording_tools
+         COMMAND ${ROOM_MEMORY_PYTHON} -m pytest -q -rs -p no:cacheprovider ${CMAKE_CURRENT_SOURCE_DIR}/recording/test_tools.py)
+# They also check that static_recording, run as below without a recording, reports skipped.
+set_tests_properties(recording_tools PROPERTIES
+  ENVIRONMENT "${RECORDING_ENVIRONMENT};ROOM_MEMORY_STATIC_RECORDING_TEST=${STATIC_RECORDING_TEST}"
+  TIMEOUT 600)
+# The real static recording (not in git; skipped with the reason printed when absent). Alone in its
+# test, so a machine without the recording reports it skipped: recording/conftest.py exits 77 when
+# every test skipped.
 add_test(NAME static_recording
-         COMMAND ${ROOM_MEMORY_PYTHON} -m pytest -q -rs -p no:cacheprovider ${CMAKE_CURRENT_SOURCE_DIR}/recording)
+         COMMAND ${ROOM_MEMORY_PYTHON} -m pytest -q -rs -p no:cacheprovider ${STATIC_RECORDING_TEST})
 set_tests_properties(static_recording PROPERTIES
-  ENVIRONMENT "ROOM_MEMORY_BAG=$<TARGET_FILE:room_memory_bag>;ROOM_MEMORY_PYTHON_PACKAGE=${ROOM_MEMORY_PYTHON_PACKAGE};PYTHONPATH=${ROOM_MEMORY_PYTHON_PACKAGE}"
-  SKIP_REGULAR_EXPRESSION "(^|\n)[0-9]+ skipped( in |, [0-9]+ warnings? in )"
+  ENVIRONMENT "${RECORDING_ENVIRONMENT}"
+  SKIP_RETURN_CODE 77
   TIMEOUT 3600)
