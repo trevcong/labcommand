@@ -8,6 +8,8 @@ public enum LiveRoomTopic: String, Sendable, CaseIterable {
     case status = "/room_memory/status"
     case syncMapBricks = "/room_memory/sync/map_bricks"
     case syncEvents = "/room_memory/sync/events"
+    /// The end-of-answer manifest of every `RequestSync` answer (`SyncEnd`).
+    case syncEnd = "/room_memory/sync/end"
 
     /// `schemaName` the bridge advertises for the topic (ROS 2 form).
     public var schemaName: String {
@@ -15,11 +17,12 @@ public enum LiveRoomTopic: String, Sendable, CaseIterable {
         case .mapBricks, .syncMapBricks: return "labcommand_msgs/msg/MapBricks"
         case .events, .syncEvents: return "labcommand_msgs/msg/ChangeEvent"
         case .status: return "labcommand_msgs/msg/MemoryStatus"
+        case .syncEnd: return "labcommand_msgs/msg/SyncEnd"
         }
     }
 
-    /// True for the two topics that carry answers to `RequestSync`.
-    public var isSync: Bool { self == .syncMapBricks || self == .syncEvents }
+    /// True for the topics that carry answers to `RequestSync`, any Mac's.
+    public var isSync: Bool { self == .syncMapBricks || self == .syncEvents || self == .syncEnd }
 
     /// The advertised channel, if it is one of ours. A known topic with another schema
     /// (or a non-CDR encoding) is refused rather than misdecoded.

@@ -1,13 +1,13 @@
 #!/bin/bash
 # Capture one Live Room window from the build-output app.
-# Usage: scripts/live-room-shots.sh live|map|status|stale|unavailable
+# Usage: scripts/live-room-shots.sh live|map|status|stale|lost|restart|legacy|unavailable
 # Quits that process by PID. Does not install, and does not touch ~/Applications.
 set -euo pipefail
 
 MODE="${1:-}"
 case "$MODE" in
-  live|map|status|stale|unavailable) ;;
-  *) echo "usage: $0 live|map|status|stale|unavailable" >&2; exit 2 ;;
+  live|map|status|stale|lost|restart|legacy|unavailable) ;;
+  *) echo "usage: $0 live|map|status|stale|lost|restart|legacy|unavailable" >&2; exit 2 ;;
 esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

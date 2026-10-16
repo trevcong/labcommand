@@ -60,50 +60,104 @@ public enum LiveRoomFixtureError: Error, Equatable, CustomStringConvertible {
     }
 }
 
-/// Offline room. Decodes the hand goldens and drives `RoomMemoryMirror`. It does not open a socket.
+/// Offline room. Decodes the hand goldens (v2, one publisher generation) and drives
+/// `RoomMemoryMirror`. It does not open a socket. `lost`, `restart` and `legacy` show the
+/// history and identity states the screenshots check: lost ranges, a restart banner with the
+/// earlier run's open events, and an old Spark node.
 public struct LiveRoomFixture: Equatable, Sendable {
     public enum Mode: String, Equatable, Sendable, CaseIterable {
-        case map, status, stale, unavailable
+        case map, status, stale, lost, restart, legacy, unavailable
     }
+
+    /// The publisher generation of every v2 hand golden.
+    public static let generation: UInt64 = 1_760_400_000_000
+    /// The run before it in `restart` mode: an hour earlier.
+    static let earlierGeneration: UInt64 = generation - 3_600_000
 
     public var mode: Mode
     public var mirror: RoomMemoryMirror
     public var connection: LiveRoomConnection
     private var statusSeq: UInt64
+    private var statusGeneration: UInt64?
+    private var statusEventsSeq: UInt64?
 
     public static func load(mode: Mode, root: URL?, now: TimeInterval) throws -> LiveRoomFixture {
+        var fixture = LiveRoomFixture(mode: mode, mirror: RoomMemoryMirror(tokenSeed: 0), connection: connected, statusSeq: 1,
+                                      statusGeneration: generation, statusEventsSeq: 5)
         switch mode {
         case .unavailable:
-            return LiveRoomFixture(mode: .unavailable, mirror: RoomMemoryMirror(), connection: .off, statusSeq: 0)
+            fixture.connection = .off
+            return fixture
         case .status:
-            var mirror = RoomMemoryMirror()
-            _ = mirror.connectionOpened(at: now, canRequest: false)
-            let bytes = try goldenBytes(name: "memory_status_le", root: root)
-            _ = mirror.receive(topic: .status, payload: bytes, at: now)
-            return LiveRoomFixture(mode: .status, mirror: mirror, connection: connected, statusSeq: 0)
-        case .map, .stale:
+            _ = fixture.mirror.connectionOpened(at: now, canRequest: false)
+            _ = fixture.mirror.receive(topic: .status, payload: try goldenBytes(name: "memory_status_v2_le", root: root), at: now)
+            return fixture
+        case .map, .stale, .lost:
             let at = mode == .stale ? now - 4 : now
-            var mirror = RoomMemoryMirror()
-            _ = mirror.connectionOpened(at: at, canRequest: false)
-            _ = mirror.receive(topic: .mapBricks, payload: try goldenBytes(name: "map_bricks_snapshot_zlib_le", root: root), at: at)
-            _ = mirror.receive(topic: .events, payload: try goldenBytes(name: "change_event_moved_mask_le", root: root), at: at)
-            _ = mirror.receive(topic: .events, payload: try goldenBytes(name: "change_event_appeared_le", root: root), at: at)
-            _ = mirror.receive(topic: .events, payload: try disappearedEvent().encodedCDR(), at: at)
-            let seq: UInt64 = 1
-            _ = mirror.receive(topic: .status, payload: try trackingStatus(seq: seq, stamp: RoomMemory.Time(sec: 1, nanosec: 0)).encodedCDR(), at: at)
-            if mode == .stale {
-                _ = mirror.tick(at: now)
+            _ = fixture.mirror.connectionOpened(at: at, canRequest: false)
+            fixture.feed(.mapBricks, try snapshot(root: root, generation: generation), at: at)
+            if mode != .lost {
+                // The run's first three transitions: an earlier candidate of the moved box, and a speck that expired.
+                for message in earlierTransitions(generation: generation) {
+                    fixture.feed(.events, try message.encodedCDR(), at: at)
+                }
             }
-            return LiveRoomFixture(mode: mode, mirror: mirror, connection: connected, statusSeq: seq)
+            fixture.feed(.events, try goldenBytes(name: "change_event_moved_mask_v2_le", root: root), at: at)
+            fixture.feed(.events, try goldenBytes(name: "change_event_appeared_v2_le", root: root), at: at)
+            fixture.feed(.events, try disappearedEvent(generation: generation).encodedCDR(), at: at)
+            if mode == .lost {
+                // Another Mac's fallback: seqs 0-2 fell out of the Spark's log before anyone fetched them.
+                fixture.feed(.syncEnd, try lostSyncEnd().encodedCDR(), at: at)
+            }
+            fixture.feed(.status, try trackingStatus(seq: 1, stamp: RoomMemory.Time(sec: 1, nanosec: 0), eventsSeq: 5,
+                                                     generation: generation).encodedCDR(), at: at)
+            if mode == .stale {
+                _ = fixture.mirror.tick(at: now)
+            }
+            return fixture
+        case .restart:
+            _ = fixture.mirror.connectionOpened(at: now - 1, canRequest: false)
+            fixture.feed(.mapBricks, try snapshot(root: root, generation: earlierGeneration), at: now - 1)
+            fixture.feed(.events, try retagged(goldenBytes(name: "change_event_moved_mask_v2_le", root: root), earlierGeneration), at: now - 1)
+            fixture.feed(.status, try trackingStatus(seq: 40, stamp: RoomMemory.Time(sec: 1, nanosec: 0), eventsSeq: 3,
+                                                     generation: earlierGeneration).encodedCDR(), at: now - 1)
+            // The node restarted: its status counts from 0 again under a higher generation, no events yet.
+            fixture.statusEventsSeq = nil
+            fixture.statusSeq = 0
+            fixture.feed(.mapBricks, try snapshot(root: root, generation: generation, seq: 0), at: now)
+            fixture.feed(.status, try trackingStatus(seq: 0, stamp: RoomMemory.Time(sec: 2, nanosec: 0), eventsSeq: nil,
+                                                     generation: generation).encodedCDR(), at: now)
+            return fixture
+        case .legacy:
+            fixture.statusGeneration = nil
+            fixture.statusEventsSeq = nil
+            _ = fixture.mirror.connectionOpened(at: now, canRequest: false)
+            fixture.feed(.mapBricks, try goldenBytes(name: "map_bricks_snapshot_zlib_le", root: root), at: now)
+            fixture.feed(.events, try goldenBytes(name: "change_event_moved_mask_le", root: root), at: now)
+            fixture.feed(.events, try goldenBytes(name: "change_event_appeared_le", root: root), at: now)
+            fixture.feed(.status, try trackingStatus(seq: 1, stamp: RoomMemory.Time(sec: 1, nanosec: 0), eventsSeq: nil,
+                                                     generation: nil).encodedCDR(), at: now)
+            return fixture
         }
     }
 
-    /// Map mode only: a new status seq so the 3 s freshness window stays open.
+    private mutating func feed(_ topic: LiveRoomTopic, _ payload: Data, at now: TimeInterval) {
+        _ = mirror.receive(topic: topic, payload: payload, at: now)
+    }
+
+    /// The modes whose status the app refreshes, so they read as a live room.
+    public static func keepsFresh(_ mode: Mode) -> Bool {
+        [.map, .lost, .restart, .legacy].contains(mode)
+    }
+
+    /// A new status seq so the 3 s freshness window stays open (every mode with a live map).
     public func refreshed(at now: TimeInterval) -> LiveRoomFixture {
-        guard mode == .map else { return self }
+        guard Self.keepsFresh(mode) else { return self }
         var copy = self
         let seq = statusSeq &+ 1
-        guard let payload = try? Self.trackingStatus(seq: seq, stamp: RoomMemory.Time(sec: 1, nanosec: UInt32(seq % 1_000_000_000))).encodedCDR() else {
+        let stamp = RoomMemory.Time(sec: 1, nanosec: UInt32(seq % 1_000_000_000))
+        guard let payload = try? Self.trackingStatus(seq: seq, stamp: stamp, eventsSeq: statusEventsSeq,
+                                                     generation: statusGeneration).encodedCDR() else {
             return self
         }
         _ = copy.mirror.receive(topic: .status, payload: payload, at: now)
@@ -148,8 +202,9 @@ public struct LiveRoomFixture: Equatable, Sendable {
         )
     )
 
-    /// Tracking status for room `lab`, coverage and `eventsSeq` left unmeasured.
-    static func trackingStatus(seq: UInt64, stamp: RoomMemory.Time) -> RoomMemory.MemoryStatus {
+    /// Tracking status for room `lab` at epoch 43, coverage left unmeasured.
+    static func trackingStatus(seq: UInt64, stamp: RoomMemory.Time, eventsSeq: UInt64? = nil,
+                               generation: UInt64? = LiveRoomFixture.generation) -> RoomMemory.MemoryStatus {
         RoomMemory.MemoryStatus(
             header: RoomMemory.Header(roomId: "lab", mapEpoch: 43, seq: seq, stamp: stamp),
             state: .tracking,
@@ -161,12 +216,73 @@ public struct LiveRoomFixture: Equatable, Sendable {
             mid360Hz: nil,
             jt128Hz: nil,
             droppedWindows: 0,
-            eventsSeq: nil
+            eventsSeq: eventsSeq,
+            publisherGeneration: generation
+        )
+    }
+
+    /// The zlib snapshot golden's bricks as a v2 snapshot of `generation` (there is no v2 snapshot golden).
+    static func snapshot(root: URL?, generation: UInt64, seq: UInt64? = nil) throws -> Data {
+        var message = try RoomMemory.MapBricks.decode(cdr: goldenBytes(name: "map_bricks_snapshot_zlib_le", root: root))
+        message.publisherGeneration = generation
+        if let seq { message.header.seq = seq }
+        return try message.encodedCDR()
+    }
+
+    /// A v2 event golden re-stamped with another generation (the mask follows).
+    static func retagged(_ bytes: Data, _ generation: UInt64) throws -> Data {
+        var event = try RoomMemory.ChangeEvent.decode(cdr: bytes)
+        event.publisherGeneration = generation
+        event.mask?.publisherGeneration = generation
+        return try event.encodedCDR()
+    }
+
+    /// Seqs 0-2: the moved box's CANDIDATE (event 9), and a speck (event 12) that appeared and expired.
+    static func earlierTransitions(generation: UInt64) -> [RoomMemory.ChangeEvent] {
+        let stamp = RoomMemory.Time(sec: 1_760_400_002, nanosec: 0)
+        func event(seq: UInt64, id: UInt64, kind: RoomMemory.ChangeEvent.Kind, state: RoomMemory.ChangeEvent.State,
+                   centroid: SIMD3<Float>, from: SIMD3<Float>?) -> RoomMemory.ChangeEvent {
+            RoomMemory.ChangeEvent(
+                header: RoomMemory.Header(roomId: "lab", mapEpoch: 43, seq: seq, stamp: stamp),
+                eventId: id,
+                kind: kind,
+                state: state,
+                centroid: centroid,
+                aabb: RoomMemory.ChangeEvent.Box(min: centroid - 0.125, max: centroid + 0.125),
+                fromCentroid: from,
+                voxelCount: 8,
+                volumeM3: 0.001,
+                evidence: nil,
+                alpha: nil,
+                sensors: .jt128,
+                firstSeen: stamp,
+                lastSeen: stamp,
+                mask: nil,
+                publisherGeneration: generation
+            )
+        }
+        return [
+            event(seq: 0, id: 9, kind: .moved, state: .candidate, centroid: SIMD3(1.5, -0.25, 0.125), from: SIMD3(0.5, -0.25, 0.125)),
+            event(seq: 1, id: 12, kind: .appeared, state: .candidate, centroid: SIMD3(-1, 2, 0.25), from: nil),
+            event(seq: 2, id: 12, kind: .appeared, state: .expired, centroid: SIMD3(-1, 2, 0.25), from: nil),
+        ]
+    }
+
+    /// An events fallback's manifest: 3-5 sent, 0-2 no longer held.
+    static func lostSyncEnd() -> RoomMemory.SyncEnd {
+        RoomMemory.SyncEnd(
+            header: RoomMemory.Header(roomId: "lab", mapEpoch: 43, seq: 0, stamp: RoomMemory.Time(sec: 1_760_400_012, nanosec: 0)),
+            publisherGeneration: generation,
+            token: RoomMemory.RequestToken(bytes: [0x3c, 0x5f, 0x10, 0x8d, 0x22, 0x91, 0x4e, 0x07, 0x9a, 0x61, 0x0b, 0xd2, 0x37, 0xe4, 0x58, 0xa6])!,
+            topic: .events,
+            bound: 5,
+            delivered: [3...5],
+            unavailable: [0...2]
         )
     }
 
     /// Confirmed disappeared box, clear of the two hand-golden boxes. Not a new hex file.
-    static func disappearedEvent() -> RoomMemory.ChangeEvent {
+    static func disappearedEvent(generation: UInt64? = LiveRoomFixture.generation) -> RoomMemory.ChangeEvent {
         let stamp = RoomMemory.Time(sec: 1_760_400_012, nanosec: 0)
         return RoomMemory.ChangeEvent(
             header: RoomMemory.Header(roomId: "lab", mapEpoch: 43, seq: 5, stamp: stamp),
@@ -183,7 +299,8 @@ public struct LiveRoomFixture: Equatable, Sendable {
             sensors: .mid360,
             firstSeen: stamp,
             lastSeen: stamp,
-            mask: nil
+            mask: nil,
+            publisherGeneration: generation
         )
     }
 }
@@ -248,11 +365,16 @@ public struct LiveRoomScreen: Equatable, Sendable {
     public var canvasSentence: String?
     public var brickOpacity: Float
     public var markers: [LiveRoomMarker]
-    public var incompleteLine: String?
+    /// "Spark node restarted · …" while continuity is broken. Shown under `banner`.
+    public var restartBanner: LiveRoomBanner?
+    /// The event history line from `EventHistory`; nil before any witness.
+    public var historyLine: String?
     public var standaloneResync: String?
     public var caption: String
     public var openRows: [LiveRoomEventRow]
     public var historyRows: [LiveRoomEventRow]
+    /// Open events of earlier runs: "earlier run · may be outdated", never on the map.
+    public var earlierRows: [LiveRoomEventRow]
     /// The column prints `caption` in place of the event sections.
     public var columnIsUnavailable: Bool
 
@@ -267,23 +389,23 @@ public struct LiveRoomScreen: Equatable, Sendable {
     ) -> LiveRoomScreen {
         let canvas = roomCanvasSentence(mirror: mirror, connection: connection, started: started)
         var banner = baseBanner(mirror: mirror, connection: connection, started: started, now: now)
-        var incomplete = formatIncomplete(mirror.eventsState)
+        let history = formatHistory(mirror: mirror, requestPathExists: requestPathExists)
         let phrase = resyncPhrase(mirror: mirror, requestPathExists: requestPathExists)
         var standalone: String?
         if let phrase {
             if banner?.text.hasPrefix("resyncing · as of epoch") == true {
                 banner?.text += " · " + phrase
-            } else if incomplete != nil {
-                incomplete = (incomplete ?? "") + " · " + phrase
             } else {
                 standalone = phrase
             }
         }
         let markers = LiveRoomMarkers.draw(mirror: mirror, kinds: kinds, selection: selection)
-        let outdated = mirror.eventsState != .complete
+        let outdated = !mirror.eventHistory.caughtUp
         let openRows = rows(from: sortedOpen(mirror.openEvents), mirror: mirror, history: false, outdated: outdated, kinds: kinds)
         let historySource = Array(mirror.events.filter { isTerminal($0.event.state) }.reversed())
         let historyRows = rows(from: historySource, mirror: mirror, history: true, outdated: false, kinds: kinds)
+        let earlierRows = rows(from: sortedOpen(mirror.archivedOpenEvents.map(\.entry)), mirror: mirror, history: false,
+                               outdated: false, earlier: true, kinds: kinds)
         let unavailable = columnUnavailable(mirror: mirror, connection: connection)
         return LiveRoomScreen(
             pip: roomPip(mirror: mirror, connection: connection),
@@ -292,11 +414,13 @@ public struct LiveRoomScreen: Equatable, Sendable {
             canvasSentence: canvas,
             brickOpacity: roomBrickOpacity(mirror: mirror, drawingMap: canvas == nil),
             markers: markers,
-            incompleteLine: incomplete,
+            restartBanner: restartNotice(mirror),
+            historyLine: history,
             standaloneResync: standalone,
             caption: roomCaption(mirror: mirror, markers: markers, unavailable: unavailable),
             openRows: openRows,
             historyRows: historyRows,
+            earlierRows: earlierRows,
             columnIsUnavailable: unavailable
         )
     }
@@ -313,6 +437,9 @@ public struct LiveRoomScreen: Equatable, Sendable {
         }
         let epoch = mirror.mapEpoch ?? mirror.status?.mapEpoch
         parts.append(epoch.map { "epoch \($0)" } ?? "epoch —")
+        if let generation = mirror.activeGeneration {
+            parts.append(runTag(generation))
+        }
         if let coverage = mirror.status?.coverageKnownFraction {
             parts.append("coverage \(oneDecimal(coverage * 100))%")
         } else {
@@ -330,6 +457,11 @@ public struct LiveRoomScreen: Equatable, Sendable {
             parts.append("cell \(oneDecimal(size * 100)) cm")
         }
         return parts.joined(separator: " · ")
+    }
+
+    /// `run …1234`: the last 4 digits of the publisher generation.
+    public static func runTag(_ generation: UInt64) -> String {
+        "run …" + String(String(generation).suffix(4))
     }
 
     static func ageSeconds(mirror: RoomMemoryMirror, now: TimeInterval) -> Int {
@@ -508,6 +640,9 @@ public enum LiveRoomSidecar {
         case "map": name = "live-room-map"
         case "status": name = "live-room-status"
         case "stale": name = "live-room-stale"
+        case "lost": name = "live-room-lost"
+        case "restart": name = "live-room-restart"
+        case "legacy": name = "live-room-legacy"
         default: name = "live-room-unavailable"
         }
         return "build/screenshots/\(name).txt"
@@ -527,18 +662,21 @@ public enum LiveRoomSidecar {
         if let banner = screen.banner {
             lines.append("banner \(banner.text)")
         }
+        if let restart = screen.restartBanner {
+            lines.append("restart \(restart.text)")
+        }
         lines.append("status \(screen.statusLine)")
         lines.append("pip \(screen.pip.rawValue)")
         lines.append("markers \(screen.markers.count)")
         lines.append("caption \(screen.caption)")
-        if let incomplete = screen.incompleteLine {
-            lines.append("incomplete \(incomplete)")
+        if let history = screen.historyLine {
+            lines.append("history \(history)")
         }
         if let standalone = screen.standaloneResync {
             lines.append("resync \(standalone)")
         }
         lines.append("rows")
-        for row in screen.openRows + screen.historyRows {
+        for row in screen.openRows + screen.historyRows + screen.earlierRows {
             lines.append(row.line1)
             lines.append(row.line2)
         }
@@ -723,18 +861,39 @@ private func columnUnavailable(mirror: RoomMemoryMirror, connection: LiveRoomCon
     return false
 }
 
-private func formatIncomplete(_ state: RoomMemoryMirror.EventsState) -> String? {
-    switch state {
-    case .complete:
+/// The event history line (PLAN-PUBGEN §4.8). Nil while nothing witnesses the history.
+private func formatHistory(mirror: RoomMemoryMirror, requestPathExists: Bool) -> String? {
+    if isLegacy(mirror) { return "history unverified (old Spark node)" }
+    let history = mirror.eventHistory
+    switch history.coverage {
+    case .unknown:
         return nil
-    case .incomplete(let since):
-        guard let since else { return "incomplete" }
-        return "incomplete since \(liveRoomClock(since))"
+    case .empty:
+        return "no events this run"
+    case .completeThrough(let top):
+        return "history complete through #\(top)"
+    case .missing:
+        let (missing, lost) = history.missingCounts
+        var line = "history incomplete: \(missing) missing"
+        if lost > 0 { line += " (\(lost) lost on the Spark)" }
+        if !requestPathExists, missing > lost { line += " · no request path" }
+        return line
     }
 }
 
+private func isLegacy(_ mirror: RoomMemoryMirror) -> Bool {
+    mirror.wire == .legacy || mirror.mapState == .stale(.unverified)
+}
+
+private func restartNotice(_ mirror: RoomMemoryMirror) -> LiveRoomBanner? {
+    guard case .broken = mirror.continuity else { return nil }
+    return LiveRoomBanner(text: "Spark node restarted · events from the earlier run may be missing", tone: .warn)
+}
+
+/// The map needs a resync no request path can carry, or requests went unsent. The history line
+/// says "no request path" for events itself.
 private func resyncPhrase(mirror: RoomMemoryMirror, requestPathExists: Bool) -> String? {
-    let recovery = isStale(mirror.mapState) || mirror.eventsState != .complete
+    let recovery = isStale(mirror.mapState) && !isLegacy(mirror)
     let unsent = mirror.activity.requestsUnsent
     guard (recovery && !requestPathExists) || unsent > 0 else { return nil }
     if unsent > 0 { return "cannot request resync · \(unsent) unsent" }
@@ -769,12 +928,13 @@ private func rows(
     mirror: RoomMemoryMirror,
     history: Bool,
     outdated: Bool,
+    earlier: Bool = false,
     kinds: Set<RoomMemory.ChangeEvent.Kind>
 ) -> [LiveRoomEventRow] {
     events.compactMap { entry in
         guard kinds.contains(entry.event.kind) else { return nil }
         let event = entry.event
-        let id = history ? "\(entry.seq)-\(event.eventId)" : String(event.eventId)
+        let id = earlier ? "earlier-\(entry.seq)-\(event.eventId)" : history ? "\(entry.seq)-\(event.eventId)" : String(event.eventId)
         let voxels = event.voxelCount == 1 ? "1 voxel" : "\(event.voxelCount) voxels"
         let line1 = "\(kindWord(event.kind)) · \(stateName(event.state)) · \(voxels) · \(liveRoomClock(event.header.stamp))"
         var bits: [String] = []
@@ -793,7 +953,11 @@ private func rows(
         if history, LiveRoomMarkers.isWaiting(entry, mirror: mirror) {
             bits.append("accepted · map updating")
         }
-        if !history, outdated { bits.append("may be outdated") }
+        if earlier {
+            bits.append("earlier run · may be outdated")
+        } else if !history, outdated {
+            bits.append("may be outdated")
+        }
         return LiveRoomEventRow(id: id, kind: event.kind, line1: line1, line2: bits.joined(separator: " · "), history: history)
     }
 }

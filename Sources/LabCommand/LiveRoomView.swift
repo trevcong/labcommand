@@ -84,6 +84,13 @@ private struct LiveRoomBody: View {
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            if let restart = screen.restartBanner {
+                Text(restart.text)
+                    .font(LabTheme.t(13))
+                    .foregroundStyle(toneColor(restart.tone))
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 8) {
                     canvasStack(screen)
@@ -132,11 +139,14 @@ private struct LiveRoomBody: View {
                     Text("Map").tag(LiveRoomFixture.Mode.map)
                     Text("Status").tag(LiveRoomFixture.Mode.status)
                     Text("Stale").tag(LiveRoomFixture.Mode.stale)
+                    Text("Lost").tag(LiveRoomFixture.Mode.lost)
+                    Text("Restart").tag(LiveRoomFixture.Mode.restart)
+                    Text("Legacy").tag(LiveRoomFixture.Mode.legacy)
                     Text("Off").tag(LiveRoomFixture.Mode.unavailable)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 280)
+                .frame(width: 480)
                 .font(LabTheme.t(11))
             }
         }
@@ -193,10 +203,10 @@ private struct LiveRoomBody: View {
                     .foregroundStyle(LabTheme.dim)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
-                if let line = screen.incompleteLine {
+                if let line = screen.historyLine {
                     Text(line)
                         .font(LabTheme.mono(11))
-                        .foregroundStyle(line.contains("cannot request resync") ? LabTheme.warn : LabTheme.dim)
+                        .foregroundStyle(line.hasPrefix("history incomplete") || line.hasPrefix("history unverified") ? LabTheme.warn : LabTheme.dim)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -212,6 +222,12 @@ private struct LiveRoomBody: View {
                         if !screen.openRows.isEmpty {
                             sectionLabel("Events")
                             ForEach(screen.openRows) { row in
+                                rowButton(row)
+                            }
+                        }
+                        if !screen.earlierRows.isEmpty {
+                            sectionLabel("Earlier run")
+                            ForEach(screen.earlierRows) { row in
                                 rowButton(row)
                             }
                         }

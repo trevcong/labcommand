@@ -46,19 +46,24 @@ private func viewBrick() -> RoomMemory.Brick {
     )
 }
 
+/// The publisher generation of the view tests' messages; nil builds the legacy layout.
+private let viewGeneration: UInt64? = LiveRoomFixture.generation
+
 private func viewSnapshot(
     epoch: UInt64,
     seq: UInt64 = 1,
     room: String = "lab",
     voxel: Float = 0.05,
-    bricks: [RoomMemory.Brick] = []
+    bricks: [RoomMemory.Brick] = [],
+    generation: UInt64? = viewGeneration
 ) -> Data {
     let message = RoomMemory.MapBricks(
         header: viewHeader(epoch, seq, room: room),
         kind: .snapshot,
         baseEpoch: 0,
         voxelSize: voxel,
-        bricks: bricks
+        bricks: bricks,
+        publisherGeneration: generation
     )
     return viewCDR(message.encodedCDR, "snapshot \(epoch)")
 }
@@ -71,7 +76,8 @@ private func viewStatus(
     eventsSeq: UInt64? = nil,
     room: String = "lab",
     residual: Float? = nil,
-    stamp: RoomMemory.Time = RoomMemory.Time(sec: 1, nanosec: 0)
+    stamp: RoomMemory.Time = RoomMemory.Time(sec: 1, nanosec: 0),
+    generation: UInt64? = viewGeneration
 ) -> Data {
     let message = RoomMemory.MemoryStatus(
         header: viewHeader(epoch, seq, room: room, stamp: stamp),
@@ -84,7 +90,8 @@ private func viewStatus(
         mid360Hz: nil,
         jt128Hz: nil,
         droppedWindows: 0,
-        eventsSeq: eventsSeq
+        eventsSeq: eventsSeq,
+        publisherGeneration: generation
     )
     return viewCDR(message.encodedCDR, "status \(seq)")
 }
@@ -97,7 +104,8 @@ private func viewEvent(
     kind: RoomMemory.ChangeEvent.Kind = .appeared,
     stamp: RoomMemory.Time = RoomMemory.Time(sec: 1_760_400_010, nanosec: 0),
     evidence: Float? = nil,
-    alpha: Float? = nil
+    alpha: Float? = nil,
+    generation: UInt64? = viewGeneration
 ) -> Data {
     let message = RoomMemory.ChangeEvent(
         header: viewHeader(epoch, seq, stamp: stamp),
@@ -114,13 +122,14 @@ private func viewEvent(
         sensors: [],
         firstSeen: stamp,
         lastSeen: stamp,
-        mask: nil
+        mask: nil,
+        publisherGeneration: generation
     )
     return viewCDR(message.encodedCDR, "event \(id) s\(seq)")
 }
 
 private func viewOpened(at now: TimeInterval = 100, canRequest: Bool = false) -> RoomMemoryMirror {
-    var mirror = RoomMemoryMirror()
+    var mirror = RoomMemoryMirror(tokenSeed: 1)
     _ = mirror.connectionOpened(at: now, canRequest: canRequest)
     return mirror
 }
@@ -165,18 +174,24 @@ private func viewLoad(_ mode: LiveRoomFixture.Mode, now: TimeInterval) -> LiveRo
 func testLiveRoomStatusLine() {
     let bytes: Data
     do {
-        bytes = try LiveRoomFixture.goldenBytes(name: "memory_status_le", root: viewRepoRoot())
+        bytes = try LiveRoomFixture.goldenBytes(name: "memory_status_v2_le", root: viewRepoRoot())
     } catch {
-        expect(false, "memory_status_le.hex loads: \(error)")
+        expect(false, "memory_status_v2_le.hex loads: \(error)")
         return
     }
     let decoded = try? RoomMemory.MemoryStatus.decode(cdr: bytes)
-    expect(decoded?.eventsSeq == 12, "memory_status_le eventsSeq is 12, got \(String(describing: decoded?.eventsSeq))")
+    expect(decoded?.eventsSeq == 12, "memory_status_v2_le eventsSeq is 12, got \(String(describing: decoded?.eventsSeq))")
 
     var golden = viewOpened()
     viewFeed(&golden, .status, bytes, at: 10)
     let goldenLine = LiveRoomScreen.statusLine(mirror: golden, connection: viewServer(), now: 10)
     expect(goldenLine.contains("events 12"), "golden status line contains events 12: \(goldenLine)")
+    expect(goldenLine.contains("epoch 42 · run …0000 ·"), "the status line tags the run with the generation's last 4 digits: \(goldenLine)")
+    expect(LiveRoomScreen.runTag(1_760_400_001_234) == "run …1234", "run tag is the last 4 digits")
+    var legacyStatus = viewOpened()
+    viewFeed(&legacyStatus, .status, viewStatus(epoch: 1, seq: 1, generation: nil), at: 10)
+    expect(!LiveRoomScreen.statusLine(mirror: legacyStatus, connection: viewServer(), now: 10).contains("run"),
+           "a legacy status has no run tag")
 
     var bare = viewOpened()
     viewFeed(&bare, .status, viewStatus(epoch: 1, seq: 1, eventsSeq: nil), at: 10)
@@ -186,7 +201,8 @@ func testLiveRoomStatusLine() {
     var baseline = viewOpened(canRequest: false)
     viewFeed(&baseline, .events, viewEvent(id: 1, seq: 4, state: .candidate), at: 10)
     viewFeed(&baseline, .status, viewStatus(epoch: 43, seq: 2, eventsSeq: 12), at: 10)
-    expect(baseline.eventsSeq == 4, "baseline stays at the first event seq 4, got \(String(describing: baseline.eventsSeq))")
+    expect(baseline.eventHistory.contiguousThrough == nil, "seq 4 alone starts no run from 0")
+    expect(baseline.eventHistory.coverage == .missing(pending: [0...3, 5...12], lost: []), "got \(baseline.eventHistory.coverage)")
     expect(baseline.status?.eventsSeq == 12, "status high-water is 12")
     let baseLine = LiveRoomScreen.statusLine(mirror: baseline, connection: viewServer(), now: 10)
     expect(baseLine.contains("events 12"), "bar reads status.eventsSeq 12, not the baseline: \(baseLine)")
@@ -214,7 +230,7 @@ func testLiveRoomStatusLine() {
     expect(!staleLine.contains("Tracking"), "a stale status drops the state word: \(staleLine)")
 }
 
-func testLiveRoomEventRowsAndIncomplete() {
+func testLiveRoomEventRowsAndHistory() {
     var mirror = viewOpened()
     viewFeed(&mirror, .mapBricks, viewSnapshot(epoch: 43), at: 10)
     viewFeed(&mirror, .status, viewStatus(epoch: 43, seq: 1), at: 10)
@@ -222,34 +238,76 @@ func testLiveRoomEventRowsAndIncomplete() {
     let row = viewScreen(mirror, path: true).openRows.first
     expect(row?.line2.contains("uncalibrated") == true, "nil alpha is uncalibrated: \(row?.line2 ?? "")")
     expect(row?.line2.contains("evidence —") == true, "nil evidence is evidence —: \(row?.line2 ?? "")")
+    expect(row?.line2.contains("may be outdated") == true, "an open row says may be outdated while not caught up: \(row?.line2 ?? "")")
+
+    var none = viewOpened()
+    viewFeed(&none, .mapBricks, viewSnapshot(epoch: 1), at: 10)
+    viewFeed(&none, .status, viewStatus(epoch: 1, seq: 1, eventsSeq: nil), at: 10)
+    expect(none.eventHistory.coverage == .empty && none.eventHistory.caughtUp, "a v2 status with no events is a known-empty history")
+    expect(viewScreen(none, path: true, now: 10).historyLine == "no events this run", "got \(String(describing: viewScreen(none).historyLine))")
 
     var done = viewOpened()
-    viewFeed(&done, .mapBricks, viewSnapshot(epoch: 1), at: 10)
-    viewFeed(&done, .status, viewStatus(epoch: 1, seq: 1, eventsSeq: nil), at: 10)
-    expect(done.eventsState == .complete, "no events is a complete history")
-    expect(viewScreen(done, path: true).incompleteLine == nil, "complete history prints no incomplete line")
+    viewFeed(&done, .events, viewEvent(id: 4, seq: 0, state: .candidate), at: 10)
+    viewFeed(&done, .events, viewEvent(id: 4, seq: 1, state: .confirmed), at: 10)
+    viewFeed(&done, .status, viewStatus(epoch: 43, seq: 1, eventsSeq: 1), at: 10)
+    expect(done.eventHistory.caughtUp, "every seq through the status's events_seq: caught up")
+    let doneScreen = viewScreen(done, path: true, now: 10)
+    expect(doneScreen.historyLine == "history complete through #1", "got \(String(describing: doneScreen.historyLine))")
+    expect(doneScreen.openRows.first.map { !$0.line2.contains("may be outdated") } == true, "caught up: open rows are current")
 
     var gap = viewOpened(canRequest: true)
     viewFeed(&gap, .status, viewStatus(epoch: 1, seq: 1, eventsSeq: nil), at: 10)
     viewFeed(&gap, .events, viewEvent(id: 3, seq: 5, state: .candidate), at: 10)
-    expect(gap.eventsState == .incomplete(since: nil), "first seq after a cleared initial sync is incomplete(since: nil), got \(gap.eventsState)")
-    let gapLine = viewScreen(gap, path: true).incompleteLine
-    expect(gapLine == "incomplete", "nil since prints incomplete, got \(String(describing: gapLine))")
+    expect(gap.eventHistory.coverage == .missing(pending: [0...4], lost: []), "seq 5 first: 0-4 pending, got \(gap.eventHistory.coverage)")
+    expect(viewScreen(gap, path: true).historyLine == "history incomplete: 5 missing", "got \(String(describing: viewScreen(gap).historyLine))")
+    expect(viewScreen(gap, path: false).historyLine == "history incomplete: 5 missing · no request path",
+           "no request path says so, got \(String(describing: viewScreen(gap, path: false).historyLine))")
 
-    let when = RoomMemory.Time(sec: 1_760_400_010, nanosec: 0)
-    var stamped = viewOpened(canRequest: false)
-    viewFeed(&stamped, .events, viewEvent(id: 4, seq: 0, state: .candidate, stamp: when), at: 10)
-    viewFeed(&stamped, .events, viewEvent(id: 4, seq: 2, state: .confirmed, stamp: RoomMemory.Time(sec: 1_760_400_020, nanosec: 0)), at: 10)
-    expect(stamped.eventsState == .incomplete(since: when), "no request path: since the last message before the hole, got \(stamped.eventsState)")
-    let stampedLine = viewScreen(stamped, path: true).incompleteLine
-    expect(stampedLine == "incomplete since 00:00:10", "stamp renders UTC, got \(String(describing: stampedLine))")
+    // Lost on the Spark: a fallback's manifest declares 0-2 unavailable.
+    guard let lost = viewLoad(.lost, now: 200) else { return }
+    let lostScreen = viewScreen(lost.mirror, connection: lost.connection, path: false, started: false, now: 200)
+    expect(lostScreen.historyLine == "history incomplete: 3 missing (3 lost on the Spark)",
+           "lost ranges, no request-path suffix when nothing is pending: \(String(describing: lostScreen.historyLine))")
+    expect(lost.mirror.eventHistory.coverage == .missing(pending: [], lost: [0...2]), "got \(lost.mirror.eventHistory.coverage)")
 
-    let zero = RoomMemory.Time(sec: 0, nanosec: 0)
-    var zeroTime = viewOpened(canRequest: false)
-    viewFeed(&zeroTime, .events, viewEvent(id: 5, seq: 0, state: .candidate, stamp: zero), at: 10)
-    viewFeed(&zeroTime, .events, viewEvent(id: 5, seq: 2, state: .confirmed), at: 10)
-    let zeroLine = viewScreen(zeroTime, path: true).incompleteLine
-    expect(zeroLine == "incomplete since time —", "a zero stamp is time —, got \(String(describing: zeroLine))")
+    var legacy = viewOpened()
+    viewFeed(&legacy, .status, viewStatus(epoch: 1, seq: 1, generation: nil), at: 10)
+    viewFeed(&legacy, .events, viewEvent(id: 1, seq: 0, state: .candidate, generation: nil), at: 10)
+    expect(viewScreen(legacy, path: true, now: 10).historyLine == "history unverified (old Spark node)", "legacy history line")
+    expect(legacy.eventHistory.coverage == .unknown && legacy.eventHistory.continuity == .unknown, "legacy is unknown")
+}
+
+func testLiveRoomRestartBanner() {
+    var mirror = viewOpened(at: 10)
+    let earlier = LiveRoomFixture.generation - 1000
+    viewFeed(&mirror, .mapBricks, viewSnapshot(epoch: 43, bricks: [viewBrick()], generation: earlier), at: 10)
+    viewFeed(&mirror, .events, viewEvent(id: 7, seq: 0, state: .confirmed, generation: earlier), at: 10)
+    viewFeed(&mirror, .status, viewStatus(epoch: 43, seq: 9, eventsSeq: 0, generation: earlier), at: 10)
+    expect(viewScreen(mirror, now: 10).restartBanner == nil && mirror.continuity == .verified, "one run: no restart banner")
+    expect(viewScreen(mirror, now: 10).markers.count == 1, "the confirmed event is drawn while current")
+
+    // The node restarted: its first status counts from 0 under a higher generation.
+    viewFeed(&mirror, .status, viewStatus(epoch: 44, seq: 0, eventsSeq: nil), at: 11)
+    let restarted = viewScreen(mirror, now: 11)
+    expect(restarted.restartBanner?.text == "Spark node restarted · events from the earlier run may be missing",
+           "restart banner, got \(String(describing: restarted.restartBanner))")
+    expect(mirror.continuity == .broken(sinceGeneration: earlier), "continuity broken since the earlier run")
+    expect(restarted.earlierRows.count == 1 && restarted.earlierRows[0].line2.contains("earlier run · may be outdated"),
+           "the earlier run's open event is listed, got \(restarted.earlierRows)")
+    expect(restarted.openRows.isEmpty && restarted.markers.isEmpty, "never drawn as a current change")
+    expect(mirror.mapState == .stale(.newGeneration) && mirror.bricks.count == 1, "the earlier run's map stays, greyed")
+    expect(restarted.historyLine == "no events this run", "the new run's history: \(String(describing: restarted.historyLine))")
+
+    guard let fixture = viewLoad(.restart, now: 300) else { return }
+    let screen = viewScreen(fixture.mirror, connection: fixture.connection, path: false, started: false, now: 300)
+    expect(screen.restartBanner != nil && screen.earlierRows.count == 1, "restart fixture shows the banner and one earlier event")
+    expect(fixture.mirror.isMapCurrent && screen.markers.isEmpty, "restart fixture: the new run's map is current, nothing drawn")
+
+    guard let legacy = viewLoad(.legacy, now: 300) else { return }
+    let legacyScreen = viewScreen(legacy.mirror, connection: legacy.connection, path: false, started: false, now: 300)
+    expect(legacy.mirror.mapState == .stale(.unverified) && legacyScreen.markers.isEmpty, "legacy fixture: unverified, no overlays")
+    expect(legacyScreen.historyLine == "history unverified (old Spark node)" && legacyScreen.restartBanner == nil, "legacy fixture lines")
+    expect(legacyScreen.standaloneResync == nil, "legacy never asks for a resync")
 }
 
 func testLiveRoomVoxels() {
@@ -379,7 +437,7 @@ func testLiveRoomBannersAndResync() {
     viewFeed(&staleMap, .status, viewStatus(epoch: 43, seq: 1), at: 20)
     viewFeed(&staleMap, .status, viewStatus(epoch: 80, seq: 2), at: 20)
     viewFeed(&staleMap, .status, viewStatus(epoch: 80, seq: 3, stamp: RoomMemory.Time(sec: 3, nanosec: 0)), at: 20)
-    expect(staleMap.eventsState == .complete, "no events leaves history complete")
+    expect(staleMap.eventHistory.coverage == .empty, "no events leaves the history known-empty")
     let resync = viewScreen(staleMap, path: false, now: 20)
     expect(
         resync.banner?.text == "resyncing · as of epoch 43 · cannot request resync",
@@ -394,14 +452,14 @@ func testLiveRoomBannersAndResync() {
     var history = viewOpened(at: 20, canRequest: true)
     viewFeed(&history, .status, viewStatus(epoch: 1, seq: 1, eventsSeq: nil), at: 20)
     viewFeed(&history, .events, viewEvent(id: 1, seq: 4, state: .candidate), at: 20)
-    expect(history.eventsState == .incomplete(since: nil), "got \(history.eventsState)")
+    expect(history.eventHistory.coverage == .missing(pending: [0...3], lost: []), "got \(history.eventHistory.coverage)")
     let suffixed = viewScreen(history, connection: .waiting(retryIn: 5, reason: "down"), path: false, now: 20)
     expect(suffixed.banner?.text == "connection lost", "the banner stays connection lost")
     expect(
-        suffixed.incompleteLine == "incomplete · cannot request resync",
-        "the incomplete line takes the phrase, got \(String(describing: suffixed.incompleteLine))"
+        suffixed.historyLine == "history incomplete: 4 missing · no request path",
+        "the history line says no request path, got \(String(describing: suffixed.historyLine))"
     )
-    expect(suffixed.standaloneResync == nil, "no standalone line when the incomplete line has the phrase")
+    expect(suffixed.standaloneResync == nil, "no map to resync: no standalone line")
 
     var unsent = viewOpened(at: 30)
     viewFeed(&unsent, .mapBricks, viewSnapshot(epoch: 43, seq: 1, bricks: [viewBrick()]), at: 30)
@@ -409,7 +467,7 @@ func testLiveRoomBannersAndResync() {
     unsent.noteRequestUnsent()
     unsent.noteRequestUnsent()
     let unsentScreen = viewScreen(unsent, path: true, now: 30)
-    expect(unsent.isMapCurrent && unsent.eventsState == .complete, "unsent count on a current, complete mirror")
+    expect(unsent.isMapCurrent && unsent.eventHistory.coverage == .empty, "unsent count on a current, complete mirror")
     expect(unsentScreen.banner == nil, "fresh tracking has no banner, got \(String(describing: unsentScreen.banner))")
     expect(
         unsentScreen.standaloneResync == "cannot request resync · 2 unsent",
@@ -455,18 +513,23 @@ func testLiveRoomLaunchAndFixtures() {
 
     expect(map.mirror.roomId != status.mirror.roomId, "map and status fixtures do not share a room")
     expect(status.mirror.status?.eventsSeq == 12, "status fixture eventsSeq is 12")
-    expect(map.mirror.status?.eventsSeq == nil, "map fixture leaves eventsSeq nil")
+    expect(map.mirror.status?.eventsSeq == 5, "map fixture names events_seq 5")
+    expect(map.mirror.activeGeneration == LiveRoomFixture.generation && map.mirror.wire == .v2, "fixtures are v2, one generation")
 
     let mapScreen = viewScreen(map.mirror, connection: map.connection, path: false, started: false, now: now)
     expect(
-        mapScreen.statusLine == "epoch 43 · coverage — · events — · Tracking · cell 5.0 cm",
+        mapScreen.statusLine == "epoch 43 · run …0000 · coverage — · events 5 · Tracking · cell 5.0 cm",
         "map status line, got \(mapScreen.statusLine)"
     )
     expect(mapScreen.pip == .good, "map pip is good, got \(mapScreen.pip)")
+    expect(mapScreen.historyLine == "history complete through #5", "map fixture history, got \(String(describing: mapScreen.historyLine))")
+    expect(map.mirror.eventHistory.caughtUp, "map fixture is caught up")
+    let refreshed = map.refreshed(at: now + 2)
+    expect(refreshed.mirror.isStatusFresh && refreshed.mirror.status?.seq == 2, "refresh feeds the next status seq")
 
     let statusScreen = viewScreen(status.mirror, connection: status.connection, path: false, started: false, now: now)
     expect(
-        statusScreen.statusLine == "epoch 42 · coverage 75.0% · events 12 · Tracking",
+        statusScreen.statusLine == "epoch 42 · run …0000 · coverage 75.0% · events 12 · Tracking",
         "status line, got \(statusScreen.statusLine)"
     )
     expect(statusScreen.banner?.text == "Waiting for map", "status banner, got \(String(describing: statusScreen.banner?.text))")
@@ -488,8 +551,10 @@ func testLiveRoomLaunchAndFixtures() {
 func runLiveRoomViewTests() {
     testLiveRoomStatusLine()
     print("  LiveRoom view: status line reads status.eventsSeq, coverage, stale age, cell"); passed()
-    testLiveRoomEventRowsAndIncomplete()
-    print("  LiveRoom view: row words and incomplete-history lines"); passed()
+    testLiveRoomEventRowsAndHistory()
+    print("  LiveRoom view: row words; history lines (no events, complete through #n, n missing, lost on the Spark, no request path, unverified)"); passed()
+    testLiveRoomRestartBanner()
+    print("  LiveRoom view: restart banner, earlier-run rows never drawn, greyed earlier map; restart and legacy fixtures"); passed()
     testLiveRoomVoxels()
     print("  LiveRoom view: zlib snapshot centers and one brick frame"); passed()
     testLiveRoomMarkerLifecycle()

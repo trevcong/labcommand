@@ -151,7 +151,7 @@ final class AppState: ObservableObject {
         fixtureTimer?.invalidate()
         fixtureTimer = nil
         fixture = try? LiveRoomFixture.load(mode: mode, root: nil, now: ProcessInfo.processInfo.systemUptime)
-        if mode == .map { startFixtureClock() }
+        if LiveRoomFixture.keepsFresh(mode) { startFixtureClock() }
     }
 
     var health: RigConfidence { RigHealth.evaluate(rig) }
@@ -246,7 +246,7 @@ final class AppState: ObservableObject {
             room.start()
             roomDidStart = true
         }
-        if roomLaunch.fixtureMode == .map {
+        if let mode = roomLaunch.fixtureMode, LiveRoomFixture.keepsFresh(mode) {
             startFixtureClock()
         }
     }

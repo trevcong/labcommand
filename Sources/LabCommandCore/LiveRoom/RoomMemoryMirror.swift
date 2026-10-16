@@ -17,8 +17,10 @@ public struct LiveRoomStatus: Sendable, Equatable {
     public var mid360Hz: UInt16?
     public var jt128Hz: UInt16?
     public var droppedWindows: UInt32
-    /// The events high-water mark: `seq` of the newest live `events` message. Nil before the first.
+    /// `seq` of the newest live `events` message of this generation. Nil before the first.
     public var eventsSeq: UInt64?
+    /// Nil: a legacy node.
+    public var publisherGeneration: UInt64?
     /// When the Mac received it, on the mirror's clock.
     public var receivedAt: TimeInterval
 
@@ -37,6 +39,7 @@ public struct LiveRoomStatus: Sendable, Equatable {
         jt128Hz = status.jt128Hz
         droppedWindows = status.droppedWindows
         eventsSeq = status.eventsSeq
+        publisherGeneration = status.publisherGeneration
         self.receivedAt = receivedAt
     }
 }
@@ -46,7 +49,7 @@ public struct LiveRoomEvent: Sendable, Equatable {
     /// `header.seq` on the events topic.
     public var seq: UInt64
     public var receivedAt: TimeInterval
-    /// Arrived on `/room_memory/sync/events` (a replay), not live.
+    /// Arrived on `/room_memory/sync/events` (a replay), not live. Diagnostics only.
     public var fromSync: Bool
     public var event: RoomMemory.ChangeEvent
 
@@ -70,9 +73,16 @@ public struct LiveRoomActivity: Sendable, Equatable {
     /// Undecodable or contract-breaking messages, dropped whole.
     public var rejected = 0
     public var duplicates = 0
+    /// Map messages that did not chain (a seq gap or a wrong base).
     public var gaps = 0
-    /// Event histories cut off by a publisher restart, which only status evidence signals.
-    public var historyCuts = 0
+    /// Generations archived after something was observed in them (a publisher restart, or a legacy/v2 switch).
+    public var generationChanges = 0
+    /// Messages of a generation below the highest installed, ignored.
+    public var olderGeneration = 0
+    /// A seq received twice with different payloads; the first is kept. Never a restart signal.
+    public var contractViolations = 0
+    /// A message in the other layout (legacy or v2) than the connection's first one, dropped.
+    public var wireMismatch = 0
     /// Messages for another `room_id`, ignored.
     public var foreignRoom = 0
     public var requestsSent = 0
@@ -86,13 +96,30 @@ public struct LiveRoomActivity: Sendable, Equatable {
     }
 }
 
+/// A retired generation, kept for display only (its map greyed until the new one has a map, its
+/// open events as "earlier run · may be outdated").
+public struct ArchivedGeneration: Sendable, Equatable {
+    /// Nil for a legacy (unverified) run.
+    public var generation: UInt64?
+    public var openEvents: [LiveRoomEvent]
+    public var bricks: [RoomMemory.BrickCoordinate: RoomMemory.Brick]
+    public var voxelSize: Float?
+    public var mapEpoch: UInt64?
+}
+
 // MARK: - Mirror
 
-/// The Mac's copy of the Spark's room memory: map bricks, the event list and the newest status,
-/// kept by the resync rules of `docs/ROOM-MEMORY-PROTOCOL.md` §5.
+/// The Mac's copy of the Spark's room memory, scoped to one publisher generation
+/// (`docs/ROOM-MEMORY-PROTOCOL.md` §5, PLAN-PUBGEN §4).
 ///
 /// Pure state, like `LiveSession`: the client feeds it socket events, message payloads and clock
 /// ticks, and performs the actions each step returns. Times are seconds on one monotonic clock.
+///
+/// Three components replace every heuristic: the active `GenerationState` (the only state that
+/// renders as current; a newer generation installs on its first validated message), a
+/// `Retrieval` per topic (request tokens, `SyncEnd` manifests, backoff), and the `EventHistory`
+/// projection, derived after every input. On a legacy wire (an old node) nothing is verified: the
+/// map is never current, coverage is unknown and no request is sent.
 public struct RoomMemoryMirror: Sendable, Equatable {
     /// Event messages kept in `events`.
     public static let eventCapacity = 1000
@@ -100,12 +127,33 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     public static let eventIdCapacity = 10_000
     /// `status` is fresh for 3 periods (protocol §5).
     public static let statusFreshFor: TimeInterval = 3
-    /// Wait before repeating an unresolved request, by attempt: 5, 10, 20, then 30 s (Phase 3 P3).
+    /// Retrieval timeout by attempt: 5, 10, 20, then 30 s (Phase 3 P3).
     public static let requestRetry: [TimeInterval] = [5, 10, 20, 30]
     /// At most one request per topic per this long (protocol §2).
     public static let requestMinInterval: TimeInterval = 5
-    /// An events answer is complete once its sync topic has been quiet this long.
-    public static let syncSettle: TimeInterval = 2
+    /// Retired generations kept for display.
+    public static let archiveDepth = 2
+
+    /// Bounds on what the mirror keeps. Eviction only ever lowers certainty (protocol §5).
+    public struct Limits: Sendable, Equatable {
+        public var eventLog: Int
+        public var latest: Int
+        public var digest: Int
+        /// Ranges in the received coverage; past it the generation's coverage reads unknown.
+        public var coverageIntervals: Int
+
+        public init(
+            eventLog: Int = RoomMemoryMirror.eventCapacity,
+            latest: Int = RoomMemoryMirror.eventIdCapacity,
+            digest: Int = 10_000,
+            coverageIntervals: Int = 1000
+        ) {
+            self.eventLog = eventLog
+            self.latest = latest
+            self.digest = digest
+            self.coverageIntervals = coverageIntervals
+        }
+    }
 
     public enum Action: Sendable, Equatable {
         /// Send this request. `header.stamp` is `{0, 0}`; the sender stamps it.
@@ -113,7 +161,14 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     }
 
     public enum StaleReason: String, Sendable, Equatable {
-        case disconnected, deltaFirst, seqGap, wrongBase, epochMismatch, rejected
+        case disconnected
+        /// Connected, no status of this generation on this connection yet.
+        case awaitingStatus
+        case seqGap, wrongBase, epochMismatch, rejected
+        /// A newer publisher generation has no map yet: the bricks shown are the earlier run's.
+        case newGeneration
+        /// Legacy wire: the Spark node predates publisher generations.
+        case unverified
     }
 
     public enum MapState: Sendable, Equatable {
@@ -124,166 +179,194 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         case stale(StaleReason)
     }
 
-    public enum EventsState: Sendable, Equatable {
-        case complete
-        /// Transitions may be missing after `since`, the stamp of the last good message.
-        case incomplete(since: RoomMemory.Time?)
+    /// The layout of this connection's first room-memory message.
+    public enum Wire: Sendable, Equatable {
+        case undetermined, v2, legacy
     }
 
-    // Map
+    public enum Connection: Sendable, Equatable {
+        case offline
+        /// Open; no status of the active generation on it yet.
+        case awaitingStatus(connection: Int)
+        case observing(connection: Int, generation: UInt64)
+    }
+
+    public enum RetrievalStatus: Sendable, Equatable {
+        case idle, waiting, receiving
+    }
+
+    public let limits: Limits
     public private(set) var roomId: String?
-    public private(set) var bricks: [RoomMemory.BrickCoordinate: RoomMemory.Brick] = [:]
-    public private(set) var voxelSize: Float?
-    public private(set) var mapEpoch: UInt64?
-    public private(set) var mapSeq: UInt64?
+    public private(set) var connection = Connection.offline
+    public private(set) var wire = Wire.undetermined
+    /// Some request path exists on this connection.
+    public private(set) var canRequest = false
+    /// The highest generation ever installed. Survives archiving and legacy mode.
+    public private(set) var highestGeneration: UInt64?
+    public private(set) var archive: [ArchivedGeneration] = []
     public private(set) var mapRevision = 0
-    public private(set) var mapState: MapState = .empty
-
-    // Events
-    public private(set) var events: [LiveRoomEvent] = []
-    public private(set) var eventsById: [UInt64: LiveRoomEvent] = [:]
-    public private(set) var eventsSeq: UInt64?
-
-    /// One invariant: the history is complete only when every seq in `[0, max(status events_seq
-    /// high-water, highest seq received)]` of this generation has been received, no earlier
-    /// generation was cut off, and a status on the open connection vouches for the high-water.
-    /// Computed, so no message, tick or reconnect path can leave it behind.
-    public var eventsState: EventsState {
-        if historyCut { return .incomplete(since: historyCutSince) }
-        let prefix = receivedSpans.first.flatMap { $0.low == 0 ? $0 : nil }
-        guard let top = [eventsHighWater, receivedSpans.last?.high].compactMap({ $0 }).max() else {
-            // Nothing published and nothing held: the empty history is complete.
-            return .complete
-        }
-        if connected, statusThisConnection, let prefix, prefix.high >= top {
-            return .complete
-        }
-        // Transitions may be missing after the last message of the gapless run from 0.
-        return .incomplete(since: prefix?.topStamp)
-    }
-
-    // Status
-    public private(set) var status: LiveRoomStatus?
+    public private(set) var activity = LiveRoomActivity()
     public private(set) var isStatusFresh = false
 
-    public private(set) var activity = LiveRoomActivity()
+    var active: GenerationState?
+    private var retrieval: [RoomMemory.RequestSync.Topic: Retrieval] = [.mapBricks: Retrieval(), .events: Retrieval()]
+    private var tokens: TokenRandom
+    private var connectionCounter = 0
+    private var requestCounter: UInt64 = 0
+    private var clock: TimeInterval = 0
+    /// Set once a generation in which something was observed is archived; never cleared.
+    private var brokenSince: UInt64??
+
+    /// - Parameters:
+    ///   - roomId: the room to mirror; nil adopts the first room a message names.
+    ///   - limits: the bounds on kept state.
+    ///   - tokenSeed: seeds the request-token generator (tests). Nil seeds it from the system generator.
+    public init(roomId: String? = nil, limits: Limits = Limits(), tokenSeed: UInt64? = nil) {
+        self.roomId = roomId
+        self.limits = limits
+        var system = SystemRandomNumberGenerator()
+        tokens = TokenRandom(seed: tokenSeed ?? system.next())
+    }
+
+    // MARK: Projection
+
+    private var connectionID: Int? {
+        switch connection {
+        case .offline: return nil
+        case .awaitingStatus(let id), .observing(let id, _): return id
+        }
+    }
+
+    private var connected: Bool { connectionID != nil }
+
+    /// The newest status of the active generation (legacy: of the legacy run).
+    public var status: LiveRoomStatus? { active?.status }
+
+    public var activeGeneration: UInt64? { active?.generation }
+
+    /// The bricks shown: the active generation's, else the newest archived run's (greyed).
+    public var bricks: [RoomMemory.BrickCoordinate: RoomMemory.Brick] {
+        if let chain = active?.chain { return chain.bricks }
+        return archive.first(where: { !$0.bricks.isEmpty })?.bricks ?? [:]
+    }
+
+    public var voxelSize: Float? {
+        if let chain = active?.chain { return chain.voxelSize }
+        return archive.first(where: { !$0.bricks.isEmpty })?.voxelSize
+    }
+
+    public var mapEpoch: UInt64? {
+        if let chain = active?.chain { return chain.epoch }
+        return archive.first(where: { !$0.bricks.isEmpty })?.mapEpoch
+    }
+
+    /// The seq of the last map message applied in the active generation.
+    public var mapSeq: UInt64? { active?.chain?.appliedSeq }
+
+    public var mapState: MapState {
+        guard let active, let chain = active.chain else {
+            guard archive.contains(where: { !$0.bricks.isEmpty }) else { return .empty }
+            let legacy = active != nil && active?.generation == nil
+            return .stale(legacy ? .unverified : .newGeneration)
+        }
+        if active.generation == nil { return .stale(.unverified) }
+        guard let id = connectionID else { return .stale(.disconnected) }
+        guard active.statusConnection == id else { return .stale(.awaitingStatus) }
+        if active.mapRejected { return .stale(.rejected) }
+        if let high = active.highestMapSeq, chain.appliedSeq < high { return .stale(active.chainBreak ?? .seqGap) }
+        if active.statusEpochMismatches >= 2 { return .stale(.epochMismatch) }
+        return .current
+    }
 
     /// The map is CURRENT and the status that vouches for it is fresh. Draw change overlays only then.
     public var isMapCurrent: Bool { mapState == .current && isStatusFresh }
 
-    /// CANDIDATE or CONFIRMED events, by `event_id`.
-    public var openEvents: [LiveRoomEvent] {
-        eventsById.values
-            .filter { $0.event.state == .candidate || $0.event.state == .confirmed }
-            .sorted { $0.event.eventId < $1.event.eventId }
+    /// The active generation's event messages, oldest first.
+    public var events: [LiveRoomEvent] { active?.log ?? [] }
+
+    /// The highest-seq transition received per event, active generation only.
+    public var eventsById: [UInt64: LiveRoomEvent] { active?.latest ?? [:] }
+
+    /// CANDIDATE or CONFIRMED events of the active generation, by `event_id`.
+    public var openEvents: [LiveRoomEvent] { active?.openEvents ?? [] }
+
+    /// Open events of archived generations, newest run first: "earlier run · may be outdated".
+    public var archivedOpenEvents: [ArchivedEvent] {
+        archive.flatMap { run in run.openEvents.map { ArchivedEvent(generation: run.generation, entry: $0) } }
     }
 
-    // Per connection
-    private var connected = false
-    private var canRequest = false
-    private var sawMapThisConnection = false
-    private var highestLiveMapSeq: UInt64?
-    private var highestLiveEventsSeq: UInt64?
-    /// Consecutive statuses whose `map_epoch` disagreed with the mirror (D20).
-    private var statusEpochMismatches = 0
-    /// `events_seq` of the previous status, while it was above the baseline.
-    private var eventsMark: UInt64?
-    /// The previous status named less than this generation reached: `events_seq` below the baseline
-    /// or an earlier status's mark, or none at all. A restart, or lag by one.
-    private var eventsLow = false
-    /// A sync delta chained onto the mirror since it went stale: proof it can catch up.
-    private var replayChained = false
-
-    // Event history coverage (this generation)
-    /// Seqs received, as disjoint ranges in order. Each keeps the stamp of its top message.
-    private struct Span: Sendable, Equatable {
-        var low: UInt64
-        var high: UInt64
-        var topStamp: RoomMemory.Time
+    public var continuity: EventHistory.Continuity {
+        if wire == .legacy || active?.generation == nil && active != nil { return .unknown }
+        if let since = brokenSince { return .broken(sinceGeneration: since) }
+        return active == nil ? .unknown : .verified
     }
 
-    /// What each received seq carried, to tell a late copy from out-of-order delivery.
-    private struct Transition: Sendable, Equatable {
-        var eventId: UInt64
-        var state: RoomMemory.ChangeEvent.State
+    public var eventHistory: EventHistory {
+        let freshness: EventHistory.Freshness
+        if !connected {
+            freshness = .offline
+        } else if isStatusFresh {
+            freshness = .fresh
+        } else if let status = active?.status, active?.statusConnection == connectionID {
+            freshness = .stale(age: Swift.max(0, clock - status.receivedAt))
+        } else {
+            freshness = .stale(age: nil)
+        }
+        guard let active, active.generation != nil else {
+            return EventHistory(generation: nil, coverage: .unknown, freshness: freshness, continuity: continuity,
+                                caughtUp: false, contiguousThrough: nil)
+        }
+        let coverage = active.coverage
+        var caughtUp = false
+        if case .empty = coverage, isStatusFresh, active.status?.eventsSeq == nil {
+            caughtUp = true
+        } else if case .completeThrough = coverage, isStatusFresh, let named = active.status?.eventsSeq, let top = active.received.max {
+            caughtUp = named >= top
+        }
+        return EventHistory(
+            generation: active.generation,
+            coverage: coverage,
+            freshness: freshness,
+            continuity: continuity,
+            caughtUp: caughtUp,
+            contiguousThrough: active.received.contiguousFromZeroThrough
+        )
     }
 
-    private var receivedSpans: [Span] = []
-    /// Bounded to `eventIdCapacity`; the lowest seqs go first.
-    private var transitions: [UInt64: Transition] = [:]
-    /// The highest `events_seq` any status of this generation named.
-    private var eventsHighWater: UInt64?
-    /// A status arrived on the open connection: the high-water is not from before a disconnect.
-    private var statusThisConnection = false
-    /// An earlier generation ended with transitions possibly unseen. Sticky.
-    private var historyCut = false
-    private var historyCutSince: RoomMemory.Time?
-
-    // Events bookkeeping
-    /// `map_epoch` of the message at the events baseline, for `RequestSync.since`.
-    private var eventsEpoch: UInt64?
-    private var lastGoodEventStamp: RoomMemory.Time?
-    /// Seqs above the baseline already received (seq → map_epoch); the baseline advances through them.
-    private var eventsAhead: [UInt64: UInt64] = [:]
-    /// A `SINCE_NONE` events request is out: its answer, not a live event, settles what exists.
-    private var eventsInitialSync = false
-    /// Newest message on the events sync topic, for the settle window.
-    private var lastSyncEventAt: TimeInterval?
-    /// Bumped when status evidence shows the node restarted; per-event seq order holds only within
-    /// one generation.
-    private var eventsGeneration = 0
-    private var eventGeneration: [UInt64: Int] = [:]
-
-    // Requests
-    private struct Need: Sendable, Equatable {
-        var sentAt: TimeInterval?
-        var attempts = 0
-    }
-
-    private var needs: [RoomMemory.RequestSync.Topic: Need] = [:]
-    private var lastSentAt: [RoomMemory.RequestSync.Topic: TimeInterval] = [:]
-    private var requestCounter: UInt64 = 0
-
-    /// - Parameter roomId: the room to mirror; nil adopts the first room a message names.
-    public init(roomId: String? = nil) {
-        self.roomId = roomId
+    public func retrievalStatus(_ topic: RoomMemory.RequestSync.Topic) -> RetrievalStatus {
+        switch retrieval[topic]?.phase ?? .idle {
+        case .idle: return .idle
+        case .waiting: return .waiting
+        case .receiving: return .receiving
+        }
     }
 
     // MARK: Connection
 
     /// The socket opened and subscribed. `canRequest` says whether any request path exists.
+    /// Keeps the active generation and the archive (stale display); every old token dies.
     public mutating func connectionOpened(at now: TimeInterval, canRequest: Bool) -> [Action] {
-        connected = true
+        clock = now
+        connectionCounter += 1
+        connection = .awaitingStatus(connection: connectionCounter)
+        wire = .undetermined
         self.canRequest = canRequest
-        sawMapThisConnection = false
-        highestLiveMapSeq = nil
-        highestLiveEventsSeq = nil
-        statusEpochMismatches = 0
-        eventsMark = nil
-        eventsLow = false
-        replayChained = false
-        needs = [:]
-        lastSyncEventAt = nil
-        statusThisConnection = false
-        // A live event may have set the baseline before the initial answer came: that answer is still owed.
-        eventsInitialSync = canRequest && (eventsSeq == nil || eventsInitialSync)
-        if canRequest {
-            needs[.mapBricks] = Need()
-            needs[.events] = Need()
-        }
-        return flushRequests(at: now)
+        resetRetrievals()
+        refreshFreshness()
+        return flushRequests()
     }
 
-    /// The socket closed. The bricks stay, but nothing proves them current until the next connection resyncs.
+    /// The socket closed. Nothing proves the map current until a status of the generation arrives
+    /// on the next connection. Coverage is untouched.
     public mutating func connectionClosed(at now: TimeInterval) {
-        connected = false
-        statusThisConnection = false
-        needs = [:]
-        if mapState == .current { markStale(.disconnected) }
-        refreshFreshness(at: now)
+        clock = now
+        connection = .offline
+        resetRetrievals()
+        refreshFreshness()
     }
 
-    /// The client could not carry a request the mirror asked for.
+    /// The client could not carry a request the mirror asked for. The retrieval stays waiting;
+    /// the next attempt follows the backoff.
     public mutating func noteRequestUnsent() {
         activity.requestsSent -= 1
         activity.requestsUnsent += 1
@@ -291,51 +374,100 @@ public struct RoomMemoryMirror: Sendable, Equatable {
 
     // MARK: Messages
 
+    private enum Message {
+        case map(RoomMemory.MapBricks)
+        case event(RoomMemory.ChangeEvent)
+        case status(RoomMemory.MemoryStatus)
+        case syncEnd(RoomMemory.SyncEnd)
+
+        var roomId: String {
+            switch self {
+            case .map(let m): return m.header.roomId
+            case .event(let m): return m.header.roomId
+            case .status(let m): return m.header.roomId
+            case .syncEnd(let m): return m.header.roomId
+            }
+        }
+
+        var generation: UInt64? {
+            switch self {
+            case .map(let m): return m.publisherGeneration
+            case .event(let m): return m.publisherGeneration
+            case .status(let m): return m.publisherGeneration
+            case .syncEnd(let m): return m.publisherGeneration
+            }
+        }
+    }
+
+    private static func decode(_ topic: LiveRoomTopic, _ payload: Data) throws -> Message {
+        switch topic {
+        case .mapBricks, .syncMapBricks: return .map(try RoomMemory.MapBricks.decode(cdr: payload))
+        case .events, .syncEvents: return .event(try RoomMemory.ChangeEvent.decode(cdr: payload))
+        case .status: return .status(try RoomMemory.MemoryStatus.decode(cdr: payload))
+        case .syncEnd: return .syncEnd(try RoomMemory.SyncEnd.decode(cdr: payload))
+        }
+    }
+
     /// One message's CDR payload (the Foxglove frame without its 13-byte header).
     public mutating func receive(topic: LiveRoomTopic, payload: Data, at now: TimeInterval) -> [Action] {
+        clock = now
         activity.note(topic, at: now)
-        guard connected || !topic.isSync else { return [] }
-        if topic.isSync {
-            let requestTopic: RoomMemory.RequestSync.Topic = topic == .syncMapBricks ? .mapBricks : .events
-            // Shared topic: answers only matter while this Mac has a request out (protocol §5).
-            guard needs[requestTopic]?.sentAt != nil else { return [] }
-        }
+        guard let id = connectionID else { return [] }
+        defer { refreshFreshness() }
+        let message: Message
         do {
-            switch topic {
-            case .mapBricks, .syncMapBricks:
-                let message = try RoomMemory.MapBricks.decode(cdr: payload)
-                guard adopt(room: message.header.roomId) else { break }
-                receiveMap(message, fromSync: topic.isSync)
-            case .events, .syncEvents:
-                let message = try RoomMemory.ChangeEvent.decode(cdr: payload)
-                guard adopt(room: message.header.roomId) else { break }
-                if topic.isSync {
-                    receiveSyncEvent(message, at: now)
-                } else {
-                    receiveLiveEvent(message, at: now)
-                }
-            case .status:
-                let message = try RoomMemory.MemoryStatus.decode(cdr: payload)
-                guard adopt(room: message.header.roomId) else { break }
-                receiveStatus(message, at: now)
-            }
+            message = try Self.decode(topic, payload)
         } catch {
             activity.rejected += 1
             if topic == .mapBricks || topic == .syncMapBricks {
                 // An unreadable map update may be the next delta: nothing proves the bricks current now.
-                markStale(.rejected)
-                needMap()
+                active?.mapRejected = true
             }
+            return settleAndFlush()
         }
-        refreshFreshness(at: now)
-        return flushRequests(at: now)
+        guard adopt(room: message.roomId) else { return [] }
+
+        // The connection's first message fixes its layout; SyncEnd exists only in v2.
+        let layout: Wire = message.generation == nil ? .legacy : .v2
+        switch wire {
+        case .undetermined:
+            wire = layout
+            if layout == .legacy { enterLegacy() }
+        case let fixed where fixed != layout:
+            activity.wireMismatch += 1
+            if topic == .mapBricks || topic == .syncMapBricks {
+                // A v2 map message cut inside its trailing fields reads as legacy: it may be the next delta.
+                active?.mapRejected = true
+            }
+            return settleAndFlush()
+        default:
+            break
+        }
+
+        // Matched before any install resets the retrievals: the manifest applies to its own generation.
+        var matched: Retrieval?
+        if case .syncEnd(let end) = message, let current = retrieval[end.topic], current.matches(end.token) {
+            matched = current
+        }
+        if let generation = message.generation {
+            guard enterGeneration(generation) else { return settleAndFlush() }
+        }
+        switch message {
+        case .map(let map): receiveMap(map, connection: id)
+        case .event(let event): receiveEvent(event, at: now, fromSync: topic.isSync)
+        case .status(let status): receiveStatus(status, at: now, connection: id)
+        case .syncEnd(let end): receiveSyncEnd(end, matched: matched)
+        }
+        // Any validated message of the generation counts: archiving it now breaks continuity.
+        active?.observed = true
+        return settleAndFlush()
     }
 
-    /// Clock tick: status freshness and request repeats.
+    /// Clock tick: status freshness, retrieval timeouts and request scheduling.
     public mutating func tick(at now: TimeInterval) -> [Action] {
-        refreshFreshness(at: now)
-        settleEventsAnswer(at: now)
-        return flushRequests(at: now)
+        clock = now
+        refreshFreshness()
+        return settleAndFlush()
     }
 
     private mutating func adopt(room: String) -> Bool {
@@ -350,88 +482,98 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         return true
     }
 
-    private mutating func refreshFreshness(at now: TimeInterval) {
-        isStatusFresh = connected && status.map { now - $0.receivedAt < Self.statusFreshFor } ?? false
+    private mutating func refreshFreshness() {
+        guard let id = connectionID, let active, let status = active.status, active.statusConnection == id else {
+            isStatusFresh = false
+            return
+        }
+        isStatusFresh = clock - status.receivedAt < Self.statusFreshFor
+    }
+
+    // MARK: Generations
+
+    /// Puts a v2 message's generation in place. False: the message is older than the highest
+    /// generation and changes nothing but a counter.
+    private mutating func enterGeneration(_ generation: UInt64) -> Bool {
+        if let highest = highestGeneration, generation < highest {
+            activity.olderGeneration += 1
+            return false
+        }
+        if highestGeneration.map({ generation > $0 }) ?? true {
+            // A newer generation: generations are durable and wall-clock floored, so it is a later process.
+            install(generation)
+        } else if active?.generation != generation {
+            // The highest generation again after a legacy connection archived it: start empty,
+            // never reactivate the archive.
+            archiveActive()
+            active = GenerationState(generation: generation)
+        }
+        return true
+    }
+
+    private mutating func install(_ generation: UInt64) {
+        archiveActive()
+        active = GenerationState(generation: generation)
+        highestGeneration = generation
+        resetRetrievals()
+        if case .observing(let id, _) = connection {
+            connection = .awaitingStatus(connection: id)
+        }
+    }
+
+    /// A legacy layout on this connection: the active v2 generation retires; one legacy state
+    /// (identity unverified) holds what this and later legacy connections show.
+    private mutating func enterLegacy() {
+        if active?.generation != nil {
+            archiveActive()
+        }
+        if active == nil {
+            active = GenerationState(generation: nil)
+        }
+        resetRetrievals()
+    }
+
+    private mutating func archiveActive() {
+        guard let old = active else { return }
+        active = nil
+        if old.observed {
+            brokenSince = .some(old.generation)
+            activity.generationChanges += 1
+        }
+        guard old.observed || old.chain != nil else { return }
+        archive.insert(ArchivedGeneration(
+            generation: old.generation,
+            openEvents: old.openEvents,
+            bricks: old.chain?.bricks ?? [:],
+            voxelSize: old.chain?.voxelSize,
+            mapEpoch: old.chain?.epoch
+        ), at: 0)
+        if archive.count > Self.archiveDepth {
+            archive.removeLast(archive.count - Self.archiveDepth)
+        }
     }
 
     // MARK: Map
 
-    private mutating func receiveMap(_ message: RoomMemory.MapBricks, fromSync: Bool) {
-        let seq = message.header.seq
-        let firstOnConnection = !sawMapThisConnection
-        if !fromSync {
-            sawMapThisConnection = true
-            highestLiveMapSeq = max(highestLiveMapSeq ?? seq, seq)
+    private mutating func receiveMap(_ message: RoomMemory.MapBricks, connection id: Int) {
+        guard var state = active else { return }
+        if state.generation != nil {
+            state.noteMapSeq(message.header.seq)
         }
-
-        switch message.kind {
-        case .snapshot:
-            // Always accepted: resets the bricks, the epoch and the seq baseline (protocol §5).
-            setBricks(Dictionary(uniqueKeysWithValues: message.bricks.map { ($0.coordinate, $0) }))
-            voxelSize = message.voxelSize
-            mapEpoch = message.header.mapEpoch
-            mapSeq = seq
-            statusEpochMismatches = 0
-            if !fromSync {
-                // The live topic is in order: its snapshot is the newest there is, even after a restart.
-                highestLiveMapSeq = seq
-            }
-            // A live snapshot is the newest on that topic. A replay is current only once its seq
-            // has caught the live topic and its epoch has reached the latest status: an older
-            // snapshot must leave the request open, or the deltas after it are ignored.
-            let seqCaughtUp = seq >= (highestLiveMapSeq ?? seq)
-            let epochCaughtUp = !fromSync || (status.map { message.header.mapEpoch >= $0.mapEpoch } ?? true)
-            if seqCaughtUp && epochCaughtUp {
-                mapState = .current
-                replayChained = false
-                needs[.mapBricks] = nil
-            } else {
-                mapState = .stale(seqCaughtUp ? .epochMismatch : .seqGap)
-                replayChained = true
-            }
-
-        case .delta:
-            guard let epoch = mapEpoch, let last = mapSeq else {
-                // Nothing to apply it to.
-                needMap()
-                return
-            }
-            if seq <= last, message.header.mapEpoch <= epoch {
-                activity.duplicates += 1
-                return
-            }
-            if fromSync, seq <= last {
-                return
-            }
-            if !fromSync, firstOnConnection {
-                markStale(.deltaFirst)
-                needMap()
-                return
-            }
-            guard seq == last &+ 1 else {
-                activity.gaps += 1
-                markStale(.seqGap)
-                needMap()
-                return
-            }
-            guard message.baseEpoch == epoch else {
-                markStale(.wrongBase)
-                needMap()
-                return
-            }
-            guard let next = Self.applying(message, to: bricks, voxelSize: voxelSize) else {
-                activity.rejected += 1
-                markStale(.rejected)
-                needMap()
-                return
-            }
-            setBricks(next)
-            mapEpoch = message.header.mapEpoch
-            mapSeq = seq
-            statusEpochMismatches = 0
-            if fromSync { replayChained = true }
-            reevaluateMap()
+        let before = state.chain?.bricks
+        switch state.apply(message, connection: id) {
+        case .applied:
+            if state.chain?.bricks != before { mapRevision += 1 }
+        case .duplicate:
+            activity.duplicates += 1
+        case .gap, .wrongBase:
+            activity.gaps += 1
+        case .applyFailed:
+            activity.rejected += 1
+        case .older, .noChain:
+            break
         }
+        active = state
     }
 
     /// The delta applied to `bricks`, or nil when it cannot apply as a whole (protocol §3.1).
@@ -463,418 +605,199 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         return next
     }
 
-    private mutating func setBricks(_ next: [RoomMemory.BrickCoordinate: RoomMemory.Brick]) {
-        if next != bricks {
-            bricks = next
-            mapRevision += 1
-        }
-    }
-
-    private mutating func markStale(_ reason: StaleReason) {
-        guard mapEpoch != nil else { return }
-        switch mapState {
-        case .current:
-            mapState = .stale(reason)
-            replayChained = false
-        case .stale(.epochMismatch) where reason != .epochMismatch:
-            // A broken chain outranks a lagging status: only a resync recovers now.
-            mapState = .stale(reason)
-        case .stale, .empty:
-            break
-        }
-    }
-
-    private mutating func needMap() {
-        guard canRequest, needs[.mapBricks] == nil else { return }
-        needs[.mapBricks] = Need()
-    }
-
-    /// A stale map is current again once it has applied every live `seq` seen and the newest
-    /// status agrees on the epoch, and it has proof it chains (protocol §5).
-    private mutating func reevaluateMap() {
-        guard case .stale(let reason) = mapState, let epoch = mapEpoch, let seq = mapSeq else { return }
-        guard reason == .epochMismatch || replayChained else { return }
-        guard seq >= (highestLiveMapSeq ?? seq) else { return }
-        if let status, status.mapEpoch != epoch { return }
-        mapState = .current
-        needs[.mapBricks] = nil
-    }
-
     // MARK: Events
 
-    private mutating func receiveLiveEvent(_ message: RoomMemory.ChangeEvent, at now: TimeInterval) {
-        let seq = message.header.seq
-        highestLiveEventsSeq = max(highestLiveEventsSeq ?? seq, seq)
-
-        guard let base = eventsSeq else {
-            // First message after launch (or after a reset): it starts the baseline.
-            record(message, at: now, fromSync: false)
-            noteReceived(message)
-            moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
-            if seq != 0, canRequest, !eventsInitialSync {
-                // Seqs start at 0 per publisher: events before this one exist and are not held.
-                eventsInitialSync = true
-                needEvents()
-            }
-            resolveEventsIfDone()
-            return
+    private mutating func receiveEvent(_ message: RoomMemory.ChangeEvent, at now: TimeInterval, fromSync: Bool) {
+        guard active != nil else { return }
+        switch active!.record(message, at: now, fromSync: fromSync, limits: limits) {
+        case .recorded: break
+        case .duplicate: activity.duplicates += 1
+        case .conflict: activity.contractViolations += 1
         }
-        if seq == base &+ 1 {
-            record(message, at: now, fromSync: false)
-            noteReceived(message)
-            moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
-            advanceThroughAhead()
-            resolveEventsIfDone()
-            return
-        }
-        if seq <= base || eventsAhead[seq] != nil {
-            // Already passed or held: out-of-order delivery (a replay overtook the live topic), never
-            // a restart, whatever its event. A seq already carrying this transition is a late copy;
-            // any other fills the coverage. Neither moves the baseline or rolls an event back. Only
-            // status evidence starts a new generation.
-            if transitions[seq] == Transition(eventId: message.eventId, state: message.state) {
-                activity.duplicates += 1
-                return
-            }
-            record(message, at: now, fromSync: false)
-            noteReceived(message)
-            return
-        }
-        activity.gaps += 1
-        record(message, at: now, fromSync: false)
-        noteReceived(message)
-        if canRequest {
-            // Hold the baseline so the replay can fill the gap; remember what is already here.
-            holdAhead(seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
-        } else {
-            // Nothing can fill it: skip over. The skipped seqs stay missing from the coverage.
-            eventsAhead = [:]
-            moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
-        }
-        needEvents()
-    }
-
-    private mutating func receiveSyncEvent(_ message: RoomMemory.ChangeEvent, at now: TimeInterval) {
-        let seq = message.header.seq
-        lastSyncEventAt = now
-        noteReceived(message)
-        guard let base = eventsSeq else {
-            record(message, at: now, fromSync: true)
-            moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
-            return
-        }
-        if seq <= base {
-            // Older than the baseline (an old open event in a fallback): it may only add what the
-            // Mac never had, never roll an event back.
-            record(message, at: now, fromSync: true, onlyIfNewer: true)
-            return
-        }
-        if eventsAhead[seq] != nil { return }
-        record(message, at: now, fromSync: true)
-        if seq == base &+ 1 {
-            moveBaseline(to: seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
-            advanceThroughAhead()
-        } else {
-            holdAhead(seq, epoch: message.header.mapEpoch, stamp: message.header.stamp)
-        }
-        resolveEventsIfDone()
-    }
-
-    /// Adds one received seq to this generation's coverage, merging neighbouring ranges.
-    private mutating func noteReceived(_ message: RoomMemory.ChangeEvent) {
-        let seq = message.header.seq
-        let stamp = message.header.stamp
-        transitions[seq] = Transition(eventId: message.eventId, state: message.state)
-        if transitions.count > Self.eventIdCapacity, let lowest = transitions.keys.min() {
-            transitions[lowest] = nil
-        }
-        guard let index = receivedSpans.firstIndex(where: { seq <= $0.high || seq - $0.high == 1 }) else {
-            receivedSpans.append(Span(low: seq, high: seq, topStamp: stamp))
-            boundSpans()
-            return
-        }
-        var span = receivedSpans[index]
-        if seq >= span.low, seq <= span.high { return }
-        if seq > span.high {
-            span.high = seq
-            span.topStamp = stamp
-        } else if span.low - seq == 1 {
-            span.low = seq
-        } else {
-            receivedSpans.insert(Span(low: seq, high: seq, topStamp: stamp), at: index)
-            boundSpans()
-            return
-        }
-        receivedSpans[index] = span
-        if index + 1 < receivedSpans.count, receivedSpans[index + 1].low - span.high == 1 {
-            receivedSpans[index].high = receivedSpans[index + 1].high
-            receivedSpans[index].topStamp = receivedSpans[index + 1].topStamp
-            receivedSpans.remove(at: index + 1)
-        }
-    }
-
-    /// Forgetting a range only ever makes the history less complete, never falsely complete.
-    private mutating func boundSpans() {
-        guard receivedSpans.count > Self.eventCapacity else { return }
-        receivedSpans.remove(at: receivedSpans.first?.low == 0 ? 1 : 0)
-    }
-
-    /// A new publisher generation, reached only from status evidence through `nodeRestarted` (a status
-    /// seq reset, or `events_seq` below what this generation reached, or NONE, twice): coverage starts
-    /// again at nothing. If the old one held or named any event, its unseen tail is lost for good.
-    private mutating func cutHistory() {
-        activity.historyCuts += 1
-        if !receivedSpans.isEmpty || eventsHighWater != nil, !historyCut {
-            if case .incomplete(let since) = eventsState {
-                historyCutSince = since
-            } else {
-                historyCutSince = receivedSpans.first?.topStamp
-            }
-            historyCut = true
-        }
-        receivedSpans = []
-        eventsHighWater = nil
-        transitions = [:]
-    }
-
-    private mutating func moveBaseline(to seq: UInt64, epoch: UInt64, stamp: RoomMemory.Time) {
-        eventsSeq = seq
-        eventsEpoch = epoch
-        lastGoodEventStamp = stamp
-    }
-
-    private mutating func advanceThroughAhead() {
-        while let base = eventsSeq, let epoch = eventsAhead.removeValue(forKey: base &+ 1) {
-            eventsSeq = base &+ 1
-            eventsEpoch = epoch
-            if let latest = events.last(where: { $0.seq == base &+ 1 }) {
-                lastGoodEventStamp = latest.event.header.stamp
-            }
-        }
-    }
-
-    /// Remembers a seq received above the baseline. Past `eventCapacity` of them the baseline
-    /// gives up on the gap and jumps to this one.
-    private mutating func holdAhead(_ seq: UInt64, epoch: UInt64, stamp: RoomMemory.Time) {
-        eventsAhead[seq] = epoch
-        guard eventsAhead.count > Self.eventCapacity, seq == eventsAhead.keys.max() else { return }
-        eventsAhead = [:]
-        moveBaseline(to: seq, epoch: epoch, stamp: stamp)
-    }
-
-    /// Once an events answer has gone quiet, what it could not fill is lost: a bounded fallback
-    /// (protocol §5) skips to the highest seq it replayed and leaves the history incomplete.
-    private mutating func settleEventsAnswer(at now: TimeInterval) {
-        guard let sentAt = needs[.events]?.sentAt, let last = lastSyncEventAt, last >= sentAt,
-              now - last >= Self.syncSettle else { return }
-        lastSyncEventAt = nil
-        if let top = eventsAhead.keys.max(), let epoch = eventsAhead[top] {
-            eventsAhead = [:]
-            let stamp = events.last(where: { $0.seq == top })?.event.header.stamp ?? lastGoodEventStamp ?? RoomMemory.Time(sec: 0, nanosec: 0)
-            moveBaseline(to: top, epoch: epoch, stamp: stamp)
-        }
-        // Whatever the answer left out stays missing from the coverage.
-        eventsInitialSync = false
-        resolveEventsIfDone()
-    }
-
-    /// Appends to the ring, and moves the event's state only on a newer seq. With `onlyIfNewer`,
-    /// a message that would not move its event is dropped entirely.
-    private mutating func record(
-        _ message: RoomMemory.ChangeEvent,
-        at now: TimeInterval,
-        fromSync: Bool,
-        onlyIfNewer: Bool = false
-    ) {
-        let entry = LiveRoomEvent(seq: message.header.seq, receivedAt: now, fromSync: fromSync, event: message)
-        if onlyIfNewer, let held = eventsById[message.eventId], held.seq >= entry.seq,
-           eventGeneration[message.eventId] == eventsGeneration {
-            return
-        }
-        events.append(entry)
-        if events.count > Self.eventCapacity {
-            events.removeFirst(events.count - Self.eventCapacity)
-        }
-        if let held = eventsById[message.eventId], held.seq >= entry.seq,
-           eventGeneration[message.eventId] == eventsGeneration {
-            return
-        }
-        eventsById[message.eventId] = entry
-        eventGeneration[message.eventId] = eventsGeneration
-        if eventsById.count > Self.eventIdCapacity {
-            let terminal = eventsById.values.filter { ![.candidate, .confirmed].contains($0.event.state) }
-            if let oldest = (terminal.isEmpty ? Array(eventsById.values) : terminal).min(by: { $0.seq < $1.seq }) {
-                eventsById[oldest.event.eventId] = nil
-                eventGeneration[oldest.event.eventId] = nil
-            }
-        }
-    }
-
-    private mutating func needEvents() {
-        guard canRequest, needs[.events] == nil else { return }
-        needs[.events] = Need()
-    }
-
-    /// An events request is done once the baseline reaches both the newest live seq and the
-    /// status high-water mark, with nothing held ahead (Phase 3 §4.3).
-    private mutating func resolveEventsIfDone() {
-        // A mark from before a reconnect is no high-water now: closing early drops the rest of the answer.
-        guard statusThisConnection else { return }
-        if eventsSeq == nil, let status, status.eventsSeq == nil {
-            // Nothing held and the Spark has published no event: nothing to fetch.
-            eventsInitialSync = false
-            needs[.events] = nil
-            return
-        }
-        // A live event is no proof the history before it was fetched: the initial answer settles that.
-        guard let base = eventsSeq, !eventsInitialSync, eventsAhead.isEmpty else { return }
-        // A status mark below the baseline, or none, is a restart (or lag by one); either way not done yet.
-        guard base >= (highestLiveEventsSeq ?? base), status?.eventsSeq == base else { return }
-        needs[.events] = nil
     }
 
     // MARK: Status
 
-    private mutating func receiveStatus(_ message: RoomMemory.MemoryStatus, at now: TimeInterval) {
-        if let status, status.seq == message.header.seq, status.stamp == message.header.stamp {
-            // A cached copy delivered twice.
-            activity.duplicates += 1
-            return
+    private mutating func receiveStatus(_ message: RoomMemory.MemoryStatus, at now: TimeInterval, connection id: Int) {
+        guard var state = active else { return }
+        if let held = state.status {
+            // v2: a seq not above the held one is a duplicate or a delayed copy, never a generation
+            // signal. Legacy: only an exact copy is known to be one.
+            let duplicate = state.generation != nil
+                ? message.header.seq <= held.seq
+                : message.header.seq == held.seq && message.header.stamp == held.stamp
+            if duplicate {
+                activity.duplicates += 1
+                return
+            }
         }
-        let previous = status
-        status = LiveRoomStatus(message, receivedAt: now)
-        statusThisConnection = connected
-        if let previous, message.header.seq < previous.seq {
-            // Status seq starts at 0 per publisher: the node restarted.
-            nodeRestarted()
+        state.status = LiveRoomStatus(message, receivedAt: now)
+        state.statusConnection = id
+        state.observed = true
+        if let generation = state.generation {
+            state.witness = state.witness.merged(message.eventsSeq.map(EventsWitness.through) ?? .empty)
+            connection = .observing(connection: id, generation: generation)
         }
-
         // D20: a lost trailing delta shows as the status epoch disagreeing twice in a row.
-        if let epoch = mapEpoch, mapState != .empty {
-            if message.header.mapEpoch != epoch {
-                statusEpochMismatches += 1
-                if statusEpochMismatches >= 2, mapState == .current {
-                    markStale(.epochMismatch)
-                    needMap()
-                }
+        if let chain = state.chain {
+            if message.header.mapEpoch != chain.epoch {
+                state.statusEpochMismatches += 1
             } else {
-                statusEpochMismatches = 0
-                reevaluateMap()
+                state.statusEpochMismatches = 0
+                state.mismatchRetrieved = false
             }
         }
-
-        // Seqs only fall when the publisher restarts: a status naming less than this generation
-        // reached (the baseline or an earlier status's mark), NONE included, twice in a row is a
-        // restart (protocol §5, new generation). Once may be lag.
-        let reached = [eventsSeq, eventsHighWater].compactMap { $0 }.max()
-        if let reached, message.eventsSeq.map({ $0 < reached }) ?? true {
-            if eventsLow {
-                nodeRestarted()
-            } else {
-                eventsLow = true
-            }
-            eventsMark = nil
-        } else {
-            eventsLow = false
-            // events_seq gap: a high-water mark the baseline still has not reached one status later.
-            if eventsSeq == nil, let mark = message.eventsSeq {
-                // Events exist but none is held (the first was lost, or none has arrived yet). The
-                // coverage already reads incomplete; this only decides whether to ask again.
-                if eventsMark != nil, canRequest, needs[.events] == nil {
-                    activity.gaps += 1
-                    eventsInitialSync = true
-                    needEvents()
-                }
-                eventsMark = mark
-            }
-            if let base = eventsSeq, let mark = message.eventsSeq {
-                if mark > base {
-                    if let previous = eventsMark, base < previous, needs[.events] == nil, eventsAhead.isEmpty {
-                        activity.gaps += 1
-                        needEvents()
-                    }
-                    eventsMark = mark
-                } else {
-                    eventsMark = nil
-                }
-            }
-        }
-        // After any generation change above, so a restart's mark starts the new high-water.
-        if let mark = message.eventsSeq {
-            eventsHighWater = max(eventsHighWater ?? mark, mark)
-        }
-        resolveEventsIfDone()
+        active = state
     }
 
-    /// The node restarted: live seqs start again at 0 on every topic. Every status-based restart
-    /// (a status seq reset, or `events_seq` below what this generation reached, or NONE, twice)
-    /// lands here, so map and events state reset together. Drops the events baseline and fetches
-    /// what exists anew.
-    private mutating func nodeRestarted() {
-        // The old generation's live seqs prove nothing about the new one's snapshot. D20 catches
-        // a missed startup snapshot, and the answer to that request may then be current. Before
-        // the events guard: a restart with no events baseline still resets the map high-water.
-        highestLiveMapSeq = nil
-        cutHistory()
-        // Even with no baseline: a leftover low status must not count toward the next generation.
-        eventsLow = false
-        guard eventsSeq != nil else { return }
-        eventsGeneration += 1
-        eventsSeq = nil
-        eventsEpoch = nil
-        eventsAhead = [:]
-        highestLiveEventsSeq = nil
-        eventsMark = nil
-        if canRequest {
-            eventsInitialSync = true
-            needEvents()
+    // MARK: Retrieval
+
+    /// Publisher facts from any `SyncEnd` of the generation, whoever asked; the manifest too when
+    /// it answers this Mac's outstanding request.
+    private mutating func receiveSyncEnd(_ end: RoomMemory.SyncEnd, matched: Retrieval?) {
+        guard var state = active, state.generation == end.publisherGeneration else { return }
+        switch end.topic {
+        case .events:
+            state.witness = state.witness.merged(end.bound.map(EventsWitness.through) ?? .empty)
+            for range in end.unavailable {
+                state.unavailable.formUnion(range)
+            }
+        case .mapBricks:
+            if let bound = end.bound {
+                state.noteMapSeq(bound)
+            } else if state.highestMapSeq == nil {
+                state.mapKnownEmpty = true
+            }
+        }
+        state.observed = true
+        active = state
+        if var current = matched {
+            current.phase = .receiving(end)
+            current.generation = end.publisherGeneration
+            retrieval[end.topic] = current
         }
     }
 
-    // MARK: Requests
-
-    private mutating func flushRequests(at now: TimeInterval) -> [Action] {
-        guard connected, canRequest, roomId != nil else { return [] }
-        var actions: [Action] = []
+    private mutating func resetRetrievals() {
         for topic in RoomMemory.RequestSync.Topic.allCases {
-            guard var need = needs[topic] else { continue }
-            if let sentAt = need.sentAt {
-                let wait = Self.requestRetry[min(need.attempts - 1, Self.requestRetry.count - 1)]
-                guard now - sentAt >= wait else { continue }
+            retrieval[topic]?.reset()
+        }
+    }
+
+    /// Completes the retrievals whose manifests are now held.
+    private mutating func settleRetrievals() {
+        for topic in RoomMemory.RequestSync.Topic.allCases {
+            guard var current = retrieval[topic], case .receiving(let end) = current.phase else { continue }
+            guard var state = active, state.generation == end.publisherGeneration else {
+                current.reset()
+                retrieval[topic] = current
+                continue
             }
-            if let last = lastSentAt[topic], now - last < Self.requestMinInterval { continue }
-            guard let request = makeRequest(topic) else { continue }
-            need.sentAt = now
-            need.attempts += 1
-            needs[topic] = need
-            lastSentAt[topic] = now
-            activity.requestsSent += 1
-            activity.lastRequest = request
-            actions.append(.requestSync(request))
+            let done: Bool
+            switch topic {
+            case .events:
+                done = end.delivered.allSatisfy { state.received.contains($0) }
+            case .mapBricks:
+                if let last = end.delivered.last {
+                    done = state.chain.map { $0.appliedSeq >= last.upperBound } ?? false
+                } else if let bound = end.bound {
+                    done = state.chain.map { $0.appliedSeq >= bound } ?? false
+                } else {
+                    done = true
+                }
+                if done {
+                    state.mapRejected = false
+                    if state.statusEpochMismatches >= 2 { state.mismatchRetrieved = true }
+                    active = state
+                }
+            }
+            if done {
+                current.reset()
+                retrieval[topic] = current
+            }
+        }
+    }
+
+    private func needs(_ topic: RoomMemory.RequestSync.Topic) -> Bool {
+        guard let active, active.generation != nil else { return false }
+        switch topic {
+        case .mapBricks: return active.mapNeedsRetrieval
+        case .events: return !active.overflowed && !active.pending.isEmpty
+        }
+    }
+
+    private mutating func settleAndFlush() -> [Action] {
+        settleRetrievals()
+        return flushRequests()
+    }
+
+    /// Requests go out only while observing a v2 generation, with a request path.
+    private mutating func flushRequests() -> [Action] {
+        let now = clock
+        var actions: [Action] = []
+        let generation: UInt64?
+        if case .observing(_, let observed) = connection, wire == .v2, canRequest, roomId != nil,
+           active?.generation == observed {
+            generation = observed
+        } else {
+            generation = nil
+        }
+        for topic in RoomMemory.RequestSync.Topic.allCases {
+            guard var current = retrieval[topic] else { continue }
+            if current.isOutstanding {
+                guard current.timedOut(at: now) else { continue }
+                guard let generation, needs(topic) else {
+                    current.reset()
+                    retrieval[topic] = current
+                    continue
+                }
+                actions.append(.requestSync(send(topic, &current, generation: generation, attempt: current.attempt + 1, at: now)))
+            } else {
+                guard let generation, needs(topic), current.maySend(at: now) else { continue }
+                actions.append(.requestSync(send(topic, &current, generation: generation, attempt: 1, at: now)))
+            }
+            retrieval[topic] = current
         }
         return actions
     }
 
-    private mutating func makeRequest(_ topic: RoomMemory.RequestSync.Topic) -> RoomMemory.RequestSync? {
-        guard let roomId else { return nil }
+    private mutating func send(
+        _ topic: RoomMemory.RequestSync.Topic,
+        _ current: inout Retrieval,
+        generation: UInt64,
+        attempt: Int,
+        at now: TimeInterval
+    ) -> RoomMemory.RequestSync {
         let since: RoomMemory.RequestSync.Position?
         switch topic {
         case .mapBricks:
-            since = mapEpoch.flatMap { epoch in mapSeq.map { .init(epoch: epoch, seq: $0) } }
+            // A retry asks for a snapshot: the replay the first answer named did not complete.
+            since = attempt > 1 ? nil : active?.chain.map { .init(epoch: $0.epoch, seq: $0.appliedSeq) }
         case .events:
-            // Until the initial answer settles, retries keep asking for everything.
-            since = eventsInitialSync ? nil : eventsEpoch.flatMap { epoch in eventsSeq.map { .init(epoch: epoch, seq: $0) } }
+            since = active?.eventsSince
         }
-        defer { requestCounter += 1 }
-        return RoomMemory.RequestSync(
+        let token = RoomMemory.RequestToken(using: &tokens)
+        current.phase = .waiting
+        current.token = token
+        current.generation = generation
+        current.sentAt = now
+        current.lastSentAt = now
+        current.attempt = attempt
+        let request = RoomMemory.RequestSync(
             header: RoomMemory.Header(
-                roomId: roomId,
+                roomId: roomId ?? "",
                 mapEpoch: since?.epoch ?? RoomMemory.RequestSync.sinceNone,
                 seq: requestCounter,
                 stamp: RoomMemory.Time(sec: 0, nanosec: 0)
             ),
             since: since,
-            topic: topic
+            topic: topic,
+            expectedGeneration: generation,
+            token: token
         )
+        requestCounter += 1
+        activity.requestsSent += 1
+        activity.lastRequest = request
+        return request
     }
 }
