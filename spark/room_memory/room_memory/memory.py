@@ -1135,6 +1135,8 @@ class RoomMemory:
             return
         # The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
         save_epoch(epoch_path(self.config.state_dir, self.config.room_id), self.map_epoch)
+        if self._building():
+            return  # a frame commits whole: until every sensor built, the last committed one stays on disk
         header = Header(self.config.room_id, self.map_epoch, 0, stamp)
         for name, path in self._paths().items():
             save_reference(path, self.channels[name].reference, header, self.config.voxel_size)
@@ -1215,6 +1217,8 @@ class RoomMemory:
         now = _nanoseconds(stamp)
         if guard and tracking:
             self._guard_triggers(now)
+        elif guard:
+            self._guard_building(now)
         # A guard check holds every promotion and all learning until it decides.
         hold = guard and self._check is not None
         for channel in self.channels.values():
@@ -1224,18 +1228,14 @@ class RoomMemory:
             channel.failed = 0
             if guard:
                 channel.window = np.concatenate(frames) if frames else _NO_POINTS
-            if self.state == MemoryState.BUILDING:
-                # A sensor's reference freezes once it is ready while the others catch up, and
-                # only windows with at least one occupied voxel count toward it.
-                if frames and not self._reference_ready(channel):
-                    window = occupancy_map(np.concatenate(frames), self.change)
-                    if len(window.occupied):
-                        observed = VoxelLayer.observe(window, self.change)
-                        channel.stats.add(observed.occupied, observed.known)
-                        channel.reference_windows += 1
-                        self._set_reference(channel, channel.stats.settled(self.config.settle_rule()))
-                        if guard:
-                            channel.builder.add(channel.window, self.config.max_range)
+                if len(channel.window):
+                    channel.silent_since = None
+                elif channel.silent_since is None:
+                    channel.silent_since = now
+            # A sensor silent through the build (guard only) builds its reference when it returns,
+            # while the others track.
+            if self.state == MemoryState.BUILDING or channel.builder is not None:
+                self._build(channel, frames)
                 continue
             config = channel.config
             points = np.concatenate(frames) if frames else _NO_POINTS
@@ -1293,17 +1293,18 @@ class RoomMemory:
             self._activity = (len(activity), sum(region.voxel_count for _, region in activity),
                               functools.reduce(operator.or_, (b for b, _ in activity)), bit, largest)
             self._last_activity_ns = _nanoseconds(stamp)
-        if self.state == MemoryState.BUILDING and all(self._reference_ready(c) for c in self.channels.values()):
+        if self.state == MemoryState.BUILDING and self._built(now):
             self.state = MemoryState.TRACKING
             # From here on only the voxels the reference has not settled keep their counts.
             # learn_windows 0 drops those leftovers: this run teaches the reference nothing.
-            for channel in self.channels.values():
+            built = [channel for channel in self.channels.values() if self._reference_ready(channel)]
+            for channel in built:
                 channel.stats.erase(channel.reference.known)
             if self.config.learn_windows == 0:
-                for channel in self.channels.values():
+                for channel in built:
                     channel.stats = VoxelStats()
                 self._settle_pending = False
-            elif any(len(channel.stats.keys) for channel in self.channels.values()):
+            elif any(len(channel.stats.keys) for channel in built):
                 self._settle_pending = True
             self.map_epoch += 1
             if guard:
@@ -1315,6 +1316,30 @@ class RoomMemory:
             for channel in self.channels.values():
                 channel.window = None
         return events
+
+    def _build(self, channel, frames):
+        """One window toward the channel's reference. It freezes once ready, and only windows with
+        at least one occupied voxel count toward it."""
+        if frames and not self._reference_ready(channel):
+            window = occupancy_map(np.concatenate(frames), self.change)
+            if len(window.occupied):
+                observed = VoxelLayer.observe(window, self.change)
+                channel.stats.add(observed.occupied, observed.known)
+                channel.reference_windows += 1
+                self._set_reference(channel, channel.stats.settled(self.config.settle_rule()))
+                if channel.builder is not None:
+                    channel.builder.add(channel.window, self.config.max_range)
+
+    def _built(self, now):
+        """BUILDING is done: every sensor's reference is ready. With the guard, a sensor silent for
+        RESUME_SILENCE_NS does not hold the others (silent channels never block): it builds when it
+        returns. At least one must be ready."""
+        ready = [self._reference_ready(c) for c in self.channels.values()]
+        if all(ready):
+            return True
+        return self.config.rig_guard and any(ready) and all(
+            r or (c.silent_since is not None and now - c.silent_since >= RESUME_SILENCE_NS)
+            for r, c in zip(ready, self.channels.values()))
 
     # MARK: Rig guard
 
@@ -1382,12 +1407,19 @@ class RoomMemory:
         elif (gravity is not None and self._g_base is not None and detector.quiet(now)
               and rig.angle_between_deg(gravity, self._g_base) >= self.config.tilt_trigger_deg):
             causes |= CAUSE_IMU_TILT
+        elif (gravity is not None and self._g_base is None and detector.quiet(now) and not causes
+              and self._check is None and all(c.mode == "normal" for c in self.channels.values())):
+            # No baseline yet (the IMU came up after the build, or a state file without one): quiet
+            # gravity with the rig in place starts it, so a tilt is evidence even where ICP never fits.
+            self._g_base = gravity
+            self._save_rig()
         if self._next_check is not None and now >= self._next_check:
             causes |= CAUSE_PERIODIC
         for channel in self.channels.values():
             if channel.mode == "normal" and channel.pose_over == 2:
                 causes |= CAUSE_POSE_OFFSET
-            if channel.frames and channel.silent_since is not None and now - channel.silent_since >= RESUME_SILENCE_NS:
+            if (channel.frames and channel.builder is None and channel.silent_since is not None
+                    and now - channel.silent_since >= RESUME_SILENCE_NS):
                 causes |= CAUSE_SENSOR_RESUMED
         if not causes:
             return
@@ -1397,25 +1429,54 @@ class RoomMemory:
         elif not any(c.mode == "moved" for c in self.channels.values()):
             self._start_check(now, causes)
 
+    def _guard_building(self, now):
+        """Each BUILDING window: the newest gravity, for the baseline the new frame starts with. A
+        shock or rotation during the build is the reference's, never a trigger after it."""
+        detector = self._detector
+        detector.take_shock()
+        detector.take_rotation(now)
+        gravity = detector.take_gravity()
+        if gravity is not None:
+            self._gravity = gravity
+
     def _guard_built(self, now):
         """BUILDING → TRACKING: the registration clouds, a new frame, the gravity baseline."""
         for channel in self.channels.values():
-            channel.cloud = channel.builder.finish(channel.reference.occupied, self.config.voxel_size,
-                                                   self.config.reg_max_points)
-            channel.builder = None
-            channel.registration = None
+            if self._reference_ready(channel):
+                self._finish_cloud(channel)
         self._frame_epoch = self.map_epoch
         self._g_base = self._gravity
         self._end_check(now, RigOutcome.IN_PLACE)
 
+    def _finish_cloud(self, channel):
+        channel.cloud = channel.builder.finish(channel.reference.occupied, self.config.voxel_size,
+                                               self.config.reg_max_points)
+        channel.builder = None
+        channel.registration = None
+
+    def _building(self):
+        """A sensor silent through the build has not built its reference yet (guard only)."""
+        return any(c.builder is not None for c in self.channels.values())
+
+    def _joined(self, channel, stamp):
+        """A sensor silent through the build finished its reference: it joins the frame, which is
+        then committed whole."""
+        channel.stats.erase(channel.reference.known)
+        if self.config.learn_windows == 0 or self._tracking_windows >= self.config.learn_windows:
+            channel.stats = VoxelStats()
+        elif len(channel.stats.keys):
+            self._settle_pending = True
+        self._finish_cloud(channel)
+        self._rig_dirty = True
+        if not self._building():
+            self.save(stamp)
+
     def _guard_step(self, now, stamp, events):
         for channel in self.channels.values():
+            if channel.builder is not None and self._reference_ready(channel):
+                self._joined(channel, stamp)
             has = channel.window is not None and len(channel.window) > 0
             channel.available = has and channel.cloud is not None
-            if has:
-                channel.silent_since = None
-            elif channel.silent_since is None:
-                channel.silent_since = now
             if channel.mode == "stale" and channel.available:
                 self._channel_moved(channel, stamp, events)  # moved while it was silent
                 if self._moved_since is None:  # the others re-aligned while it was silent
@@ -1545,7 +1606,7 @@ class RoomMemory:
             if channel.available and not in_place:
                 self._channel_moved(channel, stamp, events)
                 any_moved = True
-            elif not channel.available:
+            elif not channel.available and channel.builder is None:
                 channel.mode = "stale"
         if not any_moved:
             # The IMU or the overlap said moved, every channel's own fit says in place: trust the fit.
@@ -1625,8 +1686,9 @@ class RoomMemory:
             self._end_check(now, RigOutcome.REALIGNED if realigned else RigOutcome.IN_PLACE)
             self._save_rig()
             return
-        if (config.auto_relearn and now - self._moved_since >= int(config.relearn_after_s * 1e9)
-                and all(c.window is not None and len(c.window) for c in self.channels.values())):
+        # Every moved channel delivered this window (a silent one went stale), so the rebuild has a
+        # sensor to build on; silent ones build when they return (_built).
+        if config.auto_relearn and now - self._moved_since >= int(config.relearn_after_s * 1e9):
             self._relearn(now, stamp, events)
 
     def _relearn(self, now, stamp, events):
@@ -1754,7 +1816,7 @@ class RoomMemory:
         when the deltas since it would exceed ``keyframe_delta_ratio`` of its size. After
         ``learn_windows`` tracking windows, that settle pass drops every sensor's counts. Later
         ticks do not settle, and a keyframe of the unchanged map does not bump ``map_epoch``."""
-        if self.state == MemoryState.BUILDING:
+        if self.state == MemoryState.BUILDING or self.channels[self.map_sensor].builder is not None:
             return None
         ns = _nanoseconds(stamp)
         if not self._map_started:
@@ -1767,6 +1829,8 @@ class RoomMemory:
         changed = False
         if self._settle_pending:
             for channel in self.channels.values():
+                if channel.builder is not None:
+                    continue  # still building: its counts are its reference's
                 fresh = channel.stats.settled(self.config.settle_rule())
                 if not len(fresh.known):
                     continue
@@ -1777,7 +1841,8 @@ class RoomMemory:
             # counts that never reached the rule. A tick that is not due returned above.
             if self._tracking_windows >= self.config.learn_windows:
                 for channel in self.channels.values():
-                    channel.stats = VoxelStats()
+                    if channel.builder is None:
+                        channel.stats = VoxelStats()
                 self._settle_pending = False
         if not changed and not keyframe_due:
             return None

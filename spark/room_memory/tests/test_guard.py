@@ -3,6 +3,7 @@ registration cloud, the solver pieces, and ICP on ray-cast rooms."""
 
 import math
 import pathlib
+import shutil
 import warnings
 from dataclasses import dataclass, replace
 
@@ -11,9 +12,11 @@ import pytest
 
 from room_memory import guard as g
 from room_memory.core import Config, decode_pointcloud2, occupancy_map
+from room_memory import state as rig_files
 from room_memory.memory import MemoryConfig, RoomMemory, pose_shift
-from room_memory.messages import (CAUSE_IMU_SHOCK, CAUSE_PERIODIC, CAUSE_POSE_OFFSET, CAUSE_STARTUP, EventKind,
-                                  EventState, ImuSample, MemoryState, RigChannel, RigOutcome, Time)
+from room_memory.messages import (CAUSE_IMU_SHOCK, CAUSE_IMU_TILT, CAUSE_PERIODIC, CAUSE_POSE_OFFSET, CAUSE_STARTUP,
+                                  SENSOR_JT128, SENSOR_MID360, EventKind, EventState, ImuSample, MemoryState,
+                                  RigChannel, RigOutcome, Time)
 
 import rooms
 
@@ -255,7 +258,7 @@ class Window:
     rig: object  # RigPose or None
 
 
-def drive(memory, poses, first, boxes=rooms.FURNITURE, imu=None, frames=1):
+def drive(memory, poses, first, boxes=rooms.FURNITURE, imu=None, frames=1, room=rooms.ROOM):
     """One window per pose, at seconds ``first``, ``first + 1``, ..., of ``frames`` scans each;
     ``imu(second)`` gives the samples received during the second before that window closes."""
     trace = []
@@ -263,7 +266,7 @@ def drive(memory, poses, first, boxes=rooms.FURNITURE, imu=None, frames=1):
         for sample in (imu(second) if imu else ()):
             memory.add_imu(sample.to_cdr(), sample.stamp)
         for frame in range(frames):
-            memory.add_points("mid360", rooms.scan(pose, boxes=boxes, seed=second * frames + frame))
+            memory.add_points("mid360", rooms.scan(pose, room=room, boxes=boxes, seed=second * frames + frame))
         stamp = Time(second, 0)
         events = memory.close_window(stamp)
         rig = memory.rig_pose(stamp)
@@ -351,10 +354,12 @@ def test_a_static_rig_checks_periodically_and_stays_in_place():
     assert memory.channels["mid360"].pose.is_identity
 
 
-def imu_stream(shock_at=None, yaw_deg=0.0, rate=50):
+def imu_stream(shock_at=None, yaw_deg=0.0, rate=50, roll_deg=0.0):
     """Quiet samples at ``rate`` Hz, and with ``shock_at`` a 0.2 s jolt that turns the sensor by
-    ``yaw_deg`` about its z axis."""
+    ``yaw_deg`` about its z axis, or rolls it by ``roll_deg`` about x so gravity reads tilted after it."""
     yaw_rate = math.radians(yaw_deg) / 0.2
+    roll_rate = math.radians(roll_deg) / 0.2
+    rolled = (0.0, -math.sin(math.radians(roll_deg)), -math.cos(math.radians(roll_deg)))
 
     def samples(second):
         out = []
@@ -362,7 +367,9 @@ def imu_stream(shock_at=None, yaw_deg=0.0, rate=50):
             t = (second - 1) + n / rate
             a, w = (0.0, 0.0, -1.0), (0.0, 0.0, 0.0)
             if shock_at is not None and shock_at <= t < shock_at + 0.2:
-                a, w = (0.3, 0.0, -1.2), (0.0, 0.0, yaw_rate)
+                a, w = (0.3, 0.0, -1.2), (roll_rate, 0.0, yaw_rate)
+            elif shock_at is not None and t >= shock_at + 0.2:
+                a = rolled
             ns = int(round(t * 1e9))
             out.append(ImuSample(Time(ns // 1_000_000_000, ns % 1_000_000_000), "livox_frame", w, a))
         return out
@@ -390,6 +397,137 @@ def test_an_imu_shock_alone_checks_and_stays_in_place():
     assert outcomes(trace)[-2:] == [RigOutcome.CHECKING, RigOutcome.IN_PLACE]
     assert MemoryState.RIG_MOVED not in [window.state for window in trace]
     assert memory.channels["mid360"].pose.is_identity
+
+
+def test_the_gravity_baseline_is_set_while_building(tmp_path):
+    """The IMU streams through BUILDING, so the new frame starts with a gravity baseline."""
+    memory = guarded(tmp_path)
+    drive(memory, [rooms.Pose()] * REFERENCE_WINDOWS, 1, imu=imu_stream())
+    assert memory.state == MemoryState.TRACKING
+    state = rig_files.parse_rig_state((tmp_path / "lab" / "rig_state").read_bytes(), "rig_state")
+    assert state.g_base is not None and math.isclose(state.g_base[2], -1.0)
+
+
+def test_an_imu_tilt_is_move_evidence_where_icp_cannot_register():
+    """Codex's repro: a planar reference with the IMU streaming throughout, then a 3 degree roll with
+    a gyro shock. ICP rejects the floor, so the tilt alone must give RIG_MOVED, not INCONCLUSIVE."""
+    memory = guarded()
+    shock = REFERENCE_WINDOWS + 2.5
+    tilted = rooms.rig(roll_deg=3.0)
+    poses = [rooms.Pose()] * (REFERENCE_WINDOWS + 3) + [tilted] * 20
+    trace = drive(memory, poses, 1, boxes=(), room=rooms.FLOOR_ONLY, imu=imu_stream(shock, roll_deg=3.0))
+    assert MemoryState.RIG_MOVED in [window.state for window in trace]
+    assert RigOutcome.MOVED in outcomes(trace) and RigOutcome.INCONCLUSIVE not in outcomes(trace)
+    assert any(w.rig.causes & CAUSE_IMU_TILT for w in trace if w.rig and w.rig.outcome == RigOutcome.MOVED)
+
+
+def test_an_imu_that_comes_up_after_the_build_starts_the_gravity_baseline(tmp_path):
+    """The IMU is silent through BUILDING, so the frame starts without a baseline: quiet gravity in
+    place starts it (and saves it), and a tilt on a floor ICP cannot register still gives RIG_MOVED."""
+    memory = guarded(tmp_path)
+    stream = imu_stream(REFERENCE_WINDOWS + 6.5, roll_deg=3.0)
+    late = lambda second: stream(second) if second > REFERENCE_WINDOWS else ()
+    drive(memory, [rooms.Pose()] * REFERENCE_WINDOWS, 1, boxes=(), room=rooms.FLOOR_ONLY, imu=late)
+    assert memory.state == MemoryState.TRACKING and memory._g_base is None
+    trace = drive(memory, [rooms.Pose()] * 6, REFERENCE_WINDOWS + 1, boxes=(), room=rooms.FLOOR_ONLY, imu=late)
+    state = rig_files.parse_rig_state((tmp_path / "lab" / "rig_state").read_bytes(), "rig_state")
+    assert state.g_base is not None and math.isclose(state.g_base[2], -1.0)
+    trace += drive(memory, [rooms.rig(roll_deg=3.0)] * 20, REFERENCE_WINDOWS + 7, boxes=(), room=rooms.FLOOR_ONLY,
+                   imu=late)
+    assert MemoryState.RIG_MOVED in [window.state for window in trace]
+    assert RigOutcome.MOVED in outcomes(trace) and RigOutcome.INCONCLUSIVE not in outcomes(trace)
+    assert any(w.rig.causes & CAUSE_IMU_TILT for w in trace if w.rig and w.rig.outcome == RigOutcome.MOVED)
+
+
+def test_a_shock_while_building_does_not_start_a_check():
+    memory = guarded()
+    trace = drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 5), 1, imu=imu_stream(REFERENCE_WINDOWS / 2))
+    assert not any(window.rig.causes & CAUSE_IMU_SHOCK for window in trace if window.rig)
+
+
+def test_a_sensor_lost_after_a_move_does_not_block_the_relearn(tmp_path):
+    """Codex's repro: both sensors see a move outside the envelope, then the JT128 drops. The
+    Mid-360 relearns on its own at relearn_after_s and tracks again; the JT128 builds its reference
+    when it returns, and only then is the new frame committed. The move rolls the rig 3 degrees under a
+    streaming IMU, so the tilt confirms it whatever ICP makes of a pose it cannot reach."""
+    memory = guarded(tmp_path, sensors=("mid360", "jt128"))
+    far = rooms.rig(0.5, yaw_deg=20.0, roll_deg=3.0)
+    imu = imu_stream()
+    trace = []
+
+    def step(second, pose, sensors, boxes=rooms.FURNITURE, frames=1):
+        for sample in imu(second):
+            memory.add_imu(sample.to_cdr(), sample.stamp)
+        for name in sensors:
+            for frame in range(frames):
+                memory.add_points(name, rooms.scan(pose, boxes=boxes, seed=second * frames + frame))
+        stamp = Time(second, 0)
+        events = memory.close_window(stamp)
+        memory.map_update(stamp)
+        trace.append(Window(second, events, memory.status(stamp, 1.0).state, memory.rig_pose(stamp)))
+
+    both, mid = ("mid360", "jt128"), ("mid360",)
+    second = 1
+    # Until an accepted check gives both an inlier baseline: without one, gross mismatch is no evidence.
+    while any(c.baseline is None for c in memory.channels.values()):
+        step(second, rooms.Pose(), both)
+        second += 1
+        assert second < REFERENCE_WINDOWS + 60
+    moving = second
+    imu = imu_stream(moving - 0.5, roll_deg=3.0)
+    old_epoch, old_frame = memory.map_epoch, memory._frame_epoch
+    while not all(c.mode == "moved" for c in memory.channels.values()):
+        step(second, far, both)
+        second += 1
+        assert second < moving + 20
+    moved_at = second
+    while memory.rig_outcome != RigOutcome.RELEARNING:
+        step(second, far, mid)
+        second += 1
+        assert second <= moved_at + 62, "the silent JT128 blocked the relearn"
+    # The room rebuilds on the Mid-360 alone and tracks again; the JT128 waits unbuilt.
+    relearned_at = second
+    while memory.state != MemoryState.TRACKING:
+        assert memory.rig_outcome == RigOutcome.RELEARNING
+        step(second, far, mid)
+        second += 1
+        assert second <= relearned_at + REFERENCE_WINDOWS + 1
+    jt128 = memory.channels["jt128"]
+    assert memory.channels["mid360"].cloud is not None and jt128.cloud is None
+    assert memory.map_epoch > old_epoch
+    # Nothing commits a frame without the JT128: the files on disk are still the old frame's.
+    state = rig_files.parse_rig_state((tmp_path / "lab" / "rig_state").read_bytes(), "rig_state")
+    assert state.frame_epoch == old_frame
+    # A restart now loads that old frame whole and checks it.
+    shutil.copytree(tmp_path / "lab", tmp_path / "copy" / "lab")
+    restarted = guarded(tmp_path / "copy", sensors=("mid360", "jt128"))
+    assert restarted.state == MemoryState.TRACKING and restarted.rig_outcome == RigOutcome.CHECKING
+    assert restarted._frame_epoch == old_frame and restarted.channels["jt128"].cloud is not None
+    start = len(trace)
+    for _ in range(40):
+        step(second, far, mid, boxes=rooms.FURNITURE + (CUBE,), frames=4)
+        second += 1
+    after = trace[start:]
+    assert {window.state for window in after} == {MemoryState.DEGRADED}
+    [found] = [event for window in after for event in window.events if event.state == EventState.CANDIDATE]
+    cube = [(low + high) / 2 for low, high in zip(*CUBE)]
+    assert found.sensors == SENSOR_MID360
+    assert math.dist(found.centroid, far.inverse().apply(np.array([cube]))[0]) <= 0.25
+    assert not any(window.rig.sensors & SENSOR_JT128 for window in after if window.rig)
+    # The JT128 returns: it builds its reference in the new frame, which is then committed.
+    for _ in range(REFERENCE_WINDOWS):
+        assert jt128.cloud is None
+        step(second, far, both, boxes=rooms.FURNITURE + (CUBE,))
+        second += 1
+    assert jt128.cloud is not None
+    step(second, far, both, boxes=rooms.FURNITURE + (CUBE,))
+    assert trace[-1].state == MemoryState.TRACKING
+    assert jt128.available and jt128.mode == "normal" and jt128.pose.is_identity
+    state = rig_files.parse_rig_state((tmp_path / "lab" / "rig_state").read_bytes(), "rig_state")
+    assert state.frame_epoch == memory._frame_epoch > old_frame
+    restarted = guarded(tmp_path, sensors=("mid360", "jt128"))
+    assert restarted.state == MemoryState.TRACKING
+    assert len(restarted.channels["jt128"].cloud) == len(jt128.cloud)
 
 
 def test_a_sensor_silent_through_a_realignment_realigns_when_it_returns():

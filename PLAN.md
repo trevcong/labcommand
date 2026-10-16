@@ -12,7 +12,7 @@ A nudged tripod must not flag the whole room. The node detects a rig move (Mid-3
 
 **1. Re-align the pose, not the map.** Each channel gets `T_c` (sensor → reference frame), identity at build. Points are range-clipped, transformed by `T_c`; rays start at `t_c`. Reference and `map_epoch` are untouched, so re-alignment sends no map. At identity the transform is skipped (byte-identical to today).
 
-**2. Triggers** (start a check; never evidence): IMU shock (`||a|/g0−1|` or gyro over threshold), IMU tilt vs baseline `g_base`, `pose_offset` > 1.5 cm on 2 windows, periodic every 30 s, node start with saved state, sensor back after ≥ 5 s silence. The IMU is optional (no samples → ICP-only).
+**2. Triggers** (start a check; never evidence): IMU shock (`||a|/g0−1|` or gyro over threshold), IMU tilt vs baseline `g_base` (gravity at the last decision: taken while building, or the first quiet reading in place when there is none), `pose_offset` > 1.5 cm on 2 windows, periodic every 30 s, node start with saved state, sensor back after ≥ 5 s silence. The IMU is optional (no samples → ICP-only).
 
 **3. KISS-ICP-style point-to-point ICP** (Vizzo et al. 2023), no new dependencies.
 - Target: per-sensor registration cloud of real points at 2 cm, built only during BUILDING, only in reference-occupied voxels, ≤ 300 k.
@@ -26,7 +26,7 @@ A nudged tripod must not flag the whole room. The node detects a rig move (Mid-3
 - Move evidence → **RIG_MOVED**: a fit `MOVED`; IMU tilt ≥ 0.25° once quiet; or gross mismatch (every available channel's `inlier_frac` < 0.5 × baseline on 2 windows, and no quiet IMU watched throughout). Moved channels expire open CANDIDATEs and stop diffing.
 - **Rejection is never evidence.** Rejected without evidence → `INCONCLUSIVE`: pose kept, hold released, never relearns.
 - Re-align: 3 fit estimates agreeing within 5 mm / 0.1°, inside the absolute envelope 0.30 m / 10° → applied, `REALIGNED`, TRACKING.
-- Relearn: evidence but no applicable estimate for 60 s (`auto_relearn`) → archive state to `prev/`, rebuild; first map is a snapshot.
+- Relearn: evidence but no applicable estimate for 60 s (`auto_relearn`) → archive state to `prev/`, rebuild; first map is a snapshot. A sensor silent ≥ 5 s does not hold the rebuild: it builds its reference when it returns, and the new frame is committed to disk only then.
 - Precedence RIG_MOVED > DEGRADED > TRACKING; silent channels never block a decision.
 - Check period + 2 windows ≤ 35 s (validated), so a yaw only the periodic check sees resolves before a false 40 s run promotes.
 

@@ -494,6 +494,10 @@ private:
     // A built reference: its quota of windows and some settled occupancy, which tracking needs
     // (pose_offset registers on it, and without it no window may teach the reference).
     bool reference_ready(const Channel& channel) const;
+    void build(Channel& channel, std::size_t frames, const std::vector<float>& points);
+    bool built(std::int64_t now) const;
+    // A sensor silent through the build has not built its reference yet (guard only).
+    bool building() const;
     std::vector<std::filesystem::path> paths() const;
     void load(const msg::Time& start);
     std::uint64_t next_id();
@@ -517,7 +521,10 @@ private:
     void start_check(std::int64_t now, std::int64_t causes);
     void end_check(std::int64_t now, msg::RigOutcome outcome);
     void guard_triggers(std::int64_t now);
+    void guard_building(std::int64_t now);
     void guard_built(std::int64_t now);
+    void finish_cloud(Channel& channel);
+    void joined(Channel& channel, const msg::Time& stamp);
     void guard_step(std::int64_t now, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
     std::optional<rig::Mat3> rotation_prior(const Channel& channel) const;
     msg::RigChannel estimate(Channel& channel, const std::optional<rig::Pose>& seed_from_last = std::nullopt);

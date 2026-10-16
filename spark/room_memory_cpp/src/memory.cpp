@@ -768,6 +768,7 @@ void RoomMemory::save(const msg::Time& stamp) {
     const msg::Header header{config_.room_id, map_epoch_, 0, stamp};
     // The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
     save_epoch(epoch_path(*config_.state_dir, config_.room_id), map_epoch_);
+    if (building()) return;  // a frame commits whole: until every sensor built, the last committed one stays on disk
     const std::vector<std::filesystem::path> all = paths();
     for (std::size_t n = 0; n < all.size(); ++n) {
         save_reference(all[n], channels_[n].reference, header, static_cast<float>(config_.voxel_size));
@@ -818,6 +819,40 @@ bool RoomMemory::reference_ready(const Channel& channel) const {
     return channel.reference_windows >= config_.reference_windows && !channel.reference.occupied.empty();
 }
 
+void RoomMemory::build(Channel& channel, std::size_t frames, const std::vector<float>& points) {
+    // A sensor's reference freezes once it is ready, and only windows with at least one occupied
+    // voxel count toward it.
+    if (!frames || reference_ready(channel)) return;
+    const OccupancyMap window = occupancy_map(points, change_);
+    if (window.occupied.empty()) return;
+    const VoxelLayer observed = VoxelLayer::observe(window, change_, backend_);
+    channel.stats.add(observed.occupied, observed.known);
+    ++channel.reference_windows;
+    set_reference(channel, channel.stats.settled(config_.settle_rule()));
+    if (channel.builder) channel.builder->add(channel.window, config_.max_range);
+}
+
+bool RoomMemory::built(std::int64_t now) const {
+    // Every sensor's reference is ready. With the guard, a sensor silent for kResumeSilenceNs does
+    // not hold the others (silent channels never block): it builds when it returns. At least one
+    // must be ready.
+    if (std::all_of(channels_.begin(), channels_.end(), [&](const Channel& c) { return reference_ready(c); })) return true;
+    if (!config_.rig_guard) return false;
+    bool any = false;
+    for (const Channel& channel : channels_) {
+        if (reference_ready(channel)) {
+            any = true;
+        } else if (!channel.silent_since || now - *channel.silent_since < kResumeSilenceNs) {
+            return false;
+        }
+    }
+    return any;
+}
+
+bool RoomMemory::building() const {
+    return std::any_of(channels_.begin(), channels_.end(), [](const Channel& c) { return c.builder.has_value(); });
+}
+
 std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
     std::vector<msg::ChangeEvent> events;
     // Every activity region of this window, all sensors.
@@ -835,7 +870,11 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
     const bool learning = tracking && tracking_windows_ <= config_.learn_windows;
     const bool guard = config_.rig_guard;
     const std::int64_t now = nanoseconds(stamp);
-    if (guard && tracking) guard_triggers(now);
+    if (guard && tracking) {
+        guard_triggers(now);
+    } else if (guard) {
+        guard_building(now);
+    }
     // A guard check holds every promotion and all learning until it decides.
     const bool hold = guard && check_.has_value();
     for (Channel& channel : channels_) {
@@ -844,20 +883,18 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         channel.points.clear();
         if (channel.failed && frames == 0) dropped = true;
         channel.failed = 0;
-        if (guard) channel.window = points;
-        if (state_ == msg::MemoryState::building) {
-            // A sensor's reference freezes once it is ready while the others catch up, and
-            // only windows with at least one occupied voxel count toward it.
-            if (frames && !reference_ready(channel)) {
-                const OccupancyMap window = occupancy_map(points, change_);
-                if (!window.occupied.empty()) {
-                    const VoxelLayer observed = VoxelLayer::observe(window, change_, backend_);
-                    channel.stats.add(observed.occupied, observed.known);
-                    ++channel.reference_windows;
-                    set_reference(channel, channel.stats.settled(config_.settle_rule()));
-                    if (guard) channel.builder->add(channel.window, config_.max_range);
-                }
+        if (guard) {
+            channel.window = points;
+            if (!channel.window.empty()) {
+                channel.silent_since.reset();
+            } else if (!channel.silent_since) {
+                channel.silent_since = now;
             }
+        }
+        // A sensor silent through the build (guard only) builds its reference when it returns,
+        // while the others track.
+        if (state_ == msg::MemoryState::building || channel.builder) {
+            build(channel, frames, points);
             continue;
         }
         const Config& config = channel.config;
@@ -961,18 +998,21 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         activity_ = std::move(summary);
         last_activity_ns_ = nanoseconds(stamp);
     }
-    if (state_ == msg::MemoryState::building &&
-        std::all_of(channels_.begin(), channels_.end(), [&](const Channel& c) { return reference_ready(c); })) {
+    if (state_ == msg::MemoryState::building && built(now)) {
         state_ = msg::MemoryState::tracking;
         // From here on only the voxels the reference has not settled keep their counts.
         // learn_windows 0 drops those leftovers: this run teaches the reference nothing.
-        for (Channel& channel : channels_) channel.stats.erase(channel.reference.known);
+        for (Channel& channel : channels_) {
+            if (reference_ready(channel)) channel.stats.erase(channel.reference.known);
+        }
         if (config_.learn_windows == 0) {
-            for (Channel& channel : channels_) channel.stats = VoxelStats{};
+            for (Channel& channel : channels_) {
+                if (reference_ready(channel)) channel.stats = VoxelStats{};
+            }
             settle_pending_ = false;
         } else {
             for (const Channel& channel : channels_) {
-                if (!channel.stats.keys.empty()) {
+                if (reference_ready(channel) && !channel.stats.keys.empty()) {
                     settle_pending_ = true;
                     break;
                 }
@@ -1030,7 +1070,7 @@ msg::Bytes RoomMemory::publish_map(const msg::MapBricks& message) {
 }
 
 std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
-    if (state_ == msg::MemoryState::building) return std::nullopt;
+    if (state_ == msg::MemoryState::building || channels_[map_channel_].builder) return std::nullopt;
     const std::int64_t ns = nanoseconds(stamp);
     if (!map_started_) {
         map_started_ = true;
@@ -1044,6 +1084,7 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
     bool changed = false;
     if (settle_pending_) {
         for (Channel& channel : channels_) {
+            if (channel.builder) continue;  // still building: its counts are its reference's
             VoxelLayer fresh = channel.stats.settled(config_.settle_rule());
             if (fresh.known.empty()) continue;
             channel.stats.erase(fresh.known);
@@ -1053,7 +1094,9 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
         // The budget is spent: merge whatever just settled, then drop the rest, including
         // counts that never reached the rule. A tick that is not due returned above.
         if (tracking_windows_ >= config_.learn_windows) {
-            for (Channel& channel : channels_) channel.stats = VoxelStats{};
+            for (Channel& channel : channels_) {
+                if (!channel.builder) channel.stats = VoxelStats{};
+            }
             settle_pending_ = false;
         }
     }
@@ -1315,11 +1358,17 @@ void RoomMemory::guard_triggers(std::int64_t now) {
     } else if (gravity && g_base_ && detector_->quiet(now) &&
                rig::angle_between_deg(*gravity, *g_base_) >= config_.tilt_trigger_deg) {
         causes |= msg::kCauseImuTilt;
+    } else if (gravity && !g_base_ && detector_->quiet(now) && !causes && !check_ &&
+               std::all_of(channels_.begin(), channels_.end(), [](const Channel& c) { return c.mode == Channel::Mode::normal; })) {
+        // No baseline yet (the IMU came up after the build, or a state file without one): quiet
+        // gravity with the rig in place starts it, so a tilt is evidence even where ICP never fits.
+        g_base_ = gravity;
+        save_rig();
     }
     if (next_check_ && now >= *next_check_) causes |= msg::kCausePeriodic;
     for (const Channel& channel : channels_) {
         if (channel.mode == Channel::Mode::normal && channel.pose_over == 2) causes |= msg::kCausePoseOffset;
-        if (channel.frames && channel.silent_since && now - *channel.silent_since >= kResumeSilenceNs) {
+        if (channel.frames && !channel.builder && channel.silent_since && now - *channel.silent_since >= kResumeSilenceNs) {
             causes |= msg::kCauseSensorResumed;
         }
     }
@@ -1332,27 +1381,48 @@ void RoomMemory::guard_triggers(std::int64_t now) {
     }
 }
 
+void RoomMemory::guard_building(std::int64_t now) {
+    // The newest gravity, for the baseline the new frame starts with. A shock or rotation during
+    // the build is the reference's, never a trigger after it.
+    detector_->take_shock();
+    detector_->take_rotation(now);
+    if (const std::optional<rig::Vec3d> gravity = detector_->take_gravity()) gravity_ = gravity;
+}
+
 void RoomMemory::guard_built(std::int64_t now) {
     for (Channel& channel : channels_) {
-        channel.cloud = std::make_shared<const rig::RegistrationCloud>(channel.builder->finish(
-            channel.reference.occupied, config_.voxel_size, static_cast<std::size_t>(config_.reg_max_points)));
-        channel.builder.reset();
-        channel.registration.reset();
+        if (reference_ready(channel)) finish_cloud(channel);
     }
     frame_epoch_ = map_epoch_;
     g_base_ = gravity_;
     end_check(now, msg::RigOutcome::in_place);
 }
 
+void RoomMemory::finish_cloud(Channel& channel) {
+    channel.cloud = std::make_shared<const rig::RegistrationCloud>(channel.builder->finish(
+        channel.reference.occupied, config_.voxel_size, static_cast<std::size_t>(config_.reg_max_points)));
+    channel.builder.reset();
+    channel.registration.reset();
+}
+
+void RoomMemory::joined(Channel& channel, const msg::Time& stamp) {
+    // A sensor silent through the build finished its reference: it joins the frame, which is then
+    // committed whole.
+    channel.stats.erase(channel.reference.known);
+    if (config_.learn_windows == 0 || tracking_windows_ >= config_.learn_windows) {
+        channel.stats = VoxelStats{};
+    } else if (!channel.stats.keys.empty()) {
+        settle_pending_ = true;
+    }
+    finish_cloud(channel);
+    rig_dirty_ = true;
+    if (!building()) save(stamp);
+}
+
 void RoomMemory::guard_step(std::int64_t now, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events) {
     for (Channel& channel : channels_) {
-        const bool has = !channel.window.empty();
-        channel.available = has && channel.cloud;
-        if (has) {
-            channel.silent_since.reset();
-        } else if (!channel.silent_since) {
-            channel.silent_since = now;
-        }
+        if (channel.builder && reference_ready(channel)) joined(channel, stamp);
+        channel.available = !channel.window.empty() && channel.cloud;
         if (channel.mode == Channel::Mode::stale && channel.available) {
             channel_moved(channel, stamp, events);  // moved while it was silent
             if (!moved_since_) moved_since_ = now;  // the others re-aligned while it was silent
@@ -1492,7 +1562,7 @@ void RoomMemory::enter_moved(std::int64_t now, const msg::Time& stamp, std::vect
         if (channel.available && !in_place) {
             channel_moved(channel, stamp, events);
             any = true;
-        } else if (!channel.available) {
+        } else if (!channel.available && !channel.builder) {
             channel.mode = Channel::Mode::stale;
         }
     }
@@ -1586,10 +1656,9 @@ void RoomMemory::track_moved(std::int64_t now, const msg::Time& stamp, std::vect
         save_rig();
         return;
     }
-    if (config_.auto_relearn && now - *moved_since_ >= period_ns(config_.relearn_after_s) &&
-        std::all_of(channels_.begin(), channels_.end(), [](const Channel& c) { return !c.window.empty(); })) {
-        relearn(stamp, events);
-    }
+    // Every moved channel delivered this window (a silent one went stale), so the rebuild has a
+    // sensor to build on; silent ones build when they return (built).
+    if (config_.auto_relearn && now - *moved_since_ >= period_ns(config_.relearn_after_s)) relearn(stamp, events);
 }
 
 void RoomMemory::relearn(const msg::Time& stamp, std::vector<msg::ChangeEvent>& events) {
