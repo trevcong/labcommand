@@ -1,0 +1,24 @@
+# labcommand_msgs/MemoryStatus v2 (publisher_generation), CDR little endian. Derived by hand; the
+# values of memory_status_le.hex (legacy, kept) plus the trailing generation. Covers: events_seq
+# ends 8-aligned, so publisher_generation follows with no pad; 1760400000000 is a start time in ms
+# (the wall-clock floor of protocol §1.4). 92 bytes on the wire.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+06 00 00 00                 # pos 0   room_id length 6 (5 chars + NUL)
+6c 61 62 2d 61 00           # pos 4   "lab-a\0"
+00 00 00 00 00 00           # pos 10  pad to 8
+2a 00 00 00 00 00 00 00     # pos 16  map_epoch 42
+07 00 00 00 00 00 00 00     # pos 24  seq 7
+80 92 ed 68                 # pos 32  stamp.sec 1760400000
+00 65 cd 1d                 # pos 36  stamp.nanosec 500000000
+01                          # pos 40  state TRACKING
+00 00 00                    # pos 41  pad to 4
+80 0c 00 00                 # pos 44  n_bricks 3200
+02 00 00 00                 # pos 48  n_open_events 2
+00 00 40 3f                 # pos 52  coverage_known_frac 0.75
+00 00 c0 7f                 # pos 56  pose_residual_m NaN (guard has not run)
+00 00 80 3f                 # pos 60  window_s 1.0
+0a 00                       # pos 64  per_sensor_hz[0] Mid-360 10 Hz
+ff ff                       # pos 66  per_sensor_hz[1] JT128 HZ_UNAVAILABLE
+03 00 00 00                 # pos 68  dropped_windows 3
+0c 00 00 00 00 00 00 00     # pos 72  events_seq 12 (already 8-aligned)
+00 44 04 e0 99 01 00 00     # pos 80  publisher_generation 1760400000000

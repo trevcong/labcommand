@@ -1,5 +1,10 @@
 """The Python oracle side of ``room_memory_replay``: runs the same script through
-``room_memory.memory.RoomMemory`` and prints the same lines (see tools/replay.cpp)."""
+``room_memory.memory.RoomMemory`` and prints the same lines (see tools/replay.cpp).
+
+``start <sec> <nanosec> [generation]``: the generation defaults to the start time in ms (at least
+1), the allocator's wall-clock floor, so successive starts take rising generations. ``sync``
+prints ``sync <n>``, the answer's messages as ``data`` lines, then ``end <SyncEnd hex>`` (``end
+none`` for another room)."""
 
 import dataclasses
 import pathlib
@@ -48,8 +53,10 @@ def run(script):
             for pair in args:
                 _config(fields, pair)
         elif command == "start":
+            sec, nanosec = int(args[0]), int(args[1])
             try:
-                memory = RoomMemory(MemoryConfig(**fields), Time(int(args[0]), int(args[1])))
+                generation = int(args[2]) if len(args) > 2 else max(1, sec * 1000 + nanosec // 1_000_000)
+                memory = RoomMemory(MemoryConfig(**fields), Time(sec, nanosec), generation)
                 out.append(f"init {memory.state.name} {memory.map_epoch}")
             except ValueError:
                 out.append("init error")
@@ -81,8 +88,10 @@ def run(script):
             except CDRError:
                 out.append("sync invalid")
             else:
-                out.append(f"sync {len(answer)}")
-                out += [f"data {message.hex()}" for message in answer]
+                messages, end = answer
+                out.append(f"sync {len(messages)}")
+                out += [f"data {message.hex()}" for message in messages]
+                out.append(f"end {'none' if end is None else end.to_cdr().hex()}")
         else:
             raise ValueError(f"unknown command {command}")
     return "".join(line + "\n" for line in out)

@@ -99,7 +99,7 @@ struct SyntheticRoom {
 // MARK: - Scanner
 
 /// SplitMix64: small, fast, and identical on every platform.
-struct SplitMix64 {
+struct SplitMix64: RandomNumberGenerator {
     private var state: UInt64
 
     init(seed: UInt64) {

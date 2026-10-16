@@ -1,5 +1,5 @@
-// CDR codecs for the five labcommand_msgs room-memory messages, with no ROS dependency: the
-// C++ port of room_memory/messages.py. The contract is docs/ROOM-MEMORY-PROTOCOL.md (Phase 0).
+// CDR codecs for the labcommand_msgs room-memory messages, with no ROS dependency: the C++ port
+// of room_memory/messages.py. The contract is docs/ROOM-MEMORY-PROTOCOL.md (Phase 0).
 //
 // Classic CDR (XCDR1): a 4-byte encapsulation header (00 01 little endian, 00 00 big endian),
 // every primitive aligned to its own size counted from the byte after the header, strings as
@@ -9,6 +9,12 @@
 // exactly what from_cdr rejects. Integer fields are held wider than the wire where the Python
 // codec range-checks them, so the same values are representable and rejected. A missing
 // float measurement is an empty optional here and NaN on the wire.
+//
+// Protocol v2 appends fields at the end of MemoryStatus, MapBricks, ChangeEvent and RequestSync
+// (protocol 1.4, 3). The layout comes from the bytes after the last legacy field: at most 3 is a
+// legacy message, padding to 8 then exactly the v2 fields (then at most 3) is v2, and anything else
+// is invalid. publisher_generation (and the RequestSync v2 fields) are empty for the legacy layout;
+// the encoders write it only when they hold one.
 #pragma once
 
 #include <array>
@@ -30,6 +36,12 @@ inline constexpr std::size_t kMaxTrailingPadding = 3;
 inline constexpr std::int64_t kHzUnavailable = 0xFFFF;
 inline constexpr std::uint64_t kSinceNone = ~std::uint64_t{0};
 inline constexpr std::uint64_t kEventsSeqNone = ~std::uint64_t{0};
+// SyncEnd.bound when nothing was published on the topic in this generation.
+inline constexpr std::uint64_t kSeqNone = ~std::uint64_t{0};
+// RequestSync.expected_generation only; invalid in every Spark -> Mac message.
+inline constexpr std::uint64_t kGenerationUnknown = 0;
+inline constexpr std::uint64_t kUint64Max = ~std::uint64_t{0};
+inline constexpr std::size_t kTokenBytes = 16;
 inline constexpr std::int64_t kSensorMid360 = 1;
 inline constexpr std::int64_t kSensorJT128 = 2;
 inline constexpr std::int64_t kSensorsAll = kSensorMid360 | kSensorJT128;
@@ -98,6 +110,9 @@ struct Brick {
 };
 
 using Bytes = std::vector<std::uint8_t>;
+// RequestSync.request_token / SyncEnd.request_token: 16 random bytes, never all zero in a v2 request.
+using Token = std::array<std::uint8_t, kTokenBytes>;
+inline constexpr Token kZeroToken{};
 
 // Uncompressed payload bytes: 134 per brick plus 4 per removed index.
 std::uint64_t payload_size(std::uint64_t bricks, std::uint64_t removed);
@@ -111,6 +126,7 @@ struct MapBricks {
     float voxel_size = 0.05f;
     std::vector<Brick> bricks;
     std::vector<std::int64_t> removed;
+    std::optional<std::uint64_t> publisher_generation;  // empty: the legacy layout (saved reference files)
     friend bool operator==(const MapBricks&, const MapBricks&) = default;
 
     void validate(const std::string& context = "MapBricks") const;
@@ -136,6 +152,7 @@ struct ChangeEvent {
     Time first_seen;
     Time last_seen;
     std::optional<MapBricks> mask;
+    std::optional<std::uint64_t> publisher_generation;  // empty: the legacy layout
     friend bool operator==(const ChangeEvent&, const ChangeEvent&) = default;
 
     void validate() const;
@@ -155,7 +172,9 @@ struct MemoryStatus {
     std::optional<std::int64_t> mid360_hz;
     std::optional<std::int64_t> jt128_hz;
     std::int64_t dropped_windows = 0;
-    std::optional<std::uint64_t> events_seq;  // seq of the newest live events message; empty before the first
+    // seq of the newest live events message of this generation; empty before the first
+    std::optional<std::uint64_t> events_seq;
+    std::optional<std::uint64_t> publisher_generation;  // empty: the legacy layout
     friend bool operator==(const MemoryStatus&, const MemoryStatus&) = default;
 
     void validate() const;
@@ -201,6 +220,7 @@ struct Activity {
 };
 
 // Mac -> Spark resync request (protocol 3.5). `since` is (epoch, seq) or empty.
+// expected_generation and token are both empty (the legacy layout) or both set.
 struct RequestSync {
     struct Since {
         std::uint64_t epoch = 0;
@@ -210,11 +230,39 @@ struct RequestSync {
     Header header;
     std::optional<Since> since;
     SyncTopic topic = SyncTopic::map_bricks;
+    // kGenerationUnknown (0): the since belongs to no known generation.
+    std::optional<std::uint64_t> expected_generation;
+    std::optional<Token> token;  // never all zero
     friend bool operator==(const RequestSync&, const RequestSync&) = default;
 
     void validate() const;
     Bytes to_cdr() const;
     static RequestSync from_cdr(std::span<const std::uint8_t> data);
+};
+
+// An inclusive seq range, first <= last.
+struct SeqRange {
+    std::uint64_t first = 0;
+    std::uint64_t last = 0;
+    friend bool operator==(const SeqRange&, const SeqRange&) = default;
+};
+
+// End-of-answer manifest of one RequestSync (protocol 3.8): what the answer published on the
+// topic's sync topic, and what the publisher can no longer serve. `bound` is empty for SEQ_NONE
+// (nothing published on the topic in this generation).
+struct SyncEnd {
+    Header header;
+    std::uint64_t publisher_generation = 0;
+    Token token{};  // copied from the request; all zero for a legacy request
+    SyncTopic topic = SyncTopic::map_bricks;
+    std::optional<std::uint64_t> bound;
+    std::vector<SeqRange> delivered;
+    std::vector<SeqRange> unavailable;
+    friend bool operator==(const SyncEnd&, const SyncEnd&) = default;
+
+    void validate() const;
+    Bytes to_cdr() const;
+    static SyncEnd from_cdr(std::span<const std::uint8_t> data);
 };
 
 }  // namespace room_memory::msg

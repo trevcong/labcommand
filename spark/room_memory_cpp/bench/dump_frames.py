@@ -39,7 +39,7 @@ def main():
         np.concatenate(frames).astype("<f4").tofile(out / f"{name}.f32")
 
     memory = RoomMemory(MemoryConfig(reference_windows=1, occupied_min_hits=1, occupied_min_ratio=0.0, free_min_seen=1,
-                                       candidate_windows=1, expire_windows=1, state_dir=None), Time(0, 0))
+                                       candidate_windows=1, expire_windows=1, state_dir=None), Time(0, 0), 1)
     lines, per_window = [], []
     for window in range(windows):
         start = time.perf_counter()

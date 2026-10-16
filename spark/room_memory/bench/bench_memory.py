@@ -30,7 +30,7 @@ def main():
     rng = np.random.default_rng(7)
     pool = {"still": frames(indoor(False), rng, HZ), "moved": frames(indoor(True), rng, HZ)}
     memory = RoomMemory(MemoryConfig(reference_windows=1, occupied_min_hits=1, occupied_min_ratio=0.0, free_min_seen=1,
-                                       candidate_windows=1, expire_windows=1, state_dir=None), Time(0, 0))
+                                       candidate_windows=1, expire_windows=1, state_dir=None), Time(0, 0), 1)
     add_ms, close_ms, events = [], [], 0
     for window in range(windows):
         scene = pool["still" if window < 2 else "moved"]

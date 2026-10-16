@@ -16,6 +16,11 @@ HAND = pathlib.Path(__file__).resolve().parent / "fixtures" / "hand"
 # The Swift suite's copy of the hand goldens (absent in the image).
 SWIFT_HAND = pathlib.Path(__file__).resolve().parents[3] / "Tests" / "Fixtures" / "room" / "golden" / "hand"
 T10 = m.Time(1760400010, 250000000)
+# The one publisher generation of every v2 golden (a start time in ms).
+G = 1760400000000
+TOKEN_A = bytes.fromhex("5a1e7c3d9b024f618e33c4d5e6f70819")
+TOKEN_B = bytes.fromhex("c10ffee012344567a9876543210fedcb")
+TOKEN_C = bytes.fromhex("0e8a3b5c77214d90b4065913c2ae6f01")
 
 
 def hexfile(name, directory=HAND):
@@ -92,6 +97,27 @@ def request_events_none():
     )
 
 
+def moved_event_v2():
+    event = moved_event()
+    return replace(event, mask=replace(event.mask, publisher_generation=G), publisher_generation=G)
+
+
+def request_map_v2():
+    return m.RequestSync(head("lab", 43, 2), (43, 10), m.SyncTopic.MAP_BRICKS, G, TOKEN_C)
+
+
+def sync_end_events_empty():
+    return m.SyncEnd(head("lab", 43, 0), G, m.ZERO_TOKEN, m.SyncTopic.EVENTS, None)
+
+
+def sync_end_events_fallback():
+    return m.SyncEnd(head("lab", 43, 1), G, TOKEN_B, m.SyncTopic.EVENTS, 120, ((10, 10), (21, 120)), ((11, 20),))
+
+
+def sync_end_map_replay():
+    return m.SyncEnd(head("lab", 45, 2), G, TOKEN_C, m.SyncTopic.MAP_BRICKS, 13, ((11, 13),))
+
+
 # name: (type, value, encoder reproduces the bytes)
 GOLDENS = {
     "memory_status_le.hex": (m.MemoryStatus, memory_status, True),
@@ -108,7 +134,20 @@ GOLDENS = {
     "request_sync_events_none_le.hex": (m.RequestSync, request_events_none, True),
     "activity_le.hex": (m.Activity, activity, True),
     "activity_idle_le.hex": (m.Activity, activity_idle, True),
+    "memory_status_v2_le.hex": (m.MemoryStatus, lambda: replace(memory_status(), publisher_generation=G), True),
+    "map_bricks_delta_v2_le.hex": (m.MapBricks, lambda: replace(delta(), publisher_generation=G), True),
+    "map_bricks_delta_v2_be.hex": (m.MapBricks, lambda: replace(delta(), publisher_generation=G), False),
+    "change_event_appeared_v2_le.hex": (m.ChangeEvent, lambda: replace(appeared_event(), publisher_generation=G), True),
+    "change_event_moved_mask_v2_le.hex": (m.ChangeEvent, moved_event_v2, True),
+    "request_sync_events_v2_le.hex": (
+        m.RequestSync, lambda: replace(request_events_none(), expected_generation=0, token=TOKEN_A), True),
+    "request_sync_map_v2_be.hex": (m.RequestSync, request_map_v2, False),
+    "sync_end_events_empty_le.hex": (m.SyncEnd, sync_end_events_empty, True),
+    "sync_end_events_fallback_le.hex": (m.SyncEnd, sync_end_events_fallback, True),
+    "sync_end_map_replay_be.hex": (m.SyncEnd, sync_end_map_replay, False),
 }
+# v2 goldens whose cut at the legacy length (+ up to 3 bytes) is a valid legacy message.
+V2_EXTENDS_LEGACY = {name for name in GOLDENS if "_v2_" in name}
 # Derived on this branch; the Swift suite does not decode Activity yet (PROVENANCE.md).
 NOT_IN_SWIFT = {"activity_le.hex", "activity_idle_le.hex"}
 
@@ -162,11 +201,20 @@ def test_lzfse_compressed_block_is_unsupported_and_not_encodable():
 
 @pytest.mark.parametrize("name", sorted(GOLDENS))
 def test_every_truncation_throws(name):
-    kind, _, _ = GOLDENS[name]
+    kind, build, _ = GOLDENS[name]
     data = hexfile(name)
+    legacy_cuts = 0
     for length in range(len(data)):
-        with pytest.raises(m.CDRError):
-            kind.from_cdr(data[:length])
+        try:
+            value = kind.from_cdr(data[:length])
+        except m.CDRError:
+            continue
+        # A v2 message cut where its legacy layout ends is that legacy message, never the golden.
+        assert name in V2_EXTENDS_LEGACY, (name, length)
+        generation = value.expected_generation if kind is m.RequestSync else value.publisher_generation
+        assert generation is None and value != build(), (name, length)
+        legacy_cuts += 1
+    assert legacy_cuts <= 4
 
 
 @pytest.mark.parametrize("name", sorted(GOLDENS))
@@ -334,3 +382,108 @@ def test_float_fields_hold_binary32():
     status = replace(memory_status(), coverage_known_frac=0.1)
     assert status.coverage_known_frac == struct.unpack("<f", struct.pack("<f", 0.1))[0]
     assert m.MemoryStatus.from_cdr(status.to_cdr()) == status
+
+
+# MARK: Protocol v2
+
+
+def test_layout_detection_from_trailing_bytes():
+    legacy = hexfile("memory_status_le.hex")
+    assert m.MemoryStatus.from_cdr(legacy).publisher_generation is None
+    for extra in range(4, 8):
+        with pytest.raises(m.Invalid, match="neither padding"):
+            m.MemoryStatus.from_cdr(legacy + bytes(extra))
+    with pytest.raises(m.Invalid, match="GENERATION_UNKNOWN"):
+        m.MemoryStatus.from_cdr(legacy + bytes(8))  # generation 0 rejects 8 appended zero bytes
+    assert m.MemoryStatus.from_cdr(legacy + struct.pack("<Q", 7) + bytes(3)).publisher_generation == 7
+    with pytest.raises(m.Invalid):
+        m.MemoryStatus.from_cdr(legacy + struct.pack("<Q", 7) + bytes(4))
+    # MapBricks: the pad before the generation depends on the payload length.
+    v2 = hexfile("map_bricks_delta_v2_le.hex")
+    legacy = hexfile("map_bricks_delta_le.hex")
+    assert v2[:len(legacy)] == legacy and len(v2) == len(legacy) + 6 + 8
+    with pytest.raises(m.Invalid):
+        m.MapBricks.from_cdr(legacy + bytes(6) + struct.pack("<Q", G)[:7])
+    # RequestSync: 24 v2 bytes after the pad.
+    request = hexfile("request_sync_events_none_le.hex")
+    assert m.RequestSync.from_cdr(request).token is None
+    with pytest.raises(m.Invalid):
+        m.RequestSync.from_cdr(request + bytes(7 + 8))
+    with pytest.raises(m.Invalid, match="all-zero"):
+        m.RequestSync.from_cdr(request + bytes(7 + 24))
+
+
+def test_v2_mask_follows_the_parent():
+    event = moved_event_v2()
+    with pytest.raises(m.Invalid, match="mask publisher_generation"):
+        replace(event, mask=replace(event.mask, publisher_generation=None)).to_cdr()
+    with pytest.raises(m.Invalid, match="mask publisher_generation"):
+        replace(event, publisher_generation=None).to_cdr()
+    with pytest.raises(m.Invalid, match="mask publisher_generation"):
+        replace(event, mask=replace(event.mask, publisher_generation=G + 1)).to_cdr()
+    data = bytearray(hexfile("change_event_moved_mask_v2_le.hex"))
+    data[4 + 344:4 + 352] = struct.pack("<Q", G + 1)
+    with pytest.raises(m.Invalid, match="mask publisher_generation"):
+        m.ChangeEvent.from_cdr(bytes(data))
+    # Only the parent's generation after a v2 mask is a bad length, not a legacy parent.
+    data = hexfile("change_event_moved_mask_v2_le.hex")
+    with pytest.raises(m.Invalid, match="neither padding"):
+        m.ChangeEvent.from_cdr(data[:-8])
+    assert m.ChangeEvent.from_cdr(hexfile("change_event_moved_mask_le.hex")) == moved_event()
+
+
+@pytest.mark.parametrize("change", [
+    lambda r: replace(r, token=None),
+    lambda r: replace(r, expected_generation=None),
+    lambda r: replace(r, token=m.ZERO_TOKEN),
+    lambda r: replace(r, token=TOKEN_A[:15]),
+    lambda r: replace(r, expected_generation=-1),
+])
+def test_request_sync_v2_rejections(change):
+    with pytest.raises(m.Invalid):
+        change(request_map_v2()).to_cdr()
+
+
+def test_request_sync_v2_round_trip():
+    request = request_map_v2()
+    assert m.RequestSync.from_cdr(request.to_cdr()) == request
+    assert len(request.to_cdr()) == 84
+    assert hexfile("request_sync_map_v2_be.hex")[4 + 64:] == TOKEN_C  # uint8[16] is never reversed
+
+
+@pytest.mark.parametrize("change", [
+    lambda s: replace(s, publisher_generation=0),
+    lambda s: replace(s, token=TOKEN_A[:8]),
+    lambda s: replace(s, topic=2),
+    lambda s: replace(s, bound=m.SEQ_NONE),
+    lambda s: replace(s, bound=119),
+    lambda s: replace(s, bound=None),
+    lambda s: replace(s, delivered=((21, 120), (10, 10))),
+    lambda s: replace(s, delivered=((10, 20), (21, 120)), unavailable=()),
+    lambda s: replace(s, delivered=((10, 10), (10, 120))),
+    lambda s: replace(s, delivered=((11, 10),)),
+    lambda s: replace(s, unavailable=((11, 21),)),
+    lambda s: replace(s, topic=m.SyncTopic.MAP_BRICKS),
+])
+def test_sync_end_rejections(change):
+    with pytest.raises(m.Invalid):
+        change(sync_end_events_fallback()).to_cdr()
+
+
+def test_sync_end_sizes_and_patches():
+    assert len(sync_end_events_empty().to_cdr()) == 84
+    assert len(replace(sync_end_events_empty(), bound=5, delivered=((0, 5),)).to_cdr()) == 88 + 16
+    assert len(replace(sync_end_events_empty(), bound=5, unavailable=((0, 5),)).to_cdr()) == 84 + 16
+    assert len(sync_end_events_fallback().to_cdr()) == 92 + 32 + 16
+    data = bytearray(hexfile("sync_end_events_fallback_le.hex"))
+    data[4 + 72] = 3  # three delivered ranges: truncated
+    with pytest.raises(m.CDRError):
+        m.SyncEnd.from_cdr(bytes(data))
+    data = bytearray(hexfile("sync_end_events_fallback_le.hex"))
+    data[4 + 72:4 + 76] = struct.pack("<I", 0xFFFFFFFF)  # a hostile count is refused before allocating
+    with pytest.raises(m.Truncated):
+        m.SyncEnd.from_cdr(bytes(data))
+    data = bytearray(hexfile("sync_end_events_empty_le.hex"))
+    data[4 + 32:4 + 40] = bytes(8)
+    with pytest.raises(m.Invalid, match="GENERATION_UNKNOWN"):
+        m.SyncEnd.from_cdr(bytes(data))

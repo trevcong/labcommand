@@ -94,10 +94,20 @@ struct MapDelta {
 };
 MapDelta map_delta(std::span<const msg::Brick> before, std::span<const msg::Brick> after);
 
-// <state_dir>/<room_id>/reference-<sensor>.cdr, with a leading ~ expanded. Throws
-// std::invalid_argument unless room_id is a plain name ([A-Za-z0-9._-], no leading dot).
+// Python's os.path.expanduser for "~" and "~user" prefixes.
+std::filesystem::path expand_user(const std::string& path);
+// <state_dir>/<room_id>, with a leading ~ expanded. Throws std::invalid_argument unless room_id is
+// a plain name ([A-Za-z0-9._-], no leading dot).
+std::filesystem::path room_dir(const std::string& state_dir, const std::string& room_id);
+// Temp file, fsync, rename, then fsync the directory, so the rename survives a crash. Creates
+// missing parent directories only with make_parents. Throws std::runtime_error (or
+// std::filesystem::filesystem_error) on any failure.
+void write_atomic(const std::filesystem::path& path, std::span<const std::uint8_t> data, bool make_parents = true);
+// <state_dir>/<room_id>/reference-<sensor>.cdr. Same room_id rule as room_dir.
 std::filesystem::path reference_path(const std::string& state_dir, const std::string& room_id, const std::string& sensor);
-// Writes `layer` as one zlib MapBricks snapshot, atomically (temp file, fsync, rename).
+// Writes `layer` as one zlib MapBricks snapshot, atomically (write_atomic), in the legacy layout:
+// a publisher generation on disk means nothing, and an older image must still load the file
+// (protocol 1.4). load_reference reads both layouts.
 void save_reference(const std::filesystem::path& path, const VoxelLayer& layer, const msg::Header& header,
                     float voxel_size);
 // Reads a saved reference. Throws msg::CDRError or std::runtime_error.
@@ -105,11 +115,17 @@ std::pair<msg::MapBricks, VoxelLayer> load_reference(const std::filesystem::path
 // <state_dir>/<room_id>/map_epoch: the room's last map_epoch, whichever sensors the node ran,
 // as decimal ASCII and a newline. Same room_id rule as reference_path.
 std::filesystem::path epoch_path(const std::string& state_dir, const std::string& room_id);
-// Writes the epoch file, atomically (temp file, fsync, rename).
+// Writes the epoch file, atomically (write_atomic).
 void save_epoch(const std::filesystem::path& path, std::uint64_t epoch);
 // Reads the epoch file: nullopt if it does not exist. Throws std::invalid_argument if it does not
 // hold one uint64 as digits and a newline.
 std::optional<std::uint64_t> load_epoch(const std::filesystem::path& path);
+
+// Inclusive seq ranges sorted, with overlapping or touching ones merged.
+std::vector<msg::SeqRange> canonical_ranges(std::vector<msg::SeqRange> ranges);
+// Canonical `ranges` minus canonical `removed`.
+std::vector<msg::SeqRange> subtract_ranges(const std::vector<msg::SeqRange>& ranges,
+                                           const std::vector<msg::SeqRange>& removed);
 
 // One change region followed across windows: pending until it has persisted, then an open
 // candidate (CANDIDATE sent, no terminal transition yet).
@@ -302,9 +318,19 @@ struct RejectedFrame {
 
 // Accumulation windows, reference/recent layers, candidates and status for one room. The
 // caller feeds frames with add_cdr or add_points, calls close_window every window_s and
-// status at 1 Hz, and publishes the returned messages.
+// status at 1 Hz, and publishes the returned messages. publisher_generation (protocol 1.4)
+// stamps every status, event and map message; the ROS node allocates it (allocate_generation),
+// offline drivers and tests pass a fixed value. Seq counters start at 0 here and are never
+// reset within the process.
 class RoomMemory {
 public:
+    // The answer to one RequestSync: the CDR messages to publish in order on the sync topic of
+    // the request's topic, then `end` on sync/end. No end (and no messages) for another room_id.
+    struct SyncAnswer {
+        std::vector<msg::Bytes> messages;
+        std::optional<msg::SyncEnd> end;
+    };
+
     struct Channel {
         Sensor sensor;
         std::size_t frames = 0;
@@ -323,11 +349,11 @@ public:
         std::shared_ptr<const Membership> reference_index;  // over reference.occupied
     };
 
-    // Throws std::invalid_argument on a bad config or inconsistent saved state. `scope` is
-    // the diff scope of tracking windows: regions (the default) or full, which gives the same
-    // events and exists to measure and prove that.
-    RoomMemory(MemoryConfig config, const msg::Time& start, const RayBackend* backend = nullptr,
-               DiffScope scope = DiffScope::regions);
+    // Throws std::invalid_argument on a bad config, a publisher_generation of 0, or inconsistent
+    // saved state. `scope` is the diff scope of tracking windows: regions (the default) or full,
+    // which gives the same events and exists to measure and prove that.
+    RoomMemory(MemoryConfig config, const msg::Time& start, std::uint64_t publisher_generation,
+               const RayBackend* backend = nullptr, DiffScope scope = DiffScope::regions);
 
     // Queues positions (3 floats per point, meters, sensor frame) for the current window.
     void add_points(const std::string& sensor, std::span<const float> xyz);
@@ -341,7 +367,7 @@ public:
     // since the previous call, if any, and the time since the newest one ever.
     msg::Activity activity(const msg::Time& stamp);
     // MemoryStatus for the last period_s seconds; resets the per-sensor frame counts.
-    // events_seq is the seq of the newest event message, empty before the first.
+    // events_seq is the seq of the newest event message of this generation, empty before the first.
     msg::MemoryStatus status(const msg::Time& stamp, double period_s);
     // The live MapBricks message due at `stamp`, if any (call once per window, after
     // close_window). Nothing while BUILDING. The first message is a snapshot. Afterwards,
@@ -352,10 +378,11 @@ public:
     // After learn_windows tracking windows, that settle pass drops every sensor's counts.
     // Later ticks do not settle, and a keyframe of the unchanged map does not bump map_epoch.
     std::optional<msg::Bytes> map_update(const msg::Time& stamp);
-    // The answer to one RequestSync (protocol section 5), to publish in order on the sync
-    // topic of request.topic. Empty for another room_id, and for a map request before the
-    // first live map message.
-    std::vector<msg::Bytes> sync(const msg::RequestSync& request, const msg::Time& stamp);
+    // The answer to one RequestSync (protocol section 5) and its SyncEnd; nothing for another
+    // room_id. `since` counts only when expected_generation is this generation; otherwise (a
+    // legacy request included, as generation 0 with an all-zero token) the request is answered
+    // as SINCE_NONE.
+    SyncAnswer sync(const msg::RequestSync& request, const msg::Time& stamp);
     // Writes every sensor's reference and the room's epoch file with the current map_epoch.
     // No-op without state_dir.
     void save(const msg::Time& stamp);
@@ -363,6 +390,9 @@ public:
     const MemoryConfig& config() const { return config_; }
     msg::MemoryState state() const { return state_; }
     std::uint64_t map_epoch() const { return map_epoch_; }
+    std::uint64_t publisher_generation() const { return publisher_generation_; }
+    std::uint64_t event_seq() const { return event_seq_; }
+    std::uint64_t sync_end_seq() const { return sync_end_seq_; }
     std::int64_t dropped_windows() const { return dropped_windows_; }
     const Channel& channel(const std::string& sensor) const;
     const Channel& map_channel() const { return channels_[map_channel_]; }
@@ -383,6 +413,7 @@ private:
     void log_event(const msg::ChangeEvent& event);
 
     MemoryConfig config_;
+    std::uint64_t publisher_generation_;
     Config change_;
     const RayBackend* backend_;
     DiffScope scope_;
@@ -395,6 +426,7 @@ private:
     std::uint64_t event_seq_ = 0;
     std::uint64_t status_seq_ = 0;
     std::uint64_t activity_seq_ = 0;
+    std::uint64_t sync_end_seq_ = 0;
     // The newest window with activity since the last activity message, and that window's stamp
     // (the newest window with activity ever).
     std::optional<msg::Activity> activity_;

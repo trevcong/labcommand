@@ -12,27 +12,37 @@ from labcommand_msgs.msg import MemoryStatus as MemoryStatusMsg  # noqa: E402
 from rclpy.parameter import Parameter  # noqa: E402
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy  # noqa: E402
 
+from room_memory.generation import GenerationError, generation_path  # noqa: E402
 from room_memory.memory import SENSORS  # noqa: E402
-from room_memory.messages import Activity, Header, MemoryState, MemoryStatus  # noqa: E402
-from room_memory.node import ACTIVITY_TOPIC, EVENTS_TOPIC, STATUS_TOPIC, RoomMemoryNode  # noqa: E402
-from test_messages import T10, appeared_event  # noqa: E402
+from room_memory.messages import (  # noqa: E402
+    Activity, Header, MemoryState, MemoryStatus, RequestSync, SyncEnd, SyncTopic,
+)
+from room_memory.node import ACTIVITY_TOPIC, EVENTS_TOPIC, STATUS_TOPIC, SYNC_END_TOPIC, RoomMemoryNode  # noqa: E402
+from test_messages import T10, TOKEN_A, appeared_event  # noqa: E402
+
+
+def _make_node(state_dir):
+    return RoomMemoryNode(parameter_overrides=[
+        Parameter("state_dir", value=str(state_dir)), Parameter("sensors", value=["mid360"]),
+        Parameter("max_range", value=0.0),
+    ])
 
 
 @pytest.fixture
-def node():
+def node(tmp_path):
     rclpy.init()
-    node = RoomMemoryNode(parameter_overrides=[
-        Parameter("state_dir", value=""), Parameter("sensors", value=["mid360"]), Parameter("max_range", value=0.0),
-    ])
+    node = _make_node(tmp_path)
     yield node
     node.destroy_node()
+    node.generation.release()
     rclpy.shutdown()
 
 
-def test_node_wires_topics_and_parameters(node):
-    assert node.config.state_dir is None and node.config.max_range is None
+def test_node_wires_topics_and_parameters(node, tmp_path):
+    assert node.config.state_dir == str(tmp_path) and node.config.max_range is None
     assert node.config.sensors == ("mid360",)
-    assert {publisher.topic_name for publisher in node.publishers} >= {EVENTS_TOPIC, STATUS_TOPIC, ACTIVITY_TOPIC}
+    assert {publisher.topic_name for publisher in node.publishers} >= {
+        EVENTS_TOPIC, STATUS_TOPIC, ACTIVITY_TOPIC, SYNC_END_TOPIC}
     subscribed = {subscription.topic_name for subscription in node.subscriptions}
     assert SENSORS["mid360"].topic in subscribed and SENSORS["jt128"].topic not in subscribed
 
@@ -95,3 +105,34 @@ def test_status_reports_the_last_published_event_seq(node, monkeypatch):
     node._publish_status()
     assert len(published) == 2
     assert [MemoryStatus.from_cdr(data).events_seq for data in statuses] == [None, 1]
+
+
+def test_generation_is_allocated_before_the_first_publish(node, tmp_path, monkeypatch):
+    stored = int(generation_path(tmp_path, "lab").read_bytes())
+    assert stored == node.generation.generation == node.memory.publisher_generation
+    statuses = []
+    monkeypatch.setattr(node.status, "publish", statuses.append)
+    node._publish_status()
+    assert MemoryStatus.from_cdr(statuses[0]).publisher_generation == stored
+
+
+def test_node_refuses_to_start_without_state_dir(tmp_path):
+    rclpy.init()
+    try:
+        with pytest.raises(GenerationError):
+            _make_node("")
+        with pytest.raises(GenerationError):
+            _make_node(tmp_path / "missing")
+    finally:
+        rclpy.shutdown()
+
+
+def test_answer_publishes_messages_then_sync_end(node, monkeypatch):
+    order = []
+    monkeypatch.setattr(node.sync_events, "publish", lambda data: order.append(("events", data)))
+    monkeypatch.setattr(node.sync_end, "publish", lambda data: order.append(("end", data)))
+    request = RequestSync(Header("lab", (1 << 64) - 1, 0, T10), None, SyncTopic.EVENTS, 0, TOKEN_A)
+    node._answer(request.to_cdr())
+    assert [topic for topic, _ in order] == ["end"]
+    end = SyncEnd.from_cdr(order[0][1])
+    assert end.token == TOKEN_A and end.bound is None and end.publisher_generation == node.generation.generation

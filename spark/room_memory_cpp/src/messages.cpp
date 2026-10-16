@@ -23,6 +23,13 @@ void require_int(std::int64_t value, std::int64_t low, std::int64_t high, const 
     if (value < low || value > high) throw Invalid(what + " " + str(value) + " is outside " + str(low) + "..." + str(high));
 }
 
+// A publisher_generation, when present, is 1 ... 2^64 - 1.
+void require_generation(const std::optional<std::uint64_t>& value, const std::string& what) {
+    if (value && *value == kGenerationUnknown) {
+        throw Invalid(what + " (0 is GENERATION_UNKNOWN) 0 is outside 1..." + str(kUint64Max));
+    }
+}
+
 void require_finite(const std::array<float, 3>& values, const std::string& what) {
     for (const float value : values) {
         if (!std::isfinite(value)) throw Invalid(what + " is not finite");
@@ -122,6 +129,14 @@ public:
         time(value.stamp);
     }
     void bytes(const Bytes& value) { data_.insert(data_.end(), value.begin(), value.end()); }
+    void token(const Token& value) { data_.insert(data_.end(), value.begin(), value.end()); }
+    void ranges(const std::vector<SeqRange>& values) {
+        u32(values.size());
+        for (const SeqRange& range : values) {
+            u64(range.first);
+            u64(range.last);
+        }
+    }
     Bytes take() { return std::move(data_); }
 
 private:
@@ -226,6 +241,42 @@ public:
         const std::size_t start = take(count, what);
         return Bytes(data_.begin() + static_cast<std::ptrdiff_t>(start),
                      data_.begin() + static_cast<std::ptrdiff_t>(start + count));
+    }
+
+    Token token(const std::string& what) {
+        Token value;
+        std::memcpy(value.data(), data_.data() + take(kTokenBytes, what), kTokenBytes);
+        return value;
+    }
+
+    // u32 count, then (first, last) u64 pairs. A count the remaining bytes cannot hold is
+    // refused before anything is allocated; the first u64 aligns after the count.
+    std::vector<SeqRange> ranges(const std::string& what) {
+        const std::uint32_t count = u32(what + " length");
+        if (count > available() / 16) {
+            throw Truncated(message_ + " CDR: truncated " + what + " at byte " + str(std::uint64_t{offset_}) + " (" +
+                            str(std::uint64_t{count}) + " ranges, have " + str(std::uint64_t{available()}) + " bytes)");
+        }
+        std::vector<SeqRange> out(count);
+        for (std::uint32_t n = 0; n < count; ++n) {
+            const std::string at = what + "[" + str(std::uint64_t{n}) + "]";
+            out[n].first = u64(at + ".first");
+            out[n].last = u64(at + ".last");
+        }
+        return out;
+    }
+
+    // Decides the layout after the last legacy field: false when at most 3 bytes are left
+    // (legacy), true when padding to 8 and then exactly `size` bytes (and at most 3) are left
+    // (v2). Throws Invalid otherwise. Pad bytes are not checked, as with every alignment.
+    bool is_v2(std::size_t size, const std::string& what) const {
+        const std::size_t unread = available();
+        if (unread <= kMaxTrailingPadding) return false;
+        const std::size_t pad = (8 - (offset_ - 4) % 8) % 8;
+        if (unread >= pad && unread - pad >= size && unread - pad <= size + kMaxTrailingPadding) return true;
+        throw Invalid(message_ + " CDR: " + str(std::uint64_t{unread}) + " bytes after " + what +
+                      " are neither padding (at most " + str(std::uint64_t{kMaxTrailingPadding}) + ") nor the " +
+                      str(std::uint64_t{size}) + "-byte v2 fields");
     }
 
     void finish() const {
@@ -414,9 +465,12 @@ void write_map_bricks(Writer& writer, const MapBricks& m) {
     const Bytes payload = compress(pack_payload(m.bricks, m.removed), m.compression);
     writer.u32(payload.size());
     writer.bytes(payload);
+    if (m.publisher_generation) writer.u64(*m.publisher_generation);
 }
 
-MapBricks read_map_bricks(Reader& reader, const std::string& path) {
+// `tail` is the size of the v2 fields that end the buffer from here: 8 at the top level, 16 inside
+// ChangeEvent.mask (the mask's generation, then the parent's). The layout is decided after the payload.
+MapBricks read_map_bricks(Reader& reader, const std::string& path, std::size_t tail) {
     MapBricks m;
     m.header = reader.header(path);
     m.compression = read_enum<Compression>(reader.u8(path + "compression"), 3, "MapBricks: " + path + "compression");
@@ -438,6 +492,7 @@ MapBricks read_map_bricks(Reader& reader, const std::string& path) {
     const Bytes payload = reader.byte_sequence(path + "payload");
     const Bytes raw = decompress(payload, m.compression, static_cast<std::size_t>(size), "MapBricks: " + path + "payload");
     unpack_payload(raw, brick_count, removed_count, m.bricks, m.removed);
+    if (reader.is_v2(tail, path + "payload")) m.publisher_generation = reader.u64(path + "publisher_generation");
     return m;
 }
 
@@ -502,6 +557,7 @@ void Header::validate(const std::string& context) const {
 
 void MapBricks::validate(const std::string& context) const {
     header.validate(context);
+    require_generation(publisher_generation, context + ": publisher_generation");
     require_enum(compression, 3, context + ": compression");
     require_enum(kind, 2, context + ": kind");
     if (!(std::isfinite(voxel_size) && voxel_size > 0)) throw Invalid(context + ": voxel_size must be finite and > 0 m");
@@ -556,7 +612,7 @@ Bytes MapBricks::to_cdr() const {
 
 MapBricks MapBricks::from_cdr(std::span<const std::uint8_t> data) {
     return decode<MapBricks>(data, "MapBricks", [](Reader& reader) {
-        MapBricks m = read_map_bricks(reader, "");
+        MapBricks m = read_map_bricks(reader, "", 8);
         m.validate();
         return m;
     });
@@ -565,6 +621,7 @@ MapBricks MapBricks::from_cdr(std::span<const std::uint8_t> data) {
 void ChangeEvent::validate() const {
     const std::string context = "ChangeEvent";
     header.validate(context);
+    require_generation(publisher_generation, context + ": publisher_generation");
     require_enum(kind, 3, context + ": kind");
     require_enum(state, 5, context + ": state");
     require_finite(centroid, context + ": centroid");
@@ -593,6 +650,12 @@ void ChangeEvent::validate() const {
         if (!(mask->header.stamp == header.stamp)) throw Invalid(context + ": mask stamp is not the event's stamp");
         if (mask->header.seq != 0) throw Invalid(context + ": mask seq must be 0");
         if (mask->base_epoch != 0) throw Invalid(context + ": mask base_epoch must be 0");
+        if (mask->publisher_generation != publisher_generation) {
+            const auto text = [](const std::optional<std::uint64_t>& g) { return g ? str(*g) : std::string("None"); };
+            throw Invalid(context + ": mask publisher_generation " + text(mask->publisher_generation) +
+                          " is not the event's " + text(publisher_generation) +
+                          " (a legacy event has a legacy mask, a v2 event a v2 mask)");
+        }
     }
 }
 
@@ -620,6 +683,7 @@ Bytes ChangeEvent::to_cdr() const {
     writer.time(last_seen);
     writer.u32(mask ? 1 : 0);
     if (mask) write_map_bricks(writer, *mask);
+    if (publisher_generation) writer.u64(*publisher_generation);
     return writer.take();
 }
 
@@ -646,7 +710,10 @@ ChangeEvent ChangeEvent::from_cdr(std::span<const std::uint8_t> data) {
         e.last_seen = reader.time("last_seen");
         const std::uint32_t mask_count = reader.u32("mask length");
         if (mask_count > 1) throw Invalid("ChangeEvent: mask holds " + str(std::uint64_t{mask_count}) + " maps; the bound is 1");
-        if (mask_count) e.mask = read_map_bricks(reader, "mask[0].");
+        // With a mask, the nested reader decides the layout after its payload, for both messages.
+        if (mask_count) e.mask = read_map_bricks(reader, "mask[0].", 16);
+        const bool v2 = e.mask ? e.mask->publisher_generation.has_value() : reader.is_v2(8, "mask length");
+        if (v2) e.publisher_generation = reader.u64("publisher_generation");
         e.validate();
         return e;
     });
@@ -655,6 +722,7 @@ ChangeEvent ChangeEvent::from_cdr(std::span<const std::uint8_t> data) {
 void MemoryStatus::validate() const {
     const std::string context = "MemoryStatus";
     header.validate(context);
+    require_generation(publisher_generation, context + ": publisher_generation");
     require_enum(state, 5, context + ": state");
     require_int(n_bricks, 0, (std::int64_t{1} << 32) - 1, context + ": n_bricks");
     require_int(n_open_events, 0, (std::int64_t{1} << 32) - 1, context + ": n_open_events");
@@ -683,6 +751,7 @@ Bytes MemoryStatus::to_cdr() const {
     writer.u16(static_cast<std::uint64_t>(jt128_hz.value_or(kHzUnavailable)));
     writer.u32(static_cast<std::uint64_t>(dropped_windows));
     writer.u64(events_seq.value_or(kEventsSeqNone));
+    if (publisher_generation) writer.u64(*publisher_generation);
     return writer.take();
 }
 
@@ -703,6 +772,7 @@ MemoryStatus MemoryStatus::from_cdr(std::span<const std::uint8_t> data) {
         s.dropped_windows = reader.u32("dropped_windows");
         const std::uint64_t events_seq = reader.u64("events_seq");
         if (events_seq != kEventsSeqNone) s.events_seq = events_seq;
+        if (reader.is_v2(8, "events_seq")) s.publisher_generation = reader.u64("publisher_generation");
         s.validate();
         return s;
     });
@@ -824,6 +894,10 @@ void RequestSync::validate() const {
     const std::string context = "RequestSync";
     header.validate(context);
     require_enum(topic, 2, context + ": topic");
+    if (expected_generation.has_value() != token.has_value()) {
+        throw Invalid(context + ": expected_generation and request_token are both set (v2) or both absent (legacy)");
+    }
+    if (token && *token == kZeroToken) throw Invalid(context + ": an all-zero request_token is invalid in v2");
     if (since && (since->epoch == kSinceNone || since->seq == kSinceNone)) {
         throw Invalid(context + ": since uses SINCE_NONE; use an empty since");
     }
@@ -840,6 +914,10 @@ Bytes RequestSync::to_cdr() const {
     writer.u64(since ? since->epoch : kSinceNone);
     writer.u64(since ? since->seq : kSinceNone);
     writer.u8(static_cast<std::uint8_t>(topic));
+    if (token) {
+        writer.u64(*expected_generation);
+        writer.token(*token);
+    }
     return writer.take();
 }
 
@@ -854,8 +932,89 @@ RequestSync RequestSync::from_cdr(std::span<const std::uint8_t> data) {
             throw Invalid("RequestSync: since_epoch and since_seq must both be SINCE_NONE or neither");
         }
         if (since_epoch != kSinceNone) r.since = Since{since_epoch, since_seq};
+        if (reader.is_v2(8 + kTokenBytes, "topic")) {
+            r.expected_generation = reader.u64("expected_generation");
+            r.token = reader.token("request_token");
+        }
         r.validate();
         return r;
+    });
+}
+
+namespace {
+
+std::string range_text(const std::string& what, std::size_t index) { return what + "[" + str(std::uint64_t{index}) + "]"; }
+
+// Canonical: first <= last, strictly increasing and non-adjacent, every range within the bound.
+void require_ranges(const std::vector<SeqRange>& values, const std::optional<std::uint64_t>& bound, const std::string& what) {
+    for (std::size_t n = 0; n < values.size(); ++n) {
+        const SeqRange& range = values[n];
+        if (range.last < range.first) {
+            throw Invalid(range_text(what, n) + ".last (first <= last) " + str(range.last) + " is outside " +
+                          str(range.first) + "..." + str(kUint64Max));
+        }
+        // The previous range passed these checks, so its last is below this first's and + 1 fits.
+        if (n && range.first <= values[n - 1].last + 1) {
+            throw Invalid(range_text(what, n) + " is not after " + range_text(what, n - 1) + " with a gap (canonical ranges)");
+        }
+        if (!bound || range.last > *bound) {
+            throw Invalid(range_text(what, n) + " ends at " + str(range.last) + ", past the bound " +
+                          (bound ? str(*bound) : std::string("SEQ_NONE")));
+        }
+    }
+}
+
+bool overlaps(const std::vector<SeqRange>& a, const std::vector<SeqRange>& b) {
+    for (const SeqRange& x : a) {
+        for (const SeqRange& y : b) {
+            if (x.first <= y.last && y.first <= x.last) return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+void SyncEnd::validate() const {
+    const std::string context = "SyncEnd";
+    header.validate(context);
+    require_generation(publisher_generation, context + ": publisher_generation");
+    require_enum(topic, 2, context + ": topic");
+    if (bound == kSeqNone) throw Invalid(context + ": bound (2^64 - 1 is SEQ_NONE; use nullopt)");
+    require_ranges(delivered, bound, context + ": delivered");
+    require_ranges(unavailable, bound, context + ": unavailable");
+    if (overlaps(delivered, unavailable)) throw Invalid(context + ": delivered and unavailable overlap");
+    if (topic == SyncTopic::map_bricks && !unavailable.empty()) {
+        throw Invalid(context + ": a map answer has no unavailable ranges");
+    }
+}
+
+Bytes SyncEnd::to_cdr() const {
+    validate();
+    Writer writer;
+    writer.header(header);
+    writer.u64(publisher_generation);
+    writer.token(token);
+    writer.u8(static_cast<std::uint8_t>(topic));
+    writer.u64(bound.value_or(kSeqNone));
+    writer.ranges(delivered);
+    writer.ranges(unavailable);
+    return writer.take();
+}
+
+SyncEnd SyncEnd::from_cdr(std::span<const std::uint8_t> data) {
+    return decode<SyncEnd>(data, "SyncEnd", [](Reader& reader) {
+        SyncEnd e;
+        e.header = reader.header("");
+        e.publisher_generation = reader.u64("publisher_generation");
+        e.token = reader.token("request_token");
+        e.topic = read_enum<SyncTopic>(reader.u8("topic"), 2, "SyncEnd: topic");
+        const std::uint64_t bound = reader.u64("bound");
+        if (bound != kSeqNone) e.bound = bound;
+        e.delivered = reader.ranges("delivered");
+        e.unavailable = reader.ranges("unavailable");
+        e.validate();
+        return e;
     });
 }
 

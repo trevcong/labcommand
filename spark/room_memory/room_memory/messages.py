@@ -1,4 +1,4 @@
-"""CDR codecs for the five ``labcommand_msgs`` room-memory messages, with no ROS imports.
+"""CDR codecs for the ``labcommand_msgs`` room-memory messages, with no ROS imports.
 
 The contract is ``docs/ROOM-MEMORY-PROTOCOL.md`` (Phase 0 branch). Classic CDR (XCDR1):
 4-byte encapsulation header (``00 01`` little endian, ``00 00`` big endian), every primitive
@@ -8,6 +8,12 @@ alignment of their own, at most 3 trailing padding bytes. Decoders read either b
 encoders write little endian. Validation is symmetric (protocol D16): ``to_cdr`` refuses
 exactly what ``from_cdr`` rejects. Float fields hold binary32 values; a missing float
 measurement is ``None`` here and NaN on the wire.
+
+Protocol v2 appends fields at the end of ``MemoryStatus``, ``MapBricks``, ``ChangeEvent`` and
+``RequestSync`` (protocol §1.4, §3). The layout comes from the bytes after the last legacy field:
+at most 3 is a legacy message, padding to 8 then exactly the v2 fields (then at most 3) is v2, and
+anything else is invalid. ``publisher_generation`` (and the ``RequestSync`` v2 fields) are
+``None`` for the legacy layout; the encoders write it only when they hold one.
 """
 
 import math
@@ -28,6 +34,11 @@ MAX_TRAILING_PADDING = 3
 HZ_UNAVAILABLE = 0xFFFF
 SINCE_NONE = (1 << 64) - 1
 EVENTS_SEQ_NONE = (1 << 64) - 1
+SEQ_NONE = (1 << 64) - 1  # SyncEnd.bound when nothing was published on the topic in this generation
+GENERATION_UNKNOWN = 0  # RequestSync.expected_generation only; invalid in every Spark -> Mac message
+UINT64_MAX = (1 << 64) - 1
+TOKEN_BYTES = 16
+ZERO_TOKEN = bytes(TOKEN_BYTES)
 SENSOR_MID360 = 1
 SENSOR_JT128 = 2
 SENSORS_ALL = SENSOR_MID360 | SENSOR_JT128
@@ -134,6 +145,11 @@ def _require_finite(values, what):
         raise Invalid(f"{what} {values} is not finite")
 
 
+def _require_generation(value, what):
+    if value is not None:
+        _require_int(value, 1, UINT64_MAX, f"{what} (0 is GENERATION_UNKNOWN)")
+
+
 def _require_fraction(value, what):
     if value is not None and not 0 <= value <= 1:
         raise Invalid(f"{what} {value} is outside 0...1")
@@ -233,6 +249,12 @@ class _Writer:
         self.u64(value.seq)
         self.time(value.stamp)
 
+    def ranges(self, values):
+        self.u32(len(values))
+        for first, last in values:
+            self.u64(first)
+            self.u64(last)
+
 
 class _Reader:
     def __init__(self, data, message):
@@ -312,6 +334,28 @@ class _Reader:
             map_epoch=self.u64(path + "map_epoch"),
             seq=self.u64(path + "seq"),
             stamp=self.time(path + "stamp"),
+        )
+
+    def ranges(self, what):
+        count = self.u32(what + " length")
+        available = max(0, len(self.data) - self.offset)
+        if count > available // 16:
+            raise Truncated(f"{self.message} CDR: truncated {what} at byte {self.offset} ({count} ranges, have {available} bytes)")
+        return tuple((self.u64(f"{what}[{index}].first"), self.u64(f"{what}[{index}].last")) for index in range(count))
+
+    def is_v2(self, size, what):
+        """Decides the layout after the last legacy field: False when at most 3 bytes are left
+        (legacy), True when padding to 8 and then exactly ``size`` bytes (and at most 3) are left
+        (v2). Raises ``Invalid`` otherwise. Pad bytes are not checked, as with every alignment."""
+        unread = len(self.data) - self.offset
+        if unread <= MAX_TRAILING_PADDING:
+            return False
+        pad = -(self.offset - 4) % 8
+        if size <= unread - pad <= size + MAX_TRAILING_PADDING:
+            return True
+        raise Invalid(
+            f"{self.message} CDR: {unread} bytes after {what} are neither padding (at most {MAX_TRAILING_PADDING}) "
+            f"nor the {size}-byte v2 fields"
         )
 
     def byte_sequence(self, what):
@@ -433,12 +477,14 @@ class MapBricks:
     voxel_size: float
     bricks: Tuple[Brick, ...]
     removed: Tuple[int, ...] = ()
+    publisher_generation: Optional[int] = None  # None: the legacy layout (saved reference files)
 
     def __post_init__(self):
         _f32_fields(self, ("voxel_size",))
 
     def validate(self, context="MapBricks"):
         self.header.validate(context)
+        _require_generation(self.publisher_generation, f"{context}: publisher_generation")
         _enum(Compression, self.compression, f"{context}: compression")
         _enum(MapKind, self.kind, f"{context}: kind")
         _require_int(self.base_epoch, 0, SINCE_NONE, f"{context}: base_epoch")
@@ -481,9 +527,14 @@ class MapBricks:
         payload = _compress(_pack_payload(self.bricks, self.removed), self.compression)
         writer.u32(len(payload))
         writer.data.extend(payload)
+        if self.publisher_generation is not None:
+            writer.u64(self.publisher_generation)
 
     @classmethod
-    def _read(cls, reader, path):
+    def _read(cls, reader, path, tail=8):
+        """``tail`` is the size of the v2 fields that end the buffer from here: 8 at the top level,
+        16 inside ``ChangeEvent.mask`` (the mask's generation, then the parent's). The layout is
+        decided after the payload."""
         header = reader.header(path)
         compression = _enum(Compression, reader.u8(path + "compression"), f"MapBricks: {path}compression")
         kind = _enum(MapKind, reader.u8(path + "kind"), f"MapBricks: {path}kind")
@@ -503,7 +554,8 @@ class MapBricks:
         payload = reader.byte_sequence(path + "payload")
         raw = _decompress(payload, compression, size, f"MapBricks: {path}payload")
         bricks, removed = _unpack_payload(raw, brick_count, removed_count)
-        return cls(header, compression, kind, base_epoch, voxel_size, bricks, removed)
+        generation = reader.u64(path + "publisher_generation") if reader.is_v2(tail, path + "payload") else None
+        return cls(header, compression, kind, base_epoch, voxel_size, bricks, removed, generation)
 
     def to_cdr(self):
         """CDR little endian, encapsulation header included. Raises ``Invalid``/``Unsupported``."""
@@ -542,6 +594,7 @@ class ChangeEvent:
     first_seen: Time
     last_seen: Time
     mask: Optional[MapBricks] = None
+    publisher_generation: Optional[int] = None  # None: the legacy layout
 
     def __post_init__(self):
         _f32_fields(self, ("centroid", "aabb_min", "aabb_max", "from_centroid", "volume_m3", "evidence", "alpha"))
@@ -549,6 +602,7 @@ class ChangeEvent:
     def validate(self):
         context = "ChangeEvent"
         self.header.validate(context)
+        _require_generation(self.publisher_generation, f"{context}: publisher_generation")
         _require_int(self.event_id, 0, SINCE_NONE, f"{context}: event_id")
         kind = _enum(EventKind, self.kind, f"{context}: kind")
         _enum(EventState, self.state, f"{context}: state")
@@ -589,6 +643,11 @@ class ChangeEvent:
                 raise Invalid(f"{context}: mask seq {self.mask.header.seq} must be 0")
             if self.mask.base_epoch != 0:
                 raise Invalid(f"{context}: mask base_epoch {self.mask.base_epoch} must be 0")
+            if self.mask.publisher_generation != self.publisher_generation:
+                raise Invalid(
+                    f"{context}: mask publisher_generation {self.mask.publisher_generation} is not the event's "
+                    f"{self.publisher_generation} (a legacy event has a legacy mask, a v2 event a v2 mask)"
+                )
 
     def to_cdr(self):
         """CDR little endian, encapsulation header included. Raises ``Invalid``/``Unsupported``."""
@@ -612,6 +671,8 @@ class ChangeEvent:
         writer.u32(0 if self.mask is None else 1)
         if self.mask is not None:
             self.mask._write(writer)
+        if self.publisher_generation is not None:
+            writer.u64(self.publisher_generation)
         return bytes(writer.data)
 
     @classmethod
@@ -639,11 +700,17 @@ class ChangeEvent:
             mask_count = reader.u32("mask length")
             if mask_count > 1:
                 raise Invalid(f"ChangeEvent: mask holds {mask_count} maps; the bound is 1")
-            mask = MapBricks._read(reader, "mask[0].") if mask_count else None
+            # With a mask, the nested reader decides the layout after its payload, for both messages.
+            mask = MapBricks._read(reader, "mask[0].", 16) if mask_count else None
+            if mask is not None:
+                v2 = mask.publisher_generation is not None
+            else:
+                v2 = reader.is_v2(8, "mask length")
+            generation = reader.u64("publisher_generation") if v2 else None
             event = cls(
                 header, event_id, kind, state, centroid, aabb_min, aabb_max, None if all(nans) else from_centroid,
                 voxel_count, volume, None if math.isnan(evidence) else evidence, None if math.isnan(alpha) else alpha,
-                sensors, first_seen, last_seen, mask,
+                sensors, first_seen, last_seen, mask, generation,
             )
             event.validate()
             return event
@@ -664,7 +731,8 @@ class MemoryStatus:
     mid360_hz: Optional[int]
     jt128_hz: Optional[int]
     dropped_windows: int
-    events_seq: Optional[int]  # seq of the newest live events message; None before the first
+    events_seq: Optional[int]  # seq of the newest live events message of this generation; None before the first
+    publisher_generation: Optional[int] = None  # None: the legacy layout
 
     def __post_init__(self):
         _f32_fields(self, ("coverage_known_frac", "pose_residual_m", "window_s"))
@@ -672,6 +740,7 @@ class MemoryStatus:
     def validate(self):
         context = "MemoryStatus"
         self.header.validate(context)
+        _require_generation(self.publisher_generation, f"{context}: publisher_generation")
         _enum(MemoryState, self.state, f"{context}: state")
         _require_int(self.n_bricks, 0, (1 << 32) - 1, f"{context}: n_bricks")
         _require_int(self.n_open_events, 0, (1 << 32) - 1, f"{context}: n_open_events")
@@ -704,6 +773,8 @@ class MemoryStatus:
         writer.u16(HZ_UNAVAILABLE if self.jt128_hz is None else self.jt128_hz)
         writer.u32(self.dropped_windows)
         writer.u64(EVENTS_SEQ_NONE if self.events_seq is None else self.events_seq)
+        if self.publisher_generation is not None:
+            writer.u64(self.publisher_generation)
         return bytes(writer.data)
 
     @classmethod
@@ -718,10 +789,11 @@ class MemoryStatus:
             hz = [reader.u16(f"per_sensor_hz[{index}]") for index in range(2)]
             dropped = reader.u32("dropped_windows")
             events_seq = reader.u64("events_seq")
+            generation = reader.u64("publisher_generation") if reader.is_v2(8, "events_seq") else None
             status = cls(
                 header, state, n_bricks, n_open, *(None if math.isnan(value) else value for value in optional),
                 *(None if value == HZ_UNAVAILABLE else value for value in hz), dropped,
-                None if events_seq == EVENTS_SEQ_NONE else events_seq,
+                None if events_seq == EVENTS_SEQ_NONE else events_seq, generation,
             )
             status.validate()
             return status
@@ -875,16 +947,27 @@ class Activity:
 
 @dataclass(frozen=True)
 class RequestSync:
-    """Mac → Spark resync request (protocol §3.5). ``since`` is ``(epoch, seq)`` or ``None``."""
+    """Mac → Spark resync request (protocol §3.5). ``since`` is ``(epoch, seq)`` or ``None``.
+    ``expected_generation`` and ``token`` are both ``None`` (the legacy layout) or both set."""
 
     header: Header
     since: Optional[Tuple[int, int]]
     topic: SyncTopic
+    expected_generation: Optional[int] = None  # GENERATION_UNKNOWN (0): the since belongs to no known generation
+    token: Optional[bytes] = None  # 16 random bytes, never all zero
 
     def validate(self):
         context = "RequestSync"
         self.header.validate(context)
         _enum(SyncTopic, self.topic, f"{context}: topic")
+        if (self.expected_generation is None) != (self.token is None):
+            raise Invalid(f"{context}: expected_generation and request_token are both set (v2) or both absent (legacy)")
+        if self.token is not None:
+            _require_int(self.expected_generation, 0, UINT64_MAX, f"{context}: expected_generation")
+            if not isinstance(self.token, bytes) or len(self.token) != TOKEN_BYTES:
+                raise Invalid(f"{context}: request_token must be {TOKEN_BYTES} bytes")
+            if self.token == ZERO_TOKEN:
+                raise Invalid(f"{context}: an all-zero request_token is invalid in v2")
         if self.since is not None:
             for value in self.since:
                 _require_int(value, 0, SINCE_NONE - 1, f"{context}: since ({SINCE_NONE} is SINCE_NONE; use None)")
@@ -900,6 +983,9 @@ class RequestSync:
         writer.u64(SINCE_NONE if self.since is None else self.since[0])
         writer.u64(SINCE_NONE if self.since is None else self.since[1])
         writer.u8(self.topic)
+        if self.token is not None:
+            writer.u64(self.expected_generation)
+            writer.data.extend(self.token)
         return bytes(writer.data)
 
     @classmethod
@@ -913,7 +999,95 @@ class RequestSync:
             if (since_epoch == SINCE_NONE) != (since_seq == SINCE_NONE):
                 raise Invalid("RequestSync: since_epoch and since_seq must both be SINCE_NONE or neither")
             since = None if since_epoch == SINCE_NONE else (since_epoch, since_seq)
-            request = cls(header, since, topic)
+            expected, token = None, None
+            if reader.is_v2(8 + TOKEN_BYTES, "topic"):
+                expected = reader.u64("expected_generation")
+                start = reader.take(TOKEN_BYTES, "request_token")
+                token = bytes(reader.data[start:start + TOKEN_BYTES])
+            request = cls(header, since, topic, expected, token)
             request.validate()
             return request
         return _decode(data, "RequestSync", body)
+
+
+def _require_ranges(values, bound, what):
+    previous = None
+    for index, value in enumerate(values):
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise Invalid(f"{what}[{index}] is not a (first, last) pair")
+        first, last = value
+        _require_int(first, 0, UINT64_MAX, f"{what}[{index}].first")
+        _require_int(last, first, UINT64_MAX, f"{what}[{index}].last (first <= last)")
+        if previous is not None and first <= previous + 1:
+            raise Invalid(f"{what}[{index}] is not after {what}[{index - 1}] with a gap (canonical ranges)")
+        if bound is None or last > bound:
+            raise Invalid(f"{what}[{index}] ends at {last}, past the bound {'SEQ_NONE' if bound is None else bound}")
+        previous = last
+
+
+def _overlaps(a, b):
+    return any(first <= other_last and other_first <= last for first, last in a for other_first, other_last in b)
+
+
+@dataclass(frozen=True)
+class SyncEnd:
+    """End-of-answer manifest of one ``RequestSync`` (protocol §3.8): what the answer published on
+    the topic's sync topic, and what the publisher can no longer serve. ``bound`` is ``None`` for
+    ``SEQ_NONE`` (nothing published on the topic in this generation). Ranges are inclusive
+    ``(first, last)`` pairs."""
+
+    header: Header
+    publisher_generation: int
+    token: bytes  # copied from the request; all zero for a legacy request
+    topic: SyncTopic
+    bound: Optional[int]
+    delivered: Tuple[Tuple[int, int], ...] = ()
+    unavailable: Tuple[Tuple[int, int], ...] = ()
+
+    def validate(self):
+        context = "SyncEnd"
+        self.header.validate(context)
+        _require_generation(self.publisher_generation, f"{context}: publisher_generation")
+        if self.publisher_generation is None:
+            raise Invalid(f"{context}: publisher_generation is required")
+        if not isinstance(self.token, bytes) or len(self.token) != TOKEN_BYTES:
+            raise Invalid(f"{context}: request_token must be {TOKEN_BYTES} bytes")
+        topic = _enum(SyncTopic, self.topic, f"{context}: topic")
+        if self.bound is not None:
+            _require_int(self.bound, 0, SEQ_NONE - 1, f"{context}: bound ({SEQ_NONE} is SEQ_NONE; use None)")
+        _require_ranges(self.delivered, self.bound, f"{context}: delivered")
+        _require_ranges(self.unavailable, self.bound, f"{context}: unavailable")
+        if _overlaps(self.delivered, self.unavailable):
+            raise Invalid(f"{context}: delivered and unavailable overlap")
+        if topic == SyncTopic.MAP_BRICKS and self.unavailable:
+            raise Invalid(f"{context}: a map answer has no unavailable ranges")
+
+    def to_cdr(self):
+        """CDR little endian, encapsulation header included. Raises ``Invalid``."""
+        self.validate()
+        writer = _Writer()
+        writer.header(self.header)
+        writer.u64(self.publisher_generation)
+        writer.data.extend(self.token)
+        writer.u8(self.topic)
+        writer.u64(SEQ_NONE if self.bound is None else self.bound)
+        writer.ranges(self.delivered)
+        writer.ranges(self.unavailable)
+        return bytes(writer.data)
+
+    @classmethod
+    def from_cdr(cls, data):
+        """Decodes either byte order. Raises ``Truncated`` or ``Invalid``."""
+        def body(reader):
+            header = reader.header("")
+            generation = reader.u64("publisher_generation")
+            start = reader.take(TOKEN_BYTES, "request_token")
+            token = bytes(reader.data[start:start + TOKEN_BYTES])
+            topic = _enum(SyncTopic, reader.u8("topic"), "SyncEnd: topic")
+            bound = reader.u64("bound")
+            delivered = reader.ranges("delivered")
+            unavailable = reader.ranges("unavailable")
+            end = cls(header, generation, token, topic, None if bound == SEQ_NONE else bound, delivered, unavailable)
+            end.validate()
+            return end
+        return _decode(data, "SyncEnd", body)

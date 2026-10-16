@@ -1,0 +1,20 @@
+# labcommand_msgs/RequestSync v2 TOPIC_EVENTS from a Mac that holds no events and knows no
+# generation, CDR little endian. Derived by hand; the values of request_sync_events_none_le.hex
+# (legacy, kept) plus the two v2 fields. Covers: topic ends at pos 57, 7 pad bytes, then
+# expected_generation GENERATION_UNKNOWN (0) and a 16-byte UUID v4 token (version nibble 4 in
+# byte 6, variant bits 10 in byte 8), which needs no alignment. 92 bytes on the wire.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+06 00 00 00                 # pos 0   room_id length 6 (5 chars + NUL)
+6c 61 62 2d 61 00           # pos 4   "lab-a\0"
+00 00 00 00 00 00           # pos 10  pad to 8
+ff ff ff ff ff ff ff ff     # pos 16  map_epoch SINCE_NONE (repeats since_epoch)
+00 00 00 00 00 00 00 00     # pos 24  seq 0 (first request)
+80 92 ed 68                 # pos 32  stamp.sec 1760400000
+00 65 cd 1d                 # pos 36  stamp.nanosec 500000000
+ff ff ff ff ff ff ff ff     # pos 40  since_epoch SINCE_NONE
+ff ff ff ff ff ff ff ff     # pos 48  since_seq SINCE_NONE
+01                          # pos 56  topic TOPIC_EVENTS
+00 00 00 00 00 00 00        # pos 57  pad to 8
+00 00 00 00 00 00 00 00     # pos 64  expected_generation GENERATION_UNKNOWN
+5a 1e 7c 3d 9b 02 4f 61     # pos 72  request_token[0..7]
+8e 33 c4 d5 e6 f7 08 19     # pos 80  request_token[8..15]

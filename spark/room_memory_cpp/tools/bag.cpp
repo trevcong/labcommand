@@ -34,6 +34,8 @@ using room_memory::RoomMemory;
 namespace msg = room_memory::msg;
 
 constexpr std::int64_t kSecond = 1'000'000'000;
+// A fixed publisher generation: a replay is no node start and allocates none.
+constexpr std::uint64_t kGeneration = 1;
 
 msg::Time time_of(std::int64_t ns) { return msg::Time{ns / kSecond, ns % kSecond}; }
 
@@ -191,7 +193,7 @@ int main(int argc, char** argv) {
         const auto ns = static_cast<std::int64_t>(t);
         if (!memory) {
             try {
-                memory = std::make_unique<RoomMemory>(config, time_of(ns));
+                memory = std::make_unique<RoomMemory>(config, time_of(ns), kGeneration);
             } catch (const std::exception& error) {
                 std::cerr << "room_memory_bag: " << error.what() << "\n";
                 return 2;

@@ -7,7 +7,14 @@ import Foundation
 /// The contract is `docs/ROOM-MEMORY-PROTOCOL.md`. Values that can be missing on the wire
 /// (a NaN float, the `0xFFFF` rate sentinel, an empty `mask`) are Optionals here, so a
 /// missing value can never be read as a measured zero. `RoomMemoryCDR.swift` holds the codecs.
+///
+/// Protocol v2 appends a `publisherGeneration` to `MemoryStatus`, `MapBricks` and `ChangeEvent`,
+/// and an expected generation and a request token to `RequestSync`. Nil means the message used the
+/// legacy layout (an old node, or a rolled-back image); the encoders write the v2 fields only when
+/// they hold them.
 public enum RoomMemory {
+    /// `GENERATION_UNKNOWN`: reserved. Valid only as `RequestSync.expectedGeneration`.
+    public static let generationUnknown: UInt64 = 0
 
     /// `builtin_interfaces/Time`: seconds and nanoseconds since the Unix epoch.
     public struct Time: Sendable, Hashable, Comparable {
@@ -192,6 +199,9 @@ public enum RoomMemory {
         /// Delta only: indices into the `baseEpoch` brick list (canonical order) of bricks that became all UNKNOWN.
         /// Strictly increasing.
         public var removedBrickIndices: [UInt32]
+        /// The publishing process's generation, never 0. Nil: the legacy layout. Inside a
+        /// `ChangeEvent.mask` it repeats the parent's.
+        public var publisherGeneration: UInt64?
 
         /// Creates a map message. The payload is zlib-compressed unless `compression` says otherwise.
         public init(
@@ -201,7 +211,8 @@ public enum RoomMemory {
             baseEpoch: UInt64,
             voxelSize: Float,
             bricks: [Brick],
-            removedBrickIndices: [UInt32] = []
+            removedBrickIndices: [UInt32] = [],
+            publisherGeneration: UInt64? = nil
         ) {
             self.header = header
             self.compression = compression
@@ -210,6 +221,7 @@ public enum RoomMemory {
             self.voxelSize = voxelSize
             self.bricks = bricks
             self.removedBrickIndices = removedBrickIndices
+            self.publisherGeneration = publisherGeneration
         }
     }
 
@@ -283,6 +295,8 @@ public enum RoomMemory {
         public var lastSeen: Time
         /// The region's voxels as a snapshot-kind map: `occupied` = in the region. Nil when not sent.
         public var mask: MapBricks?
+        /// The publishing process's generation, never 0. Nil: the legacy layout.
+        public var publisherGeneration: UInt64?
 
         /// Creates an event message.
         public init(
@@ -300,7 +314,8 @@ public enum RoomMemory {
             sensors: Sensors,
             firstSeen: Time,
             lastSeen: Time,
-            mask: MapBricks?
+            mask: MapBricks?,
+            publisherGeneration: UInt64? = nil
         ) {
             self.header = header
             self.eventId = eventId
@@ -317,6 +332,7 @@ public enum RoomMemory {
             self.firstSeen = firstSeen
             self.lastSeen = lastSeen
             self.mask = mask
+            self.publisherGeneration = publisherGeneration
         }
     }
 
@@ -345,8 +361,10 @@ public enum RoomMemory {
         public var jt128Hz: UInt16?
         /// Windows dropped since the node started.
         public var droppedWindows: UInt32
-        /// `seq` of the newest live `events` message, the events high-water mark. Nil before the first event.
+        /// `seq` of the newest live `events` message of this generation. Nil before the first event.
         public var eventsSeq: UInt64?
+        /// The publishing process's generation, never 0. Nil: the legacy layout.
+        public var publisherGeneration: UInt64?
 
         /// Creates a status message.
         public init(
@@ -360,7 +378,8 @@ public enum RoomMemory {
             mid360Hz: UInt16?,
             jt128Hz: UInt16?,
             droppedWindows: UInt32,
-            eventsSeq: UInt64?
+            eventsSeq: UInt64?,
+            publisherGeneration: UInt64? = nil
         ) {
             self.header = header
             self.state = state
@@ -373,6 +392,7 @@ public enum RoomMemory {
             self.jt128Hz = jt128Hz
             self.droppedWindows = droppedWindows
             self.eventsSeq = eventsSeq
+            self.publisherGeneration = publisherGeneration
         }
     }
 
@@ -413,7 +433,8 @@ public enum RoomMemory {
     ///
     /// `header.mapEpoch` repeats `since.epoch` (`RequestSync.SINCE_NONE` when `since` is nil), and
     /// `header.seq` counts this client's requests. The Spark answers on the topic's sync topic with
-    /// the missed messages or a snapshot (`docs/ROOM-MEMORY-PROTOCOL.md` §5).
+    /// the missed messages or a snapshot, then a `SyncEnd` (`docs/ROOM-MEMORY-PROTOCOL.md` §5).
+    /// `expectedGeneration` and `token` are both nil (legacy layout) or both set (v2).
     public struct RequestSync: Sendable, Equatable {
         /// `RequestSync.TOPIC_*`: which topic the request is about.
         public enum Topic: UInt8, Sendable, CaseIterable {
@@ -446,12 +467,100 @@ public enum RoomMemory {
         public var since: Position?
         /// The topic to resynchronize.
         public var topic: Topic
+        /// The publisher generation `since` belongs to; `RoomMemory.generationUnknown` for none.
+        public var expectedGeneration: UInt64?
+        /// New for every send, retries included; the `SyncEnd` copies it.
+        public var token: RequestToken?
 
         /// Creates a request.
-        public init(header: Header, since: Position?, topic: Topic) {
+        public init(header: Header, since: Position?, topic: Topic, expectedGeneration: UInt64? = nil, token: RequestToken? = nil) {
             self.header = header
             self.since = since
             self.topic = topic
+            self.expectedGeneration = expectedGeneration
+            self.token = token
+        }
+    }
+
+    /// `RequestSync.request_token`: 16 bytes, as sent (never byte-swapped).
+    public struct RequestToken: Sendable, Hashable, CustomStringConvertible {
+        /// Bytes in a token.
+        public static let count = 16
+        /// The token a `SyncEnd` carries when it answers a legacy request.
+        public static let zero = RequestToken(uncheckedBytes: [UInt8](repeating: 0, count: count))
+
+        /// Exactly `count` bytes.
+        public let bytes: [UInt8]
+
+        /// Nil unless `bytes` holds exactly 16 bytes.
+        public init?(bytes: [UInt8]) {
+            guard bytes.count == Self.count else { return nil }
+            self.bytes = bytes
+        }
+
+        init(uncheckedBytes bytes: [UInt8]) {
+            self.bytes = bytes
+        }
+
+        /// A random UUID v4: version nibble 4, variant bits 10, so never all zero.
+        public init<G: RandomNumberGenerator>(using generator: inout G) {
+            var bytes: [UInt8] = []
+            bytes.reserveCapacity(Self.count)
+            for _ in 0..<2 {
+                withUnsafeBytes(of: generator.next().littleEndian) { bytes.append(contentsOf: $0) }
+            }
+            bytes[6] = (bytes[6] & 0x0F) | 0x40
+            bytes[8] = (bytes[8] & 0x3F) | 0x80
+            self.bytes = bytes
+        }
+
+        public var isZero: Bool { bytes.allSatisfy { $0 == 0 } }
+
+        public var description: String { bytes.map { String(format: "%02x", $0) }.joined() }
+    }
+
+    /// `labcommand_msgs/SyncEnd`: the end-of-answer manifest of one `RequestSync`, on `/room_memory/sync/end`.
+    ///
+    /// It says what the answer published on the topic's sync topic and which requested seqs the
+    /// publisher no longer holds. It travels on its own topic, so it can arrive before the answer:
+    /// it proves nothing about what this Mac received.
+    public struct SyncEnd: Sendable, Equatable {
+        /// `SyncEnd.SEQ_NONE`: the wire value of `bound` when nothing was published on the topic in this generation.
+        public static let seqNone = UInt64.max
+
+        /// The common fields. `seq` counts SyncEnds from 0 per generation.
+        public var header: Header
+        /// The answering generation; every message of the answer carries it. Never 0.
+        public var publisherGeneration: UInt64
+        /// Copied from the request; `RequestToken.zero` for a legacy request.
+        public var token: RequestToken
+        /// The topic the request was about.
+        public var topic: RequestSync.Topic
+        /// The topic's newest live seq in this generation when the answer was computed. Nil: nothing published (known empty).
+        public var bound: UInt64?
+        /// Seqs this answer published, canonical (increasing, non-adjacent), each ≤ `bound`.
+        public var delivered: [ClosedRange<UInt64>]
+        /// Requested seqs the publisher no longer holds (events only), canonical, disjoint from `delivered`.
+        /// Permanent within the generation.
+        public var unavailable: [ClosedRange<UInt64>]
+
+        /// Creates a manifest.
+        public init(
+            header: Header,
+            publisherGeneration: UInt64,
+            token: RequestToken,
+            topic: RequestSync.Topic,
+            bound: UInt64?,
+            delivered: [ClosedRange<UInt64>] = [],
+            unavailable: [ClosedRange<UInt64>] = []
+        ) {
+            self.header = header
+            self.publisherGeneration = publisherGeneration
+            self.token = token
+            self.topic = topic
+            self.bound = bound
+            self.delivered = delivered
+            self.unavailable = unavailable
         }
     }
 }

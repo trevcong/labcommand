@@ -36,7 +36,8 @@ bool plain_name(const std::string& text) {
     return true;
 }
 
-// Python's os.path.expanduser for "~" and "~user" prefixes.
+}  // namespace
+
 std::filesystem::path expand_user(const std::string& path) {
     if (path.empty() || path[0] != '~') return path;
     const std::size_t slash = path.find('/');
@@ -55,6 +56,8 @@ std::filesystem::path expand_user(const std::string& path) {
     while (home.size() > 1 && home.back() == '/') home.pop_back();
     return home + (slash == std::string::npos ? std::string() : path.substr(slash));
 }
+
+namespace {
 
 std::int64_t nanoseconds(const msg::Time& t) { return t.sec * 1'000'000'000 + t.nanosec; }
 
@@ -315,8 +318,6 @@ MapDelta map_delta(std::span<const msg::Brick> before, std::span<const msg::Bric
 
 // MARK: Persistence
 
-namespace {
-
 std::filesystem::path room_dir(const std::string& state_dir, const std::string& room_id) {
     if (!plain_name(room_id)) {
         throw std::invalid_argument("room_id '" + room_id + "' is not a plain file name ([A-Za-z0-9._-], no leading dot)");
@@ -324,9 +325,9 @@ std::filesystem::path room_dir(const std::string& state_dir, const std::string& 
     return expand_user(state_dir) / room_id;
 }
 
-// Temp file, fsync, rename.
-void write_atomic(const std::filesystem::path& path, std::span<const std::uint8_t> data) {
-    std::filesystem::create_directories(path.parent_path());
+void write_atomic(const std::filesystem::path& path, std::span<const std::uint8_t> data, bool make_parents) {
+    const std::filesystem::path parent = path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
+    if (make_parents) std::filesystem::create_directories(parent);
     const std::filesystem::path scratch = path.string() + ".tmp";
     const int fd = ::open(scratch.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) throw std::runtime_error("cannot write " + scratch.string());
@@ -343,9 +344,12 @@ void write_atomic(const std::filesystem::path& path, std::span<const std::uint8_
     ::close(fd);
     if (!synced) throw std::runtime_error("cannot sync " + scratch.string());
     std::filesystem::rename(scratch, path);
+    const int directory = ::open(parent.c_str(), O_RDONLY);
+    if (directory < 0) throw std::runtime_error("cannot open " + parent.string() + " to sync it");
+    const bool dir_synced = ::fsync(directory) == 0;
+    ::close(directory);
+    if (!dir_synced) throw std::runtime_error("cannot sync " + parent.string());
 }
-
-}  // namespace
 
 std::filesystem::path reference_path(const std::string& state_dir, const std::string& room_id, const std::string& sensor) {
     return room_dir(state_dir, room_id) / ("reference-" + sensor + ".cdr");
@@ -387,6 +391,42 @@ std::optional<std::uint64_t> load_epoch(const std::filesystem::path& path) {
         epoch = epoch * 10 + digit;
     }
     return epoch;
+}
+
+// MARK: Seq ranges
+
+std::vector<msg::SeqRange> canonical_ranges(std::vector<msg::SeqRange> ranges) {
+    std::sort(ranges.begin(), ranges.end(), [](const msg::SeqRange& a, const msg::SeqRange& b) {
+        return a.first != b.first ? a.first < b.first : a.last < b.last;
+    });
+    std::vector<msg::SeqRange> merged;
+    for (const msg::SeqRange& range : ranges) {
+        if (!merged.empty() && (merged.back().last == msg::kUint64Max || range.first <= merged.back().last + 1)) {
+            merged.back().last = std::max(merged.back().last, range.last);
+        } else {
+            merged.push_back(range);
+        }
+    }
+    return merged;
+}
+
+std::vector<msg::SeqRange> subtract_ranges(const std::vector<msg::SeqRange>& ranges,
+                                           const std::vector<msg::SeqRange>& removed) {
+    std::vector<msg::SeqRange> out;
+    for (msg::SeqRange range : ranges) {
+        bool left = true;
+        for (const msg::SeqRange& cut : removed) {
+            if (cut.last < range.first || cut.first > range.last) continue;
+            if (cut.first > range.first) out.push_back({range.first, cut.first - 1});
+            if (cut.last >= range.last) {
+                left = false;
+                break;
+            }
+            range.first = cut.last + 1;
+        }
+        if (left) out.push_back(range);
+    }
+    return out;
 }
 
 std::pair<msg::MapBricks, VoxelLayer> load_reference(const std::filesystem::path& path) {
@@ -507,8 +547,12 @@ SettleRule MemoryConfig::settle_rule() const {
     return SettleRule{occupied_min_hits, occupied_min_ratio, free_min_seen, free_max_ratio};
 }
 
-RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, const RayBackend* backend, DiffScope scope)
-    : config_(std::move(config)), backend_(backend), scope_(scope) {
+RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, std::uint64_t publisher_generation,
+                       const RayBackend* backend, DiffScope scope)
+    : config_(std::move(config)), publisher_generation_(publisher_generation), backend_(backend), scope_(scope) {
+    if (publisher_generation_ == msg::kGenerationUnknown) {
+        throw std::invalid_argument("publisher_generation must be in 1..." + std::to_string(msg::kUint64Max) + ", got 0");
+    }
     std::vector<std::string> names;
     bool unknown = config_.sensors.empty();
     for (const std::string& name : config_.sensors) {
@@ -859,6 +903,7 @@ msg::MapBricks RoomMemory::map_message(msg::MapKind kind, const msg::Time& stamp
     message.compression = msg::Compression::zlib;
     message.kind = kind;
     message.voxel_size = static_cast<float>(config_.voxel_size);
+    message.publisher_generation = publisher_generation_;
     return message;
 }
 
@@ -933,44 +978,75 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
     return publish_map(snapshot);
 }
 
-std::vector<msg::Bytes> RoomMemory::sync(const msg::RequestSync& request, const msg::Time& stamp) {
-    std::vector<msg::Bytes> answer;
+RoomMemory::SyncAnswer RoomMemory::sync(const msg::RequestSync& request, const msg::Time& stamp) {
+    SyncAnswer answer;
     if (request.header.room_id != config_.room_id) return answer;
+    const std::uint64_t expected = request.expected_generation.value_or(msg::kGenerationUnknown);
+    const std::optional<msg::RequestSync::Since> since =
+        expected == publisher_generation_ ? request.since : std::nullopt;
     const auto since_index = [&](const std::deque<Logged>& log) -> std::optional<std::size_t> {
-        if (!request.since) return std::nullopt;
+        if (!since) return std::nullopt;
         for (std::size_t n = 0; n < log.size(); ++n) {
-            if (log[n].seq == request.since->seq && log[n].map_epoch == request.since->epoch) return n;
+            if (log[n].seq == since->seq && log[n].map_epoch == since->epoch) return n;
         }
         return std::nullopt;
     };
+    std::vector<msg::Bytes>& messages = answer.messages;
+    std::optional<std::uint64_t> bound;
+    std::vector<msg::SeqRange> delivered, unavailable;
     if (request.topic == msg::SyncTopic::map_bricks) {
-        if (!map_started_) return answer;
+        if (map_started_) bound = map_seq_ - 1;
         const auto at = since_index(map_log_);
-        if (at && *at + 1 < map_log_.size()) {
-            for (std::size_t n = *at + 1; n < map_log_.size(); ++n) answer.push_back(map_log_[n].bytes);
-            return answer;
+        if (!bound || (at && *at + 1 == map_log_.size())) {
+            // Nothing published yet (BUILDING), or the Mac holds the newest message.
+        } else if (at) {
+            for (std::size_t n = *at + 1; n < map_log_.size(); ++n) messages.push_back(map_log_[n].bytes);
+            delivered = {{since->seq + 1, *bound}};
+        } else {
+            // A fresh snapshot of the last live state, under the latest live seq.
+            msg::MapBricks snapshot = map_message(msg::MapKind::snapshot, stamp);
+            snapshot.header.seq = *bound;
+            snapshot.bricks = map_bricks_;
+            messages.push_back(snapshot.to_cdr());
+            delivered = {{*bound, *bound}};
         }
-        // A fresh snapshot of the last live state, under the latest live seq.
-        msg::MapBricks snapshot = map_message(msg::MapKind::snapshot, stamp);
-        snapshot.header.seq = map_seq_ - 1;
-        snapshot.bricks = map_bricks_;
-        answer.push_back(snapshot.to_cdr());
-        return answer;
+    } else {
+        if (event_seq_) bound = event_seq_ - 1;
+        const auto at = since_index(event_log_);
+        if (!bound) {
+            // Nothing published in this generation: known empty.
+        } else if (at) {
+            for (std::size_t n = *at + 1; n < event_log_.size(); ++n) messages.push_back(event_log_[n].bytes);
+            if (!messages.empty()) delivered = {{since->seq + 1, *bound}};
+        } else {
+            // Bounded fallback: open events whose latest message is older than the kept ones, then
+            // every kept message. What was requested and neither is sent can never be served again.
+            const std::uint64_t oldest = event_log_.front().seq;
+            std::vector<const Logged*> older;
+            for (const auto& [id, entry] : open_latest_) {
+                if (entry.seq < oldest) older.push_back(&entry);
+            }
+            std::sort(older.begin(), older.end(), [](const Logged* a, const Logged* b) { return a->seq < b->seq; });
+            std::vector<msg::SeqRange> sent;
+            for (const Logged* entry : older) {
+                messages.push_back(entry->bytes);
+                sent.push_back({entry->seq, entry->seq});
+            }
+            for (const Logged& entry : event_log_) messages.push_back(entry.bytes);
+            sent.push_back({oldest, *bound});
+            delivered = canonical_ranges(std::move(sent));
+            const std::uint64_t first = since ? since->seq + 1 : 0;
+            if (first <= *bound) unavailable = subtract_ranges({{first, *bound}}, delivered);
+        }
     }
-    if (const auto at = since_index(event_log_)) {
-        for (std::size_t n = *at + 1; n < event_log_.size(); ++n) answer.push_back(event_log_[n].bytes);
-        return answer;
-    }
-    // Bounded fallback: open events whose latest message is older than the kept ones, then
-    // every kept message.
-    const std::uint64_t oldest = event_log_.empty() ? ~std::uint64_t{0} : event_log_.front().seq;
-    std::vector<const Logged*> older;
-    for (const auto& [id, entry] : open_latest_) {
-        if (entry.seq < oldest) older.push_back(&entry);
-    }
-    std::sort(older.begin(), older.end(), [](const Logged* a, const Logged* b) { return a->seq < b->seq; });
-    for (const Logged* entry : older) answer.push_back(entry->bytes);
-    for (const Logged& entry : event_log_) answer.push_back(entry.bytes);
+    msg::SyncEnd& end = answer.end.emplace();
+    end.header = msg::Header{config_.room_id, map_epoch_, sync_end_seq_++, stamp};
+    end.publisher_generation = publisher_generation_;
+    end.token = request.token.value_or(msg::kZeroToken);
+    end.topic = request.topic;
+    end.bound = bound;
+    end.delivered = std::move(delivered);
+    end.unavailable = std::move(unavailable);
     return answer;
 }
 
@@ -1002,7 +1078,9 @@ msg::ChangeEvent RoomMemory::event(const Channel& channel, msg::EventState state
     layer.occupied = candidate.keys;
     layer.known = candidate.keys;
     mask.bricks = layer.to_bricks();
+    mask.publisher_generation = publisher_generation_;
     e.mask = std::move(mask);
+    e.publisher_generation = publisher_generation_;
     return e;
 }
 
@@ -1058,6 +1136,7 @@ msg::MemoryStatus RoomMemory::status(const msg::Time& stamp, double period_s) {
     message.jt128_hz = hz[1];
     message.dropped_windows = dropped_windows_;
     if (event_seq_) message.events_seq = event_seq_ - 1;
+    message.publisher_generation = publisher_generation_;
     return message;
 }
 

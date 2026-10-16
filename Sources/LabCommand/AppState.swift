@@ -2,19 +2,21 @@ import Foundation
 import Combine
 import LabCommandCore
 
-/// App destinations. Simplified for the redesign — workspace and settings only.
+/// App destinations. Rig, Settings, and the live room.
 enum Dest: String, CaseIterable, Identifiable {
     case workspace
     case settings
+    case liveRoom
 
     var id: String { rawValue }
 
-    static var navCases: [Dest] { [.workspace, .settings] }
+    static var navCases: [Dest] { [.workspace, .settings, .liveRoom] }
 
     var label: String {
         switch self {
         case .workspace: return "Rig"
         case .settings: return "Settings"
+        case .liveRoom: return "Room"
         }
     }
 
@@ -22,6 +24,7 @@ enum Dest: String, CaseIterable, Identifiable {
         switch self {
         case .workspace: return "1"
         case .settings: return "2"
+        case .liveRoom: return "3"
         }
     }
 }
@@ -69,6 +72,15 @@ final class AppState: ObservableObject {
     /// Launch mode. Named apart from `session`, which is the capture spec.
     let launch: SnapshotSession
 
+    /// Live room socket. Nil in fixture mode: the view reads `fixture` instead.
+    /// A snapshot launch isolates the network, so it leaves this nil too.
+    let roomLaunch: LiveRoomLaunch
+    let room: LiveRoomClient?
+    @Published private(set) var fixture: LiveRoomFixture?
+    /// True after `start()` has opened the room socket. The Off screen is the other case.
+    private(set) var roomDidStart = false
+    private var fixtureTimer: Timer?
+
     private let service: ConnectivityService
     private let rigIO: RigServiceProtocol
     private var task: Task<Void, Never>?
@@ -85,11 +97,22 @@ final class AppState: ObservableObject {
     ) {
         let launch = SnapshotSession(environment: environment)
         self.launch = launch
+        let roomLaunch = LiveRoomLaunch.parse(environment)
+        self.roomLaunch = roomLaunch
         self.service = service ?? ConnectivityService()
         self.rigIO = rigIO ?? MockMode.createRigService(isolates: launch.isolates)
+        // The room gate launch and every fixture leave the lidar client dark.
         self.live = FoxgloveLiveClient(
-            isAvailable: !launch.isolates && MockMode.parseArgs() == nil
+            isAvailable: !launch.isolates && roomLaunch.lidarAvailable && MockMode.parseArgs() == nil
         )
+        switch roomLaunch {
+        case .live:
+            self.room = launch.isolates ? nil : LiveRoomClient()
+            self.fixture = nil
+        case .fixture(let mode):
+            self.room = nil
+            self.fixture = try? LiveRoomFixture.load(mode: mode, root: nil, now: ProcessInfo.processInfo.systemUptime)
+        }
         self.snapshot = LabStatusSnapshot(
             overall: .unknown,
             spark: .unknown,
@@ -102,6 +125,33 @@ final class AppState: ObservableObject {
             pointCloudColorMode = .sensor
             autoRefreshEnabled = false
         }
+        if roomLaunch.opensRoom {
+            dest = .liveRoom
+        }
+    }
+
+    var roomMirror: RoomMemoryMirror {
+        if let room { return room.mirror }
+        return fixture?.mirror ?? RoomMemoryMirror()
+    }
+
+    var roomConnection: LiveRoomConnection {
+        if let room { return room.connection }
+        return fixture?.connection ?? .off
+    }
+
+    /// The bridge can publish, or a relay sink is installed. This job leaves the sink nil.
+    var requestPathExists: Bool {
+        if case .connected(let server) = room?.connection, server.canPublish { return true }
+        return room?.requestSyncSink != nil
+    }
+
+    func selectFixture(_ mode: LiveRoomFixture.Mode) {
+        guard roomLaunch.fixtureMode != nil else { return }
+        fixtureTimer?.invalidate()
+        fixtureTimer = nil
+        fixture = try? LiveRoomFixture.load(mode: mode, root: nil, now: ProcessInfo.processInfo.systemUptime)
+        if LiveRoomFixture.keepsFresh(mode) { startFixtureClock() }
     }
 
     var health: RigConfidence { RigHealth.evaluate(rig) }
@@ -179,7 +229,8 @@ final class AppState: ObservableObject {
         if launch.isolates {
             logLine(ChangeOverlay.localSessionLine)
         }
-        switch launch.begin(rig: { [weak self] in self?.beginRig() }) {
+        let skipsProbes = roomLaunch.skipsProbes
+        switch launch.begin(rig: { [weak self] in if !skipsProbes { self?.beginRig() } }) {
         case .rig:
             break
         case .failed(let message):
@@ -190,6 +241,13 @@ final class AppState: ObservableObject {
                 let loaded = SnapshotFiles.load(directoryA: directoryA, directoryB: directoryB)
                 await self?.applySnapshot(loaded)
             }
+        }
+        if roomLaunch.startsClient, let room {
+            room.start()
+            roomDidStart = true
+        }
+        if let mode = roomLaunch.fixtureMode, LiveRoomFixture.keepsFresh(mode) {
+            startFixtureClock()
         }
     }
 
@@ -294,10 +352,23 @@ final class AppState: ObservableObject {
     func stop() {
         slowTimer?.invalidate()
         fastTimer?.invalidate()
+        fixtureTimer?.invalidate()
         slowTimer = nil
         fastTimer = nil
+        fixtureTimer = nil
         task?.cancel()
+        room?.stop()
         live.shutdown()
+    }
+
+    private func startFixtureClock() {
+        fixtureTimer?.invalidate()
+        fixtureTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.fixture = self.fixture?.refreshed(at: ProcessInfo.processInfo.systemUptime)
+            }
+        }
     }
 
     func restartTimer() {

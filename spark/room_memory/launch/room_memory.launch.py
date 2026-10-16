@@ -2,7 +2,8 @@
 
     ros2 launch room_memory room_memory.launch.py room_id:=lab sensors:="['mid360']"
 
-``max_range`` <= 0 disables the range clip; an empty ``state_dir`` disables saving and loading;
+``max_range`` <= 0 disables the range clip; ``state_dir`` must already exist (it holds the
+references, ``map_epoch`` and the publisher generation), and an empty or missing one stops the node;
 an empty ``map_sensor`` publishes the JT128's reference when it is configured, else the first
 sensor's. The defaults are ``MemoryConfig``'s, measured on the static recording.
 """

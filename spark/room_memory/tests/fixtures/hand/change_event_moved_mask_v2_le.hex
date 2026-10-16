@@ -1,0 +1,67 @@
+# labcommand_msgs/ChangeEvent v2 KIND_MOVED with a mask, CDR little endian. Derived by hand; the
+# values of change_event_moved_mask_le.hex (legacy, kept) plus two generations. Covers: the nested
+# v2 MapBricks puts its own publisher_generation after its payload (ends pos 338, 6 pad bytes), and
+# the parent's follows at once, already aligned. The mask copies the parent's generation (D14).
+00 01 00 00                 # encapsulation CDR_LE, options 0
+04 00 00 00                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   "lab\0"
+2b 00 00 00 00 00 00 00     # pos 8   map_epoch 43
+03 00 00 00 00 00 00 00     # pos 16  seq 3
+8a 92 ed 68                 # pos 24  stamp.sec 1760400010
+80 b2 e6 0e                 # pos 28  stamp.nanosec 250000000
+09 00 00 00 00 00 00 00     # pos 32  event_id 9
+02                          # pos 40  kind KIND_MOVED
+01                          # pos 41  state STATE_CONFIRMED
+00 00                       # pos 42  pad to 4
+00 00 c0 3f                 # pos 44  centroid.x 1.5
+00 00 80 be                 # pos 48  centroid.y -0.25
+00 00 00 3e                 # pos 52  centroid.z 0.125
+00 00 a0 3f                 # pos 56  aabb min_x 1.25
+00 00 00 bf                 # pos 60  aabb min_y -0.5
+00 00 00 00                 # pos 64  aabb min_z 0.0
+00 00 e0 3f                 # pos 68  aabb max_x 1.75
+00 00 00 00                 # pos 72  aabb max_y 0.0
+00 00 80 3e                 # pos 76  aabb max_z 0.25
+00 00 00 3f                 # pos 80  from_centroid.x 0.5
+00 00 80 be                 # pos 84  from_centroid.y -0.25
+00 00 00 3e                 # pos 88  from_centroid.z 0.125
+7d 00 00 00                 # pos 92  voxel_count 125
+00 00 80 3c                 # pos 96  volume_m3 0.015625
+00 00 60 3f                 # pos 100 evidence 0.875
+00 00 c0 7f                 # pos 104 alpha NaN (uncalibrated)
+03                          # pos 108 sensors MID360 | JT128
+00 00 00                    # pos 109 pad to 4
+80 92 ed 68                 # pos 112 first_seen.sec 1760400000
+00 00 00 00                 # pos 116 first_seen.nanosec 0
+8a 92 ed 68                 # pos 120 last_seen.sec 1760400010
+80 b2 e6 0e                 # pos 124 last_seen.nanosec 250000000
+01 00 00 00                 # pos 128 mask length 1
+04 00 00 00                 # pos 132 mask.room_id length 4
+6c 61 62 00                 # pos 136 mask.room_id "lab\0"
+00 00 00 00                 # pos 140 pad to 8
+2b 00 00 00 00 00 00 00     # pos 144 mask.map_epoch 43
+00 00 00 00 00 00 00 00     # pos 152 mask.seq 0
+8a 92 ed 68                 # pos 160 mask.stamp.sec 1760400010
+80 b2 e6 0e                 # pos 164 mask.stamp.nanosec 250000000
+00                          # pos 168 mask.compression COMPRESSION_NONE
+00                          # pos 169 mask.kind KIND_SNAPSHOT
+00 00 00 00 00 00           # pos 170 pad to 8
+00 00 00 00 00 00 00 00     # pos 176 mask.base_epoch 0
+cd cc 4c 3d                 # pos 184 mask.voxel_size 0.05
+08                          # pos 188 mask.brick_dim 8
+00 00 00                    # pos 189 pad to 4
+01 00 00 00                 # pos 192 mask.n_bricks 1
+00 00 00 00                 # pos 196 mask.n_removed 0
+86 00 00 00                 # pos 200 mask.payload length 134
+03 00 ff ff 00 00           # pos 204 mask.payload brick_ijk (3, -1, 0)
+01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 210 occ: voxel (0,0,0) is in the region
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 226
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 242
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 258
+01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 274 known: voxel (0,0,0) has evidence
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 290
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 306
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   # pos 322
+00 00 00 00 00 00           # pos 338 pad to 8
+00 44 04 e0 99 01 00 00     # pos 344 mask.publisher_generation 1760400000000 (repeats the parent's)
+00 44 04 e0 99 01 00 00     # pos 352 publisher_generation 1760400000000

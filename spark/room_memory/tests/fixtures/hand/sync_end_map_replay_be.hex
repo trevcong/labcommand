@@ -1,0 +1,22 @@
+# labcommand_msgs/SyncEnd TOPIC_MAP_BRICKS answering request_sync_map_v2_be.hex, CDR big endian.
+# Decode-only. Derived by hand from SyncEnd.msg. since (43, 10) was in the map log, the newest
+# live map seq is 13: the replay delivered seqs 11-13. Covers: token copied unreversed (uint8[16]);
+# one SeqRange after its count and 4 pad bytes; an empty unavailable list. 104 bytes on the wire.
+00 00 00 00                 # encapsulation CDR_BE, options 0
+00 00 00 04                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   "lab\0"
+00 00 00 00 00 00 00 2d     # pos 8   map_epoch 45
+00 00 00 00 00 00 00 02     # pos 16  seq 2
+68 ed 92 8a                 # pos 24  stamp.sec 1760400010
+0e e6 b2 80                 # pos 28  stamp.nanosec 250000000
+00 00 01 99 e0 04 44 00     # pos 32  publisher_generation 1760400000000
+0e 8a 3b 5c 77 21 4d 90     # pos 40  request_token[0..7]
+b4 06 59 13 c2 ae 6f 01     # pos 48  request_token[8..15]
+00                          # pos 56  topic TOPIC_MAP_BRICKS
+00 00 00 00 00 00 00        # pos 57  pad to 8
+00 00 00 00 00 00 00 0d     # pos 64  bound 13
+00 00 00 01                 # pos 72  delivered length 1
+00 00 00 00                 # pos 76  pad to 8
+00 00 00 00 00 00 00 0b     # pos 80  delivered[0].first 11
+00 00 00 00 00 00 00 0d     # pos 88  delivered[0].last 13
+00 00 00 00                 # pos 96  unavailable length 0

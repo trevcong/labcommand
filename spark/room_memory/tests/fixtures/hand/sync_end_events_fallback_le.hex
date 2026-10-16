@@ -1,0 +1,28 @@
+# labcommand_msgs/SyncEnd TOPIC_EVENTS for an events fallback, CDR little endian. Derived by hand
+# from SyncEnd.msg. The request asked since (43, 9), which the 100-message log (seqs 21-120) no
+# longer holds; the fallback sent the latest message of one open event (seq 10), then the log.
+# R = [10, 120]: delivered [10, 10], [21, 120]; unavailable [11, 20]. Covers: SeqRange elements
+# (two uint64) aligned to 8 after each uint32 count (4 pad bytes each). 140 bytes on the wire.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+04 00 00 00                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   "lab\0"
+2b 00 00 00 00 00 00 00     # pos 8   map_epoch 43
+01 00 00 00 00 00 00 00     # pos 16  seq 1
+8a 92 ed 68                 # pos 24  stamp.sec 1760400010
+80 b2 e6 0e                 # pos 28  stamp.nanosec 250000000
+00 44 04 e0 99 01 00 00     # pos 32  publisher_generation 1760400000000
+c1 0f fe e0 12 34 45 67     # pos 40  request_token[0..7]
+a9 87 65 43 21 0f ed cb     # pos 48  request_token[8..15]
+01                          # pos 56  topic TOPIC_EVENTS
+00 00 00 00 00 00 00        # pos 57  pad to 8
+78 00 00 00 00 00 00 00     # pos 64  bound 120
+02 00 00 00                 # pos 72  delivered length 2
+00 00 00 00                 # pos 76  pad to 8
+0a 00 00 00 00 00 00 00     # pos 80  delivered[0].first 10
+0a 00 00 00 00 00 00 00     # pos 88  delivered[0].last 10
+15 00 00 00 00 00 00 00     # pos 96  delivered[1].first 21
+78 00 00 00 00 00 00 00     # pos 104 delivered[1].last 120
+01 00 00 00                 # pos 112 unavailable length 1
+00 00 00 00                 # pos 116 pad to 8
+0b 00 00 00 00 00 00 00     # pos 120 unavailable[0].first 11
+14 00 00 00 00 00 00 00     # pos 128 unavailable[0].last 20

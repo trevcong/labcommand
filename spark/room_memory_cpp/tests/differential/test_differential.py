@@ -1,6 +1,7 @@
 """C++ against the Python oracle, byte for byte: the offline CLI on the golden scenes and on a
 grid of flag variations, and RoomMemory window sequences (the memory tests' scenarios, the
-three Codex regressions of 289afb6, two-sensor runs, persistence) through the replay tools.
+three Codex regressions of 289afb6, two-sensor runs, persistence, every RequestSync answer with
+its SyncEnd, restarts across publisher generations) through the replay tools.
 
 When CHANGE_DETECT names a built Swift ``change-detect``, the offline cases that Swift
 accepts are compared against it too.
@@ -21,7 +22,8 @@ import replay
 import scenes
 from room_memory import offline
 from room_memory.messages import (
-    Activity, ChangeEvent, EventKind, EventState, Header, MapBricks, MapKind, RequestSync, SyncTopic, Time,
+    Activity, ChangeEvent, EventKind, EventState, Header, MapBricks, MapKind, MemoryStatus, RequestSync, SyncEnd,
+    SyncTopic, Time, ZERO_TOKEN,
 )
 
 OFFLINE = os.environ.get("ROOM_MEMORY_OFFLINE")
@@ -42,6 +44,10 @@ OVERFLOWING_CLOUD = (
 # makes a region fresh, no activity holds a region back, every region is sent and expired at once); scenarios written for them prepend it to their config line.
 SINGLE_WINDOW = ("recent_windows=1 occupied_min_hits=1 occupied_min_ratio=0 free_min_seen=1 candidate_windows=1 "
                  "expire_windows=1 fresh_min_voxels=1 fresh_min_fraction=0 activity_radius_m=0")
+
+# The generation replay gives `start 1760400000 0` (its start time in ms), and a request token.
+G = 1760400000000
+TOKEN = bytes.fromhex("5a1e7c3d9b024f618e33c4d5e6f70819")
 
 pytestmark = pytest.mark.skipif(not (OFFLINE and REPLAY), reason="ROOM_MEMORY_OFFLINE / ROOM_MEMORY_REPLAY not set")
 
@@ -321,7 +327,10 @@ def test_sync_cursor_across_restarts(tmp_path):
     assert [(e.header.map_epoch, e.header.seq) for e in events] == [(1, 0), (3, 0)]
     assert events[0].event_id != events[1].event_id
     assert [line for line in out if line.startswith("init ")] == ["init BUILDING 0", "init TRACKING 2", "init TRACKING 3"]
-    assert out[-2:] == ["sync 1", f"data {events[1].to_cdr().hex()}"]
+    # The old cursor belongs to the first run's generation: answered as SINCE_NONE in this one.
+    assert out[-3:-1] == ["sync 1", f"data {events[1].to_cdr().hex()}"]
+    end = SyncEnd.from_cdr(bytes.fromhex(out[-1].split()[1]))
+    assert end.publisher_generation == 1760400200000 and end.delivered == ((0, 0),) and end.unavailable == ()
 
 
 def test_sensor_subset_restarts(tmp_path):
@@ -595,9 +604,25 @@ def test_bench_scale_window(tmp_path):
     assert out.count("event ") == 2
 
 
-def request(room, since, topic, seq=0):
+def request(room, since, topic, seq=0, expected=G, token=TOKEN):
+    """A v2 request in generation ``expected``; ``expected=None`` makes a legacy one."""
     epoch = (1 << 64) - 1 if since is None else since[0]
-    return RequestSync(Header(room, epoch, seq, Time(1760400000, 0)), since, topic).to_cdr().hex()
+    return RequestSync(Header(room, epoch, seq, Time(1760400000, 0)), since, topic, expected,
+                       None if expected is None else token).to_cdr().hex()
+
+
+def answers(out):
+    """Each ``sync`` answer: (messages as bytes, SyncEnd or None), in order; ``sync invalid`` is skipped."""
+    found, current = [], None
+    for line in out.splitlines():
+        word, _, rest = line.partition(" ")
+        if word == "sync" and rest != "invalid":
+            current = []
+        elif word == "data":
+            current.append(bytes.fromhex(rest))
+        elif word == "end":
+            found.append((current, None if rest == "none" else SyncEnd.from_cdr(bytes.fromhex(rest))))
+    return found
 
 
 @pytest.mark.parametrize("variant", [
@@ -784,4 +809,140 @@ def test_real_mid360_frames(tmp_path):
             if line.startswith("map ") and line != "map none"]
     # The reference settles after two windows and keeps learning: a snapshot, then deltas.
     assert [(m.kind, m.header.map_epoch) for m in maps] == [(MapKind.SNAPSHOT, 1), (MapKind.DELTA, 2), (MapKind.DELTA, 3)]
-    assert out.splitlines()[-3] == "sync 1" and out.endswith("sync 0\n")
+    tail = out.splitlines()[-5:]
+    assert tail[0] == "sync 1" and tail[1].startswith("data ") and tail[3] == "sync 0"
+    (_, map_end), (_, events_end) = answers(out)[-2:]
+    assert map_end.delivered == ((map_end.bound, map_end.bound),) and events_end.bound is None
+
+
+def test_sync_answers_every_case(tmp_path):
+    """Every protocol 2.3 answer with its SyncEnd, byte for byte: the BUILDING map, events known
+    empty, the map replay, the "nothing missed" map, fresh snapshots (since unknown, another
+    generation, generation 0, a legacy request), the events replay and fallback with unavailable
+    ranges, and a foreign room. v2 requests expect the node's generation (77), another one, 0, or
+    are legacy."""
+    room = scenes.room_shell()
+    box, speck = scenes.box_shell((0.3, 1.2, 0.3)), scenes.box_shell((-0.8, -0.8, 0.3))
+    clouds = {name: floats(tmp_path, name, cloud) for name, cloud in (
+        ("room", room), ("boxed", np.concatenate([room, box])), ("both", np.concatenate([room, box, speck])))}
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360 max_range=none reference_windows=3 learn_windows=0 "
+             "delta_period_s=1 keyframe_period_s=1 state_dir=none", "start 1760400000 0 77"]
+    second = 0
+
+    def window(name):
+        nonlocal second
+        stamp = f"{1760400000 + second} 0"
+        lines.extend([f"points mid360 {clouds[name]}", f"close {stamp}", f"map {stamp}", f"status {stamp} 1.0"])
+        second += 1
+
+    def sync(since, topic, expected=77, room_id="lab"):
+        lines.append(f"sync {1760400000 + second} 0 {request(room_id, since, topic, len(lines), expected)}")
+
+    sync(None, SyncTopic.MAP_BRICKS)  # 0: BUILDING, no map
+    sync(None, SyncTopic.EVENTS)  # 1: nothing published
+    for _ in range(3):
+        window("room")
+    sync(None, SyncTopic.EVENTS)  # 2: TRACKING, still no event
+    sync(None, SyncTopic.EVENTS, None)  # 3: the same, legacy
+    window("boxed")  # event seq 0 (candidate), map seq 1
+    window("room")  # event seq 1 (expired), map seq 2
+    sync((1, 2), SyncTopic.MAP_BRICKS)  # 4: nothing missed
+    sync((1, 0), SyncTopic.MAP_BRICKS)  # 5: replay of 1, 2
+    for expected in (0, 76, None):
+        sync((1, 0), SyncTopic.MAP_BRICKS, expected)  # 6-8: fresh snapshots, since not honoured
+    sync((1, 40), SyncTopic.MAP_BRICKS)  # 9: since not in the log
+    sync((1, 0), SyncTopic.EVENTS)  # 10: replay of 1
+    sync((1, 1), SyncTopic.EVENTS)  # 11: nothing missed
+    sync((1, 0), SyncTopic.EVENTS, 0)  # 12: since not honoured: everything
+    sync(None, SyncTopic.MAP_BRICKS, 77, "other")  # 13: another room, no answer
+    # The box stays open while the speck comes and goes, until the box's only message has left the
+    # 100-message log.
+    window("boxed")
+    for n in range(124):
+        window("both" if n % 2 == 0 else "boxed")
+    sync(None, SyncTopic.EVENTS)  # 14: fallback
+    sync((1, 5), SyncTopic.EVENTS)  # 15: fallback, since evicted
+    sync((1, 5), SyncTopic.EVENTS, 0)  # 16: the same since in generation 0
+    sync((1, 5), SyncTopic.EVENTS, None)  # 17: legacy
+    out = run_both(tmp_path, "\n".join(lines))
+    replies = answers(out)
+    assert len(replies) == 18
+    ends = [end for _, end in replies]
+    assert ends[13] is None and replies[13][0] == []
+    for n, end in enumerate(ends):
+        if end is not None:
+            assert end.publisher_generation == 77 and end.header.seq == n - (n > 13)
+            assert end.token == (ZERO_TOKEN if n in (3, 8, 17) else TOKEN)
+    count = [len(messages) for messages, _ in replies]
+    assert count[:4] == [0, 0, 0, 0] and all(end.bound is None and end.delivered == () for end in ends[:4])
+    assert count[4] == 0 and ends[4].bound == 2 and ends[4].delivered == ()
+    assert count[5] == 2 and ends[5].delivered == ((1, 2),)
+    for n in (6, 7, 8, 9):
+        (snapshot,) = replies[n][0]
+        message = MapBricks.from_cdr(snapshot)
+        assert message.kind == MapKind.SNAPSHOT and message.header.seq == 2 and message.publisher_generation == 77
+        assert ends[n].delivered == ((2, 2),)
+    assert count[10] == 1 and ends[10].delivered == ((1, 1),) and ends[10].bound == 1
+    assert count[11] == 0 and ends[11].delivered == ()
+    assert count[12] == 2 and ends[12].delivered == ((0, 1),) and ends[12].unavailable == ()
+    bound = ends[14].bound
+    oldest = bound - 99
+    opened = ChangeEvent.from_cdr(replies[14][0][0]).header.seq
+    assert opened < oldest and count[14] == 101
+    assert ends[14].delivered == ((opened, opened), (oldest, bound))
+
+    def missing(first):
+        """[first, bound] minus what the fallback sent, as canonical ranges."""
+        seqs = sorted(set(range(first, bound + 1)) - {opened} - set(range(oldest, bound + 1)))
+        ranges = []
+        for seq in seqs:
+            if ranges and seq == ranges[-1][1] + 1:
+                ranges[-1] = (ranges[-1][0], seq)
+            else:
+                ranges.append((seq, seq))
+        return tuple(ranges)
+
+    assert ends[14].unavailable == missing(0) and ends[15].unavailable == missing(6) != missing(0)
+    assert ends[16].unavailable == ends[17].unavailable == ends[14].unavailable
+
+
+def test_sync_across_restarts_with_two_generations(tmp_path):
+    """Two starts with two explicit generations (5, then 9) over one state dir: every message of a
+    start carries its generation, the first run's cursor is not honoured in the second, a refused
+    generation (0, negative, past uint64) leaves the state untouched, and requests expecting the
+    new generation, the old one, 0, or legacy are answered alike in both engines."""
+    room = scenes.room_shell()
+    plain = floats(tmp_path, "room", room)
+    boxed = floats(tmp_path, "boxed", np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))]))
+    lines = [f"config {SINGLE_WINDOW} sensors=mid360 max_range=none reference_windows=3 state_dir={{state}}",
+             "start 1760400000 0 5"]
+    for second in range(3):
+        lines += [f"points mid360 {plain}", f"close {1760400000 + second} 0", f"map {1760400000 + second} 0"]
+    lines += [f"points mid360 {boxed}", "close 1760400003 0", "map 1760400003 0", "status 1760400003 0 1.0",
+              f"sync 1760400004 0 {request('lab', (1, 0), SyncTopic.EVENTS, 0, 5)}"]
+    lines += ["start 1760400100 0 0", "start 1760400100 0 -3", "start 1760400100 0 18446744073709551616",
+              "start 1760400100 0 9", f"points mid360 {boxed}", "close 1760400101 0", "map 1760400101 0",
+              "status 1760400101 0 1.0"]
+    for expected in (9, 5, 0, None):
+        lines.append(f"sync 1760400102 0 {request('lab', (2, 0), SyncTopic.EVENTS, 1, expected)}")
+        lines.append(f"sync 1760400102 0 {request('lab', (2, 0), SyncTopic.MAP_BRICKS, 2, expected)}")
+    out = run_both(tmp_path, "\n".join(lines)).splitlines()
+    assert [line for line in out if line.startswith("init ")] == [
+        "init BUILDING 0", "init error", "init error", "init error", "init TRACKING 2"]
+    statuses = [MemoryStatus.from_cdr(bytes.fromhex(line.split()[1])) for line in out if line.startswith("status ")]
+    assert [s.publisher_generation for s in statuses] == [5, 9]
+    maps = [MapBricks.from_cdr(bytes.fromhex(line.split()[1])) for line in out if line.startswith("map ") and line != "map none"]
+    assert {m.publisher_generation for m in maps[:-1]} == {5} and maps[-1].publisher_generation == 9
+    replies = answers("\n".join(out))
+    assert [end.publisher_generation for _, end in replies] == [5] + [9] * 8
+    assert [end.header.seq for _, end in replies] == [0] + list(range(8))  # the SyncEnd seq restarts with the generation
+    events, maps_end = replies[1::2], replies[2::2]
+    # Generation 9: the event at (2, 0) is its first message, so the honoured since holds everything.
+    assert len(events[0][0]) == 0 and events[0][1].delivered == () and events[0][1].bound == 0
+    for messages, end in events[1:]:
+        assert len(messages) == 1 and end.delivered == ((0, 0),)
+        assert ChangeEvent.from_cdr(messages[0]).publisher_generation == 9
+    # The map since (2, 0) is the newest message of generation 9: nothing missed, else a snapshot.
+    assert maps_end[0][0] == [] and maps_end[0][1].delivered == ()
+    for messages, end in maps_end[1:]:
+        assert len(messages) == 1 and end.delivered == ((0, 0),) and MapBricks.from_cdr(messages[0]).publisher_generation == 9

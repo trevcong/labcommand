@@ -4,8 +4,11 @@ Subscribes to each configured lidar with the sensor-data QoS and ``raw=True``, s
 through the tested ``decode_pointcloud2`` rather than rclpy's deserializer. Publishes the
 codec's CDR bytes on ``/room_memory/status`` and ``/room_memory/activity`` (1 Hz), ``/room_memory/events`` and
 ``/room_memory/map_bricks`` (after each window, when ``map_update`` has a message), and answers
-``/room_memory/request_sync`` on the two sync topics (protocol §2, §5); the ``labcommand_msgs``
-classes only provide the type support. A rejected frame logs one warning per sensor per 10 s.
+``/room_memory/request_sync`` on the two sync topics, each answer followed by its ``SyncEnd`` on
+``/room_memory/sync/end`` (protocol §2, §5); the ``labcommand_msgs`` classes only provide the type
+support. The publisher generation is allocated (durably, under ``publisher.lock``) before any
+publisher exists; without it the node refuses to start. A rejected frame logs one warning per
+sensor per 10 s.
 """
 
 import time
@@ -16,10 +19,12 @@ from labcommand_msgs.msg import ChangeEvent as ChangeEventMsg
 from labcommand_msgs.msg import MapBricks as MapBricksMsg
 from labcommand_msgs.msg import MemoryStatus as MemoryStatusMsg
 from labcommand_msgs.msg import RequestSync as RequestSyncMsg
+from labcommand_msgs.msg import SyncEnd as SyncEndMsg
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import PointCloud2
 
+from .generation import GenerationError, allocate_generation
 from .memory import SENSORS, MemoryConfig, RoomMemory
 from .messages import CDRError, RequestSync, SyncTopic, Time
 from .rejectlog import RejectionLog
@@ -31,6 +36,7 @@ MAP_TOPIC = "/room_memory/map_bricks"
 REQUEST_TOPIC = "/room_memory/request_sync"
 SYNC_MAP_TOPIC = "/room_memory/sync/map_bricks"
 SYNC_EVENTS_TOPIC = "/room_memory/sync/events"
+SYNC_END_TOPIC = "/room_memory/sync/end"
 
 
 def _time(node):
@@ -78,7 +84,14 @@ class RoomMemoryNode(Node):
         values["max_range"] = values["max_range"] if values["max_range"] > 0 else None
         values["state_dir"] = values["state_dir"] or None
         self.config = MemoryConfig(**values)
-        self.memory = RoomMemory(self.config, _time(self))
+        # Before any publisher: every message this process sends carries the generation. The
+        # allocation holds publisher.lock until the process exits.
+        try:
+            self.generation = allocate_generation(self.config.state_dir, self.config.room_id, int(time.time() * 1000))
+        except GenerationError as error:
+            self.get_logger().fatal(f"refusing to start: {error}")
+            raise
+        self.memory = RoomMemory(self.config, _time(self), self.generation.generation)
 
         reliable = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE)
         self.events = self.create_publisher(ChangeEventMsg, EVENTS_TOPIC, reliable)
@@ -93,6 +106,8 @@ class RoomMemoryNode(Node):
         self.sync_map = self.create_publisher(MapBricksMsg, SYNC_MAP_TOPIC, maps)
         self.sync_events = self.create_publisher(
             ChangeEventMsg, SYNC_EVENTS_TOPIC, QoSProfile(depth=200, reliability=ReliabilityPolicy.RELIABLE))
+        self.sync_end = self.create_publisher(
+            SyncEndMsg, SYNC_END_TOPIC, QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE))
         self.create_subscription(RequestSyncMsg, REQUEST_TOPIC, self._answer, maps, raw=True)
         for name in self.config.sensors:
             sensor = SENSORS[name]
@@ -105,7 +120,7 @@ class RoomMemoryNode(Node):
         self.create_timer(1.0, self._publish_status)
         self.get_logger().info(
             f"room '{self.config.room_id}' sensors {list(self.config.sensors)} state {self.memory.state.name} "
-            f"map_epoch {self.memory.map_epoch}"
+            f"map_epoch {self.memory.map_epoch} publisher_generation {self.generation.generation}"
         )
 
     def _on_cloud(self, name, data):
@@ -142,10 +157,17 @@ class RoomMemoryNode(Node):
             self.get_logger().warning(f"RequestSync dropped: {error}")
             return
         publisher = self.sync_map if request.topic == SyncTopic.MAP_BRICKS else self.sync_events
-        reply = self.memory.sync(request, _time(self))
+        reply, end = self.memory.sync(request, _time(self))
+        if end is None:
+            self.get_logger().warning(f"RequestSync for room '{request.header.room_id}' dropped: not this room")
+            return
+        # The answer first, then its manifest (which may still arrive first: it has its own topic).
         for message in reply:
             publisher.publish(message)
-        self.get_logger().info(f"RequestSync {request.topic.name} from room '{request.header.room_id}': {len(reply)} messages")
+        self.sync_end.publish(end.to_cdr())
+        self.get_logger().info(
+            f"RequestSync {request.topic.name} expected_generation {request.expected_generation}: {len(reply)} messages, "
+            f"bound {end.bound}, delivered {list(end.delivered)}, unavailable {list(end.unavailable)}")
 
     def _publish_status(self):
         now = time.monotonic()

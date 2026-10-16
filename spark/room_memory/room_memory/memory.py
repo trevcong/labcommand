@@ -32,6 +32,8 @@ from .messages import (
     EventState,
     HZ_UNAVAILABLE,
     SINCE_NONE,
+    UINT64_MAX,
+    ZERO_TOKEN,
     Header,
     MapBricks,
     MapKind,
@@ -39,6 +41,7 @@ from .messages import (
     MemoryStatus,
     SENSOR_JT128,
     SENSOR_MID360,
+    SyncEnd,
     SyncTopic,
     Time,
 )
@@ -289,7 +292,9 @@ def epoch_path(state_dir, room_id):
 
 
 def save_reference(path, layer, header, voxel_size):
-    """Writes ``layer`` as one zlib ``MapBricks`` snapshot, atomically (temp file, then rename)."""
+    """Writes ``layer`` as one zlib ``MapBricks`` snapshot, atomically (temp file, then rename), in
+    the legacy layout: a publisher generation on disk means nothing, and an older image must still
+    load the file (protocol §1.4). ``load_reference`` reads both layouts."""
     message = MapBricks(header, Compression.ZLIB, MapKind.SNAPSHOT, 0, voxel_size, layer.to_bricks())
     _write_atomic(path, message.to_cdr())
 
@@ -311,21 +316,59 @@ def load_epoch(path):
     return int(data)
 
 
-def _write_atomic(path, data):
+def _write_atomic(path, data, make_parents=True):
+    """Temp file, fsync, rename, then fsync the directory, so the rename survives a crash."""
     path = pathlib.Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if make_parents:
+        path.parent.mkdir(parents=True, exist_ok=True)
     scratch = path.with_suffix(path.suffix + ".tmp")
     with open(scratch, "wb") as handle:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(scratch, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def load_reference(path):
     """Reads a saved reference: ``(MapBricks message, VoxelLayer)``. Raises ``messages.CDRError``."""
     message = MapBricks.from_cdr(pathlib.Path(path).read_bytes())
     return message, VoxelLayer.from_bricks(message.bricks)
+
+
+# MARK: Seq ranges
+
+
+def canonical_ranges(ranges):
+    """Inclusive ``(first, last)`` ranges sorted, with overlapping or touching ones merged."""
+    merged = []
+    for first, last in sorted(ranges):
+        if merged and first <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], last))
+        else:
+            merged.append((first, last))
+    return tuple(merged)
+
+
+def subtract_ranges(ranges, removed):
+    """Canonical ``ranges`` minus canonical ``removed``."""
+    out = []
+    for first, last in ranges:
+        for low, high in removed:
+            if high < first or low > last:
+                continue
+            if low > first:
+                out.append((first, low - 1))
+            first = high + 1
+            if first > last:
+                break
+        if first <= last:
+            out.append((first, last))
+    return tuple(out)
 
 
 # MARK: Candidates
@@ -781,9 +824,14 @@ class RoomMemory:
 
     The caller feeds frames with ``add_cdr`` or ``add_points``, calls ``close_window`` every
     ``window_s`` and ``status`` at 1 Hz, and publishes the returned messages.
+    ``publisher_generation`` (protocol §1.4) stamps every status, event and map message; the ROS
+    node allocates it (``generation.allocate_generation``), offline drivers and tests pass a fixed
+    value. Seq counters start at 0 here and are never reset within the process.
     """
 
-    def __init__(self, config, start):
+    def __init__(self, config, start, publisher_generation):
+        if not isinstance(publisher_generation, int) or not 1 <= publisher_generation <= UINT64_MAX:
+            raise ValueError(f"publisher_generation must be in 1...{UINT64_MAX}, got {publisher_generation!r}")
         unknown = [name for name in config.sensors if name not in SENSORS]
         if unknown or not config.sensors:
             raise ValueError(f"sensors must be a non-empty subset of {sorted(SENSORS)}, got {list(config.sensors)}")
@@ -811,6 +859,7 @@ class RoomMemory:
         if config.map_sensor and config.map_sensor not in names:
             raise ValueError(f"map_sensor '{config.map_sensor}' is not one of the sensors {list(config.sensors)}")
         self.config = config
+        self.publisher_generation = publisher_generation
         self.change = config.change_config()
         validate(self.change)
         self.channels = {name: _Channel(SENSORS[name], config) for name in names}
@@ -822,6 +871,7 @@ class RoomMemory:
         self.event_seq = 0
         self.status_seq = 0
         self.activity_seq = 0
+        self.sync_end_seq = 0
         self._activity = None  # the newest window with activity since the last activity message
         self._last_activity_ns = None  # stamp of the newest window with activity
         self.dropped_windows = 0
@@ -1041,7 +1091,8 @@ class RoomMemory:
 
     def _map_message(self, kind, stamp, bricks, base_epoch=0, removed=()):
         header = Header(self.config.room_id, self.map_epoch, self._map_seq, stamp)
-        return MapBricks(header, Compression.ZLIB, kind, base_epoch, self.config.voxel_size, bricks, removed)
+        return MapBricks(header, Compression.ZLIB, kind, base_epoch, self.config.voxel_size, bricks, removed,
+                         self.publisher_generation)
 
     def _publish_map(self, message):
         data = message.to_cdr()
@@ -1106,37 +1157,60 @@ class RoomMemory:
         return self._publish_map(self._map_message(MapKind.SNAPSHOT, stamp, bricks))
 
     def sync(self, request, stamp):
-        """The answer to one ``RequestSync`` (protocol §5): CDR messages to publish in order on the
-        sync topic of ``request.topic``. Empty for another ``room_id``, and for a map request
-        before the first live map message."""
+        """The answer to one ``RequestSync`` (protocol §5): ``(messages, end)``, the CDR messages to
+        publish in order on the sync topic of ``request.topic``, then the ``SyncEnd`` to publish on
+        ``sync/end``. ``([], None)`` for another ``room_id``: no answer. ``since`` counts only when
+        ``expected_generation`` is this generation; otherwise (a legacy request included, as
+        generation 0 with an all-zero token) the request is answered as ``SINCE_NONE``."""
         if request.header.room_id != self.config.room_id:
-            return []
+            return [], None
+        expected = request.expected_generation or 0
+        token = ZERO_TOKEN if request.token is None else request.token
+        since = request.since if expected == self.publisher_generation else None
 
         def since_index(log):
-            if request.since is None:
+            if since is None:
                 return None
-            return next((n for n, entry in enumerate(log) if (entry.map_epoch, entry.seq) == request.since), None)
+            return next((n for n, entry in enumerate(log) if (entry.map_epoch, entry.seq) == since), None)
 
+        unavailable = ()
         if request.topic == SyncTopic.MAP_BRICKS:
-            if not self._map_started:
-                return []
+            bound = self._map_seq - 1 if self._map_started else None
             log = list(self._map_log)
             at = since_index(log)
-            if at is not None and at + 1 < len(log):
-                return [entry.data for entry in log[at + 1:]]
-            # A fresh snapshot of the last live state, under the latest live seq.
-            header = Header(self.config.room_id, self.map_epoch, self._map_seq - 1, stamp)
-            return [MapBricks(header, Compression.ZLIB, MapKind.SNAPSHOT, 0, self.config.voxel_size,
-                              self._map_bricks).to_cdr()]
-        log = list(self._event_log)
-        at = since_index(log)
-        if at is not None:
-            return [entry.data for entry in log[at + 1:]]
-        # Bounded fallback: open events whose latest message is older than the kept ones, then
-        # every kept message.
-        oldest = log[0].seq if log else SINCE_NONE
-        older = sorted((entry for entry in self._open_latest.values() if entry.seq < oldest), key=lambda e: e.seq)
-        return [entry.data for entry in older] + [entry.data for entry in log]
+            if bound is None or at == len(log) - 1:
+                # Nothing published yet (BUILDING), or the Mac holds the newest message.
+                messages, delivered = [], ()
+            elif at is not None:
+                messages, delivered = [entry.data for entry in log[at + 1:]], ((since[1] + 1, bound),)
+            else:
+                # A fresh snapshot of the last live state, under the latest live seq.
+                header = Header(self.config.room_id, self.map_epoch, bound, stamp)
+                messages = [MapBricks(header, Compression.ZLIB, MapKind.SNAPSHOT, 0, self.config.voxel_size,
+                                      self._map_bricks, (), self.publisher_generation).to_cdr()]
+                delivered = ((bound, bound),)
+        else:
+            bound = self.event_seq - 1 if self.event_seq else None
+            log = list(self._event_log)
+            at = since_index(log)
+            if bound is None:
+                messages, delivered = [], ()
+            elif at is not None:
+                messages = [entry.data for entry in log[at + 1:]]
+                delivered = ((since[1] + 1, bound),) if messages else ()
+            else:
+                # Bounded fallback: open events whose latest message is older than the kept ones, then
+                # every kept message. What was requested and neither is sent can never be served again.
+                oldest = log[0].seq
+                older = sorted((entry for entry in self._open_latest.values() if entry.seq < oldest), key=lambda e: e.seq)
+                messages = [entry.data for entry in older] + [entry.data for entry in log]
+                delivered = canonical_ranges([(entry.seq, entry.seq) for entry in older] + [(oldest, bound)])
+                first = 0 if since is None else since[1] + 1
+                unavailable = subtract_ranges(((first, bound),) if first <= bound else (), delivered)
+        end = SyncEnd(Header(self.config.room_id, self.map_epoch, self.sync_end_seq, stamp), self.publisher_generation,
+                      token, request.topic, bound, delivered, unavailable)
+        self.sync_end_seq += 1
+        return messages, end
 
     def _event(self, channel, state, candidate, stamp):
         region = candidate.region
@@ -1146,7 +1220,7 @@ class RoomMemory:
         evidence = float(np.mean(contains(channel.reference.known, keys)))
         mask = MapBricks(
             Header(self.config.room_id, self.map_epoch, 0, stamp), Compression.ZLIB, MapKind.SNAPSHOT, 0,
-            self.config.voxel_size, VoxelLayer(keys, keys).to_bricks(),
+            self.config.voxel_size, VoxelLayer(keys, keys).to_bricks(), (), self.publisher_generation,
         )
         return ChangeEvent(
             header=header,
@@ -1165,6 +1239,7 @@ class RoomMemory:
             first_seen=candidate.first_seen,
             last_seen=candidate.last_seen,
             mask=mask,
+            publisher_generation=self.publisher_generation,
         )
 
     def status(self, stamp, period_s):
@@ -1173,7 +1248,7 @@ class RoomMemory:
         DEGRADED while a configured sensor measured 0 Hz or the last window was dropped.
         ``n_bricks`` and ``coverage_known_frac`` describe the map sensor's reference;
         ``pose_residual_m`` is the largest per-sensor residual of the last tracking windows;
-        ``events_seq`` is the seq of the newest event message, None before the first.
+        ``events_seq`` is the seq of the newest event message of this generation, None before the first.
         """
         hz = [None, None]
         for channel in self.channels.values():
@@ -1197,6 +1272,7 @@ class RoomMemory:
             jt128_hz=hz[1],
             dropped_windows=self.dropped_windows,
             events_seq=self.event_seq - 1 if self.event_seq else None,
+            publisher_generation=self.publisher_generation,
         )
         self.status_seq += 1
         return message

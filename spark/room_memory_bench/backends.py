@@ -36,7 +36,7 @@ class PythonBackend(Backend):
         from room_memory.memory import MemoryConfig, RoomMemory
         from room_memory.messages import Time
         self.Time = Time
-        self.memory = RoomMemory(MemoryConfig(**MEMORY_CONFIG), Time(0, 0))
+        self.memory = RoomMemory(MemoryConfig(**MEMORY_CONFIG), Time(0, 0), 1)
 
     def tick(self, tick):
         for sensor in SENSORS:
