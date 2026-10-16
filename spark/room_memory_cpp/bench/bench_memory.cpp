@@ -87,7 +87,8 @@ int main(int argc, char** argv) {
     config.candidate_windows = 1;
     config.expire_windows = 1;
     config.state_dir = std::nullopt;
-    RoomMemory memory(config, msg::Time{0, 0}, nullptr, full ? DiffScope::full : DiffScope::regions);
+    // Generation 1, as dump_frames.py, so the event bytes compare.
+    RoomMemory memory(config, msg::Time{0, 0}, 1, nullptr, full ? DiffScope::full : DiffScope::regions);
     std::vector<double> add_ms, close_ms;
     double reference_ms = 0;
     std::vector<std::string> events;

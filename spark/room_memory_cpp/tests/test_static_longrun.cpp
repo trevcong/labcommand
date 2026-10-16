@@ -504,7 +504,7 @@ Replay replay(const std::vector<Frame>& frames, std::int64_t t0, std::int64_t pe
     if (period_ns > INT64_MAX / loops) fail("replay span overflows");
     MemoryConfig config;
     config.state_dir = std::nullopt;
-    RoomMemory memory(config, time_of(t0));
+    RoomMemory memory(config, time_of(t0), 1);
     Replay out;
     std::int64_t window_end = t0 + kNs;
     std::int64_t next_status = t0 + kNs;

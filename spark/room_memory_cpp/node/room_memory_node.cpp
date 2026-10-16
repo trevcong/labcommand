@@ -1,8 +1,11 @@
 // Thin rclcpp node around RoomMemory: raw CDR in, codec bytes out. The C++ twin of
 // spark/room_memory/room_memory/node.py, with the same topics, QoS and parameters: status and
 // activity at 1 Hz, events per transition, map_bricks after each window when RoomMemory::map_update has
-// one, and RequestSync answers on the two sync topics (protocol sections 2 and 5). A rejected
-// frame logs one warning per sensor per 10 s (RejectionLog), with the decoder's error.
+// one, and RequestSync answers on the two sync topics, each answer followed by its SyncEnd on
+// /room_memory/sync/end (protocol sections 2 and 5). The publisher generation is allocated
+// (durably, under publisher.lock) before any publisher exists; without it the node refuses to
+// start. A rejected frame logs one warning per sensor per 10 s (RejectionLog), with the
+// decoder's error.
 //
 // Subscriptions and publishers are generic (serialized), so frames go through the tested
 // decode_pointcloud2 and outputs are the codec's CDR bytes; sensor_msgs and labcommand_msgs
@@ -21,6 +24,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/serialized_message.hpp>
 
+#include "room_memory/generation.hpp"
 #include "room_memory/memory.hpp"
 #include "room_memory/rejectlog.hpp"
 
@@ -37,6 +41,7 @@ constexpr const char* kMapTopic = "/room_memory/map_bricks";
 constexpr const char* kRequestTopic = "/room_memory/request_sync";
 constexpr const char* kSyncMapTopic = "/room_memory/sync/map_bricks";
 constexpr const char* kSyncEventsTopic = "/room_memory/sync/events";
+constexpr const char* kSyncEndTopic = "/room_memory/sync/end";
 constexpr const char* kMapType = "labcommand_msgs/msg/MapBricks";
 constexpr const char* kEventType = "labcommand_msgs/msg/ChangeEvent";
 
@@ -52,6 +57,14 @@ rclcpp::SerializedMessage serialized(const msg::Bytes& bytes) {
     std::memcpy(raw.buffer, bytes.data(), bytes.size());
     raw.buffer_length = bytes.size();
     return out;
+}
+
+std::string range_list(const std::vector<msg::SeqRange>& values) {
+    std::string text = "[";
+    for (std::size_t n = 0; n < values.size(); ++n) {
+        text += (n ? ", (" : "(") + std::to_string(values[n].first) + ", " + std::to_string(values[n].last) + ")";
+    }
+    return text + "]";
 }
 
 std::string names(const std::vector<std::string>& sensors) {
@@ -94,7 +107,20 @@ public:
         config.delta_period_s = declare_parameter<double>("delta_period_s", defaults.delta_period_s);
         config.keyframe_period_s = declare_parameter<double>("keyframe_period_s", defaults.keyframe_period_s);
         config.keyframe_delta_ratio = declare_parameter<double>("keyframe_delta_ratio", defaults.keyframe_delta_ratio);
-        memory_ = std::make_unique<RoomMemory>(config, stamp());
+        // Before any publisher: every message this process sends carries the generation. The
+        // allocation holds publisher.lock until the process exits. The wall clock, not now(),
+        // which may be sim time.
+        const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+        try {
+            generation_ = std::make_unique<room_memory::Allocation>(
+                room_memory::allocate_generation(config.state_dir, config.room_id, now_ms));
+        } catch (const room_memory::GenerationError& error) {
+            RCLCPP_FATAL(get_logger(), "refusing to start: %s", error.what());
+            throw;
+        }
+        memory_ = std::make_unique<RoomMemory>(config, stamp(), generation_->generation());
 
         events_ = create_generic_publisher(kEventsTopic, kEventType, rclcpp::QoS(100).reliable());
         status_ = create_generic_publisher(kStatusTopic, "labcommand_msgs/msg/MemoryStatus", rclcpp::QoS(1).reliable());
@@ -105,6 +131,7 @@ public:
         map_ = create_generic_publisher(kMapTopic, kMapType, rclcpp::QoS(10).reliable());
         sync_map_ = create_generic_publisher(kSyncMapTopic, kMapType, rclcpp::QoS(10).reliable());
         sync_events_ = create_generic_publisher(kSyncEventsTopic, kEventType, rclcpp::QoS(200).reliable());
+        sync_end_ = create_generic_publisher(kSyncEndTopic, "labcommand_msgs/msg/SyncEnd", rclcpp::QoS(10).reliable());
         requests_ = create_generic_subscription(
             kRequestTopic, "labcommand_msgs/msg/RequestSync", rclcpp::QoS(10).reliable(),
             [this](std::shared_ptr<const rclcpp::SerializedMessage> message) { answer(*message); });
@@ -119,9 +146,10 @@ public:
                                              [this] { close_window(); });
         status_timer_ =
             rclcpp::create_timer(this, get_clock(), rclcpp::Duration::from_seconds(1.0), [this] { publish_status(); });
-        RCLCPP_INFO(get_logger(), "room '%s' sensors %s state %s map_epoch %llu", config.room_id.c_str(),
-                    names(memory_->config().sensors).c_str(), msg::name(memory_->state()),
-                    static_cast<unsigned long long>(memory_->map_epoch()));
+        RCLCPP_INFO(get_logger(), "room '%s' sensors %s state %s map_epoch %llu publisher_generation %llu",
+                    config.room_id.c_str(), names(memory_->config().sensors).c_str(), msg::name(memory_->state()),
+                    static_cast<unsigned long long>(memory_->map_epoch()),
+                    static_cast<unsigned long long>(memory_->publisher_generation()));
     }
 
 private:
@@ -174,14 +202,26 @@ private:
             RCLCPP_WARN(get_logger(), "RequestSync dropped: %s", error.what());
             return;
         }
-        const std::vector<msg::Bytes> reply = memory_->sync(request, stamp());
+        const RoomMemory::SyncAnswer reply = memory_->sync(request, stamp());
+        if (!reply.end) {
+            RCLCPP_WARN(get_logger(), "RequestSync for room '%s' dropped: not this room", request.header.room_id.c_str());
+            return;
+        }
+        // The answer first, then its manifest (which may still arrive first: it has its own topic).
         const auto& publisher = request.topic == msg::SyncTopic::map_bricks ? sync_map_ : sync_events_;
-        for (const msg::Bytes& bytes : reply) publisher->publish(serialized(bytes));
-        RCLCPP_INFO(get_logger(), "RequestSync %s from room '%s': %zu messages",
-                    request.topic == msg::SyncTopic::map_bricks ? "map_bricks" : "events", request.header.room_id.c_str(),
-                    reply.size());
+        for (const msg::Bytes& bytes : reply.messages) publisher->publish(serialized(bytes));
+        sync_end_->publish(serialized(reply.end->to_cdr()));
+        const std::string expected =
+            request.expected_generation ? std::to_string(*request.expected_generation) : std::string("None");
+        const std::string bound = reply.end->bound ? std::to_string(*reply.end->bound) : std::string("None");
+        RCLCPP_INFO(get_logger(), "RequestSync %s expected_generation %s: %zu messages, bound %s, delivered %s, unavailable %s",
+                    request.topic == msg::SyncTopic::map_bricks ? "MAP_BRICKS" : "EVENTS", expected.c_str(),
+                    reply.messages.size(), bound.c_str(), range_list(reply.end->delivered).c_str(),
+                    range_list(reply.end->unavailable).c_str());
     }
 
+    // First, so it is destroyed last: the lock outlives every publisher.
+    std::unique_ptr<room_memory::Allocation> generation_;
     std::unique_ptr<RoomMemory> memory_;
     room_memory::RejectionLog rejections_;
     std::shared_ptr<rclcpp::GenericPublisher> events_;
@@ -190,6 +230,7 @@ private:
     std::shared_ptr<rclcpp::GenericPublisher> map_;
     std::shared_ptr<rclcpp::GenericPublisher> sync_map_;
     std::shared_ptr<rclcpp::GenericPublisher> sync_events_;
+    std::shared_ptr<rclcpp::GenericPublisher> sync_end_;
     std::shared_ptr<rclcpp::GenericSubscription> requests_;
     std::vector<std::shared_ptr<rclcpp::GenericSubscription>> subscriptions_;
     rclcpp::TimerBase::SharedPtr window_timer_;
@@ -201,7 +242,15 @@ private:
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<RoomMemoryNode>());
+    std::shared_ptr<RoomMemoryNode> node;
+    try {
+        node = std::make_shared<RoomMemoryNode>();
+    } catch (const room_memory::GenerationError&) {
+        // Logged fatal by the constructor: no generation, no publishing.
+        rclcpp::shutdown();
+        return 1;
+    }
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }

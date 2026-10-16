@@ -26,8 +26,26 @@ using scenes::Cloud;
 namespace {
 
 const msg::Time kStart{1760400000, 0};
+constexpr std::uint64_t kGeneration = 1760400000000ULL;
 
 msg::Time stamp(std::int64_t second) { return msg::Time{kStart.sec + second, 0}; }
+
+const msg::Token kTokenA = {0x5a, 0x1e, 0x7c, 0x3d, 0x9b, 0x02, 0x4f, 0x61,
+                            0x8e, 0x33, 0xc4, 0xd5, 0xe6, 0xf7, 0x08, 0x19};
+
+// A v2 request; an empty `expected` makes a legacy one.
+msg::RequestSync sync_request(std::optional<msg::RequestSync::Since> since, msg::SyncTopic topic,
+                              std::optional<std::uint64_t> expected = kGeneration, const std::string& room_id = "lab") {
+    msg::RequestSync r;
+    r.header = msg::Header{room_id, since ? since->epoch : msg::kSinceNone, 0, kStart};
+    r.since = since;
+    r.topic = topic;
+    r.expected_generation = expected;
+    if (expected) r.token = kTokenA;
+    return r;
+}
+
+using Ranges = std::vector<msg::SeqRange>;
 
 msg::Bytes unhex(const std::string& text) {
     msg::Bytes out;
@@ -218,7 +236,7 @@ TEST(reference_build_then_tracking_with_unknown_back_face) {
     const scenes::Board board = scenes::board_scene();
     MemoryConfig config = mid360_config(dir.path.string());
     config.min_extent = 1;  // the board's appeared faces are one cell thick
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     msg::MemoryStatus status = memory.status(stamp(0), 1.0);
     CHECK(status.state == MemoryState::degraded && status.header.map_epoch == 0 && status.mid360_hz == 0);
     CHECK(!status.jt128_hz && !status.pose_residual_m && !status.coverage_known_frac && !status.events_seq);
@@ -276,7 +294,7 @@ TEST(new_coverage_is_not_an_appearance) {
         Cloud& into = room[n] < 2.4f ? missing_wall : wall;
         into.insert(into.end(), room.begin() + static_cast<std::ptrdiff_t>(n), room.begin() + static_cast<std::ptrdiff_t>(n) + 3);
     }
-    RoomMemory memory(mid360_config(std::nullopt), kStart);
+    RoomMemory memory(mid360_config(std::nullopt), kStart, kGeneration);
     const std::int64_t second = build_reference(memory, missing_wall);
     const Keys wall_keys = occupied_keys(wall);
     CHECK(count_present(memory.channel("mid360").reference.known, wall_keys) < wall_keys.size());
@@ -296,7 +314,7 @@ TEST(moved_box_is_one_moved_candidate) {
     const Cloud box = scenes::box_shell({0.0, 0.5, 0.30});
     const Cloud moved = scenes::shifted(box, 1);
     for (const DiffScope scope : {DiffScope::regions, DiffScope::full}) {
-        RoomMemory memory(mid360_config(std::nullopt), kStart, nullptr, scope);
+        RoomMemory memory(mid360_config(std::nullopt), kStart, kGeneration, nullptr, scope);
         const std::int64_t second = build_reference(memory, scenes::concat({&room, &box}));
         memory.add_points("mid360", scenes::concat({&room, &moved}));
         const auto events = memory.close_window(stamp(second));
@@ -307,12 +325,12 @@ TEST(moved_box_is_one_moved_candidate) {
 
 TEST(reload_restores_epoch_and_bricks) {
     TempDir dir;
-    RoomMemory memory(mid360_config(dir.path.string()), kStart);
+    RoomMemory memory(mid360_config(dir.path.string()), kStart, kGeneration);
     const Cloud room = scenes::room_shell();
     const Cloud box = scenes::box_shell({1.0, 0.5, 0.3});
     build_reference(memory, scenes::concat({&room, &box}));
     const auto bricks = memory.channel("mid360").reference.to_bricks();
-    RoomMemory restarted(mid360_config(dir.path.string()), kStart);
+    RoomMemory restarted(mid360_config(dir.path.string()), kStart, kGeneration);
     CHECK(restarted.state() == MemoryState::tracking && memory.map_epoch() == 1 && restarted.map_epoch() == 2);
     CHECK(restarted.channel("mid360").reference.to_bricks() == bricks);
     CHECK_EQ(restarted.status(stamp(9), 1.0).n_bricks, static_cast<std::int64_t>(bricks.size()));
@@ -326,22 +344,27 @@ TEST(sync_cursor_from_before_a_restart_names_nothing_after_it) {
     const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
     const Cloud boxed = scenes::concat({&room, &box});
     const MemoryConfig config = mid360_config(dir.path.string());
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     const std::int64_t second = build_reference(memory, room);
     memory.add_points("mid360", boxed);
     const auto old = memory.close_window(stamp(second));
     CHECK(old.size() == 1 && old[0].header.map_epoch == 1 && old[0].header.seq == 0);
-    CHECK(RoomMemory(config, stamp(100)).map_epoch() == 2 && RoomMemory(config, stamp(200)).map_epoch() == 3);
-    RoomMemory restarted(config, stamp(300));
+    CHECK(RoomMemory(config, stamp(100), kGeneration + 1).map_epoch() == 2 &&
+          RoomMemory(config, stamp(200), kGeneration + 2).map_epoch() == 3);
+    RoomMemory restarted(config, stamp(300), kGeneration + 3);
     restarted.add_points("mid360", boxed);
     const auto fresh = restarted.close_window(stamp(301));
     CHECK(fresh.size() == 1 && fresh[0].event_id != old[0].event_id);
     CHECK(fresh[0].header.map_epoch == 4 && fresh[0].header.seq == 0);
-    msg::RequestSync since;
-    since.header = msg::Header{"lab", old[0].header.map_epoch, 0, kStart};
-    since.since = msg::RequestSync::Since{old[0].header.map_epoch, old[0].header.seq};
-    since.topic = msg::SyncTopic::events;
-    CHECK((restarted.sync(since, stamp(302)) == std::vector<msg::Bytes>{fresh[0].to_cdr()}));
+    // The old generation's cursor (and a legacy request) is answered as SINCE_NONE in the new one.
+    const msg::RequestSync::Since since{old[0].header.map_epoch, old[0].header.seq};
+    for (const auto& request : {sync_request(since, msg::SyncTopic::events),
+                                sync_request(since, msg::SyncTopic::events, std::nullopt)}) {
+        const RoomMemory::SyncAnswer answer = restarted.sync(request, stamp(302));
+        CHECK((answer.messages == std::vector<msg::Bytes>{fresh[0].to_cdr()}));
+        CHECK(answer.end && answer.end->publisher_generation == kGeneration + 3);
+        CHECK((answer.end->delivered == Ranges{{0, 0}}) && answer.end->unavailable.empty());
+    }
 }
 
 // Codex P2: a restart with sensors=['mid360'] saved only reference-mid360.cdr at the next
@@ -355,7 +378,7 @@ TEST(a_sensor_subset_run_keeps_the_room_loadable) {
     }
     MemoryConfig both = mid360_config(dir.path.string());
     both.sensors = {"mid360", "jt128"};
-    RoomMemory memory(both, kStart);
+    RoomMemory memory(both, kStart, kGeneration);
     for (std::int64_t second = 0; second < 3; ++second) {
         memory.add_points("mid360", partial);
         memory.add_points("jt128", partial);
@@ -365,7 +388,7 @@ TEST(a_sensor_subset_run_keeps_the_room_loadable) {
     MemoryConfig mid360 = mid360_config(dir.path.string());
     mid360.delta_period_s = 1.0;
     mid360.learn_windows = 30;  // the subset run learns new coverage
-    RoomMemory subset(mid360, kStart);
+    RoomMemory subset(mid360, kStart, kGeneration);
     CHECK(subset.state() == MemoryState::tracking && subset.map_epoch() == 2);
     CHECK_EQ(msg::MapBricks::from_cdr(*subset.map_update(stamp(10))).header.map_epoch, std::uint64_t{2});
     // The subset run learns the far wall, so reference-mid360.cdr moves ahead of reference-jt128.cdr.
@@ -375,10 +398,10 @@ TEST(a_sensor_subset_run_keeps_the_room_loadable) {
     CHECK_EQ(subset.map_epoch(), std::uint64_t{3});
     CHECK_EQ(load_reference(reference_path(dir.path.string(), "lab", "mid360")).first.header.map_epoch, std::uint64_t{3});
     CHECK_EQ(load_reference(reference_path(dir.path.string(), "lab", "jt128")).first.header.map_epoch, std::uint64_t{1});
-    RoomMemory restarted(both, stamp(20));
+    RoomMemory restarted(both, stamp(20), kGeneration);
     CHECK(restarted.state() == MemoryState::tracking && restarted.map_epoch() == 4);
     CHECK(restarted.channel("mid360").reference.to_bricks() == subset.channel("mid360").reference.to_bricks());
-    CHECK_EQ(RoomMemory(both, stamp(30)).map_epoch(), std::uint64_t{5});
+    CHECK_EQ(RoomMemory(both, stamp(30), kGeneration).map_epoch(), std::uint64_t{5});
     CHECK(load_epoch(epoch_path(dir.path.string(), "lab")) == std::optional<std::uint64_t>{5});
     std::ifstream in(epoch_path(dir.path.string(), "lab"), std::ios::binary);
     CHECK_EQ(std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()), std::string("5\n"));
@@ -389,35 +412,35 @@ TEST(a_sensor_subset_build_continues_the_room_epoch) {
     TempDir dir;
     MemoryConfig jt128_only = mid360_config(dir.path.string());
     jt128_only.sensors = {"jt128"};
-    RoomMemory jt128(jt128_only, kStart);
+    RoomMemory jt128(jt128_only, kStart, kGeneration);
     for (std::int64_t second = 0; second < 3; ++second) {
         jt128.add_points("jt128", scenes::room_shell());
         jt128.close_window(stamp(second));
     }
     CHECK(jt128.state() == MemoryState::tracking && jt128.map_epoch() == 1);
-    CHECK_EQ(RoomMemory(jt128_only, stamp(10)).map_epoch(), std::uint64_t{2});
-    RoomMemory mid360(mid360_config(dir.path.string()), kStart);
+    CHECK_EQ(RoomMemory(jt128_only, stamp(10), kGeneration).map_epoch(), std::uint64_t{2});
+    RoomMemory mid360(mid360_config(dir.path.string()), kStart, kGeneration);
     CHECK(mid360.state() == MemoryState::building && mid360.map_epoch() == 2);
     build_reference(mid360, scenes::room_shell());
     CHECK(mid360.state() == MemoryState::tracking && mid360.map_epoch() == 3);
     MemoryConfig both = mid360_config(dir.path.string());
     both.sensors = {"mid360", "jt128"};
-    CHECK_EQ(RoomMemory(both, stamp(20)).map_epoch(), std::uint64_t{4});
+    CHECK_EQ(RoomMemory(both, stamp(20), kGeneration).map_epoch(), std::uint64_t{4});
 }
 
 TEST(inconsistent_saved_state_is_refused) {
     TempDir dir;
-    RoomMemory memory(mid360_config(dir.path.string()), kStart);
+    RoomMemory memory(mid360_config(dir.path.string()), kStart, kGeneration);
     build_reference(memory, scenes::room_shell());
     MemoryConfig both;
     both.state_dir = dir.path.string();
-    CHECK_THROWS(std::invalid_argument, RoomMemory(both, kStart));
+    CHECK_THROWS(std::invalid_argument, RoomMemory(both, kStart, kGeneration));
     MemoryConfig coarse = mid360_config(dir.path.string());
     coarse.voxel_size = 0.1;
-    CHECK_THROWS(std::invalid_argument, RoomMemory(coarse, kStart));
+    CHECK_THROWS(std::invalid_argument, RoomMemory(coarse, kStart, kGeneration));
     for (const std::string data : {"", "3", "-3\n", " 3\n", "18446744073709551616\n"}) {
         std::ofstream(epoch_path(dir.path.string(), "lab"), std::ios::binary | std::ios::trunc) << data;
-        CHECK_THROWS(std::invalid_argument, RoomMemory(mid360_config(dir.path.string()), kStart));
+        CHECK_THROWS(std::invalid_argument, RoomMemory(mid360_config(dir.path.string()), kStart, kGeneration));
     }
 }
 
@@ -440,7 +463,7 @@ TEST(overflowing_cloud_size_is_rejected) {
     MemoryConfig config;
     config.state_dir = std::nullopt;
     config.reference_windows = 1;
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     memory.add_points("mid360", scenes::room_shell());
     CHECK(!memory.add_cdr("jt128", cdr));
     memory.close_window(stamp(0));
@@ -452,7 +475,7 @@ TEST(degraded_and_dropped_windows) {
     config.state_dir = std::nullopt;
     config.reference_windows = 1;
     config.occupied_min_hits = 1;  // one window settles occupancy: each reference is ready after one window
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     memory.add_points("mid360", scenes::room_shell());
     const msg::Bytes header_only = {0x00, 0x01, 0x00, 0x00};
     CHECK(!memory.add_cdr("jt128", header_only));
@@ -475,7 +498,7 @@ TEST(degraded_and_dropped_windows) {
 TEST(rejected_cdr_keeps_type_name_and_message) {
     MemoryConfig config;
     config.state_dir = std::nullopt;
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     CHECK(!memory.channel("mid360").last_error);
     CHECK(!memory.add_cdr("mid360", msg::Bytes{0x00, 0x01, 0x00, 0x00}));
     const RejectedFrame truncated{"PointCloudError", "PointCloud2 CDR: truncated header.stamp.sec at byte 4 (need 4, have 0)"};
@@ -531,7 +554,7 @@ TEST(windows_without_usable_points_do_not_build_the_reference) {
     const Cloud room = scenes::room_shell();
     MemoryConfig config = mid360_config(dir.path.string());
     config.max_range = 15.0;
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     Cloud far = room;
     for (float& v : far) v += 50.0f;
     const std::vector<Cloud> unusable = {Cloud{}, Cloud(150, std::nanf("")), far};
@@ -561,7 +584,7 @@ TEST(each_sensor_reference_freezes_at_its_own_window_count) {
     MemoryConfig config = mid360_config(std::nullopt);
     config.sensors = MemoryConfig().sensors;
     config.reference_windows = 1;
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     memory.add_points("mid360", room);
     memory.close_window(stamp(0));
     CHECK(memory.state() == MemoryState::building);
@@ -587,7 +610,7 @@ TEST(tracking_waits_for_settled_reference_occupancy) {
     config.max_range = std::nullopt;
     config.reference_windows = 1;
     config.candidate_windows = 3;
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     memory.add_points("mid360", room);
     memory.close_window(stamp(0));
     CHECK(memory.state() == MemoryState::building && memory.map_epoch() == 0);
@@ -618,7 +641,7 @@ TEST(a_return_kept_in_the_recent_layer_is_not_fresh_evidence) {
     config.candidate_windows = 3;
     config.expire_windows = 3;
     {
-        RoomMemory memory(config, kStart);
+        RoomMemory memory(config, kStart, kGeneration);
         const std::int64_t second = build_reference(memory, room);
         memory.add_points("mid360", boxed);
         CHECK(memory.close_window(stamp(second)).empty());
@@ -628,7 +651,7 @@ TEST(a_return_kept_in_the_recent_layer_is_not_fresh_evidence) {
         }
     }
     // The same box seen in three windows in a row is a candidate on the third.
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     const std::int64_t second = build_reference(memory, room);
     std::vector<std::vector<msg::ChangeEvent>> events;
     for (int n = 0; n < 3; ++n) {
@@ -657,7 +680,7 @@ TEST(free_space_kept_in_the_recent_layer_is_not_fresh_evidence) {
     config.candidate_windows = 3;
     config.expire_windows = 3;
     {
-        RoomMemory memory(config, kStart);
+        RoomMemory memory(config, kStart, kGeneration);
         std::int64_t second = build_reference(memory, boxed);
         for (const Cloud* points : std::initializer_list<const Cloud*>{&room, &other_half, &other_half, &other_half}) {
             memory.add_points("mid360", *points);
@@ -665,7 +688,7 @@ TEST(free_space_kept_in_the_recent_layer_is_not_fresh_evidence) {
         }
     }
     // The box missing from three windows in a row is a candidate on the third.
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     const std::int64_t second = build_reference(memory, boxed);
     std::vector<std::vector<msg::ChangeEvent>> events;
     for (int n = 0; n < 3; ++n) {
@@ -775,7 +798,7 @@ TEST(recent_observations_age_through_missing_windows) {
     const Cloud room = scenes::room_shell();
     MemoryConfig config = mid360_config(std::nullopt);
     config.recent_windows = 3;
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     const std::int64_t second = build_reference(memory, room);
     const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
     memory.add_points("mid360", scenes::concat({&room, &box}));
@@ -794,17 +817,17 @@ TEST(recent_observations_age_through_missing_windows) {
 TEST(config_rejections) {
     MemoryConfig velodyne;
     velodyne.sensors = {"velodyne"};
-    CHECK_THROWS(std::invalid_argument, RoomMemory(velodyne, kStart));
+    CHECK_THROWS(std::invalid_argument, RoomMemory(velodyne, kStart, kGeneration));
     MemoryConfig none;
     none.sensors = {};
-    CHECK_THROWS(std::invalid_argument, RoomMemory(none, kStart));
+    CHECK_THROWS(std::invalid_argument, RoomMemory(none, kStart, kGeneration));
     MemoryConfig instant;
     instant.window_s = 0;
     instant.state_dir = std::nullopt;
-    CHECK_THROWS(std::invalid_argument, RoomMemory(instant, kStart));
+    CHECK_THROWS(std::invalid_argument, RoomMemory(instant, kStart, kGeneration));
     for (const double bad : {-1.0, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
         instant.window_s = bad;
-        CHECK_THROWS(std::invalid_argument, RoomMemory(instant, kStart));
+        CHECK_THROWS(std::invalid_argument, RoomMemory(instant, kStart, kGeneration));
     }
 }
 
@@ -878,7 +901,7 @@ TEST(map_stream_snapshot_then_deltas_and_keyframes) {
     config.delta_period_s = 2.0;
     config.keyframe_period_s = 6.0;
     config.keyframe_delta_ratio = 100.0;
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     CHECK(!memory.map_update(stamp(0)));
     const std::int64_t second = build_reference(memory, partial);
     std::vector<msg::MapBricks> sent;
@@ -919,7 +942,7 @@ TEST(map_stream_sends_a_snapshot_when_deltas_outgrow_the_keyframe) {
     config.learn_windows = 30;
     config.delta_period_s = 1.0;
     config.keyframe_delta_ratio = 0.01;
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     const std::int64_t second = build_reference(memory, partial);
     CHECK(msg::MapBricks::from_cdr(*memory.map_update(stamp(second))).kind == msg::MapKind::snapshot);
     memory.add_points("mid360", room);
@@ -928,57 +951,84 @@ TEST(map_stream_sends_a_snapshot_when_deltas_outgrow_the_keyframe) {
     CHECK(next.kind == msg::MapKind::snapshot && next.header.map_epoch == 2 && next.header.seq == 1);
 }
 
-TEST(sync_replays_or_snapshots_maps_and_replays_or_falls_back_for_events) {
+TEST(sync_replays_or_snapshots_maps_and_replays_events) {
+    using msg::SyncTopic;
+    using Since = msg::RequestSync::Since;
     const Cloud room = scenes::room_shell();
     const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
     const Cloud boxed = scenes::concat({&room, &box});
     MemoryConfig config = mid360_config(std::nullopt);
     config.delta_period_s = 1.0;
     config.keyframe_period_s = 1.0;
-    RoomMemory memory(config, kStart);
-    const auto request = [](std::optional<msg::RequestSync::Since> since, msg::SyncTopic topic, const std::string& room_id = "lab") {
-        msg::RequestSync r;
-        r.header = msg::Header{room_id, since ? since->epoch : msg::kSinceNone, 0, kStart};
-        r.since = since;
-        r.topic = topic;
-        return r;
-    };
-    CHECK(memory.sync(request(std::nullopt, msg::SyncTopic::map_bricks), stamp(0)).empty());  // no map yet
+    RoomMemory memory(config, kStart, kGeneration);
+    // BUILDING: no map yet, an empty answer that says so (bound SEQ_NONE).
+    RoomMemory::SyncAnswer answer = memory.sync(sync_request(std::nullopt, SyncTopic::map_bricks), stamp(0));
+    CHECK(answer.messages.empty() && answer.end && !answer.end->bound && answer.end->delivered.empty());
+    CHECK(answer.end->token == kTokenA);
     std::int64_t second = build_reference(memory, room);
     std::vector<msg::Bytes> live;
-    for (int n = 0; n < 3; ++n, ++second) {
+    for (int n = 0; n < 3; ++n) {
         memory.add_points("mid360", n == 1 ? boxed : room);
-        memory.close_window(stamp(second));
-        live.push_back(*memory.map_update(stamp(second)));  // a keyframe every window
+        memory.close_window(stamp(second + n));
+        live.push_back(*memory.map_update(stamp(second + n)));  // a keyframe every window
     }
-    const auto map_answer = [&](std::optional<msg::RequestSync::Since> since) {
-        return memory.sync(request(since, msg::SyncTopic::map_bricks), stamp(second));
-    };
-    const msg::MapBricks first = msg::MapBricks::from_cdr(live[0]);
-    CHECK((map_answer(msg::RequestSync::Since{first.header.map_epoch, 0}) == std::vector<msg::Bytes>{live[1], live[2]}));
-    for (const auto since : {std::optional<msg::RequestSync::Since>{}, std::optional<msg::RequestSync::Since>{{first.header.map_epoch, 2}},
-                             std::optional<msg::RequestSync::Since>{{first.header.map_epoch + 7, 0}},
-                             std::optional<msg::RequestSync::Since>{{first.header.map_epoch, 40}}}) {
-        const std::vector<msg::Bytes> answer = map_answer(since);
-        CHECK(answer.size() == 1);
-        const msg::MapBricks snapshot = msg::MapBricks::from_cdr(answer[0]);
+    const msg::Time now = stamp(second + 3);
+    const std::uint64_t epoch = msg::MapBricks::from_cdr(live[0]).header.map_epoch;
+    const msg::Header newest = msg::MapBricks::from_cdr(live[2]).header;
+    CHECK_EQ(newest.seq, std::uint64_t{2});
+    // since in the log, older than the bound: the later logged messages, unchanged.
+    answer = memory.sync(sync_request(Since{epoch, 0}, SyncTopic::map_bricks), now);
+    CHECK((answer.messages == std::vector<msg::Bytes>{live[1], live[2]}));
+    CHECK(answer.end->bound == std::uint64_t{2} && (answer.end->delivered == Ranges{{1, 2}}));
+    // since is the newest message: nothing missed, nothing sent (no snapshot).
+    answer = memory.sync(sync_request(Since{newest.map_epoch, 2}, SyncTopic::map_bricks), now);
+    CHECK(answer.messages.empty() && answer.end->bound == std::uint64_t{2} && answer.end->delivered.empty());
+    // since not in the log, of another generation, or a legacy request: one fresh snapshot.
+    for (const auto& request : {sync_request(std::nullopt, SyncTopic::map_bricks),
+                                sync_request(Since{newest.map_epoch + 1, 2}, SyncTopic::map_bricks),
+                                sync_request(Since{epoch + 7, 0}, SyncTopic::map_bricks),
+                                sync_request(Since{epoch, 40}, SyncTopic::map_bricks),
+                                sync_request(Since{epoch, 0}, SyncTopic::map_bricks, kGeneration - 1),
+                                sync_request(Since{epoch, 0}, SyncTopic::map_bricks, 0),
+                                sync_request(Since{newest.map_epoch, 2}, SyncTopic::map_bricks, std::nullopt)}) {
+        answer = memory.sync(request, now);
+        CHECK(answer.messages.size() == 1);
+        const msg::MapBricks snapshot = msg::MapBricks::from_cdr(answer.messages[0]);
         CHECK(snapshot.kind == msg::MapKind::snapshot && snapshot.header.seq == 2);
+        CHECK(snapshot.publisher_generation == kGeneration);
         CHECK(snapshot.bricks == msg::MapBricks::from_cdr(live[2]).bricks);
+        CHECK((answer.end->delivered == Ranges{{2, 2}}));
+        CHECK(answer.end->token == (request.token ? kTokenA : msg::kZeroToken));
     }
-    CHECK(memory.sync(request(std::nullopt, msg::SyncTopic::map_bricks, "other"), stamp(second)).empty());
+    answer = memory.sync(sync_request(std::nullopt, SyncTopic::map_bricks, kGeneration, "other"), now);
+    CHECK(answer.messages.empty() && !answer.end);
     // Events: a candidate (window 1) and its expiry (window 2).
-    const std::vector<msg::Bytes> all = memory.sync(request(std::nullopt, msg::SyncTopic::events), stamp(second));
-    CHECK(all.size() == 2);
-    const msg::ChangeEvent opened = msg::ChangeEvent::from_cdr(all[0]);
-    CHECK(opened.state == EventState::candidate && msg::ChangeEvent::from_cdr(all[1]).state == EventState::expired);
-    const auto since_open = memory.sync(request(msg::RequestSync::Since{opened.header.map_epoch, opened.header.seq}, msg::SyncTopic::events), stamp(second));
-    CHECK((since_open == std::vector<msg::Bytes>{all[1]}));
-    const auto since_last = memory.sync(request(msg::RequestSync::Since{opened.header.map_epoch, 1}, msg::SyncTopic::events), stamp(second));
-    CHECK(since_last.empty());
+    answer = memory.sync(sync_request(std::nullopt, SyncTopic::events), now);
+    CHECK(answer.messages.size() == 2);
+    CHECK(answer.end->bound == std::uint64_t{1} && (answer.end->delivered == Ranges{{0, 1}}) && answer.end->unavailable.empty());
+    const std::vector<msg::Bytes> all = answer.messages;
+    const msg::ChangeEvent first = msg::ChangeEvent::from_cdr(all[0]);
+    CHECK(first.state == EventState::candidate && msg::ChangeEvent::from_cdr(all[1]).state == EventState::expired);
+    answer = memory.sync(sync_request(Since{first.header.map_epoch, first.header.seq}, SyncTopic::events), now);
+    CHECK((answer.messages == std::vector<msg::Bytes>{all[1]}));
+    answer = memory.sync(sync_request(Since{first.header.map_epoch, 1}, SyncTopic::events), now);
+    CHECK(answer.messages.empty() && answer.end->bound == std::uint64_t{1} && answer.end->delivered.empty());
+    // One SyncEnd per answer, numbered from 0 in this generation; each one encodes.
+    CHECK(answer.end->header.seq + 1 == memory.sync_end_seq());
+    CHECK(msg::SyncEnd::from_cdr(answer.end->to_cdr()) == *answer.end);
+}
+
+TEST(events_answer_with_no_events_is_known_empty) {
+    RoomMemory memory(mid360_config(std::nullopt), kStart, kGeneration);
+    build_reference(memory, scenes::room_shell());
+    const RoomMemory::SyncAnswer answer = memory.sync(sync_request(std::nullopt, msg::SyncTopic::events), stamp(10));
+    CHECK(answer.messages.empty() && answer.end && !answer.end->bound);
+    CHECK(answer.end->delivered.empty() && answer.end->unavailable.empty());
+    CHECK(!memory.status(stamp(10), 1.0).events_seq);
 }
 
 TEST(event_fallback_resends_open_events_older_than_the_log) {
-    RoomMemory memory(mid360_config(std::nullopt), kStart);
+    RoomMemory memory(mid360_config(std::nullopt), kStart, kGeneration);
     const Cloud room = scenes::room_shell();
     std::int64_t second = build_reference(memory, room);
     const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
@@ -986,27 +1036,87 @@ TEST(event_fallback_resends_open_events_older_than_the_log) {
     const Cloud boxed = scenes::concat({&room, &box});
     const Cloud both = scenes::concat({&room, &box, &speck});
     memory.add_points("mid360", boxed);
-    const auto opened = memory.close_window(stamp(second++));
+    const auto opened = memory.close_window(stamp(second));
     CHECK(opened.size() == 1 && opened[0].state == EventState::candidate);
-    // The box stays (no transition) while the speck comes and goes: 100 more transitions push
-    // the box's only message out of the log.
+    // The box stays (no transition) while the speck comes and goes: more than 100 transitions
+    // push the box's only message out of the log.
     std::size_t transitions = 0;
-    while (transitions < kEventLogDepth) {
+    std::vector<Ranges> unavailable;
+    while (transitions < kEventLogDepth + 20) {
+        ++second;
         memory.add_points("mid360", transitions % 2 ? boxed : both);
-        transitions += memory.close_window(stamp(second++)).size();
+        transitions += memory.close_window(stamp(second)).size();
+        unavailable.push_back(memory.sync(sync_request(std::nullopt, msg::SyncTopic::events), stamp(second)).end->unavailable);
     }
-    CHECK(transitions == kEventLogDepth);
-    msg::RequestSync r;
-    r.header = msg::Header{"lab", msg::kSinceNone, 0, kStart};
-    r.topic = msg::SyncTopic::events;
-    const std::vector<msg::Bytes> answer = memory.sync(r, stamp(second));
-    CHECK(answer.size() == kEventLogDepth + 1 && answer[0] == opened[0].to_cdr());
-    CHECK(msg::ChangeEvent::from_cdr(answer[1]).header.seq == 1);
+    const RoomMemory::SyncAnswer answer =
+        memory.sync(sync_request(std::nullopt, msg::SyncTopic::events, std::nullopt), stamp(second));
+    CHECK(answer.messages.size() == kEventLogDepth + 1 && answer.messages[0] == opened[0].to_cdr());
+    const std::uint64_t bound = memory.event_seq() - 1;
+    const std::uint64_t oldest = bound - kEventLogDepth + 1;
+    CHECK(answer.end->token == msg::kZeroToken && answer.end->bound == bound);
+    CHECK((answer.end->delivered == Ranges{{0, 0}, {oldest, bound}}) && (answer.end->unavailable == Ranges{{1, oldest - 1}}));
+    // Within one generation a seq once unavailable stays unavailable.
+    for (std::size_t n = 1; n < unavailable.size(); ++n) {
+        CHECK(subtract_ranges(unavailable[n - 1], unavailable[n]).empty());
+    }
+    // A since the log no longer holds limits the requested range to what follows it.
+    const std::uint64_t epoch = msg::ChangeEvent::from_cdr(answer.messages[1]).header.map_epoch;
+    const RoomMemory::SyncAnswer later =
+        memory.sync(sync_request(msg::RequestSync::Since{epoch, 5}, msg::SyncTopic::events), stamp(second));
+    CHECK((later.end->unavailable == Ranges{{6, oldest - 1}}) && (later.end->delivered == Ranges{{0, 0}, {oldest, bound}}));
+}
+
+TEST(seq_ranges_merge_and_subtract) {
+    CHECK((canonical_ranges({{5, 7}, {0, 0}, {1, 3}, {9, 9}, {6, 8}}) == Ranges{{0, 3}, {5, 9}}));
+    CHECK((canonical_ranges({{0, msg::kUint64Max}, {7, 9}}) == Ranges{{0, msg::kUint64Max}}));
+    CHECK((subtract_ranges({{0, 20}}, {{0, 0}, {5, 7}, {20, 30}}) == Ranges{{1, 4}, {8, 19}}));
+    CHECK((subtract_ranges({{3, 4}, {10, 12}}, {{4, 10}}) == Ranges{{3, 3}, {11, 12}}));
+    CHECK(subtract_ranges({{3, 4}}, {{0, msg::kUint64Max}}).empty());
+}
+
+TEST(messages_carry_the_generation_and_references_stay_legacy) {
+    TempDir dir;
+    const Cloud room = scenes::room_shell();
+    const Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
+    RoomMemory memory(mid360_config(dir.path.string()), kStart, kGeneration);
+    const std::int64_t second = build_reference(memory, room);
+    memory.add_points("mid360", scenes::concat({&room, &box}));
+    const auto events = memory.close_window(stamp(second));
+    CHECK(events.size() == 1);
+    const msg::ChangeEvent decoded = msg::ChangeEvent::from_cdr(events[0].to_cdr());
+    CHECK(decoded.publisher_generation == kGeneration && decoded.mask->publisher_generation == kGeneration);
+    CHECK(msg::MapBricks::from_cdr(*memory.map_update(stamp(second))).publisher_generation == kGeneration);
+    CHECK(msg::MemoryStatus::from_cdr(memory.status(stamp(second), 1.0).to_cdr()).publisher_generation == kGeneration);
+    const auto path = reference_path(dir.path.string(), "lab", "mid360");
+    msg::MapBricks saved = load_reference(path).first;
+    CHECK(!saved.publisher_generation);
+    std::ifstream in(path, std::ios::binary);
+    const msg::Bytes data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    CHECK(msg::MapBricks::from_cdr(data).to_cdr() == data);  // the legacy layout, byte for byte
+    // A v2 reference (written by hand) still loads.
+    const std::vector<msg::Brick> bricks = saved.bricks;
+    saved.publisher_generation = 7;
+    write_atomic(path, saved.to_cdr());
+    CHECK(RoomMemory(mid360_config(dir.path.string()), kStart, kGeneration).channel("mid360").reference.to_bricks() == bricks);
+    MemoryConfig config;
+    config.state_dir = std::nullopt;
+    CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart, 0));
+}
+
+TEST(write_atomic_replaces_and_needs_parents_only_when_asked) {
+    TempDir dir;
+    const msg::Bytes one = {'1', '\n'};
+    const auto nested = dir.path / "a" / "b" / "file";
+    CHECK_THROWS(std::runtime_error, write_atomic(nested, one, false));
+    CHECK(!std::filesystem::exists(dir.path / "a"));
+    write_atomic(nested, one);
+    write_atomic(nested, msg::Bytes{'2', '\n'}, false);
+    CHECK(harness::read_text(nested) == "2\n" && !std::filesystem::exists(nested.string() + ".tmp"));
 }
 
 TEST(coverage_and_pose_residual) {
     const Cloud room = scenes::room_shell();
-    RoomMemory memory(mid360_config(std::nullopt), kStart);
+    RoomMemory memory(mid360_config(std::nullopt), kStart, kGeneration);
     const std::int64_t second = build_reference(memory, room);
     const msg::MemoryStatus building = memory.status(stamp(second), 1.0);
     CHECK(building.coverage_known_frac && *building.coverage_known_frac > 0.2f && *building.coverage_known_frac <= 1.0f);
@@ -1035,7 +1145,7 @@ TEST(coverage_and_pose_residual) {
 TEST(learning_budget_flushes_on_the_next_due_tick_then_freezes) {
     const Cloud room = scenes::room_shell();
     const Cloud partial = partial_shell(room);
-    RoomMemory memory(budget_config(), kStart);
+    RoomMemory memory(budget_config(), kStart, kGeneration);
     const auto opening = feed(memory, &partial, 0);
     CHECK(opening && opening->kind == msg::MapKind::snapshot && opening->header.map_epoch == 1);
     CHECK(memory.channel("mid360").stats.keys.empty());
@@ -1076,7 +1186,7 @@ TEST(learning_budget_flushes_on_the_next_due_tick_then_freezes) {
 TEST(an_empty_tracking_window_consumes_the_learn_budget) {
     const Cloud room = scenes::room_shell();
     const Cloud partial = partial_shell(room);
-    RoomMemory memory(budget_config(), kStart);
+    RoomMemory memory(budget_config(), kStart, kGeneration);
     const auto opening = feed(memory, &partial, 0);
     CHECK(opening && !feed(memory, nullptr, 1) && memory.channel("mid360").stats.keys.empty());
     memory.add_points("mid360", room);
@@ -1090,7 +1200,7 @@ TEST(an_empty_tracking_window_consumes_the_learn_budget) {
 TEST(a_pose_rejected_window_consumes_the_learn_budget) {
     const Cloud room = scenes::room_shell();
     const Cloud partial = partial_shell(room);
-    RoomMemory memory(budget_config(), kStart);
+    RoomMemory memory(budget_config(), kStart, kGeneration);
     const auto opening = feed(memory, &partial, 0);
     Cloud shifted = partial;
     for (std::size_t n = 0; n < shifted.size(); n += 3) {
@@ -1116,7 +1226,7 @@ TEST(a_pose_rejected_window_consumes_the_learn_budget) {
 TEST(learn_windows_zero_drops_leftovers_and_keeps_known_space_events) {
     const Cloud room = scenes::room_shell();
     const Cloud partial = partial_shell(room);
-    RoomMemory memory(budget_config(0), kStart);
+    RoomMemory memory(budget_config(0), kStart, kGeneration);
     const auto opening = feed(memory, &partial, 0);
     CHECK(opening && memory.channel("mid360").stats.keys.empty());
     for (std::int64_t second = 1; second < 4; ++second) {
@@ -1153,13 +1263,13 @@ TEST(a_reload_with_learn_windows_zero_does_not_learn) {
     config.keyframe_period_s = 100.0;
     const Cloud room = scenes::room_shell();
     const Cloud partial = partial_shell(room);
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     memory.add_points("mid360", partial);
     CHECK(memory.close_window(stamp(0)).empty());
     CHECK(memory.state() == MemoryState::tracking);
     CHECK_EQ(memory.map_epoch(), std::uint64_t{1});
     const auto bricks = memory.channel("mid360").reference.to_bricks();
-    RoomMemory restarted(config, stamp(10));
+    RoomMemory restarted(config, stamp(10), kGeneration);
     CHECK(restarted.state() == MemoryState::tracking);
     CHECK_EQ(restarted.map_epoch(), std::uint64_t{2});
     const msg::MapBricks opening = msg::MapBricks::from_cdr(*restarted.map_update(stamp(10)));
@@ -1197,7 +1307,7 @@ TEST(stream_config_rejections) {
              [](MemoryConfig& c) { c.learn_windows = -1; }}) {
         MemoryConfig config = mid360_config(std::nullopt);
         edit(config);
-        CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart));
+        CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart, kGeneration));
     }
 }
 
@@ -1273,7 +1383,7 @@ TEST(a_gap_window_in_the_engine_interrupts_pending_regions) {
     MemoryConfig config = mid360_config(std::nullopt);
     config.candidate_windows = 3;
     config.expire_windows = 3;
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     const std::int64_t second = build_reference(memory, room);
     std::vector<int> with_events;
     for (int n = 0; n < 6; ++n) {
@@ -1425,7 +1535,7 @@ TEST(activity_reports_the_newest_window_with_motion) {
     MemoryConfig config = mid360_config(std::nullopt);
     config.candidate_windows = 5;
     config.activity_radius_m = 1.0;
-    RoomMemory memory(config, kStart);
+    RoomMemory memory(config, kStart, kGeneration);
     const msg::Activity idle = memory.activity(stamp(0));
     CHECK(!idle.active && !idle.since_s && idle.header.seq == 0);
     const std::int64_t second = build_reference(memory, room);
@@ -1454,7 +1564,7 @@ TEST(gate_config_rejections) {
         MemoryConfig config;
         config.state_dir = std::nullopt;
         edit(config);
-        CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart));
+        CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart, kGeneration));
     }
 }
 

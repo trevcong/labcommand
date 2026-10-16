@@ -54,8 +54,8 @@ def run(script):
                 _config(fields, pair)
         elif command == "start":
             sec, nanosec = int(args[0]), int(args[1])
-            generation = int(args[2]) if len(args) > 2 else max(1, sec * 1000 + nanosec // 1_000_000)
             try:
+                generation = int(args[2]) if len(args) > 2 else max(1, sec * 1000 + nanosec // 1_000_000)
                 memory = RoomMemory(MemoryConfig(**fields), Time(sec, nanosec), generation)
                 out.append(f"init {memory.state.name} {memory.map_epoch}")
             except ValueError:

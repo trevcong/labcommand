@@ -3,7 +3,9 @@
 //
 // Script lines (whitespace-separated, # comments):
 //   config key=value ...        MemoryConfig fields; sensors=a,b; max_range=none; state_dir=none
-//   start <sec> <nanosec>       construct RoomMemory
+//   start <sec> <nanosec> [generation]
+//                               construct RoomMemory; the generation defaults to the start time in
+//                               ms (at least 1), the allocator's wall-clock floor
 //   points <sensor> <file>      add_points from raw little-endian float32 x, y, z
 //   cdr <sensor> <file>         add_cdr with the file's bytes
 //   hex <sensor> <hex>          add_cdr with inline bytes
@@ -12,13 +14,17 @@
 //   activity <sec> <nanosec>    the Activity message
 //   defaults                    every MemoryConfig default, one "default <key> <value>" line each
 //   map <sec> <nanosec>         map_update
-//   sync <sec> <nanosec> <hex>  sync with a CDR RequestSync
+//   sync <sec> <nanosec> <hex>  sync with a CDR RequestSync: "sync <n>", the answer's messages as
+//                               "data" lines, then "end <SyncEnd hex>" ("end none" for another room)
+#include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -126,8 +132,15 @@ int main(int argc, char** argv) {
             for (const auto& [key, value] : fields) std::cout << "default " << key << " " << value << "\n";
         } else if (command == "start") {
             const msg::Time start = time_of(words);
+            std::uint64_t generation =
+                static_cast<std::uint64_t>(std::max<std::int64_t>(1, start.sec * 1000 + start.nanosec / 1'000'000));
+            std::string text;
+            // An explicit generation that is not a uint64 (negative, too large) is refused like 0.
+            const bool parsed = !(words >> text) ||
+                                std::from_chars(text.data(), text.data() + text.size(), generation).ec == std::errc{};
+            if (!parsed) generation = 0;
             try {
-                memory = std::make_unique<RoomMemory>(config, start);
+                memory = std::make_unique<RoomMemory>(config, start, generation);
                 std::cout << "init " << msg::name(memory->state()) << " " << memory->map_epoch() << "\n";
             } catch (const std::invalid_argument&) {
                 std::cout << "init error\n";
@@ -161,12 +174,17 @@ int main(int argc, char** argv) {
             const msg::Time stamp = time_of(words);
             std::string value;
             words >> value;
+            std::optional<msg::RequestSync> request;
             try {
-                const std::vector<msg::Bytes> answer = memory->sync(msg::RequestSync::from_cdr(unhex(value)), stamp);
-                std::cout << "sync " << answer.size() << "\n";
-                for (const msg::Bytes& message : answer) std::cout << "data " << hex(message) << "\n";
+                request = msg::RequestSync::from_cdr(unhex(value));
             } catch (const msg::CDRError&) {
                 std::cout << "sync invalid\n";
+            }
+            if (request) {
+                const RoomMemory::SyncAnswer answer = memory->sync(*request, stamp);
+                std::cout << "sync " << answer.messages.size() << "\n";
+                for (const msg::Bytes& message : answer.messages) std::cout << "data " << hex(message) << "\n";
+                std::cout << "end " << (answer.end ? hex(answer.end->to_cdr()) : "none") << "\n";
             }
         } else {
             std::cerr << "room_memory_replay: unknown command " << command << "\n";

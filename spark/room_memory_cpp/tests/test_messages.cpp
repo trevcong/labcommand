@@ -8,6 +8,8 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <set>
+#include <type_traits>
 
 #include "harness.hpp"
 #include "room_memory/messages.hpp"
@@ -20,6 +22,35 @@ const std::filesystem::path kHand = std::filesystem::path(ROOM_MEMORY_FIXTURES) 
 // The Swift suite's copy of the hand goldens (absent in the image).
 const std::filesystem::path kSwiftHand = ROOM_MEMORY_SWIFT_HAND;
 const Time kT10{1760400010, 250000000};
+// The one publisher generation of every v2 golden (a start time in ms).
+constexpr std::uint64_t kG = 1760400000000ULL;
+
+Token token_of(const char* hex) {
+    Token out{};
+    for (std::size_t n = 0; n < kTokenBytes; ++n) {
+        out[n] = static_cast<std::uint8_t>(std::stoul(std::string(hex + 2 * n, 2), nullptr, 16));
+    }
+    return out;
+}
+
+const Token kTokenA = token_of("5a1e7c3d9b024f618e33c4d5e6f70819");
+const Token kTokenB = token_of("c10ffee012344567a9876543210fedcb");
+const Token kTokenC = token_of("0e8a3b5c77214d90b4065913c2ae6f01");
+
+// Like CHECK_THROWS, and the message contains `text` (the Python suite's match=).
+#define CHECK_THROWS_MATCH(Type, text, expression)                                                         \
+    do {                                                                                                   \
+        bool thrown = false;                                                                               \
+        try {                                                                                              \
+            (void)(expression);                                                                            \
+        } catch (const Type& error) {                                                                      \
+            thrown = std::string(error.what()).find(text) != std::string::npos;                            \
+        }                                                                                                  \
+        if (!thrown) {                                                                                     \
+            throw harness::Failure(harness::location(__FILE__, __LINE__) + ": no " #Type " matching '" text \
+                                   "' from " #expression);                                                 \
+        }                                                                                                  \
+    } while (0)
 
 Bytes hexfile(const std::string& name, const std::filesystem::path& dir = kHand) {
     const std::string text = harness::read_text(dir / name);
@@ -154,18 +185,111 @@ RequestSync request_events_none() {
     return RequestSync{head("lab-a", kSinceNone, 0, Time{1760400000, 500000000}), std::nullopt, SyncTopic::events};
 }
 
+MemoryStatus memory_status_v2() {
+    MemoryStatus s = memory_status();
+    s.publisher_generation = kG;
+    return s;
+}
+
+MapBricks delta_v2() {
+    MapBricks m = delta();
+    m.publisher_generation = kG;
+    return m;
+}
+
+ChangeEvent appeared_event_v2() {
+    ChangeEvent e = appeared_event();
+    e.publisher_generation = kG;
+    return e;
+}
+
+ChangeEvent moved_event_v2() {
+    ChangeEvent e = moved_event();
+    e.mask->publisher_generation = kG;
+    e.publisher_generation = kG;
+    return e;
+}
+
+RequestSync request_events_v2() {
+    RequestSync r = request_events_none();
+    r.expected_generation = 0;
+    r.token = kTokenA;
+    return r;
+}
+
+RequestSync request_map_v2() {
+    RequestSync r{head("lab", 43, 2), RequestSync::Since{43, 10}, SyncTopic::map_bricks};
+    r.expected_generation = kG;
+    r.token = kTokenC;
+    return r;
+}
+
+SyncEnd sync_end_events_empty() {
+    SyncEnd e;
+    e.header = head("lab", 43, 0);
+    e.publisher_generation = kG;
+    e.token = kZeroToken;
+    e.topic = SyncTopic::events;
+    return e;
+}
+
+SyncEnd sync_end_events_fallback() {
+    SyncEnd e;
+    e.header = head("lab", 43, 1);
+    e.publisher_generation = kG;
+    e.token = kTokenB;
+    e.topic = SyncTopic::events;
+    e.bound = 120;
+    e.delivered = {{10, 10}, {21, 120}};
+    e.unavailable = {{11, 20}};
+    return e;
+}
+
+SyncEnd sync_end_map_replay() {
+    SyncEnd e;
+    e.header = head("lab", 45, 2);
+    e.publisher_generation = kG;
+    e.token = kTokenC;
+    e.topic = SyncTopic::map_bricks;
+    e.bound = 13;
+    e.delivered = {{11, 13}};
+    return e;
+}
+
+// The v2 field a legacy cut lacks: publisher_generation, or RequestSync.expected_generation.
+template <typename T>
+std::optional<std::uint64_t> generation_of(const T& value) {
+    if constexpr (std::is_same_v<T, RequestSync>) {
+        return value.expected_generation;
+    } else if constexpr (std::is_same_v<T, SyncEnd>) {
+        return value.publisher_generation;
+    } else if constexpr (std::is_same_v<T, Epoch> || std::is_same_v<T, Activity>) {
+        return std::nullopt;
+    } else {
+        return value.publisher_generation;
+    }
+}
+
 // Each golden: decode equals the value; `exact` means the encoder reproduces the bytes.
+// `legacy_cut` decodes (throwing like decode) and says whether the result is a legacy message
+// (no v2 fields) that differs from the golden's value.
 struct Golden {
     std::function<bool(const Bytes&)> decodes_to_value;
     std::function<Bytes()> encode;
     std::function<void(const Bytes&)> decode;
+    std::function<bool(const Bytes&)> legacy_cut;
     bool exact;
 };
 
 template <typename T>
 Golden golden(std::function<T()> build, bool exact) {
     return Golden{[build](const Bytes& data) { return T::from_cdr(data) == build(); },
-                  [build] { return build().to_cdr(); }, [](const Bytes& data) { (void)T::from_cdr(data); }, exact};
+                  [build] { return build().to_cdr(); }, [](const Bytes& data) { (void)T::from_cdr(data); },
+                  [build](const Bytes& data) {
+                      const T value = T::from_cdr(data);
+                      return !generation_of(value) && !(value == build());
+                  },
+                  exact};
 }
 
 const std::map<std::string, Golden>& goldens() {
@@ -184,8 +308,27 @@ const std::map<std::string, Golden>& goldens() {
         {"request_sync_events_none_le.hex", golden<RequestSync>(request_events_none, true)},
         {"activity_le.hex", golden<Activity>(activity, true)},
         {"activity_idle_le.hex", golden<Activity>(activity_idle, true)},
+        {"memory_status_v2_le.hex", golden<MemoryStatus>(memory_status_v2, true)},
+        {"map_bricks_delta_v2_le.hex", golden<MapBricks>(delta_v2, true)},
+        {"map_bricks_delta_v2_be.hex", golden<MapBricks>(delta_v2, false)},
+        {"change_event_appeared_v2_le.hex", golden<ChangeEvent>(appeared_event_v2, true)},
+        {"change_event_moved_mask_v2_le.hex", golden<ChangeEvent>(moved_event_v2, true)},
+        {"request_sync_events_v2_le.hex", golden<RequestSync>(request_events_v2, true)},
+        {"request_sync_map_v2_be.hex", golden<RequestSync>(request_map_v2, false)},
+        {"sync_end_events_empty_le.hex", golden<SyncEnd>(sync_end_events_empty, true)},
+        {"sync_end_events_fallback_le.hex", golden<SyncEnd>(sync_end_events_fallback, true)},
+        {"sync_end_map_replay_be.hex", golden<SyncEnd>(sync_end_map_replay, false)},
     };
     return table;
+}
+
+// v2 goldens whose cut at the legacy length (+ up to 3 bytes) is a valid legacy message.
+bool extends_legacy(const std::string& name) { return name.find("_v2_") != std::string::npos; }
+
+Bytes u64le(std::uint64_t value) {
+    Bytes out(8);
+    for (int b = 0; b < 8; ++b) out[static_cast<std::size_t>(b)] = static_cast<std::uint8_t>(value >> (8 * b));
+    return out;
 }
 
 // Derived on this branch; the Swift suite does not decode Activity yet (PROVENANCE.md).
@@ -243,14 +386,20 @@ TEST(every_hand_golden_is_covered) {
         ++files;
         CHECK(goldens().count(entry.path().filename().string()) == 1);
     }
-    CHECK_EQ(files, std::size_t{14});
+    CHECK_EQ(files, goldens().size());
+    CHECK_EQ(files, std::size_t{24});
 }
 
 TEST(hand_goldens_match_the_swift_copies) {
     if (!std::filesystem::is_directory(kSwiftHand)) throw harness::Skip("Swift hand goldens not found at " + kSwiftHand.string());
-    std::size_t copies = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(kSwiftHand)) copies += entry.path().extension() == ".hex";
-    CHECK_EQ(copies, std::size_t{12});
+    std::set<std::string> copies, expected;
+    for (const auto& entry : std::filesystem::directory_iterator(kSwiftHand)) {
+        if (entry.path().extension() == ".hex") copies.insert(entry.path().filename().string());
+    }
+    for (const auto& [name, g] : goldens()) {
+        if (in_swift(name)) expected.insert(name);
+    }
+    CHECK(copies == expected);
     for (const auto& [name, g] : goldens()) {
         if (!in_swift(name)) continue;
         if (hexfile(name, kSwiftHand) != hexfile(name)) throw harness::Failure("Swift copy differs: " + name);
@@ -323,9 +472,21 @@ TEST(compressed_lzfse_is_one_complete_stream) {
 TEST(every_truncation_throws) {
     for (const auto& [name, g] : goldens()) {
         const Bytes data = hexfile(name);
+        std::size_t legacy_cuts = 0;
         for (std::size_t length = 0; length < data.size(); ++length) {
-            CHECK_THROWS(CDRError, g.decode(slice(data, 0, length)));
+            bool decoded = false;
+            try {
+                // A v2 message cut where its legacy layout ends is that legacy message, never the golden.
+                const bool legacy = g.legacy_cut(slice(data, 0, length));
+                decoded = true;
+                if (!extends_legacy(name) || !legacy) {
+                    throw harness::Failure(name + " decodes cut at " + std::to_string(length));
+                }
+            } catch (const CDRError&) {
+            }
+            legacy_cuts += decoded;
         }
+        CHECK(legacy_cuts <= 4);
     }
 }
 
@@ -522,6 +683,118 @@ TEST(float_fields_hold_binary32) {
     MemoryStatus status = memory_status();
     status.coverage_known_frac = f32(0.1);
     CHECK(MemoryStatus::from_cdr(status.to_cdr()) == status);
+}
+
+// MARK: Protocol v2
+
+TEST(layout_detection_from_trailing_bytes) {
+    Bytes legacy = hexfile("memory_status_le.hex");
+    CHECK(!MemoryStatus::from_cdr(legacy).publisher_generation);
+    for (std::size_t extra = 4; extra < 8; ++extra) {
+        CHECK_THROWS_MATCH(Invalid, "neither padding", MemoryStatus::from_cdr(join(legacy, Bytes(extra, 0))));
+    }
+    // Generation 0 rejects 8 appended zero bytes.
+    CHECK_THROWS_MATCH(Invalid, "GENERATION_UNKNOWN", MemoryStatus::from_cdr(join(legacy, Bytes(8, 0))));
+    CHECK(MemoryStatus::from_cdr(join(join(legacy, u64le(7)), Bytes(3, 0))).publisher_generation == std::uint64_t{7});
+    CHECK_THROWS(Invalid, MemoryStatus::from_cdr(join(join(legacy, u64le(7)), Bytes(4, 0))));
+    // MapBricks: the pad before the generation depends on the payload length.
+    const Bytes v2 = hexfile("map_bricks_delta_v2_le.hex");
+    legacy = hexfile("map_bricks_delta_le.hex");
+    CHECK(slice(v2, 0, legacy.size()) == legacy && v2.size() == legacy.size() + 6 + 8);
+    CHECK_THROWS(Invalid, MapBricks::from_cdr(join(join(legacy, Bytes(6, 0)), slice(u64le(kG), 0, 7))));
+    // RequestSync: 24 v2 bytes after the pad.
+    const Bytes request = hexfile("request_sync_events_none_le.hex");
+    CHECK(!RequestSync::from_cdr(request).token);
+    CHECK_THROWS(Invalid, RequestSync::from_cdr(join(request, Bytes(7 + 8, 0))));
+    CHECK_THROWS_MATCH(Invalid, "all-zero", RequestSync::from_cdr(join(request, Bytes(7 + 24, 0))));
+}
+
+TEST(v2_mask_follows_the_parent) {
+    ChangeEvent event = moved_event_v2();
+    event.mask->publisher_generation.reset();
+    CHECK_THROWS_MATCH(Invalid, "mask publisher_generation", event.to_cdr());
+    event = moved_event_v2();
+    event.publisher_generation.reset();
+    CHECK_THROWS_MATCH(Invalid, "mask publisher_generation", event.to_cdr());
+    event = moved_event_v2();
+    event.mask->publisher_generation = kG + 1;
+    CHECK_THROWS_MATCH(Invalid, "mask publisher_generation", event.to_cdr());
+    Bytes data = hexfile("change_event_moved_mask_v2_le.hex");
+    const Bytes other = u64le(kG + 1);
+    std::memcpy(data.data() + 4 + 344, other.data(), 8);
+    CHECK_THROWS_MATCH(Invalid, "mask publisher_generation", ChangeEvent::from_cdr(data));
+    // Only the parent's generation after a v2 mask is a bad length, not a legacy parent.
+    data = hexfile("change_event_moved_mask_v2_le.hex");
+    CHECK_THROWS_MATCH(Invalid, "neither padding", ChangeEvent::from_cdr(slice(data, 0, data.size() - 8)));
+    CHECK(ChangeEvent::from_cdr(hexfile("change_event_moved_mask_le.hex")) == moved_event());
+}
+
+// Python's short-token and expected_generation=-1 cases have no C++ value (std::array, uint64).
+TEST(request_sync_v2_rejections) {
+    const std::vector<std::function<void(RequestSync&)>> changes = {
+        [](RequestSync& r) { r.token.reset(); },
+        [](RequestSync& r) { r.expected_generation.reset(); },
+        [](RequestSync& r) { r.token = kZeroToken; },
+    };
+    for (const auto& change : changes) {
+        RequestSync r = request_map_v2();
+        change(r);
+        CHECK_THROWS(Invalid, r.to_cdr());
+    }
+}
+
+TEST(request_sync_v2_round_trip) {
+    const RequestSync request = request_map_v2();
+    CHECK(RequestSync::from_cdr(request.to_cdr()) == request);
+    CHECK_EQ(request.to_cdr().size(), std::size_t{84});
+    const Bytes golden = hexfile("request_sync_map_v2_be.hex");
+    CHECK(slice(golden, 4 + 64, golden.size()) == Bytes(kTokenC.begin(), kTokenC.end()));  // uint8[16] is never reversed
+}
+
+TEST(sync_end_rejections) {
+    const std::vector<std::function<void(SyncEnd&)>> changes = {
+        [](SyncEnd& s) { s.publisher_generation = 0; },
+        [](SyncEnd& s) { s.topic = static_cast<SyncTopic>(2); },
+        [](SyncEnd& s) { s.bound = kSeqNone; },
+        [](SyncEnd& s) { s.bound = 119; },
+        [](SyncEnd& s) { s.bound.reset(); },
+        [](SyncEnd& s) { s.delivered = {{21, 120}, {10, 10}}; },
+        [](SyncEnd& s) {
+            s.delivered = {{10, 20}, {21, 120}};
+            s.unavailable = {};
+        },
+        [](SyncEnd& s) { s.delivered = {{10, 10}, {10, 120}}; },
+        [](SyncEnd& s) { s.delivered = {{11, 10}}; },
+        [](SyncEnd& s) { s.unavailable = {{11, 21}}; },
+        [](SyncEnd& s) { s.topic = SyncTopic::map_bricks; },
+    };
+    for (const auto& change : changes) {
+        SyncEnd s = sync_end_events_fallback();
+        change(s);
+        CHECK_THROWS(Invalid, s.to_cdr());
+    }
+}
+
+TEST(sync_end_sizes_and_patches) {
+    CHECK_EQ(sync_end_events_empty().to_cdr().size(), std::size_t{84});
+    SyncEnd one = sync_end_events_empty();
+    one.bound = 5;
+    one.delivered = {{0, 5}};
+    CHECK_EQ(one.to_cdr().size(), std::size_t{88 + 16});
+    one.delivered.clear();
+    one.unavailable = {{0, 5}};
+    CHECK_EQ(one.to_cdr().size(), std::size_t{84 + 16});
+    CHECK_EQ(sync_end_events_fallback().to_cdr().size(), std::size_t{92 + 32 + 16});
+    Bytes data = hexfile("sync_end_events_fallback_le.hex");
+    data[4 + 72] = 3;  // three delivered ranges: truncated
+    CHECK_THROWS(CDRError, SyncEnd::from_cdr(data));
+    data = hexfile("sync_end_events_fallback_le.hex");
+    const Bytes hostile = u32le(0xFFFFFFFFu);  // a hostile count is refused before allocating
+    std::memcpy(data.data() + 4 + 72, hostile.data(), 4);
+    CHECK_THROWS(Truncated, SyncEnd::from_cdr(data));
+    data = hexfile("sync_end_events_empty_le.hex");
+    std::memset(data.data() + 4 + 32, 0, 8);
+    CHECK_THROWS_MATCH(Invalid, "GENERATION_UNKNOWN", SyncEnd::from_cdr(data));
 }
 
 TEST(room_id_must_be_utf8) {
