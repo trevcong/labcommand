@@ -409,14 +409,14 @@ On the Spark itself the GB10's cores differ from the M5's; the code has no Apple
 - learning: `learn_max_offset_m` 0.02, `learn_windows` 0 (tracking windows that may still teach the reference);
 - the map stream: `map_sensor` (empty: the JT128 when configured), `delta_period_s` 5, `keyframe_period_s` 60, `keyframe_delta_ratio` 0.5.
 
-It subscribes to `/livox/lidar` and `/lidar_points` as generic (serialized) subscriptions with the sensor-data QoS, so the raw CDR goes through `decode_pointcloud2`. It publishes the codec bytes with generic publishers, volatile unless stated:
+It subscribes to `/livox/lidar` and `/lidar_points` as generic (serialized) subscriptions with the sensor-data QoS, so the raw CDR goes through `decode_pointcloud2`. It publishes the codec bytes with generic publishers, each declaring its durability (protocol §2, D24), volatile unless stated:
 - `/room_memory/events`: reliable, depth 100;
-- `/room_memory/status`: reliable, depth 1, 1 Hz;
+- `/room_memory/status`: reliable, transient_local, depth 1, 1 Hz;
 - `/room_memory/activity` (`labcommand_msgs/msg/Activity`): reliable, transient_local, depth 1, 1 Hz with each status;
 - `/room_memory/map_bricks`: reliable, depth 10, after each window when `map_update` returns a message;
-- `/room_memory/sync/map_bricks` and `/room_memory/sync/events`: reliable, depth 10 and 200.
+- `/room_memory/sync/map_bricks`, `/room_memory/sync/events` and `/room_memory/sync/end`: reliable, depth 10, 200 and 10.
 
-It answers each `/room_memory/request_sync` (reliable, depth 10) on the sync topic of its `topic`, and logs and drops requests that do not decode. Windows and status run on node-clock timers and log wall/CPU time per window and the map bytes. The type support for `sensor_msgs` and `labcommand_msgs` is needed only at run time. `Epoch` (0.2 Hz) is not published yet: with no CONFIRMED state its counts would always be 0.
+It answers each `/room_memory/request_sync` (reliable, volatile, depth 10) on the sync topic of its `topic`, and logs and drops requests that do not decode. Windows and status run on node-clock timers and log wall/CPU time per window and the map bytes. The type support for `sensor_msgs` and `labcommand_msgs` is needed only at run time. `Epoch` (0.2 Hz) is not published yet: with no CONFIRMED state its counts would always be 0.
 
 **Sidecar.** Whether the Mac uses this bridge or the existing :8765 with requests relayed over :8766 is open (protocol D28, Q5); the sidecar is the :8767 option, and `foxglove_bridge:=false` leaves it out. The launch file also starts `foxglove_bridge` (`ros-jazzy-foxglove-bridge`, added to the image) as node `room_memory_bridge`. Its launch arguments are `foxglove_bridge` (default `true`), `foxglove_port` (8767), `foxglove_address` (`0.0.0.0`) and `foxglove_client_publish` (`false`). Its parameters:
 - `topic_whitelist` `['^/room_memory/.*']`: the raw clouds are never relayed;

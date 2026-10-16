@@ -105,7 +105,7 @@ Topic names are a proposal for PR 2.4 (D18):
   - `map_bricks` and `events`: the Mac gets the map and the recent events by `RequestSync` (§5).
   - The sync topics, `sync/end` included: an answer is for the requests outstanding when it is sent, not for a later subscriber.
   - `request_sync` and `operator`: a restarted node must not receive a stored request or action again. A replayed `OperatorAction` would act twice.
-- **The nodes match this only for `activity`.** The Python node (`spark/room_memory`) and the C++ node (`spark/room_memory_cpp`) declare `activity` transient_local (PR #14). They publish `status` volatile, leave every other topic at the ROS 2 default (volatile) without declaring it, and have no `epoch` topic. The change is planned in `docs/phase3-live-integration.md` §2.5.
+- **The nodes match this.** The Python node (`spark/room_memory`) and the C++ node (`spark/room_memory_cpp`) declare every topic's durability: `status` and `activity` transient_local with depth 1, the others volatile (`docs/phase3-live-integration.md` §2.5). Neither publishes `epoch` yet: its counts are of CONFIRMED events (D13), nothing reaches CONFIRMED before PR 2.3, and cumulative counts "since the room was created" also need saving across restarts. The topic's QoS above is the rule for when it is published.
 - In ROS 2 a volatile subscriber still receives from a transient_local publisher. A transient_local subscriber receives nothing from a volatile one.
 
 **Transport (D28, open: Q5).** Two options are on the table, and Trevor has not chosen. Both carry the same CDR bytes, and the node answers whatever arrives on `/room_memory/request_sync`, so the protocol does not depend on the choice.
@@ -788,7 +788,8 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **D24. Durability** (PR #13; Phase 3's P2). It needs Trevor's and Codex's review.
   - `status`, `activity` and `epoch` are transient_local with depth 1, so a Mac shows the memory state as soon as it subscribes. Without it, the Mac would wait up to 1 s for `status` and `activity` and 5 s for `epoch`.
   - Every other topic is volatile, and says so explicitly (§2).
-  - The nodes match it only for `activity` (PR #14): both publish `status` volatile. `docs/phase3-live-integration.md` §2.5 plans the change.
+  - **The nodes now match it** (protocol-v2 follow-up; PR #14 had done `activity` only). The code was changed, not this decision, because nothing argued for volatile `status` any more: a stored copy is safe now that `status` carries the publisher generation (D34), the mirror already treats a `seq` not above the held one as a transient_local copy (§5.3), and `activity` had used the same QoS through the same bridge since PR #14. A Mac that subscribes gets the memory state at once instead of up to 1 s later.
+  - `epoch` is the exception: no node publishes it yet (§2), so it has no durability to get wrong. Its row in §2 stands for when PR 2.4 adds it.
 - **D25. `OperatorAction`** (PR #13; Phase 3's P6). It needs Trevor's and Codex's review. §3.6 defines it, with `ros/labcommand_msgs/msg/OperatorAction.msg`.
   - The actions asked for (acknowledge, dismiss, re-baseline, label) and Phase 3's earlier list map onto the existing transitions. Acknowledge and label are log-only. Dismiss is §4.2's "operator revert". Re-baseline is §4.1's "operator re-references the room". Pause and resume are §4.1's operator pause and resume. Accept is §4.2's "operator accept". Mark ground truth is for PR 3.2's scoring.
   - The common fields serve as the header, not `std_msgs/Header` (D2).
@@ -839,7 +840,7 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **`colcon build` of `labcommand_msgs`: not run.** There is no ROS 2 on the Mac.
 - **`OperatorAction` (§3.6, D25): the `.msg` only.** There is no Swift codec and no hand golden yet. The 117 B wire size was computed by hand from §1.1, not encoded. Codecs and goldens are Phase 3 stage S5.
 - **Protocol v2 (D34–D38): implemented** in the Python oracle, the C++ node and the Swift codec and mirror. The Python, C++ and Swift codecs decode every v2 golden and reproduce the little-endian ones. The differential tests compare Python and C++ byte for byte, `SyncEnd`s included, on every §5.2 answer case, a session across two generations, and the legacy `RequestSync` answer. The ROS node wiring (`node.py`, `room_memory_node.cpp`) needs ROS 2 and was not run on the Mac.
-- **The Spark side of §5 is implemented** in `spark/room_memory_cpp` (the node) and in the Python oracle `spark/room_memory`. Not implemented: `status` and `epoch` as transient_local (D24); `docs/phase3-live-integration.md` plans it. The bridge's client-publish path has not been tried against a live bridge, and the Mac has no request path in the deployed setup (§5.3).
+- **The Spark side of §5 is implemented** in `spark/room_memory_cpp` (the node) and in the Python oracle `spark/room_memory`. Both nodes declare D24's durability on every topic; the rclpy test for it (`test_node.py`) and the C++ node need ROS 2 and were not run on the Mac. Not implemented: the `epoch` topic (§2). The bridge's client-publish path has not been tried against a live bridge, and the Mac has no request path in the deployed setup (§5.3).
 
 ## 10. Open questions for Trevor (brief §5, Q1–Q4, and Q5)
 

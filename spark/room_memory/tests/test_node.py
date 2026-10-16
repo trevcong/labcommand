@@ -89,6 +89,31 @@ def test_activity_reaches_a_late_transient_local_subscriber(node):
     assert [Activity.from_cdr(data).header.seq for data in received] == [0]
 
 
+def test_status_reaches_a_late_transient_local_subscriber(node):
+    node._publish_status()
+    received = []
+    node.create_subscription(
+        MemoryStatusMsg, STATUS_TOPIC, received.append,
+        QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        raw=True,
+    )
+    for _ in range(50):
+        rclpy.spin_once(node, timeout_sec=0.1)
+        if received:
+            break
+    statuses = [MemoryStatus.from_cdr(data) for data in received]
+    assert [(s.header.seq, s.publisher_generation) for s in statuses] == [(0, node.generation.generation)]
+
+
+def test_publishers_declare_durability(node):
+    transient = {STATUS_TOPIC, ACTIVITY_TOPIC}
+    for publisher in node.publishers:
+        if not publisher.topic_name.startswith("/room_memory/"):
+            continue
+        want = DurabilityPolicy.TRANSIENT_LOCAL if publisher.topic_name in transient else DurabilityPolicy.VOLATILE
+        assert publisher.qos_profile.durability == want, publisher.topic_name
+
+
 def test_status_reports_the_last_published_event_seq(node, monkeypatch):
     events = [replace(appeared_event(), header=Header("lab", 0, seq, T10)) for seq in (0, 1)]
 

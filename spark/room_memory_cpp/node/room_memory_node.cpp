@@ -122,18 +122,22 @@ public:
         }
         memory_ = std::make_unique<RoomMemory>(config, stamp(), generation_->generation());
 
-        events_ = create_generic_publisher(kEventsTopic, kEventType, rclcpp::QoS(100).reliable());
-        status_ = create_generic_publisher(kStatusTopic, "labcommand_msgs/msg/MemoryStatus", rclcpp::QoS(1).reliable());
-        // Activity is full state at 1 Hz, so a late subscriber gets the last one at once; a copy delivered
-        // again repeats its seq (protocol §2). Same QoS as node.py.
-        activity_ = create_generic_publisher(
-            kActivityTopic, "labcommand_msgs/msg/Activity", rclcpp::QoS(1).reliable().transient_local());
-        map_ = create_generic_publisher(kMapTopic, kMapType, rclcpp::QoS(10).reliable());
-        sync_map_ = create_generic_publisher(kSyncMapTopic, kMapType, rclcpp::QoS(10).reliable());
-        sync_events_ = create_generic_publisher(kSyncEventsTopic, kEventType, rclcpp::QoS(200).reliable());
-        sync_end_ = create_generic_publisher(kSyncEndTopic, "labcommand_msgs/msg/SyncEnd", rclcpp::QoS(10).reliable());
+        // Durability is declared on every topic (protocol §2, D24). Status and activity are full state at
+        // 1 Hz, so a late subscriber (the bridge, when the first Mac subscribes) gets the last one at once;
+        // a copy delivered again repeats its seq in its generation. Everything else is volatile: the Mac
+        // gets the map and recent events by RequestSync, and a restarted node never receives an old
+        // request. Same QoS as node.py.
+        const auto volatile_qos = [](std::size_t depth) { return rclcpp::QoS(depth).reliable().durability_volatile(); };
+        const auto latched_qos = [] { return rclcpp::QoS(1).reliable().transient_local(); };
+        events_ = create_generic_publisher(kEventsTopic, kEventType, volatile_qos(100));
+        status_ = create_generic_publisher(kStatusTopic, "labcommand_msgs/msg/MemoryStatus", latched_qos());
+        activity_ = create_generic_publisher(kActivityTopic, "labcommand_msgs/msg/Activity", latched_qos());
+        map_ = create_generic_publisher(kMapTopic, kMapType, volatile_qos(10));
+        sync_map_ = create_generic_publisher(kSyncMapTopic, kMapType, volatile_qos(10));
+        sync_events_ = create_generic_publisher(kSyncEventsTopic, kEventType, volatile_qos(200));
+        sync_end_ = create_generic_publisher(kSyncEndTopic, "labcommand_msgs/msg/SyncEnd", volatile_qos(10));
         requests_ = create_generic_subscription(
-            kRequestTopic, "labcommand_msgs/msg/RequestSync", rclcpp::QoS(10).reliable(),
+            kRequestTopic, "labcommand_msgs/msg/RequestSync", volatile_qos(10),
             [this](std::shared_ptr<const rclcpp::SerializedMessage> message) { answer(*message); });
         for (const std::string& name : memory_->config().sensors) {
             const room_memory::Sensor& sensor = memory_->channel(name).sensor;
