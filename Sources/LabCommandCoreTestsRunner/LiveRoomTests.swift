@@ -672,6 +672,63 @@ func testLiveRoomGenerationsAndPartialHistory() {
     expect(bad.mapState == .current, "the manifest says nothing newer than 10 exists: current again")
 }
 
+/// Codex round 1: an old "no map yet" never suppresses a map request after newer evidence; an
+/// eviction never lets an older transition reopen a closed event.
+func testLiveRoomEmptyMapAndEviction() {
+    func building(epoch: UInt64, seq: UInt64) -> Data { LRWire.status(g1, seq: seq, epoch: epoch, eventsSeq: nil, state: .building) }
+    func tracking(epoch: UInt64, seq: UInt64) -> Data { LRWire.status(g1, seq: seq, epoch: epoch, eventsSeq: nil, state: .tracking) }
+    func emptyMap(_ asked: R.RequestSync?, epoch: UInt64) -> Data {
+        LRWire.syncEnd(g1, topic: .mapBricks, token: asked?.token ?? .zero, bound: nil, epoch: epoch)
+    }
+
+    // BUILDING, the SyncEnd says no map; the first snapshot is missed and the status moves on.
+    var missed = Mirror(roomId: "lab", tokenSeed: 4)
+    _ = missed.connectionOpened(at: 0, canRequest: true)
+    let first = request(missed.receive(topic: .status, payload: building(epoch: 1, seq: 0), at: 0), .mapBricks, "building")
+    expect(first?.since == nil, "no chain while BUILDING: map requested")
+    _ = missed.receive(topic: .syncEnd, payload: emptyMap(first, epoch: 1), at: 0.1)
+    expect(missed.retrievalStatus(.mapBricks) == .idle && request(missed.tick(at: 10), .mapBricks, "empty") == nil,
+           "a SyncEnd with no map: nothing more to ask")
+    expect(request(missed.receive(topic: .status, payload: building(epoch: 1, seq: 1), at: 11), .mapBricks, "still building") == nil,
+           "a later BUILDING status on the same epoch keeps the suppression")
+    let degraded = LRWire.status(g1, seq: 2, epoch: 1, eventsSeq: nil, state: .degraded)
+    expect(request(missed.receive(topic: .status, payload: degraded, at: 15), .mapBricks, "degraded") == nil,
+           "DEGRADED on the same epoch (a sensor lost while BUILDING) keeps the suppression")
+    let after = request(missed.receive(topic: .status, payload: tracking(epoch: 2, seq: 3), at: 20), .mapBricks, "tracking")
+    expect(after != nil, "a status past BUILDING with no snapshot held requests the map")
+    var epochOnly = Mirror(roomId: "lab", tokenSeed: 4)
+    _ = epochOnly.connectionOpened(at: 0, canRequest: true)
+    let asked = request(epochOnly.receive(topic: .status, payload: building(epoch: 1, seq: 0), at: 0), .mapBricks, "epoch only")
+    _ = epochOnly.receive(topic: .syncEnd, payload: emptyMap(asked, epoch: 1), at: 0.1)
+    expect(request(epochOnly.receive(topic: .status, payload: building(epoch: 3, seq: 1), at: 20), .mapBricks, "new epoch") != nil,
+           "a BUILDING status on another epoch (re-referenced while unseen) requests the map")
+
+    // A reconnect: the map may have been published while away, so the old answer no longer holds.
+    var away = Mirror(roomId: "lab", tokenSeed: 4)
+    _ = away.connectionOpened(at: 0, canRequest: true)
+    let before = request(away.receive(topic: .status, payload: building(epoch: 1, seq: 0), at: 0), .mapBricks, "before")
+    _ = away.receive(topic: .syncEnd, payload: emptyMap(before, epoch: 1), at: 0.1)
+    away.connectionClosed(at: 10)
+    _ = away.connectionOpened(at: 20, canRequest: true)
+    let again = request(away.receive(topic: .status, payload: building(epoch: 1, seq: 1), at: 21), .mapBricks, "reconnect")
+    expect(again != nil, "after a reconnect the map is asked for again")
+    _ = away.receive(topic: .syncEnd, payload: emptyMap(again, epoch: 1), at: 21.1)
+    expect(request(away.tick(at: 40), .mapBricks, "reconnect answered") == nil, "and a fresh empty answer suppresses again")
+
+    // latest holds one event: A ACCEPTED@1, B ACCEPTED@2 evicts A, then A's CANDIDATE@0 replays late.
+    var evicting = Mirror(roomId: "lab", limits: Mirror.Limits(latest: 1), tokenSeed: 4)
+    _ = evicting.connectionOpened(at: 0, canRequest: false)
+    _ = evicting.receive(topic: .events, payload: event(id: 1, seq: 1, state: .accepted), at: 1)
+    _ = evicting.receive(topic: .events, payload: event(id: 2, seq: 2, state: .accepted), at: 2)
+    _ = evicting.receive(topic: .syncEvents, payload: event(id: 1, seq: 0, state: .candidate), at: 3)
+    expect(evicting.openEvents.isEmpty && evicting.eventsById[1] == nil, "an evicted accepted event is not reopened by its older candidate")
+    _ = evicting.receive(topic: .syncEvents, payload: event(id: 1, seq: 1, state: .accepted), at: 4)
+    expect(evicting.openEvents.isEmpty, "the accepted replay is a duplicate and A stays closed")
+    expect(evicting.eventHistory.coverage == .completeThrough(2), "coverage still counts the late seq 0")
+    _ = evicting.receive(topic: .events, payload: event(id: 3, seq: 3, state: .candidate), at: 5)
+    expect(evicting.openEvents.map(\.event.eventId) == [3], "a newer event still enters latest")
+}
+
 func runLiveRoomTests() {
     testLiveRoomFoxgloveClientFrames()
     print("  LiveRoom: serverInfo capabilities, client advertise + message data, topic/schema match (sync/end in, events_fallback out)"); passed()
@@ -695,6 +752,8 @@ func runLiveRoomTests() {
     print("  LiveRoom: replayed snapshot behind live, events fallback lost ranges, timeouts never lose a seq, empty SyncEnd witness"); passed()
     testLiveRoomGenerationsAndPartialHistory()
     print("  LiveRoom: generations install on the first message, archive the old run, ignore older ones; unreadable map → resync"); passed()
+    testLiveRoomEmptyMapAndEviction()
+    print("  LiveRoom: an empty-map answer yields to a later status or reconnect; eviction never reopens a closed event"); passed()
     runLiveRoomTraceTests()
 }
 

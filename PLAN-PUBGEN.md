@@ -273,7 +273,7 @@ Validation (decode, `room_id`, D16 rules) comes first. A rejected message change
 | any v2 message | `m < highestGeneration` | ignore, count `olderGeneration`. Never reactivates an archive |
 | status of `active.g` | `seq > status.seq` | replace the status; H ← max(H, `events_seq` witness); `connection → observing(g)` if it arrived on this connection; D20 epoch-mismatch counting; then schedule retrieval |
 | status of `active.g` | `seq ≤ status.seq` | duplicate or delayed copy: ignore, count. **Never** a generation signal |
-| event of `active.g` (live or sync, any answer) | seq ∉ C | C ∪= {seq}; digest; `latest[eventID]` replaced only if `seq >` the held seq; append to log |
+| event of `active.g` (live or sync, any answer) | seq ∉ C | C ∪= {seq}; digest; `latest[eventID]` replaced only if `seq >` the held seq (an event not held only if `seq >` the highest seq evicted from `latest`); append to log |
 | event of `active.g` | seq ∈ C, same digest | duplicate: count |
 | event of `active.g` | seq ∈ C, different digest | contract violation: count and log, keep the first. Never a restart signal |
 | snapshot of `active.g` (live or sync) | chain none, or `seq ≥ appliedSeq` | replace bricks, epoch and appliedSeq |
@@ -313,6 +313,7 @@ Validation (decode, `room_id`, D16 rules) comes first. A rejected message change
 10. **Order independence (events only).** Two delivery orders of the same set of same-generation messages produce the same C, U, H and `latest`. The map chain is order-dependent by design (delta@6 before snapshot@5 is rejected; after it, it applies), so map convergence is covered by the liveness property, not by this one.
 11. **Eviction only lowers certainty.**
     - Limits (log 1000, `latest` 10,000, digest 10,000, C intervals 1,000) may drop display entries.
+    - An event evicted from `latest` is not re-entered by a transition at or below the highest evicted seq, so an older transition never reopens a closed event.
     - If C would exceed its interval cap, the generation is marked overflowed and coverage reads `unknown` from then on. It can never become more complete.
 12. **Continuity.**
     - `broken(since: g_old)` once the mirror has archived a generation in which it observed anything.

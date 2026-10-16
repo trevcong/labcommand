@@ -257,6 +257,13 @@ private struct TraceWorld {
             default: break
             }
             if history.caughtUp, !oracle.caughtUp(at: now) { return "evicting: caughtUp without the oracle" }
+            // An entry may be evicted, never older than the highest transition received for its event.
+            let latest = oracle.latest
+            for (id, held) in mirror.eventsById {
+                guard let expected = latest[id], held.seq == expected.seq, held.event.state == expected.state else {
+                    return "evicting: event \(id) held at (\(held.seq), \(held.event.state)), oracle \(String(describing: latest[id]))"
+                }
+            }
         } else {
             if history.coverage != oracle.coverage { return "coverage \(history.coverage), oracle \(oracle.coverage)" }
             if history.caughtUp != oracle.caughtUp(at: now) { return "caughtUp \(history.caughtUp), oracle \(oracle.caughtUp(at: now))" }

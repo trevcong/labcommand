@@ -75,8 +75,10 @@ struct GenerationState: Sendable, Equatable {
     var statusEpochMismatches = 0
     /// A map retrieval completed during the current mismatch run: a request cannot fix it.
     var mismatchRetrieved = false
-    /// A `SyncEnd` said the generation has published no map yet.
-    var mapKnownEmpty = false
+    /// A `SyncEnd` said the generation had published no map yet, at this `map_epoch`. Only
+    /// suppresses requests while nothing newer suggests a map: a status holding a reference or on
+    /// another epoch, a map seq, or a reconnect clears it.
+    var mapKnownEmptyAtEpoch: UInt64?
 
     // Events
     /// C: the seqs actually received, live or sync, from any Mac's answer.
@@ -87,6 +89,9 @@ struct GenerationState: Sendable, Equatable {
     var unavailable = IntervalSet()
     /// The highest-seq transition received per event.
     var latest: [UInt64: LiveRoomEvent] = [:]
+    /// The highest seq of an entry evicted from `latest`. An event not in `latest` is not
+    /// re-entered at or below it: its evicted transition may have been newer (§4.4 invariant 11).
+    var latestEvictedThrough: UInt64?
     /// What each received seq carried; bounded, lowest seqs dropped first.
     var digest: [UInt64: Transition] = [:]
     /// Display ring, oldest first.
@@ -147,12 +152,14 @@ struct GenerationState: Sendable, Equatable {
         if log.count > limits.eventLog {
             log.removeFirst(log.count - limits.eventLog)
         }
-        if latest[message.eventId].map({ $0.seq < seq }) ?? true {
+        let newer = latest[message.eventId].map { $0.seq < seq } ?? latestEvictedThrough.map { $0 < seq } ?? true
+        if newer {
             latest[message.eventId] = entry
             if latest.count > limits.latest {
                 let terminal = latest.values.filter { !$0.isOpen }
                 if let oldest = (terminal.isEmpty ? Array(latest.values) : terminal).min(by: { $0.seq < $1.seq }) {
                     latest[oldest.event.eventId] = nil
+                    latestEvictedThrough = Swift.max(latestEvictedThrough ?? oldest.seq, oldest.seq)
                 }
             }
         }
@@ -174,7 +181,17 @@ struct GenerationState: Sendable, Equatable {
 
     mutating func noteMapSeq(_ seq: UInt64) {
         highestMapSeq = Swift.max(highestMapSeq ?? seq, seq)
-        mapKnownEmpty = false
+        mapKnownEmptyAtEpoch = nil
+    }
+
+    /// A status of this generation: holding a reference (TRACKING, RIG_MOVED) or on another
+    /// epoch, a map may exist now. DEGRADED and PAUSED are entered from BUILDING too, and leaving
+    /// BUILDING bumps the epoch, so they count only through the epoch.
+    mutating func noteMapAvailability(_ status: RoomMemory.MemoryStatus) {
+        guard let epoch = mapKnownEmptyAtEpoch else { return }
+        if status.state == .tracking || status.state == .rigMoved || status.header.mapEpoch != epoch {
+            mapKnownEmptyAtEpoch = nil
+        }
     }
 
     /// Applies a snapshot or delta of this generation to the chain.
@@ -238,7 +255,7 @@ struct GenerationState: Sendable, Equatable {
         if mapRejected { return true }
         guard let chain else {
             // Nothing held: ask, unless the publisher said it has no map yet and nothing came since.
-            return !(mapKnownEmpty && highestMapSeq == nil)
+            return !(mapKnownEmptyAtEpoch != nil && highestMapSeq == nil)
         }
         if let high = highestMapSeq, chain.appliedSeq < high { return true }
         return statusEpochMismatches >= 2 && !mismatchRetrieved

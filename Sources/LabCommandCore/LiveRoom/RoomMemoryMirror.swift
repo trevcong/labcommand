@@ -351,6 +351,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         connection = .awaitingStatus(connection: connectionCounter)
         wire = .undetermined
         self.canRequest = canRequest
+        // A map may have been published while away: ask again rather than trust an old "no map yet".
+        active?.mapKnownEmptyAtEpoch = nil
         resetRetrievals()
         refreshFreshness()
         return flushRequests()
@@ -636,6 +638,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         state.observed = true
         if let generation = state.generation {
             state.witness = state.witness.merged(message.eventsSeq.map(EventsWitness.through) ?? .empty)
+            state.noteMapAvailability(message)
             connection = .observing(connection: id, generation: generation)
         }
         // D20: a lost trailing delta shows as the status epoch disagreeing twice in a row.
@@ -666,7 +669,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             if let bound = end.bound {
                 state.noteMapSeq(bound)
             } else if state.highestMapSeq == nil {
-                state.mapKnownEmpty = true
+                state.mapKnownEmptyAtEpoch = end.header.mapEpoch
             }
         }
         state.observed = true
