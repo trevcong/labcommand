@@ -97,20 +97,38 @@ set_tests_properties(static_longrun static_longrun_b PROPERTIES
   RESOURCE_LOCK static_recording_memory
   ENVIRONMENT "OMP_NUM_THREADS=${HOST_CORES}")
 
-# Differential tests against the Python oracle (pytest), when a Python with numpy is given.
-if(ROOM_MEMORY_PYTHON)
-  foreach(threads 1 ${HOST_CORES})
-    add_test(NAME differential_omp${threads}
-             COMMAND ${ROOM_MEMORY_PYTHON} -m pytest -q -p no:cacheprovider ${CMAKE_CURRENT_SOURCE_DIR}/differential)
-    set_tests_properties(differential_omp${threads} PROPERTIES
-      ENVIRONMENT "OMP_NUM_THREADS=${threads};ROOM_MEMORY_PYTHON_PACKAGE=${ROOM_MEMORY_PYTHON_PACKAGE};ROOM_MEMORY_OFFLINE=$<TARGET_FILE:room_memory_offline>;ROOM_MEMORY_REPLAY=$<TARGET_FILE:room_memory_replay>;ROOM_MEMORY_SNAPSHOTS=${ROOM_MEMORY_SNAPSHOTS};ROOM_MEMORY_PHASE0_FIXTURES=${ROOM_MEMORY_PHASE0_FIXTURES}"
-      TIMEOUT 1800)
+# Differential tests against the Python oracle (pytest), and the real static recording, when a
+# Python with numpy and pytest is given. They are registered either way: without one, each reports
+# itself skipped with the reason, so a run lists every test and never silently fewer.
+set(DIFFERENTIAL_THREADS 1 ${HOST_CORES})
+list(REMOVE_DUPLICATES DIFFERENTIAL_THREADS)
+set(PYTHON_TESTS)
+foreach(threads IN LISTS DIFFERENTIAL_THREADS)
+  list(APPEND PYTHON_TESTS differential_omp${threads})
+endforeach()
+list(APPEND PYTHON_TESTS static_recording)
+if(NOT ROOM_MEMORY_PYTHON)
+  foreach(name IN LISTS PYTHON_TESTS)
+    add_test(NAME ${name} COMMAND ${CMAKE_COMMAND} -E echo
+             "SKIPPED: ROOM_MEMORY_PYTHON is empty (configure with -DROOM_MEMORY_PYTHON=<a Python with numpy and pytest>)")
+    set_tests_properties(${name} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: ROOM_MEMORY_PYTHON is empty")
   endforeach()
-  # The real static recording (not in git; skipped with the reason printed when absent). Its tools
-  # import the oracle's decoder, from wherever the oracle is (/oracle/room_memory in the image).
-  add_test(NAME static_recording
-           COMMAND ${ROOM_MEMORY_PYTHON} -m pytest -q -rs -p no:cacheprovider ${CMAKE_CURRENT_SOURCE_DIR}/recording)
-  set_tests_properties(static_recording PROPERTIES
-    ENVIRONMENT "ROOM_MEMORY_BAG=$<TARGET_FILE:room_memory_bag>;ROOM_MEMORY_PYTHON_PACKAGE=${ROOM_MEMORY_PYTHON_PACKAGE};PYTHONPATH=${ROOM_MEMORY_PYTHON_PACKAGE}"
-    TIMEOUT 3600)
+  return()
 endif()
+foreach(threads IN LISTS DIFFERENTIAL_THREADS)
+  add_test(NAME differential_omp${threads}
+           COMMAND ${ROOM_MEMORY_PYTHON} -m pytest -q -p no:cacheprovider ${CMAKE_CURRENT_SOURCE_DIR}/differential)
+  set_tests_properties(differential_omp${threads} PROPERTIES
+    ENVIRONMENT "OMP_NUM_THREADS=${threads};ROOM_MEMORY_PYTHON_PACKAGE=${ROOM_MEMORY_PYTHON_PACKAGE};ROOM_MEMORY_OFFLINE=$<TARGET_FILE:room_memory_offline>;ROOM_MEMORY_REPLAY=$<TARGET_FILE:room_memory_replay>;ROOM_MEMORY_SNAPSHOTS=${ROOM_MEMORY_SNAPSHOTS};ROOM_MEMORY_PHASE0_FIXTURES=${ROOM_MEMORY_PHASE0_FIXTURES}"
+    TIMEOUT 1800)
+endforeach()
+# The real static recording (not in git; skipped with the reason printed when absent). Its tools
+# import the oracle's decoder, from wherever the oracle is (/oracle/room_memory in the image).
+# pytest exits 0 when every test skipped; its summary then has no "passed", and ctest reports the
+# test skipped instead of passed.
+add_test(NAME static_recording
+         COMMAND ${ROOM_MEMORY_PYTHON} -m pytest -q -rs -p no:cacheprovider ${CMAKE_CURRENT_SOURCE_DIR}/recording)
+set_tests_properties(static_recording PROPERTIES
+  ENVIRONMENT "ROOM_MEMORY_BAG=$<TARGET_FILE:room_memory_bag>;ROOM_MEMORY_PYTHON_PACKAGE=${ROOM_MEMORY_PYTHON_PACKAGE};PYTHONPATH=${ROOM_MEMORY_PYTHON_PACKAGE}"
+  SKIP_REGULAR_EXPRESSION "(^|\n)[0-9]+ skipped( in |, [0-9]+ warnings? in )"
+  TIMEOUT 3600)

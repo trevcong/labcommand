@@ -30,7 +30,7 @@ The core is plain C++20 with no ROS dependency. `CMakeLists.txt` builds core, CL
 # Mac (brew install cmake libomp; CXX=g++-16 for the GCC/libgomp build)
 cmake -S spark/room_memory_cpp -B build/room_memory_cpp -DCMAKE_BUILD_TYPE=Release
 cmake --build build/room_memory_cpp
-ctest --test-dir build/room_memory_cpp          # 16 entries; the differential ones use spark/.venv-local
+ctest --test-dir build/room_memory_cpp          # 19 entries at 18 cores; the Python ones use spark/.venv-local
 CHANGE_DETECT=$PWD/.build/release/change-detect ctest --test-dir build/room_memory_cpp -R differential  # + Swift
 spark/.venv-local/bin/python spark/room_memory_cpp/bench/dump_frames.py /tmp/frames
 OMP_NUM_THREADS=1 build/room_memory_cpp/bench_memory /tmp/frames [--full-diff]
@@ -40,7 +40,7 @@ spark/.venv-local/bin/python spark/room_memory_cpp/tools/bag_stream.py ~/Develop
     [--inject mid360:appear:180:-2.2,1.4,0.0:0.3] | build/room_memory_cpp/room_memory_bag [key=value ...]
 ```
 
-`-DROOM_MEMORY_PYTHON=` (empty) skips the differential tests, `-DROOM_MEMORY_SIMD=OFF` builds the portable lane code, `-DROOM_MEMORY_APPLE_LZFSE=OFF` drops the Apple LZFSE decoder. On the Spark: `docker build -f spark/room_memory_cpp/Dockerfile .` from the repository root.
+`-DROOM_MEMORY_PYTHON=<python>` picks the Python for the two differential runs and `static_recording` (default `spark/.venv-local/bin/python` when it exists; a git worktree has none, so pass it). Empty, the three stay registered and report *Skipped* with the reason, and `static_recording` also reports *Skipped* when every recording test skipped (no recording on this machine). `-DROOM_MEMORY_SIMD=OFF` builds the portable lane code, `-DROOM_MEMORY_APPLE_LZFSE=OFF` drops the Apple LZFSE decoder. On the Spark: `docker build -f spark/room_memory_cpp/Dockerfile .` from the repository root.
 
 ## Parity rules (what makes the bytes identical)
 
