@@ -168,6 +168,7 @@ struct CommandCenterView: View {
             switch state.dest {
             case .workspace: rigWorkspace
             case .settings: SettingsView()
+            case .liveRoom: LiveRoomPage()
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

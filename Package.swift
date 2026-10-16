@@ -12,7 +12,8 @@ let package = Package(
     targets: [
         .target(
             name: "LabCommandCore",
-            path: "Sources/LabCommandCore"
+            path: "Sources/LabCommandCore",
+            exclude: ["LiveRoom/API.md"]
         ),
         .executableTarget(
             name: "LabCommand",

@@ -41,6 +41,14 @@ if [[ -d "${ROOT}/fixtures/api" ]]; then
   cp -R "${ROOT}/fixtures/api" "${APP}/Contents/Resources/fixtures/api"
 fi
 
+# Hand goldens for the offline Room fixture. The gate stays --no-install.
+HAND="${ROOT}/Tests/Fixtures/room/golden/hand"
+if [[ -d "${HAND}" ]]; then
+  echo "==> Copying room-memory hand goldens to app bundle"
+  mkdir -p "${APP}/Contents/Resources/fixtures/room/golden/hand"
+  cp -f "${HAND}/"*.hex "${APP}/Contents/Resources/fixtures/room/golden/hand/"
+fi
+
 # Copy sample PCD for 3D canvas (just the small one for testing)
 if [[ -f "${ROOT}/fixtures/pointclouds/mid360-frame.pcd" ]]; then
   echo "==> Copying sample PCD to app bundle"
