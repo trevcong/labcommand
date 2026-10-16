@@ -1418,6 +1418,8 @@ class RoomMemory:
                 channel.silent_since = now
             if channel.mode == "stale" and channel.available:
                 self._channel_moved(channel, stamp, events)  # moved while it was silent
+                if self._moved_since is None:  # the others re-aligned while it was silent
+                    self._moved_since = now
             elif channel.mode == "moved" and not channel.available:
                 channel.mode, channel.estimates = "stale", []
                 self._rig_dirty = True
@@ -1506,8 +1508,9 @@ class RoomMemory:
         tilted = (imu_ok and self._gravity is not None and self._g_base is not None
                   and rig.angle_between_deg(self._gravity, self._g_base) >= max(config.tilt_trigger_deg, config.move_min_deg))
         self._tilt_run = self._tilt_run + 1 if tilted else 0
-        mismatch = all(c.baseline is not None and (c.last_estimate is None or c.last_estimate.inlier_frac
-                                                   < config.gross_inlier_ratio * c.baseline) for c in available)
+        # Measured low overlap only: a window without an estimate is a rejection, never evidence.
+        mismatch = all(c.baseline is not None and c.last_estimate is not None
+                       and c.last_estimate.inlier_frac < config.gross_inlier_ratio * c.baseline for c in available)
         self._gross_run = self._gross_run + 1 if mismatch else 0
         k = config.align_stable_windows
         if (moved or self._tilt_run >= k or (self._gross_run >= 2 and not self._watched)):

@@ -392,6 +392,51 @@ def test_an_imu_shock_alone_checks_and_stays_in_place():
     assert memory.channels["mid360"].pose.is_identity
 
 
+def test_a_sensor_silent_through_a_realignment_realigns_when_it_returns():
+    """Astra's repro: the JT128 is silent while the Mid-360 realigns, then returns to a moved rig."""
+    memory = guarded(sensors=("mid360", "jt128"))
+    truth = rooms.rig(0.10, yaw_deg=2.0)
+    states = []
+
+    def step(second, pose, sensors):
+        for name in sensors:
+            memory.add_points(name, rooms.scan(pose, seed=second))
+        events = memory.close_window(Time(second, 0))
+        memory.rig_pose(Time(second, 0))
+        states.append(memory.status(Time(second, 0), 1.0).state)
+        return events
+
+    events = [step(s, rooms.Pose(), ("mid360", "jt128")) for s in range(1, REFERENCE_WINDOWS + 3)]
+    events += [step(s, truth, ("mid360",)) for s in range(REFERENCE_WINDOWS + 3, REFERENCE_WINDOWS + 23)]
+    assert memory.channels["mid360"].mode == "normal" and memory.channels["jt128"].mode == "stale"
+    events += [step(s, truth, ("mid360", "jt128")) for s in range(REFERENCE_WINDOWS + 23, REFERENCE_WINDOWS + 43)]
+    assert not [event for window in events for event in window]
+    assert MemoryState.RIG_MOVED in states and states[-1] == MemoryState.TRACKING
+    for name in ("mid360", "jt128"):
+        assert memory.channels[name].mode == "normal"
+        error_m, error_deg = rooms.pose_error(memory.channels[name].pose, truth)
+        assert error_m <= 0.005 and error_deg <= 0.05
+
+
+def test_too_few_points_to_register_is_never_move_evidence():
+    """Astra's repro: sparse windows, rejected for fewer than MIN_SOURCE_POINTS, after a baseline and
+    with no IMU, end checks INCONCLUSIVE; they never enter RIG_MOVED or relearn."""
+    memory = guarded()
+    drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 10), 1)
+    assert memory.channels["mid360"].baseline is not None
+    sparse = rooms.fan(rows=2, columns=8)
+    trace = []
+    for second in range(REFERENCE_WINDOWS + 11, REFERENCE_WINDOWS + 111):
+        memory.add_points("mid360", rooms.scan(directions=sparse, seed=second))
+        stamp = Time(second, 0)
+        events = memory.close_window(stamp)
+        trace.append(Window(second, events, memory.status(stamp, 1.0).state, memory.rig_pose(stamp)))
+    assert {window.state for window in trace} == {MemoryState.TRACKING}
+    assert RigOutcome.INCONCLUSIVE in outcomes(trace)
+    assert RigOutcome.MOVED not in outcomes(trace) and RigOutcome.RELEARNING not in outcomes(trace)
+    assert memory.channels["mid360"].pose.is_identity and memory.map_epoch == 1
+
+
 def test_the_rig_state_round_trips_and_a_restart_checks_the_pose(tmp_path):
     memory = guarded(tmp_path)
     truth = rooms.rig(0.10, yaw_deg=2.0)
