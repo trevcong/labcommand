@@ -1,6 +1,7 @@
 """CDR codecs for the ``labcommand_msgs`` room-memory messages, with no ROS imports.
 
-The contract is ``docs/ROOM-MEMORY-PROTOCOL.md`` (Phase 0 branch). Classic CDR (XCDR1):
+The contract is ``docs/ROOM-MEMORY-PROTOCOL.md`` (Phase 0 branch). ``RhythmMinute`` is the
+rhythm-log record from the v1 plan: the same CDR rules, with sensor code 1 or 2. Classic CDR (XCDR1):
 4-byte encapsulation header (``00 01`` little endian, ``00 00`` big endian), every primitive
 aligned to its own size counted from the byte after the header, strings as a ``uint32``
 length that includes the NUL, ``T[]`` as a ``uint32`` count, nested messages without

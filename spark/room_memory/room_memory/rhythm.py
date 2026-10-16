@@ -48,7 +48,6 @@ FLAG_LOST = 1 << 4
 
 SENSOR_CODE = {"mid360": SENSOR_MID360, "jt128": SENSOR_JT128}
 SENSOR_NAME = {SENSOR_MID360: "mid360", SENSOR_JT128: "jt128"}
-_HEADER = struct.Struct("<4sHHBBHffIH")
 _RECORD = struct.Struct("<IqQHHHHIIBBH")
 _REGION = struct.Struct("<hhhHH")
 _NAME = re.compile(r"^rhythm-(mid360|jt128)-(\d{8})(?:-(\d+))?\.rhy$")
@@ -255,13 +254,20 @@ def parse_record(data):
     if _crc(data[4:-4]) != struct.unpack_from("<I", data, len(data) - 4)[0]:
         return None
     fields = _RECORD.unpack_from(data, 0)
-    count = fields[12]
-    if 40 + count * REGION_BYTES != body:
+    # ``<IqQHHHHIIBBH`` is 12 fields. ``n_regions`` is the last one.
+    count = fields[11]
+    if fields[6] != 0 or 40 + count * REGION_BYTES != body:
         return None
     regions = []
     offset = ENVELOPE_BYTES
+    previous = None
     for _ in range(count):
-        regions.append(_REGION.unpack_from(data, offset))
+        region = _REGION.unpack_from(data, offset)
+        current = region[:3]
+        if region[3] == 0 or (previous is not None and current <= previous):
+            return None
+        previous = current
+        regions.append(region)
         offset += REGION_BYTES
     return {
         "minute": fields[1],
@@ -327,28 +333,60 @@ class _Table:
         self.hits = np.zeros(slots, dtype=np.uint32)
         self.sums = np.zeros(slots, dtype=np.uint64)
         self.count = 0
+        # Slot cache for a repeated cell list. Probing from Python is the callback cost;
+        # a steady room presents the same cells every window. Cleared with the table.
+        self._cached = 0
+        self._cix = np.empty(slots, dtype=np.int16)
+        self._ciy = np.empty(slots, dtype=np.int16)
+        self._ciz = np.empty(slots, dtype=np.int16)
+        self._cslot = np.empty(slots, dtype=np.int32)
 
     def clear(self):
         self.used.fill(0)
         self.count = 0
+        self._cached = 0
 
     def insert_window(self, ix, iy, iz, counts):
         """Insert in signed order. The first miss returns how many regions were not stored.
 
         A miss stops the window: later regions, including ones already in the table, are
-        counted and not updated.
+        counted and not updated. An identical cell list reuses the slots from the last
+        complete insert and does not probe again.
         """
         total = len(ix)
         if total == 0:
+            return 0
+        cached = self._cached
+        if (
+            total == cached
+            and np.array_equal(ix, self._cix[:cached])
+            and np.array_equal(iy, self._ciy[:cached])
+            and np.array_equal(iz, self._ciz[:cached])
+        ):
+            slots = self._cslot[:cached]
+            updated = self.hits[slots] + np.uint32(1)
+            np.minimum(updated, np.uint32(U16_MAX), out=updated)
+            self.hits[slots] = updated
+            self.sums[slots] += np.asarray(counts, dtype=np.uint64)
             return 0
         packed = ((ix.astype(np.int64) & 0xFFFF) << 32) | ((iy.astype(np.int64) & 0xFFFF) << 16) | (iz.astype(np.int64) & 0xFFFF)
         starts = np.asarray(splitmix64(packed), dtype=np.uint64) & np.uint64(self.mask)
         for n in range(total):
             slot = self._slot(int(ix[n]), int(iy[n]), int(iz[n]), int(starts[n]))
             if slot is None:
+                self._cached = 0
                 return total - n
+            if n < self.slots:
+                self._cslot[n] = slot
             self.hits[slot] = min(U16_MAX, int(self.hits[slot]) + 1)
             self.sums[slot] = np.uint64(int(self.sums[slot]) + int(counts[n]))
+        if total <= self.slots:
+            self._cix[:total] = ix
+            self._ciy[:total] = iy
+            self._ciz[:total] = iz
+            self._cached = total
+        else:
+            self._cached = 0
         return 0
 
     def _slot(self, ix, iy, iz, start):
@@ -377,17 +415,19 @@ class _Table:
         ix = self.ix[taken].astype(np.int32)
         iy = self.iy[taken].astype(np.int32)
         iz = self.iz[taken].astype(np.int32)
-        hits = self.hits[taken].astype(np.int64)
-        sums = self.sums[taken].astype(np.int64)
+        hits = self.hits[taken]
+        sums = self.sums[taken]
         keep = hits > 0
         if not np.any(keep):
             return ()
         ix, iy, iz, hits, sums = ix[keep], iy[keep], iz[keep], hits[keep], sums[keep]
         order = np.lexsort((iz, iy, ix))
-        means = (sums[order] + with_points // 2) // with_points
-        np.minimum(means, U16_MAX, out=means)
+        # uint64 sum. Casting through int64 would invert a sum above 2^63.
+        means = (sums[order] + np.uint64(with_points // 2)) // np.uint64(with_points)
+        np.minimum(means, np.uint64(U16_MAX), out=means)
+        ix, iy, iz, hits = ix[order], iy[order], iz[order], hits[order]
         return tuple(
-            (int(ix[order][n]), int(iy[order][n]), int(iz[order][n]), int(hits[order][n]), int(means[n]))
+            (int(ix[n]), int(iy[n]), int(iz[n]), int(hits[n]), int(means[n]))
             for n in range(len(order))
         )
 
@@ -530,8 +570,8 @@ class RhythmAccumulator:
         opened = state["bin"]
         if opened is None:
             return
-        state["bin"] = None
         if opened.closed + opened.unavailable == 0:
+            state["bin"] = None
             state["table"].clear()
             return
         flags = 0
@@ -544,19 +584,30 @@ class RhythmAccumulator:
         if opened.overflow or opened.regions_dropped:
             flags |= FLAG_OVERFLOW
         pose_ok = 0 if opened.with_points == 0 or opened.pose_bad else 1
+        # Build the record before dropping the bin. A failure leaves it for ``discard``.
         regions = state["table"].regions(opened.with_points)
-        state["table"].clear()
         data = encode_record(
             opened.minute, opened.map_epoch, opened.closed, opened.with_points, opened.unavailable,
             opened.clipped, opened.regions_dropped, pose_ok, flags, regions,
         )
+        state["bin"] = None
+        state["table"].clear()
         self.finished.append(Fragment(sensor, opened.minute, opened.map_epoch, flags, data))
 
     def _cells(self, keys):
+        """Group occupied voxel keys into region cells.
+
+        ``close_window`` passes a sorted unique run. Packed ``(i, j, k)`` order matches
+        ``floor`` of each lane, so that run is already grouped and is not sorted again.
+        An unsorted caller is sorted once. Clipped cells leave the run; the 4096 slots
+        are not grown here.
+        """
         keys = np.asarray(keys, dtype=np.int64).reshape(-1)
         if len(keys) == 0:
             empty = np.zeros(0, dtype=np.int16)
             return 0, empty, empty, empty, empty
+        if len(keys) > 1 and bool(np.any(keys[1:] < keys[:-1])):
+            keys = np.sort(keys)
         i, j, k = unpack(keys)
         vpc = np.int64(self.voxels)
         ix = np.floor_divide(i, vpc)
@@ -567,20 +618,27 @@ class RhythmAccumulator:
             & (iy >= INT16_MIN) & (iy <= INT16_MAX)
             & (iz >= INT16_MIN) & (iz <= INT16_MAX)
         )
-        clipped = int((~ok).sum())
-        ix, iy, iz = ix[ok], iy[ok], iz[ok]
+        clipped = int(np.count_nonzero(~ok))
+        if not bool(np.all(ok)):
+            ix, iy, iz = ix[ok], iy[ok], iz[ok]
         if len(ix) == 0:
             empty = np.zeros(0, dtype=np.int16)
             return clipped, empty, empty, empty, empty
-        order = np.lexsort((iz, iy, ix))
-        ix, iy, iz = ix[order], iy[order], iz[order]
+        if len(ix) == 1:
+            one = np.ones(1, dtype=np.int64)
+            return (
+                clipped, ix.astype(np.int16, copy=False), iy.astype(np.int16, copy=False),
+                iz.astype(np.int16, copy=False), one,
+            )
         change = np.empty(len(ix), dtype=bool)
         change[0] = True
-        if len(ix) > 1:
-            change[1:] = (ix[1:] != ix[:-1]) | (iy[1:] != iy[:-1]) | (iz[1:] != iz[:-1])
-        starts = np.nonzero(change)[0]
+        change[1:] = (ix[1:] != ix[:-1]) | (iy[1:] != iy[:-1]) | (iz[1:] != iz[:-1])
+        starts = np.flatnonzero(change)
         counts = np.diff(np.append(starts, len(ix)))
-        return clipped, ix[starts].astype(np.int16, copy=False), iy[starts].astype(np.int16, copy=False), iz[starts].astype(np.int16, copy=False), counts
+        return (
+            clipped, ix[starts].astype(np.int16, copy=False), iy[starts].astype(np.int16, copy=False),
+            iz[starts].astype(np.int16, copy=False), counts,
+        )
 
 
 # MARK: writer
@@ -643,7 +701,7 @@ class RhythmWriter:
         self._resume = {}
         self._force_disc = {name: False for name in config.sensors}
         self._last_minute = {name: None for name in config.sensors}
-        self._last_fsync = 0.0
+        self._last_fsync = time.monotonic()
         self._last_age_day = None
         self._shutting_down = False
         self._thread = None
@@ -687,8 +745,9 @@ class RhythmWriter:
     def close(self):
         """Flush is the caller's job. Drain, one sync, join at most 5 s. No prune."""
         self._shutting_down = True
-        self.gate.set()
+        # Stop before opening the gate, so a paused writer cannot age-prune on the way out.
         self._stop.set()
+        self.gate.set()
         self._wake.set()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
@@ -716,6 +775,7 @@ class RhythmWriter:
             self.directory.mkdir(parents=True, exist_ok=True)
             self._recover_open_files()
             self._age_prune()
+            self._last_age_day = time.strftime("%Y%m%d", time.gmtime())
         except OSError as error:
             self.io_errors += 1
             self._log_once(f"rhythm directory {self.directory} is unusable ({error}); detection will still start")
@@ -812,7 +872,7 @@ class RhythmWriter:
     def _run(self):
         try:
             while not self._stop.is_set() or self._queued():
-                self._wake.wait(0.2)
+                self._wake.wait(self._idle_timeout())
                 self._wake.clear()
                 if not self.gate.is_set():
                     continue
@@ -827,6 +887,19 @@ class RhythmWriter:
             self.io_errors += 1
             self._log_once(f"rhythm writer stopped ({error})")
 
+    def _idle_timeout(self):
+        """Sleep until an enqueue or shutdown. Polling here stalls the window callback.
+
+        Periodic fsync and the daily age prune are the only reasons to wake otherwise.
+        """
+        interval = self.config.rhythm_fsync_s
+        if interval <= 0:
+            return 30.0
+        remaining = interval - (time.monotonic() - self._last_fsync)
+        if remaining < 0.05:
+            return 0.05
+        return min(30.0, remaining)
+
     def _queued(self):
         with self._lock:
             return self._count > 0
@@ -840,6 +913,9 @@ class RhythmWriter:
             code = self._codes[self._head]
             self._head = (self._head + 1) % QUEUE_SLOTS
             self._count -= 1
+            # Set before releasing the lock so a waiter cannot observe an empty, idle queue
+            # while this record is still being written.
+            self._busy = True
             return code, data
 
     def _drain(self, prune):
@@ -848,8 +924,6 @@ class RhythmWriter:
             if item is None:
                 return
             code, data = item
-            with self._lock:
-                self._busy = True
             try:
                 self._append(SENSOR_NAME[code], data, prune=prune)
             finally:
@@ -866,7 +940,6 @@ class RhythmWriter:
             return
         segment = self._open.get(sensor_name)
         if segment is not None and segment.abandoned:
-            self.io_errors += 1
             return
         last = self._last_minute.get(sensor_name)
         if last is not None and record["minute"] == last:
@@ -990,50 +1063,64 @@ class RhythmWriter:
         return True
 
     def _write_record(self, segment, data, record):
+        """Append ``data`` at the current end. The offset is saved before the write.
+
+        A short write or ``ENOSPC``/``EDQUOT`` is retried once at that offset. If the retry
+        fails, the file is truncated back there and the loss marker is written in its place.
+        The marker carries bits 1 and 4, so the following fragment is not flagged again.
+        When the marker cannot be written, the next fragment gets bit 1. A failed truncate
+        abandons the segment: nothing more is appended, and no replacement file is opened.
+        """
         try:
             offset = os.lseek(segment.fd, 0, os.SEEK_END)
         except OSError as error:
-            self._fail_segment(segment, error)
+            self._abandon(segment, error)
             return False
-        try:
-            written = self._write_all(segment.fd, data)
-        except OSError as error:
-            if error.errno not in (errno.ENOSPC, errno.EDQUOT):
-                self._fail_segment(segment, error)
-                return False
-            written = 0
-        if written == len(data):
+        status = self._attempt(segment, data, offset)
+        if status == "ok":
             return True
-        if not self._restore(segment, offset):
+        if status != "retry":
             return False
-        try:
-            written = self._write_all(segment.fd, data)
-        except OSError as error:
-            if error.errno not in (errno.ENOSPC, errno.EDQUOT):
-                self._fail_segment(segment, error)
-                return False
-            written = 0
-        if written == len(data):
+        status = self._attempt(segment, data, offset)
+        if status == "ok":
             return True
-        if not self._restore(segment, offset):
+        if status != "retry":
             return False
         marker = encode_marker(record["minute"], record["map_epoch"])
-        try:
-            marked = self._write_all(segment.fd, marker)
-        except OSError:
-            marked = 0
+        status = self._attempt(segment, marker, offset)
         sensor_name = SENSOR_NAME[self._code_of(segment)]
-        if marked != len(marker):
-            # The marker is written only at the restored offset. A failed marker leaves the prefix.
-            self._restore(segment, offset)
-            self._force_disc[sensor_name] = True
+        if status == "ok":
+            self._last_minute[sensor_name] = record["minute"]
+            segment.last_minute = record["minute"]
+            self._force_disc[sensor_name] = False
+            self._publish(sensor_name, parse_record(marker), marker)
             self.io_errors += 1
             return False
-        self._last_minute[sensor_name] = record["minute"]
-        self._force_disc[sensor_name] = True
-        self._publish(sensor_name, parse_record(marker), marker)
-        self.io_errors += 1
+        if status == "retry" and not segment.abandoned:
+            # The marker did not land at the restored offset. The next fragment carries bit 1.
+            self._force_disc[sensor_name] = True
+            self.io_errors += 1
         return False
+
+    def _attempt(self, segment, data, offset):
+        """Write ``data`` once. ``ok``, ``retry`` (file is back at ``offset``), or ``stop``."""
+        try:
+            written = self._write_all(segment.fd, data)
+        except OSError as error:
+            if error.errno in (errno.ENOSPC, errno.EDQUOT):
+                written = 0
+            else:
+                self._log_once(f"rhythm write failed on {segment.path} ({error})")
+                if not self._restore(segment, offset):
+                    return "stop"
+                self.io_errors += 1
+                self._force_disc[SENSOR_NAME[self._code_of(segment)]] = True
+                return "stop"
+        if written == len(data):
+            return "ok"
+        if not self._restore(segment, offset):
+            return "stop"
+        return "retry"
 
     def _code_of(self, segment):
         for name, open_segment in self._open.items():
@@ -1062,10 +1149,6 @@ class RhythmWriter:
         except OSError:
             pass
         segment.fd = -1
-
-    def _fail_segment(self, segment, error):
-        self.io_errors += 1
-        self._log_once(f"rhythm write failed on {segment.path} ({error})")
 
     def _write_all(self, fd, data):
         """One store write. A short count is the caller's retry signal, not a loop."""
@@ -1254,6 +1337,10 @@ class Rhythm:
             if flag:
                 self.accumulator._sensors[sensor]["force_disc"] = True
         self.writer.start()
+
+    @property
+    def rhythm_budget_dropped(self):
+        return self.writer.budget_dropped
 
     def add(self, sensor, sec, keys, map_epoch, tracking=False, residual=None, learn_max_offset_m=None):
         self.accumulator.add(sensor, sec, keys, map_epoch, tracking, residual, learn_max_offset_m)
