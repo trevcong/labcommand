@@ -1,9 +1,11 @@
 # Hand CDR goldens: provenance
 
-Copied byte for byte from `Tests/Fixtures/room/golden/hand/` on the Phase 0 branch (`labcommand-memory` worktree), commit `95f49f2` ("Apply D5/D9/D19: keep all-free bricks, header compression (zlib default), RequestSync message"). They were derived by hand from `ros/labcommand_msgs/msg/*.msg` and `docs/ROOM-MEMORY-PROTOCOL.md` §1; every span is annotated. `memory_status_le.hex` comes instead from `origin/phase3-design` commit `d751db6` (PR #13), which adds `events_seq` (D26). Format: whitespace-separated hex bytes, `#` starts a comment.
+Copied byte for byte from `Tests/Fixtures/room/golden/hand/` on the Phase 0 branch (`labcommand-memory` worktree), commit `95f49f2` ("Apply D5/D9/D19: keep all-free bricks, header compression (zlib default), RequestSync message"). They were derived by hand from `ros/labcommand_msgs/msg/*.msg` and `docs/ROOM-MEMORY-PROTOCOL.md` §1; every span is annotated. `memory_status_le.hex` was refreshed from `phase3-design` (PR #13) commit `d751db6` for `events_seq`. `activity_le.hex` and `activity_idle_le.hex` are not copies: they were derived by hand on `room-memory-cpp` from `ros/labcommand_msgs/msg/Activity.msg` (protocol §3.7) in the same annotated format, and the Swift suite has no copy yet (it does not decode `Activity`). Format: whitespace-separated hex bytes, `#` starts a comment.
 
 | file | sha256 |
 |---|---|
+| `activity_idle_le.hex` | `e389eb520462842584988251bef696f1388f94814e5326a2e6ff344d09171db1` |
+| `activity_le.hex` | `1e26a83b70b21a831c34a9e2cc5b8e21bf9e157df6f1b75ab5ea836bc2190d79` |
 | `change_event_appeared_le.hex` | `3b102fc7bff4788d702d456ec60a168a10a23b9b92559f8a27df50b7463f0491` |
 | `change_event_moved_mask_le.hex` | `f486818b3d6df538ea17e95de3bc23db59934241c37c850d160604ca130f9905` |
 | `epoch_be.hex` | `c2b121f7156c09f1126bb94c352b826ec1bd01e71f01f081e52ead257c3599c6` |

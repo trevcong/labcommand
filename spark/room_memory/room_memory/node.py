@@ -2,26 +2,35 @@
 
 Subscribes to each configured lidar with the sensor-data QoS and ``raw=True``, so frames go
 through the tested ``decode_pointcloud2`` rather than rclpy's deserializer. Publishes the
-codec's CDR bytes on ``/room_memory/status`` (1 Hz) and ``/room_memory/events``; the
-``labcommand_msgs`` classes only provide the type support. Status carries the ``seq`` of the
-last event published (``events_seq``). A rejected frame logs one warning per sensor per 10 s.
+codec's CDR bytes on ``/room_memory/status`` and ``/room_memory/activity`` (1 Hz), ``/room_memory/events`` and
+``/room_memory/map_bricks`` (after each window, when ``map_update`` has a message), and answers
+``/room_memory/request_sync`` on the two sync topics (protocol §2, §5); the ``labcommand_msgs``
+classes only provide the type support. A rejected frame logs one warning per sensor per 10 s.
 """
 
 import time
 
 import rclpy
+from labcommand_msgs.msg import Activity as ActivityMsg
 from labcommand_msgs.msg import ChangeEvent as ChangeEventMsg
+from labcommand_msgs.msg import MapBricks as MapBricksMsg
 from labcommand_msgs.msg import MemoryStatus as MemoryStatusMsg
+from labcommand_msgs.msg import RequestSync as RequestSyncMsg
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import PointCloud2
 
 from .memory import SENSORS, MemoryConfig, RoomMemory
-from .messages import Time
+from .messages import CDRError, RequestSync, SyncTopic, Time
 from .rejectlog import RejectionLog
 
 STATUS_TOPIC = "/room_memory/status"
+ACTIVITY_TOPIC = "/room_memory/activity"
 EVENTS_TOPIC = "/room_memory/events"
+MAP_TOPIC = "/room_memory/map_bricks"
+REQUEST_TOPIC = "/room_memory/request_sync"
+SYNC_MAP_TOPIC = "/room_memory/sync/map_bricks"
+SYNC_EVENTS_TOPIC = "/room_memory/sync/events"
 
 
 def _time(node):
@@ -47,6 +56,22 @@ class RoomMemoryNode(Node):
             "reference_windows": defaults.reference_windows,
             "recent_windows": defaults.recent_windows,
             "state_dir": defaults.state_dir,
+            "occupied_min_hits": defaults.occupied_min_hits,
+            "occupied_min_ratio": defaults.occupied_min_ratio,
+            "free_min_seen": defaults.free_min_seen,
+            "free_max_ratio": defaults.free_max_ratio,
+            "candidate_windows": defaults.candidate_windows,
+            "expire_windows": defaults.expire_windows,
+            "fresh_min_voxels": defaults.fresh_min_voxels,
+            "fresh_min_fraction": defaults.fresh_min_fraction,
+            "stable_min_fraction": defaults.stable_min_fraction,
+            "activity_radius_m": defaults.activity_radius_m,
+            "learn_max_offset_m": defaults.learn_max_offset_m,
+            "learn_windows": defaults.learn_windows,
+            "map_sensor": defaults.map_sensor,
+            "delta_period_s": defaults.delta_period_s,
+            "keyframe_period_s": defaults.keyframe_period_s,
+            "keyframe_delta_ratio": defaults.keyframe_delta_ratio,
         }
         values = {name: self.declare_parameter(name, value).value for name, value in params.items()}
         values["sensors"] = tuple(values["sensors"])
@@ -58,8 +83,17 @@ class RoomMemoryNode(Node):
         reliable = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE)
         self.events = self.create_publisher(ChangeEventMsg, EVENTS_TOPIC, reliable)
         self.status = self.create_publisher(MemoryStatusMsg, STATUS_TOPIC, QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
+        # Activity is full state at 1 Hz, so a late subscriber gets the last one at once; a copy delivered
+        # again repeats its seq (protocol §2). Same QoS as the C++ node.
+        self.activity = self.create_publisher(ActivityMsg, ACTIVITY_TOPIC, QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._rejections = RejectionLog()
-        self._events_seq = None
+        maps = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+        self.map = self.create_publisher(MapBricksMsg, MAP_TOPIC, maps)
+        self.sync_map = self.create_publisher(MapBricksMsg, SYNC_MAP_TOPIC, maps)
+        self.sync_events = self.create_publisher(
+            ChangeEventMsg, SYNC_EVENTS_TOPIC, QoSProfile(depth=200, reliability=ReliabilityPolicy.RELIABLE))
+        self.create_subscription(RequestSyncMsg, REQUEST_TOPIC, self._answer, maps, raw=True)
         for name in self.config.sensors:
             sensor = SENSORS[name]
             self.create_subscription(
@@ -85,10 +119,13 @@ class RoomMemoryNode(Node):
     def _close_window(self):
         start = time.perf_counter()
         cpu = time.process_time()
-        events = self.memory.close_window(_time(self))
+        stamp = _time(self)
+        events = self.memory.close_window(stamp)
         for event in events:
             self.events.publish(event.to_cdr())
-            self._events_seq = event.header.seq
+        message = self.memory.map_update(stamp)
+        if message is not None:
+            self.map.publish(message)
         elapsed_ms = (time.perf_counter() - start) * 1000
         cpu_ms = (time.process_time() - cpu) * 1000
         self.get_logger().info(
@@ -98,11 +135,25 @@ class RoomMemoryNode(Node):
         if elapsed_ms > self.config.window_s * 1000:
             self.get_logger().warning(f"window took {elapsed_ms:.0f} ms, longer than window_s")
 
+    def _answer(self, data):
+        try:
+            request = RequestSync.from_cdr(data)
+        except CDRError as error:
+            self.get_logger().warning(f"RequestSync dropped: {error}")
+            return
+        publisher = self.sync_map if request.topic == SyncTopic.MAP_BRICKS else self.sync_events
+        reply = self.memory.sync(request, _time(self))
+        for message in reply:
+            publisher.publish(message)
+        self.get_logger().info(f"RequestSync {request.topic.name} from room '{request.header.room_id}': {len(reply)} messages")
+
     def _publish_status(self):
         now = time.monotonic()
-        message = self.memory.status(_time(self), now - self._last_status, self._events_seq)
+        stamp = _time(self)
+        message = self.memory.status(stamp, now - self._last_status)
         self._last_status = now
         self.status.publish(message.to_cdr())
+        self.activity.publish(self.memory.activity(stamp).to_cdr())
 
 
 def main(args=None):

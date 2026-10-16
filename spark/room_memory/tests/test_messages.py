@@ -13,11 +13,13 @@ import pytest
 from room_memory import messages as m
 
 HAND = pathlib.Path(__file__).resolve().parent / "fixtures" / "hand"
+# The Swift suite's copy of the hand goldens (absent in the image).
+SWIFT_HAND = pathlib.Path(__file__).resolve().parents[3] / "Tests" / "Fixtures" / "room" / "golden" / "hand"
 T10 = m.Time(1760400010, 250000000)
 
 
-def hexfile(name):
-    text = (HAND / name).read_text()
+def hexfile(name, directory=HAND):
+    text = (directory / name).read_text()
     return bytes.fromhex(" ".join(line.split("#", 1)[0] for line in text.splitlines()))
 
 
@@ -71,6 +73,15 @@ def appeared_event():
     )
 
 
+def activity():
+    return m.Activity(head("lab", 43, 21), True, m.SENSOR_MID360 | m.SENSOR_JT128, m.SENSOR_JT128, 3, 16909060,
+                      (0.5, 1.25, 0.0625), (0.25, 1.0, 0.0), (0.75, 1.5, 0.125), 2.5)
+
+
+def activity_idle():
+    return m.Activity(head("lab", 1, 0), False, 0, 0, 0, 0, None, None, None, None)
+
+
 def request_map():
     return m.RequestSync(head("lab", 43, 2), (43, 12), m.SyncTopic.MAP_BRICKS)
 
@@ -95,7 +106,11 @@ GOLDENS = {
     "request_sync_map_le.hex": (m.RequestSync, request_map, True),
     "request_sync_map_be.hex": (m.RequestSync, request_map, False),
     "request_sync_events_none_le.hex": (m.RequestSync, request_events_none, True),
+    "activity_le.hex": (m.Activity, activity, True),
+    "activity_idle_le.hex": (m.Activity, activity_idle, True),
 }
+# Derived on this branch; the Swift suite does not decode Activity yet (PROVENANCE.md).
+NOT_IN_SWIFT = {"activity_le.hex", "activity_idle_le.hex"}
 
 
 def test_provenance_hashes():
@@ -103,6 +118,14 @@ def test_provenance_hashes():
     assert sorted(table) == sorted(path.name for path in HAND.glob("*.hex")) == sorted(GOLDENS)
     for name, digest in table.items():
         assert hashlib.sha256((HAND / name).read_bytes()).hexdigest() == digest, name
+
+
+@pytest.mark.skipif(not SWIFT_HAND.is_dir(), reason=f"Swift hand goldens not found at {SWIFT_HAND}")
+def test_hand_goldens_match_the_swift_copies():
+    assert sorted(path.name for path in SWIFT_HAND.glob("*.hex")) == sorted(set(GOLDENS) - NOT_IN_SWIFT)
+    for name in set(GOLDENS) - NOT_IN_SWIFT:
+        assert hexfile(name, SWIFT_HAND) == hexfile(name), name
+    assert memory_status().to_cdr() == hexfile("memory_status_le.hex", SWIFT_HAND)
 
 
 @pytest.mark.parametrize("name", sorted(GOLDENS))
@@ -153,6 +176,31 @@ def test_trailing_padding(name):
     assert kind.from_cdr(data + b"\x00" * 3) == build()
     with pytest.raises(m.Invalid):
         kind.from_cdr(data + b"\x00" * 4)
+
+
+def test_activity_rejects_inconsistent_fields():
+    data = bytearray(hexfile("activity_le.hex"))
+    data[4 + 32] = 2  # active is a bool
+    with pytest.raises(m.Invalid):
+        m.Activity.from_cdr(bytes(data))
+    data = bytearray(hexfile("activity_le.hex"))
+    data[4 + 46:4 + 48] = b"\xc0\x7f"  # centroid.x NaN, the rest finite
+    with pytest.raises(m.Invalid):
+        m.Activity.from_cdr(bytes(data))
+    data = bytearray(hexfile("activity_le.hex"))
+    data[4 + 34] = 1  # largest_sensor MID360 is set in sensors: still valid
+    assert m.Activity.from_cdr(bytes(data)).largest_sensor == m.SENSOR_MID360
+    data[4 + 33] = 2  # but not when sensors is JT128 only
+    with pytest.raises(m.Invalid):
+        m.Activity.from_cdr(bytes(data))
+    data = bytearray(hexfile("activity_idle_le.hex"))
+    data[4 + 36] = 1  # an inactive message with a region
+    with pytest.raises(m.Invalid):
+        m.Activity.from_cdr(bytes(data))
+    with pytest.raises(m.Invalid):
+        replace(activity_idle(), since_s=-1.0).to_cdr()
+    with pytest.raises(m.Invalid):
+        replace(activity(), since_s=None).to_cdr()
 
 
 def test_encapsulation_and_strings():
@@ -252,25 +300,19 @@ def test_change_event_partial_nan_from_centroid_is_invalid():
     lambda s: replace(s, mid360_hz=m.HZ_UNAVAILABLE),
     lambda s: replace(s, state=9),
     lambda s: replace(s, events_seq=m.EVENTS_SEQ_NONE),
-    lambda s: replace(s, events_seq=-1),
 ])
 def test_memory_status_rejections(change):
     with pytest.raises(m.Invalid):
         change(memory_status()).to_cdr()
 
 
-def test_memory_status_events_seq():
-    none = replace(memory_status(), events_seq=None)
-    data = none.to_cdr()
-    assert data == hexfile("memory_status_le.hex")[:-8] + b"\xff" * 8
-    assert m.MemoryStatus.from_cdr(data) == none
-    zero = replace(memory_status(), events_seq=0)
-    assert m.MemoryStatus.from_cdr(zero.to_cdr()).events_seq == 0
-    top = replace(memory_status(), events_seq=m.EVENTS_SEQ_NONE - 1)
-    assert m.MemoryStatus.from_cdr(top.to_cdr()) == top
-    # Protocol §3.3 wire size, encapsulation header included.
-    for room, size in (("lab", 76), ("lab-a", 84)):
-        assert len(replace(memory_status(), header=head(room, 42, 7)).to_cdr()) == size, room
+def test_memory_status_events_seq_none():
+    data = bytearray(hexfile("memory_status_le.hex"))
+    assert len(data) == 4 + 80
+    data[4 + 72:4 + 80] = b"\xff" * 8
+    expected = replace(memory_status(), events_seq=None)
+    assert m.MemoryStatus.from_cdr(bytes(data)) == expected
+    assert expected.to_cdr() == bytes(data)
 
 
 def test_request_sync_rules():

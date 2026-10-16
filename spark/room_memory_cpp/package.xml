@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>room_memory_cpp</name>
+  <version>0.1.0</version>
+  <description>LabCommand room memory on the DGX Spark, production C++: per-sensor voxel reference, evidence-of-absence change detection, MemoryStatus and ChangeEvent publishers. Same topics and parameters as the Python room_memory node.</description>
+  <maintainer email="taconger@students.unwsp.edu">Trevor Conger</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <build_depend>zlib</build_depend>
+
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>labcommand_msgs</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>foxglove_bridge</exec_depend>
+
+  <test_depend>python3-numpy</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

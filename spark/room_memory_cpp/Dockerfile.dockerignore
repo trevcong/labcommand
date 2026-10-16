@@ -1,0 +1,8 @@
+.build
+build
+spark/.venv-local
+**/__pycache__
+**/.pytest_cache
+recordings
+**/*.mcap
+!spark/room_memory_cpp/tests/fixtures/static5m-mid360-excerpt.mcap
