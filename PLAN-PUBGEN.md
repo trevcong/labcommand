@@ -45,6 +45,11 @@ Nothing is pushed by this task.
   - Alignment padding to 8, then exactly 8 bytes (+ ≤ 3 rmw padding): **v2**.
   - Anything else: *invalid*.
   - Alignment padding is at most 7 bytes and the field is 8, so the cases cannot overlap.
+  - **Exception, `ChangeEvent` with a mask.** The nested `MapBricks` is not at the end of the buffer, so its reader cannot detect its own layout. The outer `ChangeEvent` decoder decides once, after reading the nested payload:
+    - ≤ 3 unread bytes: legacy.
+    - Padding to 8, then exactly 16 bytes (the mask's generation, then the parent's) + ≤ 3: v2.
+    - Anything else: *invalid*.
+    - The nested reader then takes the layout as a parameter: Swift `read(from:path:)`, Python `_read`, C++ `read_map_bricks`.
   - This holds for every message below, including `MapBricks` after its variable-length payload. The client needs no schema parsing: `FoxgloveProtocol.Channel` carries no schema text today.
 - **`publisher_generation` (`uint64`).**
   - It is ordered and durably increasing per room (§3), and the same for every message one node process publishes.
@@ -186,7 +191,7 @@ Wire sizes for "lab", with d delivered and u unavailable ranges:
   - Generations are then about the start time in ms (~1.76e12), well inside `uint64`.
   - `event_id` already uses the start time this way (`memory.py` :829).
 - **Fail closed.** The node refuses to start, and logs why, in any of these cases:
-  - `state_dir` is empty;
+  - `state_dir` is empty, or **does not already exist**. The allocator may create `<state_dir>/<room_id>`, but never `state_dir` itself. Today both `write_atomic`s create missing parents (Python `memory.py` :316 `mkdir(parents=True)`, C++ `memory.cpp` :329 `create_directories`). Neither Dockerfile creates `/root/room-memory`, so in a container without the volume mount the node refuses to start, rather than allocating into a directory that disappears when the container is recreated;
   - the file is malformed (never silently reset to 0);
   - the value would overflow;
   - the write or fsync fails;
@@ -215,6 +220,7 @@ Mirror
 ├─ connection: offline | awaitingStatus(connectionID) | observing(connectionID, generation)
 ├─ wire: undetermined | v2 | legacy                    // per connection (§4.6)
 ├─ active: GenerationState?                             // the only state that renders as current
+├─ highestGeneration: UInt64?                           // highest generation ever installed; survives archiving and legacy mode
 ├─ archive: [ArchivedGeneration] (newest 2)             // display only, tagged with their generation
 ├─ retrieval[topic]: idle | waiting(token, generation, sentAt, attempt) | receiving(token, generation, manifest, sentAt, attempt)
 └─ tokenRNG: SplitMix64 state (seeded at init; injectable for tests, so the reducer stays pure and Equatable)
@@ -262,8 +268,9 @@ Validation (decode, `room_id`, D16 rules) comes first. A rejected message change
 |---|---|---|
 | `connectionOpened` | | `awaitingStatus(new id)`, `wire = undetermined`. Keep `active` and `archive` (stale display). Every retrieval → `idle`; old tokens are dead. Freshness → none |
 | `connectionClosed` | | `offline`, retrieval `idle`. Map `current` → `stale(.disconnected)`. Coverage untouched |
-| any v2 message (generation `m`) | no active, or `m > active.g` | **install**: archive the whole `active` (its tail is unknown: never sealed), create `GenerationState(m)`, then handle the message in it. Retrieval → `idle` |
-| any v2 message | `m < active.g` | ignore, count `olderGeneration`. Never reactivates an archive |
+| any v2 message (generation `m`) | `highestGeneration` nil, or `m > highestGeneration` | **install**: archive the whole `active` if any (its tail is unknown: never sealed), create `GenerationState(m)`, set `highestGeneration = m`, then handle the message in it. Retrieval → `idle` |
+| any v2 message | `m == highestGeneration`, no `active` (it was archived when a connection turned out legacy, §4.6) | create a **fresh, empty** `GenerationState(m)`; the archived copy is never reactivated. Then handle the message |
+| any v2 message | `m < highestGeneration` | ignore, count `olderGeneration`. Never reactivates an archive |
 | status of `active.g` | `seq > status.seq` | replace the status; H ← max(H, `events_seq` witness); `connection → observing(g)` if it arrived on this connection; D20 epoch-mismatch counting; then schedule retrieval |
 | status of `active.g` | `seq ≤ status.seq` | duplicate or delayed copy: ignore, count. **Never** a generation signal |
 | event of `active.g` (live or sync, any answer) | seq ∉ C | C ∪= {seq}; digest; `latest[eventID]` replaced only if `seq >` the held seq; append to log |
@@ -301,9 +308,9 @@ Validation (decode, `room_id`, D16 rules) comes first. A rejected message change
 5. **`lost` ranges are publisher-declared** (U). A request or a timeout never moves a seq from `pending` to `lost`.
 6. **`latest[eventID]` holds the highest-seq transition received.** Arrival order and transport (live or sync) do not matter.
 7. **Map `current` ⇔** chain held in `active.g`, `appliedSeq ≥ highestLiveMapSeq`, fresh status of `active.g` on this connection, its `map_epoch` == the mirror's epoch (with D20's two-status tolerance), and connected.
-8. **Generations only rise.** `active.g` is non-decreasing over any input sequence, and an older-generation message changes nothing but counters.
+8. **Generations only rise.** `highestGeneration` is non-decreasing over any input sequence, `active.g` (when present) equals it, and a message below it changes nothing but counters. Legacy mode and archiving never lower it.
 9. **Idempotence.** Delivering any message twice changes no semantic state.
-10. **Order independence.** Two delivery orders of the same set of same-generation messages produce the same C, U, H, `latest` and map chain.
+10. **Order independence (events only).** Two delivery orders of the same set of same-generation messages produce the same C, U, H and `latest`. The map chain is order-dependent by design (delta@6 before snapshot@5 is rejected; after it, it applies), so map convergence is covered by the liveness property, not by this one.
 11. **Eviction only lowers certainty.**
     - Limits (log 1000, `latest` 10,000, digest 10,000, C intervals 1,000) may drop display entries.
     - If C would exceed its interval cap, the generation is marked overflowed and coverage reads `unknown` from then on. It can never become more complete.
@@ -481,7 +488,9 @@ This plan does not change the transport.
   - Order independence: permute same-generation deliveries and compare.
   - Liveness: after a quiet tail (connected, lossless, ticks past every backoff, request path available), the mirror converges to `completeThrough(publisher bound)` or `missing(lost: exactly the publisher's unavailable)`, retrieval is idle, and the map is current.
   - Resource limits.
-- **Runs.** A seeded `SplitMix64` (existing `SyntheticRoom.swift`:102). The default gate runs 2,000 traces × ≤ 400 inputs. `LIVE_ROOM_TRACES=n` and `LIVE_ROOM_SEED=s` reproduce one trace.
+- **Runs.** A seeded `SplitMix64` (existing `SyntheticRoom.swift`:102).
+  - Target: 2,000 traces × ≤ 400 inputs, but under a **time budget of ≤ 60 s** of the runner (debug build, `swift run`). The oracle checks after every input are O(state), so measure first and set the default trace count to fit the budget. `LIVE_ROOM_TRACES=n` raises it for a soak run.
+  - `LIVE_ROOM_SEED=s` reproduces one trace.
 - **Shrinking.** On failure, a delta-debugging shrinker removes input chunks while the failure persists. It prints the seed and the minimal trace as Swift source, ready to paste as a regression seed.
 
 ### 6.2 Regression seeds: the ten Codex findings and Astra's pair
@@ -550,7 +559,7 @@ Further fixed traces:
 1. `scripts/check-shared-goldens.sh` — every shared hand golden identical (today's gate compares only `memory_status_le.hex`).
 2. `pytest` under `spark/` — pass. Count ≥ today's 300 plus the new tests.
 3. C++ `cmake` Release build — **0 warnings**; `ctest` — all pass (today 15, plus `generation`).
-4. `swift run LabCommandCoreTestsRunner` — PASS, including the default 2,000-trace run with 0 failures and every regression seed.
+4. `swift run LabCommandCoreTestsRunner` — PASS, including the default trace run (sized to the §6.1 time budget) with 0 failures and every regression seed.
 5. `./build.sh --no-install` — exit 0.
 6. Live Room screenshots (`scripts/live-room-shots.sh`), with v2 fixtures: a complete history, a restart banner, lost ranges, legacy unverified. Check them by eye.
 7. Codex review rounds as Trevor directs. This plan does not run Codex.
@@ -563,7 +572,8 @@ Trevor does these steps. This work does not touch the Spark or `~/Applications/L
 
 1. **Prerequisite.**
    - Verify that the container runs with `-v ~/room-memory:/root/room-memory` (Dockerfile comment, `spark/room_memory_cpp/Dockerfile` :6–7) and that `state_dir` resolves inside that volume.
-   - Without it, the node now refuses to start. That is intended: a generation that does not survive restarts is not durable. The wall-clock floor would still order generations, but the plan does not rely on it alone.
+   - Without the mount, `/root/room-memory` does not exist in a fresh container, and the node now refuses to start (§3: the allocator never creates `state_dir` itself). That is intended: a generation stored in the container's own filesystem would not survive recreating it. The wall-clock floor would still order generations, but the plan does not rely on it alone.
+   - On a host run (not in a container), `~/room-memory` must exist before the first start.
 2. **Mac app first.**
    - Build and install the app from the merged branch.
    - Against the still-running old node it runs in legacy mode: map and events shown, "unverified", no requests.
@@ -586,7 +596,7 @@ Trevor does these steps. This work does not touch the Spark or `~/Applications/L
 1. Protocol doc and `.msg` files: the contract frozen first (D34–D37), API.md rewritten.
 2. Hand goldens and the three codecs (Swift, Python, C++), legacy decode, layout detection.
 3. Generation allocator and node stamping (Python, then C++); `SyncEnd` answers; differential tests.
-4. The reference model and trace harness, written **before** the reducer and run against a stub, so the oracle is not shaped by the implementation.
+4. The reference model and trace harness, written **before** the reducer and run against a stub, so the oracle is not shaped by the implementation. Measure its runtime and fix the default trace count to the §6.1 budget.
 5. `SeqIntervals`, `GenerationState`, `Retrieval`, and the new `RoomMemoryMirror`. Delete the heuristics; then the regression seeds and property runs.
 6. UI projection, view tests, screenshots.
 7. Doc sweep (phase3 doc, LIVE-ROOM-PLAN), full gate, PR text (supersedes #13 and #17).
