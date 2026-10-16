@@ -221,6 +221,9 @@ class _Writer:
     def u16(self, value):
         self._put("<H", 2, value)
 
+    def i16(self, value):
+        self._put("<h", 2, value)
+
     def u32(self, value):
         self._put("<I", 4, value)
 
@@ -296,6 +299,9 @@ class _Reader:
 
     def u16(self, what):
         return self._get("H", 2, what)
+
+    def i16(self, what):
+        return self._get("h", 2, what)
 
     def u32(self, what):
         return self._get("I", 4, what)

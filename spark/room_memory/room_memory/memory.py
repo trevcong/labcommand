@@ -1064,6 +1064,8 @@ class RoomMemory:
                 self._settle_pending = True
             self.map_epoch += 1
             self.save(stamp)
+        if self._rhythm is not None:
+            self._rhythm.note_epoch(self.map_epoch)
         return events
 
     def activity(self, stamp):

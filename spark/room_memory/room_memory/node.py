@@ -88,6 +88,7 @@ class RoomMemoryNode(Node):
         values["sensors"] = tuple(values["sensors"])
         values["max_range"] = values["max_range"] if values["max_range"] > 0 else None
         values["state_dir"] = values["state_dir"] or None
+        values["rhythm_dir"] = values["rhythm_dir"] or ""
         self.config = MemoryConfig(**values)
         # Before any publisher: every message this process sends carries the generation. The
         # allocation holds publisher.lock until the process exits.
