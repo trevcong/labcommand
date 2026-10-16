@@ -410,6 +410,8 @@ public enum RoomMemory {
         public var coverageKnownFraction: Float?
         /// Memory state at this tick.
         public var state: MemoryState
+        /// The publishing process's generation (protocol §1.4); nil for the legacy layout.
+        public var publisherGeneration: UInt64?
 
         /// Creates a timeline tick.
         public init(
@@ -418,7 +420,8 @@ public enum RoomMemory {
             disappearedCount: UInt32,
             movedCount: UInt32,
             coverageKnownFraction: Float?,
-            state: MemoryState
+            state: MemoryState,
+            publisherGeneration: UInt64? = nil
         ) {
             self.header = header
             self.appearedCount = appearedCount
@@ -426,6 +429,61 @@ public enum RoomMemory {
             self.movedCount = movedCount
             self.coverageKnownFraction = coverageKnownFraction
             self.state = state
+            self.publisherGeneration = publisherGeneration
+        }
+    }
+
+    /// `labcommand_msgs/Activity`: transient motion next to the rig at 1 Hz (protocol §3.7). Never a
+    /// change: nothing in it becomes a `ChangeEvent`.
+    ///
+    /// `active` when a tracking window since the previous message had activity. The counts, sensors
+    /// and largest region describe the newest such window; the region is in the frame of
+    /// `largestSensor`. Inactive, the counts and sensors are empty and the geometry is nil.
+    public struct Activity: Sendable, Equatable {
+        /// The common fields.
+        public var header: Header
+        /// Some tracking window since the previous `Activity` had activity.
+        public var active: Bool
+        /// Sensors with activity in the newest such window.
+        public var sensors: Sensors
+        /// The one sensor whose frame `centroid` and `aabb` are in; empty when inactive.
+        public var largestSensor: Sensors
+        /// Activity regions in that window, all sensors.
+        public var regionCount: UInt32
+        /// Their voxels.
+        public var voxelCount: UInt32
+        /// The largest activity region's centroid, meters. Nil when inactive.
+        public var centroid: SIMD3<Float>?
+        /// Its box, meters. Nil when inactive.
+        public var aabb: ChangeEvent.Box?
+        /// Seconds from the newest window with activity to `header.stamp`; nil when none since the node started.
+        public var sinceS: Float?
+        /// The publishing process's generation (protocol §1.4); nil for the legacy layout.
+        public var publisherGeneration: UInt64?
+
+        /// Creates an activity report.
+        public init(
+            header: Header,
+            active: Bool,
+            sensors: Sensors,
+            largestSensor: Sensors,
+            regionCount: UInt32,
+            voxelCount: UInt32,
+            centroid: SIMD3<Float>?,
+            aabb: ChangeEvent.Box?,
+            sinceS: Float?,
+            publisherGeneration: UInt64? = nil
+        ) {
+            self.header = header
+            self.active = active
+            self.sensors = sensors
+            self.largestSensor = largestSensor
+            self.regionCount = regionCount
+            self.voxelCount = voxelCount
+            self.centroid = centroid
+            self.aabb = aabb
+            self.sinceS = sinceS
+            self.publisherGeneration = publisherGeneration
         }
     }
 

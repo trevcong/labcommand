@@ -63,6 +63,30 @@ private let goldenEpoch = Room.Epoch(
     state: .rigMoved
 )
 
+private let goldenActivity = Room.Activity(
+    header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 21, stamp: t10),
+    active: true,
+    sensors: .all,
+    largestSensor: .jt128,
+    regionCount: 3,
+    voxelCount: 16_909_060,
+    centroid: SIMD3(0.5, 1.25, 0.0625),
+    aabb: Room.ChangeEvent.Box(min: SIMD3(0.25, 1.0, 0.0), max: SIMD3(0.75, 1.5, 0.125)),
+    sinceS: 2.5
+)
+
+private let goldenActivityIdle = Room.Activity(
+    header: Room.Header(roomId: "lab", mapEpoch: 1, seq: 0, stamp: t10),
+    active: false,
+    sensors: [],
+    largestSensor: [],
+    regionCount: 0,
+    voxelCount: 0,
+    centroid: nil,
+    aabb: nil,
+    sinceS: nil
+)
+
 private let goldenDelta = Room.MapBricks(
     header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 12, stamp: t10),
     compression: .none,
@@ -161,6 +185,8 @@ private func v2<M>(_ message: M, _ set: (inout M) -> Void) -> M {
 }
 
 private let goldenStatusV2 = v2(goldenStatus) { $0.publisherGeneration = goldenGeneration }
+private let goldenEpochV2 = v2(goldenEpoch) { $0.publisherGeneration = goldenGeneration }
+private let goldenActivityV2 = v2(goldenActivity) { $0.publisherGeneration = goldenGeneration }
 private let goldenDeltaV2 = v2(goldenDelta) { $0.publisherGeneration = goldenGeneration }
 private let goldenAppearedV2 = v2(goldenAppeared) { $0.publisherGeneration = goldenGeneration }
 private let goldenMovedV2 = v2(goldenMoved) {
@@ -201,6 +227,9 @@ private let v2LegacyTwin: [String: String] = [
     "change_event_moved_mask_v2_le": "change_event_moved_mask_le",
     "request_sync_events_v2_le": "request_sync_events_none_le",
     "request_sync_map_v2_be": "request_sync_map_be",
+    "epoch_v2_le": "epoch_le",
+    "epoch_v2_be": "epoch_be",
+    "activity_v2_le": "activity_le",
 ]
 
 /// Where a compressed golden keeps its payload, in stream positions (after the 4-byte header).
@@ -259,6 +288,10 @@ private let littleEndianGoldens: [Golden] = [
     golden("request_sync_events_v2_le", goldenRequestNoneV2, decode: Room.RequestSync.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("sync_end_events_empty_le", goldenSyncEndEmpty, decode: Room.SyncEnd.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("sync_end_events_fallback_le", goldenSyncEndFallback, decode: Room.SyncEnd.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("activity_le", goldenActivity, decode: Room.Activity.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("activity_idle_le", goldenActivityIdle, decode: Room.Activity.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("activity_v2_le", goldenActivityV2, decode: Room.Activity.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("epoch_v2_le", goldenEpochV2, decode: Room.Epoch.decode(cdr:), encode: { try $0.encodedCDR() }),
 ]
 
 private let bigEndianGoldens: [Golden] = [
@@ -268,6 +301,7 @@ private let bigEndianGoldens: [Golden] = [
     golden("map_bricks_delta_v2_be", goldenDeltaV2, decode: Room.MapBricks.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("request_sync_map_v2_be", goldenRequestMapV2, decode: Room.RequestSync.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("sync_end_map_replay_be", goldenSyncEndMap, decode: Room.SyncEnd.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("epoch_v2_be", goldenEpochV2, decode: Room.Epoch.decode(cdr:), encode: { try $0.encodedCDR() }),
 ]
 
 private enum Outcome: Equatable {
@@ -430,6 +464,10 @@ func testRoomTruncationAlwaysThrows() {
                "v2 masked event cut after its mask payload is the legacy golden")
         expect(try Room.RequestSync.decode(cdr: goldenBytes("request_sync_events_v2_le").prefix(57 + 4)).token == nil,
                "v2 request cut at its topic is a legacy request")
+        expect(try Room.Epoch.decode(cdr: goldenBytes("epoch_v2_le").prefix(49 + 4)) == goldenEpoch,
+               "v2 epoch cut at its state is the legacy golden")
+        expect(try Room.Activity.decode(cdr: goldenBytes("activity_v2_le").prefix(84 + 4)) == goldenActivity,
+               "v2 activity cut at since_s is the legacy golden")
     } catch {
         expect(false, "v2 goldens cut at the legacy length decode: \(error)")
     }
@@ -576,6 +614,9 @@ private func v2MalformedCases() -> [(String, Outcome, () throws -> Bool)] {
     let request = { (data: Data) in try Room.RequestSync.decode(cdr: data) == goldenRequestNoneV2 }
     let fallback = { (data: Data) in try Room.SyncEnd.decode(cdr: data) == goldenSyncEndFallback }
     let empty = { (data: Data) in try Room.SyncEnd.decode(cdr: data) == goldenSyncEndEmpty }
+    let epoch = { (data: Data) in try Room.Epoch.decode(cdr: data) == goldenEpochV2 }
+    let activity = { (data: Data) in try Room.Activity.decode(cdr: data) == goldenActivity }
+    let idle = { (data: Data) in try Room.Activity.decode(cdr: data) == goldenActivityIdle }
     let legacyStatus = goldenBytes("memory_status_le")
     let legacyRequest = goldenBytes("request_sync_events_none_le")
     let end = "sync_end_events_fallback_le"
@@ -590,6 +631,19 @@ private func v2MalformedCases() -> [(String, Outcome, () throws -> Bool)] {
         ("RequestSync v2 all-zero token", .invalid, { try request(patched("request_sync_events_v2_le", at: 72, le64(0) + le64(0))) }),
         ("legacy RequestSync + 31 zero bytes (zero token)", .invalid, { try request(legacyRequest + Data(count: 31)) }),
         ("legacy RequestSync + 15 bytes (no token)", .invalid, { try request(legacyRequest + Data(count: 15)) }),
+        ("v2 epoch generation 0", .invalid, { try epoch(patched("epoch_v2_le", at: 56, le64(0))) }),
+        ("v2 epoch + 4 trailing bytes", .invalid, { try epoch(goldenBytes("epoch_v2_le") + Data(count: 4)) }),
+        ("legacy epoch + 8 bytes after 3 pad (misaligned v2)", .invalid, { try epoch(goldenBytes("epoch_le") + Data(count: 3) + le64(1)) }),
+        ("v2 activity generation 0", .invalid, { try activity(patched("activity_v2_le", at: 88, le64(0))) }),
+        ("v2 activity + 4 trailing bytes", .invalid, { try activity(goldenBytes("activity_v2_le") + Data(count: 4)) }),
+        ("Activity active 2", .invalid, { try activity(patched("activity_le", at: 32, [2])) }),
+        ("Activity centroid partly NaN", .invalid, { try activity(patched("activity_le", at: 44, f32(.nan))) }),
+        ("Activity aabb max NaN, min finite", .invalid,
+         { try activity(patched("activity_le", at: 68, f32(.nan) + f32(.nan) + f32(.nan))) }),
+        ("Activity largest_sensor not in sensors", .invalid, { try activity(patched("activity_le", at: 33, [1])) }),
+        ("Activity undefined sensor bit", .invalid, { try activity(patched("activity_le", at: 33, [7])) }),
+        ("Activity since_s negative", .invalid, { try activity(patched("activity_le", at: 80, f32(-1))) }),
+        ("inactive Activity with a region", .invalid, { try idle(patched("activity_idle_le", at: 36, le32(1))) }),
         ("SyncEnd generation 0", .invalid, { try empty(patched("sync_end_events_empty_le", at: 32, le64(0))) }),
         ("SyncEnd topic 2", .invalid, { try fallback(patched(end, at: 56, [2])) }),
         ("SyncEnd bound below a delivered range", .invalid, { try fallback(patched(end, at: 64, le64(119))) }),

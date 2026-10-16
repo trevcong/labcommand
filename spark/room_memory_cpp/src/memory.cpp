@@ -1098,6 +1098,7 @@ msg::Activity RoomMemory::activity(const msg::Time& stamp) {
     msg::Activity message = activity_.value_or(msg::Activity{});
     activity_.reset();
     message.header = msg::Header{config_.room_id, map_epoch_, activity_seq_++, stamp};
+    message.publisher_generation = publisher_generation_;
     if (last_activity_ns_) {
         message.since_s = static_cast<float>(static_cast<double>(std::max<std::int64_t>(0, nanoseconds(stamp) - *last_activity_ns_)) / 1e9);
     }

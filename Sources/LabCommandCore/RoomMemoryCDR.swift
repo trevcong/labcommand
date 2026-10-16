@@ -442,6 +442,9 @@ extension RoomMemory.Epoch {
         writer.u32(movedCount)
         writer.f32(coverageKnownFraction ?? .nan)
         writer.u8(state.rawValue)
+        if let publisherGeneration {
+            writer.u64(publisherGeneration)
+        }
         return writer.data
     }
 
@@ -457,13 +460,16 @@ extension RoomMemory.Epoch {
             let disappeared = try reader.u32("n_disappeared")
             let moved = try reader.u32("n_moved")
             let coverage = try reader.f32("coverage_known_frac")
+            let state = try reader.memoryState("state")
+            let generation = try reader.isV2(fields: 8, after: "state") ? try reader.u64("publisher_generation") : nil
             let epoch = RoomMemory.Epoch(
                 header: header,
                 appearedCount: appeared,
                 disappearedCount: disappeared,
                 movedCount: moved,
                 coverageKnownFraction: coverage.isNaN ? nil : coverage,
-                state: try reader.memoryState("state")
+                state: state,
+                publisherGeneration: generation
             )
             try epoch.validate()
             return epoch
@@ -472,7 +478,122 @@ extension RoomMemory.Epoch {
 
     func validate() throws {
         try header.validate("Epoch")
+        try RoomCDR.requireGeneration(publisherGeneration, "Epoch: publisher_generation")
         try RoomCDR.requireFraction(coverageKnownFraction, "Epoch: coverage_known_frac")
+    }
+}
+
+extension RoomMemory.Activity {
+    /// Encodes the message as CDR little endian, including the encapsulation header.
+    ///
+    /// - Throws: `RoomMemoryCDRError.invalid` when the message breaks the protocol contract.
+    public func encodedCDR() throws -> Data {
+        try validate()
+        var writer = RoomCDRWriter()
+        writer.header(header)
+        writer.u8(active ? 1 : 0)
+        writer.u8(sensors.rawValue)
+        writer.u8(largestSensor.rawValue)
+        writer.u32(regionCount)
+        writer.u32(voxelCount)
+        let missing = SIMD3<Float>(repeating: .nan)
+        writer.vector(centroid ?? missing)
+        writer.vector(aabb?.min ?? missing)
+        writer.vector(aabb?.max ?? missing)
+        writer.f32(sinceS ?? .nan)
+        if let publisherGeneration {
+            writer.u64(publisherGeneration)
+        }
+        return writer.data
+    }
+
+    /// Decodes a CDR `labcommand_msgs/Activity`, including the encapsulation header.
+    ///
+    /// Accepts either byte order. The input may be a slice.
+    ///
+    /// - Throws: `RoomMemoryCDRError` on truncated or invalid input.
+    public static func decode(cdr data: Data) throws -> RoomMemory.Activity {
+        try RoomCDR.decode(data, message: "Activity") { reader in
+            let header = try reader.header("")
+            let active = try reader.u8("active")
+            guard active <= 1 else {
+                throw RoomMemoryCDRError.invalid("Activity: active \(active) is not a bool")
+            }
+            let sensors = RoomMemory.Sensors(rawValue: try reader.u8("sensors"))
+            let largestSensor = RoomMemory.Sensors(rawValue: try reader.u8("largest_sensor"))
+            let regionCount = try reader.u32("n_regions")
+            let voxelCount = try reader.u32("voxel_count")
+            // Each triple is all NaN (missing) or finite-or-invalid; never partly NaN.
+            func optional(_ value: SIMD3<Float>, _ what: String) throws -> SIMD3<Float>? {
+                switch (value.x.isNaN, value.y.isNaN, value.z.isNaN) {
+                case (true, true, true): return nil
+                case (false, false, false): return value
+                default: throw RoomMemoryCDRError.invalid("Activity: \(what) \(value) is partly NaN")
+                }
+            }
+            let centroid = try optional(try reader.vector("centroid"), "centroid")
+            let low = try optional(try reader.vector("aabb[0..2]"), "aabb min")
+            let high = try optional(try reader.vector("aabb[3..5]"), "aabb max")
+            let aabb: RoomMemory.ChangeEvent.Box?
+            switch (low, high) {
+            case (nil, nil): aabb = nil
+            case let (low?, high?): aabb = .init(min: low, max: high)
+            default: throw RoomMemoryCDRError.invalid("Activity: aabb is half NaN")
+            }
+            let since = try reader.f32("since_s")
+            let generation = try reader.isV2(fields: 8, after: "since_s") ? try reader.u64("publisher_generation") : nil
+            let activity = RoomMemory.Activity(
+                header: header,
+                active: active == 1,
+                sensors: sensors,
+                largestSensor: largestSensor,
+                regionCount: regionCount,
+                voxelCount: voxelCount,
+                centroid: centroid,
+                aabb: aabb,
+                sinceS: since.isNaN ? nil : since,
+                publisherGeneration: generation
+            )
+            try activity.validate()
+            return activity
+        }
+    }
+
+    func validate() throws {
+        let context = "Activity"
+        try header.validate(context)
+        try RoomCDR.requireGeneration(publisherGeneration, "\(context): publisher_generation")
+        guard RoomMemory.Sensors.all.isSuperset(of: sensors) else {
+            throw RoomMemoryCDRError.invalid("\(context): sensors 0x\(String(sensors.rawValue, radix: 16)) sets an undefined bit")
+        }
+        if active {
+            guard regionCount >= 1, voxelCount >= 1 else {
+                throw RoomMemoryCDRError.invalid("\(context): active needs at least one region and voxel")
+            }
+            guard largestSensor == .mid360 || largestSensor == .jt128, sensors.contains(largestSensor) else {
+                throw RoomMemoryCDRError.invalid(
+                    "\(context): largest_sensor \(largestSensor.rawValue) is not one bit of sensors \(sensors.rawValue)")
+            }
+            guard let centroid, let aabb, sinceS != nil else {
+                throw RoomMemoryCDRError.invalid("\(context): active needs the largest region's centroid and aabb, and since_s")
+            }
+            try RoomCDR.requireFinite(centroid, "\(context): centroid")
+            try RoomCDR.requireFinite(aabb.min, "\(context): aabb min")
+            try RoomCDR.requireFinite(aabb.max, "\(context): aabb max")
+            guard all(aabb.min .<= aabb.max) else {
+                throw RoomMemoryCDRError.invalid("\(context): aabb min \(aabb.min) exceeds max \(aabb.max)")
+            }
+        } else {
+            guard regionCount == 0, voxelCount == 0, sensors.isEmpty, largestSensor.isEmpty else {
+                throw RoomMemoryCDRError.invalid("\(context): inactive must have zero counts and sensor bits")
+            }
+            guard centroid == nil, aabb == nil else {
+                throw RoomMemoryCDRError.invalid("\(context): inactive must have NaN geometry")
+            }
+        }
+        if let sinceS, !(sinceS.isFinite && sinceS >= 0) {
+            throw RoomMemoryCDRError.invalid("\(context): since_s \(sinceS) must be finite and ≥ 0, or NaN")
+        }
     }
 }
 

@@ -1076,10 +1076,11 @@ class RoomMemory:
             since = max(0, _nanoseconds(stamp) - self._last_activity_ns) / 1e9
         latest, self._activity = self._activity, None
         if latest is None:
-            return Activity(header, False, 0, 0, 0, 0, None, None, None, since)
+            return Activity(header, False, 0, 0, 0, 0, None, None, None, since, self.publisher_generation)
         count, voxels, sensors, bit, region = latest
         return Activity(header, True, sensors, bit, count, voxels, tuple(region.centroid.tolist()),
-                        tuple(region.bounds_min.tolist()), tuple(region.bounds_max.tolist()), since)
+                        tuple(region.bounds_min.tolist()), tuple(region.bounds_max.tolist()), since,
+                        self.publisher_generation)
 
     def _log_event(self, event):
         entry = Logged(event.header.seq, event.header.map_epoch, event.to_cdr())

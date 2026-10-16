@@ -145,11 +145,12 @@ GOLDENS = {
     "sync_end_events_empty_le.hex": (m.SyncEnd, sync_end_events_empty, True),
     "sync_end_events_fallback_le.hex": (m.SyncEnd, sync_end_events_fallback, True),
     "sync_end_map_replay_be.hex": (m.SyncEnd, sync_end_map_replay, False),
+    "epoch_v2_le.hex": (m.Epoch, lambda: replace(epoch(), publisher_generation=G), True),
+    "epoch_v2_be.hex": (m.Epoch, lambda: replace(epoch(), publisher_generation=G), False),
+    "activity_v2_le.hex": (m.Activity, lambda: replace(activity(), publisher_generation=G), True),
 }
 # v2 goldens whose cut at the legacy length (+ up to 3 bytes) is a valid legacy message.
 V2_EXTENDS_LEGACY = {name for name in GOLDENS if "_v2_" in name}
-# Derived on this branch; the Swift suite does not decode Activity yet (PROVENANCE.md).
-NOT_IN_SWIFT = {"activity_le.hex", "activity_idle_le.hex"}
 
 
 def test_provenance_hashes():
@@ -161,8 +162,8 @@ def test_provenance_hashes():
 
 @pytest.mark.skipif(not SWIFT_HAND.is_dir(), reason=f"Swift hand goldens not found at {SWIFT_HAND}")
 def test_hand_goldens_match_the_swift_copies():
-    assert sorted(path.name for path in SWIFT_HAND.glob("*.hex")) == sorted(set(GOLDENS) - NOT_IN_SWIFT)
-    for name in set(GOLDENS) - NOT_IN_SWIFT:
+    assert sorted(path.name for path in SWIFT_HAND.glob("*.hex")) == sorted(GOLDENS)
+    for name in GOLDENS:
         assert hexfile(name, SWIFT_HAND) == hexfile(name), name
     assert memory_status().to_cdr() == hexfile("memory_status_le.hex", SWIFT_HAND)
 
@@ -411,6 +412,17 @@ def test_layout_detection_from_trailing_bytes():
         m.RequestSync.from_cdr(request + bytes(7 + 8))
     with pytest.raises(m.Invalid, match="all-zero"):
         m.RequestSync.from_cdr(request + bytes(7 + 24))
+    # Epoch ends on a uint8 (7 pad bytes before the generation), Activity on a float32 (4).
+    legacy = hexfile("epoch_le.hex")
+    assert legacy + bytes(7) + struct.pack("<Q", G) == hexfile("epoch_v2_le.hex")
+    with pytest.raises(m.Invalid, match="GENERATION_UNKNOWN"):
+        m.Epoch.from_cdr(legacy + bytes(7 + 8))
+    with pytest.raises(m.Invalid, match="neither padding"):
+        m.Epoch.from_cdr(legacy + bytes(3) + struct.pack("<Q", G))
+    legacy = hexfile("activity_le.hex")
+    assert legacy + bytes(4) + struct.pack("<Q", G) == hexfile("activity_v2_le.hex")
+    with pytest.raises(m.Invalid, match="GENERATION_UNKNOWN"):
+        m.Activity.from_cdr(legacy + bytes(4 + 8))
 
 
 def test_v2_mask_follows_the_parent():

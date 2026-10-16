@@ -2,7 +2,8 @@
 """Serialize the hand-golden room-memory values with rclpy, so the Mac can compare real ROS 2 bytes.
 
 Status: written for PR 0.2, extended for protocol v2 (publisher generations, RequestSync token,
-SyncEnd; docs/ROOM-MEMORY-PROTOCOL.md section 5, D34-D36), never run. It needs ROS 2 Jazzy and a
+SyncEnd; docs/ROOM-MEMORY-PROTOCOL.md section 5, D34-D36; the Activity and Epoch generation),
+never run. It needs ROS 2 Jazzy and a
 built labcommand_msgs, so it runs on the Spark (inside a Jazzy container), by Trevor or an agent
 he authorizes:
 
@@ -21,9 +22,9 @@ RequestSync's expected_generation and request_token), so rclpy can no longer pro
 legacy-layout goldens from the v2 .msg files: built against them, the legacy builders below give
 v2-layout bytes with generation 0, which is invalid. They stay, in LEGACY_GOLDENS, as the record of
 the legacy values and as the base the v2 builders extend; main() does not write them. Producing
-them again needs a labcommand_msgs built from the pre-v2 .msg files. epoch_le is unaffected (Epoch
-has no generation). The compressed MapBricks goldens (lzfse, zlib snapshot) have no v2 twin, so
-no Spark-produced compressed golden remains.
+them again needs a labcommand_msgs built from the pre-v2 .msg files. That now includes epoch_le and
+the Activity goldens: Epoch and Activity carry the generation too. The compressed MapBricks goldens
+(lzfse, zlib snapshot) have no v2 twin, so no Spark-produced compressed golden remains.
 
 The bytes should also match the .hex files, except for up to 3 bytes of trailing padding the rmw
 layer may add. That holds for the compressed goldens too, because their payloads are built by
@@ -40,8 +41,8 @@ import sys
 import zlib
 
 from builtin_interfaces.msg import Time
-from labcommand_msgs.msg import (ChangeEvent, Epoch, MapBricks, MemoryStatus, RequestSync, SeqRange,
-                                 SyncEnd)
+from labcommand_msgs.msg import (Activity, ChangeEvent, Epoch, MapBricks, MemoryStatus, RequestSync,
+                                 SeqRange, SyncEnd)
 from rclpy.serialization import serialize_message
 
 NAN = float("nan")
@@ -127,6 +128,27 @@ def epoch_le():
     return msg
 
 
+def activity_le():
+    msg = common(Activity(), "lab", 43, 21, *T10)
+    msg.active = True
+    msg.sensors = Activity.SENSOR_MID360 | Activity.SENSOR_JT128
+    msg.largest_sensor = Activity.SENSOR_JT128
+    msg.n_regions = 3
+    msg.voxel_count = 16909060
+    msg.centroid = [0.5, 1.25, 0.0625]
+    msg.aabb = [0.25, 1.0, 0.0, 0.75, 1.5, 0.125]
+    msg.since_s = 2.5
+    return msg
+
+
+def activity_idle_le():
+    msg = common(Activity(), "lab", 1, 0, *T10)
+    msg.centroid = [NAN] * 3
+    msg.aabb = [NAN] * 6
+    msg.since_s = NAN
+    return msg
+
+
 def map_bricks_delta_le():
     return map_bricks(common(MapBricks(), "lab", 43, 12, *T10), MapBricks.COMPRESSION_NONE,
                       MapBricks.KIND_DELTA, 42, DELTA_BRICKS, DELTA_REMOVED, bytes)
@@ -209,6 +231,18 @@ def memory_status_v2_le():
     return msg
 
 
+def epoch_v2_le():
+    msg = epoch_le()
+    msg.publisher_generation = GENERATION
+    return msg
+
+
+def activity_v2_le():
+    msg = activity_le()
+    msg.publisher_generation = GENERATION
+    return msg
+
+
 def map_bricks_delta_v2_le():
     msg = map_bricks_delta_le()
     msg.publisher_generation = GENERATION
@@ -258,7 +292,8 @@ def sync_end_events_fallback_le():
 
 
 GOLDENS = [
-    epoch_le,
+    epoch_v2_le,
+    activity_v2_le,
     memory_status_v2_le,
     map_bricks_delta_v2_le,
     change_event_appeared_v2_le,
@@ -272,6 +307,9 @@ GOLDENS = [
 # (see the module docstring), so main() skips them. Kept, not deleted: the legacy .hex goldens stay
 # as decode fixtures, and the v2 builders above extend these values.
 LEGACY_GOLDENS = [
+    epoch_le,
+    activity_le,
+    activity_idle_le,
     memory_status_le,
     map_bricks_delta_le,
     map_bricks_delta_lzfse_le,

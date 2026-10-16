@@ -780,6 +780,7 @@ MemoryStatus MemoryStatus::from_cdr(std::span<const std::uint8_t> data) {
 
 void Epoch::validate() const {
     header.validate("Epoch");
+    require_generation(publisher_generation, "Epoch: publisher_generation");
     require_int(n_appeared, 0, (std::int64_t{1} << 32) - 1, "Epoch: n_appeared");
     require_int(n_disappeared, 0, (std::int64_t{1} << 32) - 1, "Epoch: n_disappeared");
     require_int(n_moved, 0, (std::int64_t{1} << 32) - 1, "Epoch: n_moved");
@@ -796,6 +797,7 @@ Bytes Epoch::to_cdr() const {
     writer.u32(static_cast<std::uint64_t>(n_moved));
     writer.f32(coverage_known_frac);
     writer.u8(static_cast<std::uint8_t>(state));
+    if (publisher_generation) writer.u64(*publisher_generation);
     return writer.take();
 }
 
@@ -808,6 +810,7 @@ Epoch Epoch::from_cdr(std::span<const std::uint8_t> data) {
         e.n_moved = reader.u32("n_moved");
         e.coverage_known_frac = maybe(reader.f32("coverage_known_frac"));
         e.state = read_enum<MemoryState>(reader.u8("state"), 5, "Epoch: state");
+        if (reader.is_v2(8, "state")) e.publisher_generation = reader.u64("publisher_generation");
         e.validate();
         return e;
     });
@@ -816,6 +819,7 @@ Epoch Epoch::from_cdr(std::span<const std::uint8_t> data) {
 void Activity::validate() const {
     const std::string context = "Activity";
     header.validate(context);
+    require_generation(publisher_generation, context + ": publisher_generation");
     require_int(sensors, 0, 0xFF, context + ": sensors");
     if (sensors & ~kSensorsAll) throw Invalid(context + ": sensors sets an undefined bit");
     require_int(largest_sensor, 0, 0xFF, context + ": largest_sensor");
@@ -862,6 +866,7 @@ Bytes Activity::to_cdr() const {
         }
     }
     writer.f32(since_s);
+    if (publisher_generation) writer.u64(*publisher_generation);
     return writer.take();
 }
 
@@ -885,6 +890,7 @@ Activity Activity::from_cdr(std::span<const std::uint8_t> data) {
             if (nans == 0) *field = values;
         }
         a.since_s = maybe(reader.f32("since_s"));
+        if (reader.is_v2(8, "since_s")) a.publisher_generation = reader.u64("publisher_generation");
         a.validate();
         return a;
     });

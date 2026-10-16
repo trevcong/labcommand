@@ -1102,6 +1102,8 @@ def test_activity_reports_the_newest_window_with_motion():
     memory = mid360_memory(None, state_dir=None, recent_windows=1, candidate_windows=5, activity_radius_m=1.0)
     idle = memory.activity(stamp(0))
     assert (idle.active, idle.since_s, idle.header.seq) == (False, None, 0)
+    # Like every stateful message, Activity carries the process's generation (seq restarts at 0 per generation).
+    assert idle.publisher_generation == memory.publisher_generation == GENERATION
     second = build_reference(memory, room)
     for n in range(4):
         box = scenes.box_shell((0.3 + 0.3 * (n % 2), 1.2, 0.3))

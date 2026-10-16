@@ -71,6 +71,7 @@ def test_activity_goes_out_with_each_status(node, monkeypatch):
     messages = [Activity.from_cdr(data) for data in sent]
     assert [m.header.seq for m in messages] == [0, 1] and not any(m.active for m in messages)
     assert all(m.since_s is None and m.header.room_id == "lab" for m in messages)
+    assert all(m.publisher_generation == node.generation.generation for m in messages)
 
 
 def test_activity_reaches_a_late_transient_local_subscriber(node):
