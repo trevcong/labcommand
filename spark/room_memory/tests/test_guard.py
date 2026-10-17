@@ -644,6 +644,23 @@ def test_the_rig_state_round_trips_and_a_restart_checks_the_pose(tmp_path):
     assert trace[0].rig.causes == CAUSE_STARTUP
 
 
+def test_a_frame_add_imu_cannot_decode_is_counted_never_raised(monkeypatch):
+    """add_imu rejects what decode_imu cannot read, whatever it raises (the C++ engine catches every
+    std::exception), and counts it; with the guard off it reads nothing."""
+    memory = guarded()
+    good = ImuSample(Time(1, 0), "livox_frame", (0.0, 0.0, 0.0), (0.0, 0.0, -1.0)).to_cdr()
+    assert memory.add_imu(good, Time(1, 0)) and memory.imu_failed == 0
+    assert not memory.add_imu(good[:40], Time(1, 0)) and memory.imu_failed == 1  # truncated: a CDRError
+
+    def broken(data):
+        raise OverflowError("not a CDRError")
+
+    monkeypatch.setattr("room_memory.memory.decode_imu", broken)
+    assert not memory.add_imu(good, Time(1, 0)) and memory.imu_failed == 2
+    off = RoomMemory(MemoryConfig(sensors=("mid360",), state_dir=None), Time(0, 0), GENERATION)
+    assert not off.add_imu(good, Time(1, 0)) and off.imu_failed == 0
+
+
 def test_a_failed_rig_save_never_leaves_close_window_and_retries(tmp_path):
     """A rig_state write that fails (a directory where its temp file goes, as a full disk or a
     permission error would) is caught: the guard runs on from memory, the failure is counted, every

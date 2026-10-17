@@ -35,7 +35,6 @@ from .messages import (
     Activity,
     BRICK_DIM,
     Brick,
-    CDRError,
     ChangeEvent,
     Compression,
     EventKind,
@@ -1350,7 +1349,7 @@ class RoomMemory:
             return False
         try:
             sample = decode_imu(data)
-        except CDRError:
+        except Exception:  # rejected frame, not a crash, as in add_cdr and the C++ engine's std::exception
             self.imu_failed += 1
             return False
         self._detector.add(sample, _nanoseconds(received))

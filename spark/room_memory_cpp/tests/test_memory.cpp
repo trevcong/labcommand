@@ -2071,6 +2071,19 @@ TEST(the_rig_state_round_trips_and_a_restart_checks_the_pose) {
     CHECK_EQ(trace[0].rig->causes, msg::kCauseStartup);
 }
 
+TEST(a_frame_add_imu_cannot_decode_is_counted_never_thrown) {
+    // add_imu rejects what decode_imu cannot read and counts it; with the guard off it reads nothing.
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
+    const msg::Bytes good = msg::ImuSample{msg::Time{1, 0}, "livox_frame", {0.0, 0.0, 0.0}, {0.0, 0.0, -1.0}}.to_cdr();
+    CHECK(memory.add_imu(good, msg::Time{1, 0}) && memory.imu_failed() == 0);
+    const msg::Bytes truncated(good.begin(), good.begin() + 40);
+    CHECK(!memory.add_imu(truncated, msg::Time{1, 0}) && memory.imu_failed() == 1);
+    MemoryConfig off = guarded_config();
+    off.rig_guard = false;
+    RoomMemory unguarded(off, msg::Time{0, 0}, kGeneration);
+    CHECK(!unguarded.add_imu(good, msg::Time{1, 0}) && unguarded.imu_failed() == 0);
+}
+
 TEST(a_failed_rig_save_never_leaves_close_window_and_retries) {
     // A rig_state write that fails (a directory where its temp file goes, as a full disk or a
     // permission error would) is caught: the guard runs on from memory, the failure is counted, every
