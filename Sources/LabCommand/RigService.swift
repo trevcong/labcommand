@@ -1,10 +1,11 @@
 import Foundation
 import LabCommandCore
 
-/// I/O for the dual rig: own the two SSH tunnels (8765 Foxglove, 8766
-/// command-center API) and speak HTTP to the API. Replaces the v0.5
-/// spark-capture.sh probe path — the Spark-side collector is the one truth,
-/// shared with the web panel.
+/// I/O for the dual rig. Holds the two SSH local forwards (Foxglove on
+/// :8765, the command-center API on :8766) and speaks HTTP to that API:
+/// GET /status.json and POST /action. An already-open local forward counts
+/// as up. When `isolates` is set, tunnel setup returns before any port
+/// probe or ssh spawn.
 public final class RigService: @unchecked Sendable {
     public static let apiPort = TunnelGate.apiPort
     public static let viewPort = TunnelGate.viewPort

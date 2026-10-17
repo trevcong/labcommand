@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import os
 
 /// The bridge as this connection found it.
 public struct LiveRoomServer: Sendable, Equatable {
@@ -52,12 +53,98 @@ public enum LiveRoomConnection: Sendable, Equatable {
     case waiting(retryIn: TimeInterval, reason: String)
 }
 
+/// Sees each HTTP redirect on the room socket and admits the destination before it is followed.
+/// `URLSession` otherwise follows the redirect, including a later hop from TLS back to cleartext.
+/// `originalRequest` stays the first URL, so each task keeps its own `RoomRedirectChain`.
+private final class RoomRedirectGuard: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private struct State {
+        var allowCleartext = false
+        var generation = 0
+        var refusal: String?
+        /// `taskIdentifier` → hops already judged on that task. Not cleared in `beginAttempt`:
+        /// a late callback from the previous socket must still refuse a downgrade.
+        var chains: [Int: RoomRedirectChain] = [:]
+        /// Test fixture only. Production stays false.
+        var trustLoopbackCertificates = false
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func setCleartextPermitted(_ allowed: Bool) {
+        state.withLock { $0.allowCleartext = allowed }
+    }
+
+    func setTrustLoopbackCertificatesForTesting(_ enabled: Bool) {
+        state.withLock { $0.trustLoopbackCertificates = enabled }
+    }
+
+    /// Drops a refusal from the previous attempt. A late callback from that attempt cannot write the next one.
+    func beginAttempt() {
+        state.withLock {
+            $0.generation += 1
+            $0.refusal = nil
+        }
+    }
+
+    func refusal() -> String? {
+        state.withLock { $0.refusal }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        let outcome = state.withLock { current -> (decision: RoomRedirectDecision, generation: Int) in
+            var chain = current.chains[task.taskIdentifier] ?? RoomRedirectChain(dialed: task.originalRequest?.url)
+            let decision = chain.decide(redirecting: response.url, to: request.url, allowCleartext: current.allowCleartext)
+            current.chains[task.taskIdentifier] = chain
+            return (decision, current.generation)
+        }
+        switch outcome.decision {
+        case .follow:
+            completionHandler(request)
+        case .refuse(let message):
+            state.withLock {
+                if $0.generation == outcome.generation {
+                    $0.refusal = message
+                }
+            }
+            completionHandler(nil)
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        state.withLock { _ = $0.chains.removeValue(forKey: task.taskIdentifier) }
+    }
+
+    /// A fixture's self-signed loopback certificate. Off unless a test asks, and never for another host.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        let trustLoopback = state.withLock { $0.trustLoopbackCertificates }
+        let host = challenge.protectionSpace.host.lowercased()
+        let loopback = host == "127.0.0.1" || host == "localhost" || host == "::1"
+        if trustLoopback,
+           challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+           loopback,
+           let trust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+            return
+        }
+        completionHandler(.performDefaultHandling, nil)
+    }
+}
+
 /// The live room-memory link: one Foxglove WebSocket to the Spark's room-memory bridge, feeding
 /// a `RoomMemoryMirror`. Bind SwiftUI to `connection` and `mirror` (see `LiveRoom/API.md`).
 @MainActor
 public final class LiveRoomClient: ObservableObject {
-    /// The room-memory bridge on the Spark's tailnet IP (Phase 3 P12).
-    public nonisolated static let defaultURL = URL(string: "ws://100.118.187.99:8767")!
     /// No `serverInfo` by then: give up on the attempt.
     public static let handshakeTimeout: TimeInterval = 5
     /// No message for this long (status is 1 Hz): the link is dead; reconnect.
@@ -94,9 +181,12 @@ public final class LiveRoomClient: ObservableObject {
         return requestSyncSink != nil ? .relay : .unavailable
     }
 
-    public let url: URL
+    public private(set) var url: URL
     /// False keeps the client read-only: it never advertises a channel or sends a request.
     public let publishRequests: Bool
+    /// The room passed to `init`. The mirror may adopt a different id from the wire.
+    private let boundRoomId: String?
+    private let redirectGuard = RoomRedirectGuard()
     private let session: URLSession
     private var runTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
@@ -123,15 +213,28 @@ public final class LiveRoomClient: ObservableObject {
         var failure: String?
     }
 
-    public init(url: URL = LiveRoomClient.defaultURL, roomId: String? = nil, publishRequests: Bool = true) {
+    public init(url: URL, roomId: String? = nil, publishRequests: Bool = true) {
         self.url = url
+        self.boundRoomId = roomId
         self.publishRequests = publishRequests
         mirror = RoomMemoryMirror(roomId: roomId)
         let config = URLSessionConfiguration.ephemeral
         config.waitsForConnectivity = false
         // The silence watchdog owns timeouts; a request timeout would cut a quiet, healthy socket.
         config.timeoutIntervalForRequest = 24 * 60 * 60
-        session = URLSession(configuration: config)
+        session = URLSession(configuration: config, delegate: redirectGuard, delegateQueue: nil)
+    }
+
+    /// The saved cleartext switch. A redirect to `ws://` is admitted only while this is true.
+    /// A secure hop anywhere on the handshake refuses a later cleartext hop either way.
+    public func setCleartextPermitted(_ allowed: Bool) {
+        redirectGuard.setCleartextPermitted(allowed)
+    }
+
+    /// Tests only. While true, a loopback server certificate is trusted so a fixture can serve the
+    /// secure hop of a redirect chain. A non-loopback host keeps the system default. The app never calls this.
+    public func trustLoopbackCertificatesForTesting(_ enabled: Bool) {
+        redirectGuard.setTrustLoopbackCertificatesForTesting(enabled)
     }
 
     deinit {
@@ -147,14 +250,55 @@ public final class LiveRoomClient: ObservableObject {
         runTask = Task { [weak self] in await self?.run(generation: generation) }
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                self?.tick()
+                // `try?` used to swallow cancellation and tick the next generation once.
+                do {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                } catch {
+                    return
+                }
+                guard let self, !Task.isCancelled, generation == self.runGeneration else { return }
+                self.tick()
             }
         }
     }
 
+    /// Points this client at `newURL`. The same canonical URL keeps the socket and the mirror.
+    /// While running, `connection` is `.connecting` to the new URL before this returns. `start()`
+    /// only schedules the attempt, so the publish cannot wait for `run()`.
+    public func retarget(_ newURL: URL) {
+        let next = Self.canonical(newURL)
+        guard next.absoluteString != url.absoluteString else { return }
+        guard runTask != nil else {
+            url = next
+            mirror = RoomMemoryMirror(roomId: boundRoomId)
+            return
+        }
+        runGeneration += 1
+        runTask?.cancel()
+        tickTask?.cancel()
+        runTask = nil
+        tickTask = nil
+        if let current = link {
+            current.socket.cancel(with: .goingAway, reason: nil)
+            link = nil
+        }
+        url = next
+        mirror = RoomMemoryMirror(roomId: boundRoomId)
+        connection = .connecting(url: next, attempt: 1)
+        start()
+    }
+
+    private static func canonical(_ url: URL) -> URL {
+        if case .success(let parsed) = RoomMemoryEndpoint.parse(url.absoluteString) {
+            return parsed
+        }
+        return url
+    }
+
     /// Closes the socket. The mirror stays, greyed: nothing proves it current any more.
     public func stop() {
+        // A run or tick still unwinding must not publish over `.off`.
+        runGeneration += 1
         runTask?.cancel()
         tickTask?.cancel()
         runTask = nil
@@ -184,11 +328,17 @@ public final class LiveRoomClient: ObservableObject {
             let delay = max(Self.reconnectFloor, FoxgloveProtocol.reconnectDelay(afterFailures: failures))
             note(opened ? "connection lost: \(reason); retrying in \(Int(delay)) s" : "\(url) unreachable: \(reason); retrying in \(Int(delay)) s")
             connection = .waiting(retryIn: delay, reason: reason)
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            } catch {
+                return
+            }
+            if Task.isCancelled || generation != runGeneration { return }
         }
     }
 
     private func connectOnce() async -> (opened: Bool, reason: String) {
+        redirectGuard.beginAttempt()
         let socket = session.webSocketTask(with: url, protocols: FoxgloveProtocol.subprotocols)
         socket.maximumMessageSize = Self.maxMessageBytes
         link = Link(socket: socket, startedAt: Self.now, lastMessageAt: Self.now)
@@ -214,7 +364,12 @@ public final class LiveRoomClient: ObservableObject {
                 }
             }
         } catch {
-            reason = (isCurrent() ? link?.failure : nil) ?? Self.describe(error, socket: socket)
+            reason = redirectGuard.refusal()
+                ?? (isCurrent() ? link?.failure : nil)
+                ?? Self.describe(error, socket: socket)
+        }
+        if let refusal = redirectGuard.refusal() {
+            reason = refusal
         }
         socket.cancel(with: .goingAway, reason: nil)
         guard isCurrent() else { return (false, "stopped") }
@@ -227,6 +382,10 @@ public final class LiveRoomClient: ObservableObject {
     }
 
     private func tick() {
+        if let refusal = redirectGuard.refusal() {
+            fail(refusal)
+            return
+        }
         let now = Self.now
         if let link {
             // A half-dead link would sit in receive() forever.

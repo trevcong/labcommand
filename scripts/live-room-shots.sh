@@ -1,14 +1,48 @@
 #!/bin/bash
 # Capture one Live Room window from the build-output app.
-# Usage: scripts/live-room-shots.sh live|map|status|stale|lost|restart|legacy|unavailable
+# Usage: scripts/live-room-shots.sh [--allow-cleartext] live|map|status|stale|lost|restart|legacy|unavailable
+#
+# --allow-cleartext  Dial ws:// for this run only. Does not save Allow cleartext WebSocket.
+#                    Without the flag, live mode stays blocked while cleartext is off.
 # Quits that process by PID. Does not install, and does not touch ~/Applications.
 set -euo pipefail
 
-MODE="${1:-}"
-case "$MODE" in
-  live|map|status|stale|lost|restart|legacy|unavailable) ;;
-  *) echo "usage: $0 live|map|status|stale|lost|restart|legacy|unavailable" >&2; exit 2 ;;
-esac
+usage() {
+  echo "usage: $0 [--allow-cleartext] live|map|status|stale|lost|restart|legacy|unavailable" >&2
+  echo "  --allow-cleartext  dial ws:// for this run only. Does not save Allow cleartext WebSocket." >&2
+  echo "                     Without the flag, live mode stays blocked while cleartext is off." >&2
+}
+
+ALLOW_CLEARTEXT=0
+MODE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --allow-cleartext)
+      ALLOW_CLEARTEXT=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    live|map|status|stale|lost|restart|legacy|unavailable)
+      if [[ -n "$MODE" ]]; then
+        usage
+        exit 2
+      fi
+      MODE="$1"
+      shift
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+if [[ -z "$MODE" ]]; then
+  usage
+  exit 2
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${ROOT}/build/LabCommand.app/Contents/MacOS/LabCommand"
@@ -29,6 +63,17 @@ rm -f "$PNG" "$SIDECAR"
 
 export LABCOMMAND_LIVE_ROOM="$MODE"
 export LABCOMMAND_ROOM_SIDECAR="$SIDECAR"
+# The sidecar grep is this IP. A saved preference must not change what live mode dials.
+if [[ "$MODE" == "live" ]]; then
+  export LABCOMMAND_ROOM_URL="ws://100.118.187.99:8767"
+fi
+# Cleartext stays off unless this invocation passed --allow-cleartext.
+# The variable covers this process only. It is not written to Settings.
+if [[ "$ALLOW_CLEARTEXT" == 1 ]]; then
+  export LABCOMMAND_ALLOW_CLEARTEXT=1
+else
+  unset LABCOMMAND_ALLOW_CLEARTEXT
+fi
 "$BIN" >/tmp/lc-liveroom-shot-${MODE}.log 2>&1 &
 PID=$!
 echo "pid ${PID}"

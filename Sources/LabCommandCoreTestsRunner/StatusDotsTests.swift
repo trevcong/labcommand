@@ -43,7 +43,7 @@ func runStatusDotsTests() {
     expect(down.mid360.state == .unknown && down.jt128.state == .unknown,
            "no room socket: sensors stay the grey probe")
 
-    let connecting = LiveRoomConnection.connecting(url: LiveRoomClient.defaultURL, attempt: 1)
+    let connecting = LiveRoomConnection.connecting(url: RoomMemoryEndpoint.defaultURL, attempt: 1)
     let dialing = StatusDots.derive(rig: offline, connection: connecting, status: live, isStatusFresh: true)
     expect(!dialing.sparkReachable && dialing.mid360.state == .unknown,
            "connecting is not a live link")

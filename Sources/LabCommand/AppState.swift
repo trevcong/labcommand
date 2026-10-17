@@ -84,6 +84,18 @@ final class AppState: ObservableObject {
     /// Live room socket. Nil in fixture mode: the view reads `fixture` instead.
     /// A snapshot launch isolates the network, so it leaves this nil too.
     let roomLaunch: LiveRoomLaunch
+    /// Resolved once, from the environment and then saved defaults. Settings reads this.
+    /// It does not resolve again on appear.
+    private let roomEndpoint: RoomMemoryEndpointStore
+    /// Saved cleartext switch. Off until the operator turns it on.
+    /// `LABCOMMAND_ALLOW_CLEARTEXT=1` does not change this and is not saved.
+    @Published private(set) var allowCleartextRoomWebSocket: Bool
+    /// This process was started with `LABCOMMAND_ALLOW_CLEARTEXT=1`. The switch stays on the saved value.
+    let cleartextFromEnvironment: Bool
+    /// Set when the current address must not be dialed. The Room screen shows this string.
+    @Published private(set) var roomEndpointBlock: String?
+    /// The Room block asked to show the cleartext switch. Settings scrolls to it and clears this.
+    @Published var showCleartextToggle = false
     let room: LiveRoomClient?
     @Published private(set) var fixture: LiveRoomFixture? {
         didSet { recomputeStatusDots() }
@@ -112,6 +124,11 @@ final class AppState: ObservableObject {
         self.launch = launch
         let roomLaunch = LiveRoomLaunch.parse(environment)
         self.roomLaunch = roomLaunch
+        let endpointStore = RoomMemoryEndpointStore(environment: environment, defaults: .standard)
+        self.roomEndpoint = endpointStore
+        self.allowCleartextRoomWebSocket = endpointStore.allowCleartext
+        self.cleartextFromEnvironment = endpointStore.cleartextFromEnvironment
+        self.roomEndpointBlock = nil
         self.service = service ?? ConnectivityService()
         self.rigIO = rigIO ?? MockMode.createRigService(isolates: launch.isolates)
         // The room gate launch and every fixture leave the lidar client dark.
@@ -120,12 +137,13 @@ final class AppState: ObservableObject {
         )
         switch roomLaunch {
         case .live:
-            self.room = launch.isolates ? nil : LiveRoomClient()
+            self.room = launch.isolates ? nil : LiveRoomClient(url: endpointStore.current)
             self.fixture = nil
         case .fixture(let mode):
             self.room = nil
             self.fixture = try? LiveRoomFixture.load(mode: mode, root: nil, now: ProcessInfo.processInfo.systemUptime)
         }
+        self.room?.setCleartextPermitted(endpointStore.cleartextPermitted)
         self.snapshot = LabStatusSnapshot(
             overall: .unknown,
             spark: .unknown,
@@ -145,6 +163,77 @@ final class AppState: ObservableObject {
         }
         recomputeStatusDots()
         watchRoomDots()
+        refreshRoomEndpointBlock()
+    }
+
+    /// The endpoint this process is using. Settings copies it into the field on appear.
+    var roomEndpointURL: URL { roomEndpoint.current }
+
+    /// True when this process may dial cleartext. The saved switch or the environment flag.
+    /// An environment URL does not turn this on.
+    var showsCleartextWarning: Bool { allowCleartextRoomWebSocket || cleartextFromEnvironment }
+
+    func setAllowCleartextRoomWebSocket(_ allow: Bool) {
+        roomEndpoint.setAllowCleartext(allow)
+        allowCleartextRoomWebSocket = allow
+        applyRoomAdmission(startIfNeeded: true)
+    }
+
+    /// One step from the Room block to the cleartext switch. Does not turn the switch on.
+    func openCleartextSettings() {
+        dest = .settings
+        showCleartextToggle = true
+    }
+
+    func cleartextToggleWasShown() {
+        showCleartextToggle = false
+    }
+
+    /// Saves a valid endpoint and retargets the live socket. An invalid string, a disallowed
+    /// cleartext host, or an unconfirmed `wss://` to `ws://` change leaves the socket alone.
+    func commitRoomEndpoint(
+        _ raw: String,
+        confirmCleartextDowngrade: Bool = false
+    ) -> RoomEndpointCommitResult {
+        let result = roomEndpoint.commit(
+            raw,
+            retargeting: room,
+            confirmCleartextDowngrade: confirmCleartextDowngrade
+        )
+        if case .saved = result {
+            applyRoomAdmission(startIfNeeded: true)
+        }
+        return result
+    }
+
+    private func refreshRoomEndpointBlock() {
+        guard let room else {
+            roomEndpointBlock = nil
+            return
+        }
+        switch RoomMemoryEndpoint.admit(room.url, allowCleartext: roomEndpoint.cleartextPermitted) {
+        case .allowed:
+            roomEndpointBlock = nil
+        case .blocked(let message):
+            roomEndpointBlock = message
+        }
+    }
+
+    /// Dials only an admitted URL. A block stops a socket that was already open.
+    /// The socket hears the switch before it dials, so a redirect is judged with the same permission.
+    private func applyRoomAdmission(startIfNeeded: Bool) {
+        room?.setCleartextPermitted(roomEndpoint.cleartextPermitted)
+        refreshRoomEndpointBlock()
+        guard let room else { return }
+        if roomEndpointBlock == nil {
+            if startIfNeeded, roomLaunch.startsClient, !roomDidStart {
+                room.start()
+                roomDidStart = true
+            }
+        } else if roomDidStart {
+            room.stop()
+            roomDidStart = false
+        }
     }
 
     var roomMirror: RoomMemoryMirror {
@@ -283,9 +372,8 @@ final class AppState: ObservableObject {
                 await self?.applySnapshot(loaded)
             }
         }
-        if roomLaunch.startsClient, let room {
-            room.start()
-            roomDidStart = true
+        if roomLaunch.startsClient, room != nil {
+            applyRoomAdmission(startIfNeeded: true)
         }
         if let mode = roomLaunch.fixtureMode, LiveRoomFixture.keepsFresh(mode) {
             startFixtureClock()

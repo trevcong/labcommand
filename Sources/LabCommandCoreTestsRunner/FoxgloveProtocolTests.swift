@@ -168,7 +168,8 @@ func testFoxgloveStreamHosts() {
     for host in ["100.118.187.99", "192.168.1.5", "0.0.0.0", "255.255.255.255"] {
         expect(FoxgloveProtocol.isIPv4Literal(host), "\(host) is an IPv4 literal")
     }
-    for host in ["spark", "spark-ts", "spark.local", "1.2.3", "1.2.3.4.5", "256.1.1.1", "1.2.3.", "1..2.3", "+1.2.3.4", "fd7a::1", ""] {
+    for host in ["spark", "spark-ts", "spark.local", "1.2.3", "1.2.3.4.5", "256.1.1.1", "1.2.3.", "1..2.3", "+1.2.3.4", "fd7a::1", "",
+                 "010.0.0.1", "0127.1.1.1", "0100.0100.0.1", "0x0a.0.0.1", "10.1", "167772161"] {
         expect(!FoxgloveProtocol.isIPv4Literal(host), "\(host) is not an IPv4 literal")
     }
 }
