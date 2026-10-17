@@ -45,9 +45,10 @@ The nodes run `close_window`, and so the guard's ICP, in the window timer on the
 | 1 | 120 / 145 / 687 ms | 139 / 166 / 702 ms |
 | 18 (default) | 42 / 46 / 105 ms | 48 / 52 / 111 ms |
 
-- Each recording: 24 of ~300 windows run ICP (the periodic checks, 2 or 3 windows each), 48 estimates; `static5m-b` is within 3 ms of `static5m`. Windows without ICP: 20 ms median on one thread, 6 ms on 18.
-- Steady state is ~60 ms per estimate on one thread and ~21 ms on 18: within the 150 ms per-check budget.
-- The first check after a build costs 5× more (687 ms on one thread, 105 ms on 18), and a restart's startup check does too: `RegistrationCloud` computes its normals and correspondence grids lazily, on first use. On one thread that holds the executor for 0.7 s once, inside `window_s`. Follow-up: compute them when the cloud is built or loaded.
+- Each recording: 24 of ~300 windows run ICP (8 periodic checks of 3 windows each), 48 estimates; `static5m-b` is within 3 ms of `static5m`. Windows without ICP: 20 ms median on one thread, 6 ms on 18.
+- Steady state is ~60 ms per estimate on one thread and ~21 ms on 18.
+- Per check (3 windows × 2 sensors), against Design 3's budget of 150 ms per check: on 18 threads 125 ms median, inside it, but 187–191 ms for the first check; on one thread 361–368 ms median and 913–914 ms for the first check, 2.4–6× over. Each window stays inside `window_s`, so the budget holds only with the default threads; whether it holds on the Spark is still to measure.
+- The first check after a build costs 5× more (687 ms on one thread, 105 ms on 18), and a restart's startup check would too (not measured): `RegistrationCloud` computes its normals and correspondence grids lazily, on first use. On one thread that holds the executor for 0.7 s once, inside `window_s`. Follow-up: compute them when the cloud is built or loaded.
 - Not measured: windows while RIG_MOVED (one estimate per moved sensor per window); the recordings hold no move.
 
 ## Tests
