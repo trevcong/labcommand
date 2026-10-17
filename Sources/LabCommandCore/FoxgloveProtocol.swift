@@ -158,10 +158,11 @@ public enum FoxgloveProtocol {
     /// Hosts to try for `ws://<host>:8765`: the IPv4 literals of `SparkSSH.hopList`,
     /// i.e. the tailnet IP, then the cached LAN hop when it is an IPv4 address. The
     /// ssh aliases and the MagicDNS name are left out; the aliases only resolve
-    /// inside ssh. Cleartext ws:// here is allowed by Info.plist's ATS block:
-    /// `NSAllowsLocalNetworking` covers LAN addresses but not the 100.x CGNAT
-    /// tailnet IP, which needs its own `NSExceptionDomains` entry (macOS honours it
-    /// for an IP literal, though Apple documents exceptions for domain names).
+    /// inside ssh. Cleartext to an IP literal is covered by Info.plist
+    /// `NSAllowsLocalNetworking` (unqualified names, `.local`, and IP addresses,
+    /// including 100.64.0.0/10). A `*.ts.net` name needs the `ts.net` exception
+    /// (`NSIncludesSubdomains` and `NSExceptionAllowsInsecureHTTPLoads`). The room
+    /// endpoint still refuses `ws://` to a public host; ATS is not that check.
     public static func streamHosts(lastLAN: String? = nil) -> [String] {
         SparkSSH.hopList(lastLAN: lastLAN).filter(isIPv4Literal)
     }

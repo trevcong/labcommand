@@ -7,8 +7,8 @@ struct SettingsView: View {
     @State private var endpointDraft = ""
     @State private var endpointError: String?
     @State private var endpointReady = false
+    @State private var pendingDowngrade = false
     @State private var rigDiagnosticsOpen = false
-    @FocusState private var endpointFieldFocused: Bool
 
     var body: some View {
         ScrollView {
@@ -16,7 +16,7 @@ struct SettingsView: View {
                 Text("Settings")
                     .font(LabTheme.t(LabTheme.titleSize, .semibold))
                     .foregroundStyle(LabTheme.text)
-                Text("Room memory address for this Mac. It is saved when the field is committed, and the room reconnects if it is already running.")
+                Text("Room memory address for this Mac. Press Return to save it. The room reconnects if it is already running.")
                     .font(LabTheme.t(13))
                     .foregroundStyle(LabTheme.dim)
                     .fixedSize(horizontal: false, vertical: true)
@@ -27,10 +27,9 @@ struct SettingsView: View {
                         .textFieldStyle(.plain)
                         .foregroundStyle(LabTheme.text)
                         .accessibilityLabel("Room memory endpoint")
-                        .focused($endpointFieldFocused)
-                        .onSubmit { commitEndpointDraft() }
-                        .onChange(of: endpointFieldFocused) { _, focused in
-                            if !focused { commitEndpointDraft() }
+                        .onSubmit { commitEndpointDraft(confirmDowngrade: false) }
+                        .onChange(of: endpointDraft) { _, _ in
+                            if endpointReady && pendingDowngrade { pendingDowngrade = false }
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 6)
@@ -43,6 +42,20 @@ struct SettingsView: View {
                                 .stroke(LabTheme.line, lineWidth: 1)
                         )
                         .padding(.vertical, 10)
+                    if pendingDowngrade {
+                        Text(RoomMemoryEndpoint.downgradePrompt)
+                            .font(LabTheme.t(11))
+                            .foregroundStyle(LabTheme.warn)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 8) {
+                            Button("Use cleartext") { commitEndpointDraft(confirmDowngrade: true) }
+                                .buttonStyle(QuietButton())
+                            Button("Keep wss://") { cancelDowngrade() }
+                                .buttonStyle(QuietButton())
+                        }
+                        .font(LabTheme.t(12))
+                        .padding(.bottom, 8)
+                    }
                     if let endpointError {
                         Text(endpointError)
                             .font(LabTheme.t(11))
@@ -50,9 +63,36 @@ struct SettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .padding(.bottom, 8)
                     }
+                    if let block = state.roomEndpointBlock {
+                        Text(block)
+                            .font(LabTheme.t(11))
+                            .foregroundStyle(LabTheme.bad)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.bottom, 8)
+                    } else if let room = state.room {
+                        RoomSocketFailureLine(room: room)
+                    }
                     Text("Default \(RoomMemoryEndpoint.defaultURL.absoluteString).")
                         .font(LabTheme.t(11))
                         .foregroundStyle(LabTheme.faint)
+                    Rectangle().fill(LabTheme.line).frame(height: 1)
+                    Toggle(isOn: Binding(
+                        get: { state.allowCleartextRoomWebSocket },
+                        set: { state.setAllowCleartextRoomWebSocket($0) }
+                    )) {
+                        Text("Allow cleartext WebSocket (ws://)")
+                            .font(LabTheme.t(13))
+                            .foregroundStyle(LabTheme.text)
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .padding(.vertical, 10)
+                    Text(state.showsCleartextWarning
+                         ? RoomMemoryEndpoint.cleartextWarning
+                         : RoomMemoryEndpoint.cleartextOffNote)
+                        .font(LabTheme.t(11))
+                        .foregroundStyle(state.showsCleartextWarning ? LabTheme.warn : LabTheme.faint)
+                        .fixedSize(horizontal: false, vertical: true)
                         .padding(.bottom, 10)
                 }
 
@@ -170,15 +210,46 @@ struct SettingsView: View {
     private func loadEndpointDraft() {
         endpointDraft = state.roomEndpointURL.absoluteString
         endpointError = nil
+        pendingDowngrade = false
         endpointReady = true
     }
 
-    private func commitEndpointDraft() {
-        guard endpointReady else { return }
-        endpointError = state.commitRoomEndpoint(endpointDraft)
-        if endpointError == nil {
-            endpointDraft = state.roomEndpointURL.absoluteString
+    /// The same dial failure the Room screen shows, once the address is allowed to connect.
+    private struct RoomSocketFailureLine: View {
+        @ObservedObject var room: LiveRoomClient
+
+        var body: some View {
+            if let line = RoomConnectionFailure.detail(connection: room.connection, urlText: room.url.absoluteString) {
+                Text(line)
+                    .font(LabTheme.t(11))
+                    .foregroundStyle(LabTheme.bad)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.bottom, 8)
+            }
         }
+    }
+
+    /// Return saves. A `wss://` to `ws://` change stays unsaved until "Use cleartext".
+    private func commitEndpointDraft(confirmDowngrade: Bool) {
+        guard endpointReady else { return }
+        switch state.commitRoomEndpoint(endpointDraft, confirmCleartextDowngrade: confirmDowngrade) {
+        case .saved:
+            pendingDowngrade = false
+            endpointError = nil
+            endpointDraft = state.roomEndpointURL.absoluteString
+        case .rejected(let message):
+            pendingDowngrade = false
+            endpointError = message
+        case .needsCleartextConfirmation:
+            endpointError = nil
+            pendingDowngrade = true
+        }
+    }
+
+    private func cancelDowngrade() {
+        pendingDowngrade = false
+        endpointError = nil
+        endpointDraft = state.roomEndpointURL.absoluteString
     }
 
     /// A probe that measures point rate costs ~4 s on the Spark, so the cheap

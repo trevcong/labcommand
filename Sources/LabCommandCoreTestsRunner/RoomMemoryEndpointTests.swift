@@ -105,11 +105,21 @@ func testRoomMemoryEndpointParsesAndResolves() {
 
     let round = isolatedDefaults()
     let store = RoomMemoryEndpointStore(environment: [:], defaults: round)
-    expect(store.commit("ws://round.example:8767/", retargeting: nil) == nil, "commit accepts a trailing slash")
-    expect(endpointString(store.current) == "ws://round.example:8767", "commit updates the current endpoint")
+    expect(store.commit("wss://round.example:8767/", retargeting: nil) == .saved, "commit accepts a trailing slash")
+    expect(endpointString(store.current) == "wss://round.example:8767", "commit updates the current endpoint")
     expect(
-        endpointString(RoomMemoryEndpoint.resolve(environment: [:], defaults: round)) == "ws://round.example:8767",
+        endpointString(RoomMemoryEndpoint.resolve(environment: [:], defaults: round)) == "wss://round.example:8767",
         "save then resolve round-trips the canonical string"
+    )
+
+    let secureSaved = isolatedDefaults()
+    secureSaved.set("wss://saved.example:443", forKey: RoomMemoryEndpoint.defaultsKey)
+    expect(
+        endpointString(RoomMemoryEndpoint.resolve(
+            environment: ["LABCOMMAND_ROOM_URL": "ws://10.0.0.5:8767"],
+            defaults: secureSaved
+        )) == "wss://saved.example:443",
+        "an environment ws:// does not replace a saved wss://"
     )
 }
 
@@ -129,27 +139,39 @@ func testRoomMemoryCommitKeepsTheCurrentEndpoint() {
     let client = LiveRoomClient(url: store.current)
     expect(client.connection == .off, "a client that has not started is off")
     let rejected = store.commit("ws://host", retargeting: client)
-    expect(rejected != nil, "a missing port is rejected")
+    if case .rejected = rejected {
+    } else {
+        expect(false, "a missing port is rejected, got \(rejected)")
+    }
     expect(endpointString(store.current) == "ws://env.example:8767", "a rejected commit keeps the current endpoint")
     expect(defaults.string(forKey: RoomMemoryEndpoint.defaultsKey) == "ws://saved.example:8767", "a rejected commit does not write")
     expect(endpointString(client.url) == "ws://env.example:8767", "a rejected commit does not retarget")
     expect(client.connection == .off, "a rejected commit leaves the connection alone")
 
-    expect(store.commit("ws://committed.example:9/", retargeting: client) == nil, "a later valid commit is saved")
-    expect(endpointString(store.current) == "ws://committed.example:9", "commit replaces the current endpoint")
-    expect(endpointString(client.url) == "ws://committed.example:9", "commit retargets the client")
+    expect(store.commit("wss://committed.example:9/", retargeting: client) == .saved, "a later valid commit is saved")
+    expect(endpointString(store.current) == "wss://committed.example:9", "commit replaces the current endpoint")
+    expect(endpointString(client.url) == "wss://committed.example:9", "commit retargets the client")
     expect(client.connection == .off, "retarget before start does not connect")
-    expect(defaults.string(forKey: RoomMemoryEndpoint.defaultsKey) == "ws://committed.example:9", "commit persists the canonical string")
+    expect(defaults.string(forKey: RoomMemoryEndpoint.defaultsKey) == "wss://committed.example:9", "commit persists the canonical string")
 
     // Reopening Settings copies `current`. Resolving again would show the environment URL, which is stale.
     let reopened = endpointString(store.current)
-    expect(reopened == "ws://committed.example:9", "reopen reads the committed endpoint")
+    expect(reopened == "wss://committed.example:9", "reopen reads the committed endpoint")
     let again = RoomMemoryEndpoint.resolve(
         environment: ["LABCOMMAND_ROOM_URL": "ws://env.example:8767"],
         defaults: defaults
     )
-    expect(endpointString(again) == "ws://env.example:8767", "a new process with the environment set uses the environment again")
-    expect(endpointString(store.current) == "ws://committed.example:9", "this process does not re-resolve on reopen")
+    expect(endpointString(again) == "wss://committed.example:9", "a new process does not let an environment ws:// replace the saved wss://")
+    let wsSaved = isolatedDefaults()
+    wsSaved.set("ws://10.0.0.9:8767", forKey: RoomMemoryEndpoint.defaultsKey)
+    expect(
+        endpointString(RoomMemoryEndpoint.resolve(
+            environment: ["LABCOMMAND_ROOM_URL": "ws://192.168.1.9:8767"],
+            defaults: wsSaved
+        )) == "ws://192.168.1.9:8767",
+        "an environment ws:// still wins over a saved ws://"
+    )
+    expect(endpointString(store.current) == "wss://committed.example:9", "this process does not re-resolve on reopen")
 }
 
 @MainActor
@@ -298,6 +320,183 @@ func testLiveRoomRetargetDuringHandshakeBackoffAndRapidChanges() {
     a.stop(); b.stop(); c.stop()
 }
 
+func testCleartextHostPolicy() {
+    func allow(_ host: String) {
+        expect(RoomMemoryEndpoint.allowsCleartextHost(host), "\(host) may use ws://")
+    }
+    func deny(_ host: String) {
+        expect(!RoomMemoryEndpoint.allowsCleartextHost(host), "\(host) may not use ws://")
+    }
+
+    allow("10.0.0.1")
+    allow("10.255.255.255")
+    allow("172.16.0.0")
+    allow("172.31.255.255")
+    deny("172.15.255.255")
+    deny("172.32.0.1")
+    allow("192.168.0.1")
+    allow("192.168.68.65")
+    deny("192.169.0.1")
+    allow("127.0.0.1")
+    allow("169.254.10.20")
+    allow("100.64.0.0")
+    allow("100.118.187.99")
+    allow("100.127.255.255")
+    deny("100.63.255.255")
+    deny("100.128.0.1")
+    deny("8.8.8.8")
+    deny("1.2.3.4")
+    deny("192.0.2.10")
+    deny("2130706433")
+    deny("localhost")
+    deny("example.com")
+    deny("notts.net")
+    deny("ts.net")
+    deny("ts.net.evil.com")
+    deny("spark.ts.net.evil.com")
+    allow("spark-1f3e.tail8dfdc7.ts.net")
+    allow("Spark-1F3E.TAIL8DFDC7.TS.NET")
+    allow("foo.bar.ts.net.")
+    deny(".ts.net")
+    deny("foo..ts.net")
+    allow("::1")
+    allow("[::1]")
+    allow("fd00::1")
+    allow("fe80::1")
+    deny("2001:db8::1")
+    deny("::ffff:127.0.0.1")
+
+    let magic = RoomMemoryEndpoint.defaultURL
+    switch RoomMemoryEndpoint.admit(magic, allowCleartext: false) {
+    case .blocked(let message):
+        expect(message.contains("Cleartext WebSocket is off"), "the default is blocked while the switch is off, got \(message)")
+        expect(message.contains(CaptureRecipe.tailscaleDNS), "the block names the MagicDNS host")
+        expect(!message.contains(CaptureRecipe.tailscaleIP), "the block does not substitute the tailnet IP")
+    case .allowed:
+        expect(false, "the default ws:// must not dial while cleartext is off")
+    }
+    expect(RoomMemoryEndpoint.admit(magic, allowCleartext: true) == .allowed, "the MagicDNS name is an allowed cleartext host")
+
+    switch RoomMemoryEndpoint.parse("wss://example.com:443") {
+    case .success(let secure):
+        expect(RoomMemoryEndpoint.admit(secure, allowCleartext: false) == .allowed, "wss:// does not need the cleartext switch")
+    case .failure(let error):
+        expect(false, "wss fixture parses: \(error.message)")
+    }
+    switch RoomMemoryEndpoint.parse("ws://example.com:443") {
+    case .success(let publicWS):
+        if case .blocked(let message) = RoomMemoryEndpoint.admit(publicWS, allowCleartext: true) {
+            expect(message.contains("example.com"), "a public ws:// names the host, got \(message)")
+            expect(message.contains("not allowed"), "a public ws:// is refused even with the switch on")
+        } else {
+            expect(false, "a public ws:// must be blocked")
+        }
+    case .failure(let error):
+        expect(false, "public ws fixture parses: \(error.message)")
+    }
+    switch RoomMemoryEndpoint.parse("ws://10.1.2.3:8767") {
+    case .success(let lan):
+        if case .blocked(let message) = RoomMemoryEndpoint.admit(lan, allowCleartext: false) {
+            expect(message.contains("Cleartext WebSocket is off"), "an allowed host still needs the switch, got \(message)")
+        } else {
+            expect(false, "ws:// to a private host is blocked while the switch is off")
+        }
+        expect(RoomMemoryEndpoint.admit(lan, allowCleartext: true) == .allowed, "a private host dials once the switch is on")
+    case .failure(let error):
+        expect(false, "lan fixture parses: \(error.message)")
+    }
+
+    let blockedScreen = LiveRoomScreen.make(
+        mirror: RoomMemoryMirror(),
+        connection: .off,
+        requestPathExists: false,
+        started: false,
+        now: 10,
+        endpointBlock: RoomMemoryEndpoint.cleartextDisabledMessage(url: magic)
+    )
+    let detail = blockedScreen.connectionDetail ?? ""
+    expect(detail.contains("Cleartext WebSocket is off"), "the Room screen shows the cleartext block, got \(detail)")
+    expect(detail.contains(CaptureRecipe.tailscaleDNS), "the Room screen names the address that was not dialed")
+    expect(blockedScreen.canvasSentence != "Room memory unavailable", "the block is not hidden behind the off sentence")
+    expect(blockedScreen.banner == nil, "a socket that never started keeps an empty banner")
+}
+
+@MainActor
+func testCleartextDowngradeRequiresConfirmation() {
+    let off = isolatedDefaults()
+    let secure = RoomMemoryEndpointStore(
+        environment: ["LABCOMMAND_ROOM_URL": "wss://secure.example:443"],
+        defaults: off
+    )
+    expect(endpointString(secure.current) == "wss://secure.example:443", "the secure environment URL is current")
+    let bypass = secure.commit("ws://10.0.0.8:8767", retargeting: nil, confirmCleartextDowngrade: true)
+    if case .rejected(let message) = bypass {
+        expect(message.contains("Cleartext WebSocket is off"), "confirmation does not bypass the switch, got \(message)")
+    } else {
+        expect(false, "ws:// with the switch off is rejected, got \(bypass)")
+    }
+    expect(secure.current.scheme == "wss", "a rejected downgrade keeps wss://")
+    expect(off.string(forKey: RoomMemoryEndpoint.defaultsKey) == nil, "a rejected downgrade does not write")
+
+    let on = isolatedDefaults()
+    on.set(true, forKey: RoomMemoryEndpoint.cleartextDefaultsKey)
+    let store = RoomMemoryEndpointStore(
+        environment: ["LABCOMMAND_ROOM_URL": "wss://secure.example:443"],
+        defaults: on
+    )
+    expect(store.allowCleartext, "the saved switch is read at init")
+    let pending = store.commit("ws://10.0.0.8:8767", retargeting: nil, confirmCleartextDowngrade: false)
+    expect(pending == .needsCleartextConfirmation, "wss:// to ws:// asks before it is saved, got \(pending)")
+    expect(store.current.scheme == "wss", "the ask does not change the current address")
+    expect(on.string(forKey: RoomMemoryEndpoint.defaultsKey) == nil, "the ask does not write")
+
+    let client = LiveRoomClient(url: store.current)
+    expect(store.commit("ws://10.0.0.8:8767", retargeting: client, confirmCleartextDowngrade: true) == .saved,
+           "a confirmed downgrade is saved")
+    expect(endpointString(store.current) == "ws://10.0.0.8:8767", "the confirmed address is current")
+    expect(endpointString(client.url) == "ws://10.0.0.8:8767", "the confirmed address retargets")
+    expect(on.string(forKey: RoomMemoryEndpoint.defaultsKey) == "ws://10.0.0.8:8767", "the confirmed address is persisted")
+
+    let publicRejected = store.commit("ws://example.com:443", retargeting: client, confirmCleartextDowngrade: true)
+    if case .rejected(let message) = publicRejected {
+        expect(message.contains("example.com") && message.contains("not allowed"), "a public host stays refused, got \(message)")
+    } else {
+        expect(false, "a public ws:// is rejected with the switch on, got \(publicRejected)")
+    }
+    expect(endpointString(store.current) == "ws://10.0.0.8:8767", "a refused host does not replace the current address")
+    expect(endpointString(client.url) == "ws://10.0.0.8:8767", "a refused host does not retarget")
+
+    let launch = isolatedDefaults()
+    let granted = RoomMemoryEndpointStore(
+        environment: ["LABCOMMAND_ROOM_URL": "ws://100.118.187.99:8767"],
+        defaults: launch
+    )
+    expect(granted.cleartextPermitted, "an explicit allowed ws:// launch may dial")
+    expect(!granted.allowCleartext, "the launch does not turn the saved switch on")
+    expect(launch.object(forKey: RoomMemoryEndpoint.cleartextDefaultsKey) == nil, "the launch does not write the switch")
+    expect(RoomMemoryEndpoint.admit(granted.current, allowCleartext: granted.cleartextPermitted) == .allowed,
+           "the launch URL is admitted")
+    granted.setAllowCleartext(false)
+    expect(!granted.cleartextPermitted, "setting the switch off beats the launch grant")
+    expect(launch.bool(forKey: RoomMemoryEndpoint.cleartextDefaultsKey) == false, "off is what gets saved")
+
+    let again = RoomMemoryEndpointStore(environment: [:], defaults: launch)
+    expect(!again.allowCleartext && !again.cleartextPermitted, "a new process reads the saved off switch")
+
+    let unsafeLaunch = isolatedDefaults()
+    let refused = RoomMemoryEndpointStore(
+        environment: ["LABCOMMAND_ROOM_URL": "ws://example.com:8767"],
+        defaults: unsafeLaunch
+    )
+    expect(refused.current.host == "example.com", "resolve still records the environment URL")
+    expect(!refused.cleartextPermitted, "a public ws:// launch is not a cleartext grant")
+    if case .blocked(let message) = RoomMemoryEndpoint.admit(refused.current, allowCleartext: refused.cleartextPermitted) {
+        expect(message.contains("not allowed"), "the public launch is blocked for the host, got \(message)")
+    } else {
+        expect(false, "a public launch must not be admitted")
+    }
+}
+
 func testRoomMemorySettingsSourcesAndATS() {
     let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     func text(_ path: String) -> String {
@@ -326,13 +525,25 @@ func testRoomMemorySettingsSourcesAndATS() {
     expect(settings.contains("roomEndpointURL"), "the draft is the current endpoint")
     expect(!settings.contains("RoomMemoryEndpoint.resolve"), "appearing does not re-resolve the environment")
     expect(!settings.contains("100.118.187.99"), "Settings does not hardcode the room IP")
+    expect(settings.contains("onSubmit"), "Return commits the address")
+    expect(!settings.contains("endpointFieldFocused"), "leaving the field does not commit")
+    expect(settings.contains("cleartextWarning"), "the cleartext switch shows a warning while it is on")
+    expect(settings.contains("downgradePrompt"), "a wss to ws change asks before it is saved")
+    expect(settings.contains("Use cleartext"), "the operator confirms the downgrade")
+    expect(settings.contains("Allow cleartext WebSocket"), "cleartext is a labeled switch")
 
     let state = text("Sources/LabCommand/AppState.swift")
     expect(state.contains("LiveRoomClient(url:"), "AppState passes an explicit URL")
     expect(state.contains("RoomMemoryEndpointStore"), "one store owns the current endpoint")
     expect(state.contains("commitRoomEndpoint"), "one commit method")
     expect(state.contains("retargeting: room"), "commit retargets the live client")
+    expect(state.contains("RoomMemoryEndpoint.admit"), "AppState admits the socket before dialing")
+    expect(state.contains("roomEndpointBlock"), "a blocked address is stored for the Room screen")
     expect(!state.contains("100.118.187.99"), "AppState does not hardcode the room IP")
+
+    let room = text("Sources/LabCommand/LiveRoomView.swift")
+    expect(room.contains("connectionDetail"), "the Room screen shows why the socket is not up")
+    expect(room.contains("roomEndpointBlock"), "the Room screen receives the cleartext block")
 
     let script = text("scripts/live-room-shots.sh")
     expect(script.contains("export LABCOMMAND_ROOM_URL=\"ws://100.118.187.99:8767\""), "live shots pin the grep URL")
@@ -345,12 +556,67 @@ func testRoomMemorySettingsSourcesAndATS() {
         expect(false, "Info.plist ATS dictionary")
         return
     }
-    expect(ats["NSAllowsArbitraryLoads"] as? Bool == true, "arbitrary loads is on")
-    expect(ats["NSAllowsLocalNetworking"] == nil, "NSAllowsLocalNetworking would mask arbitrary loads")
-    expect(ats["NSAllowsArbitraryLoadsForMedia"] == nil, "the media exception would mask arbitrary loads")
-    expect(ats["NSAllowsArbitraryLoadsInWebContent"] == nil, "the web-content exception would mask arbitrary loads")
-    let domains = ats["NSExceptionDomains"] as? [String: Any]
-    expect(domains?["100.118.187.99"] != nil && domains?["192.168.68.65"] != nil, "the existing exception domains stay")
+    expect(ats["NSAllowsArbitraryLoads"] == nil, "global arbitrary loads is not set")
+    expect(ats["NSAllowsLocalNetworking"] as? Bool == true, "local networking allows IP literals")
+    expect(ats["NSAllowsArbitraryLoadsForMedia"] == nil, "the media exception stays off")
+    expect(ats["NSAllowsArbitraryLoadsInWebContent"] == nil, "the web-content exception stays off")
+    guard let domains = ats["NSExceptionDomains"] as? [String: Any] else {
+        expect(false, "NSExceptionDomains is present")
+        return
+    }
+    expect(domains["100.118.187.99"] == nil, "the tailnet IP exception is gone")
+    expect(domains["192.168.68.65"] == nil, "the LAN IP exception is gone")
+    expect(Set(domains.keys) == Set(["ts.net"]), "the only exception domain is ts.net, got \(domains.keys)")
+    guard let tailnet = domains["ts.net"] as? [String: Any] else {
+        expect(false, "ts.net exception is a dictionary")
+        return
+    }
+    expect(tailnet["NSIncludesSubdomains"] as? Bool == true, "the ts.net exception covers MagicDNS names")
+    expect(tailnet["NSExceptionAllowsInsecureHTTPLoads"] as? Bool == true, "the ts.net exception allows cleartext")
+}
+
+func testMagicDNSFailureIsVisibleOnTheRoomScreen() {
+    let url = RoomMemoryEndpoint.defaultURL
+    let reason = "A server with the specified hostname could not be found."
+    let screen = LiveRoomScreen.make(
+        mirror: RoomMemoryMirror(),
+        connection: .waiting(retryIn: 5, reason: reason),
+        requestPathExists: false,
+        started: true,
+        now: 10,
+        endpointURL: url.absoluteString
+    )
+    let detail = screen.connectionDetail ?? ""
+    expect(detail.contains(CaptureRecipe.tailscaleDNS), "the Room screen names the MagicDNS host, got \(detail)")
+    expect(detail.contains("8767"), "the Room screen names the port, got \(detail)")
+    expect(detail.contains(reason), "the Room screen includes the dial error, got \(detail)")
+    expect(!detail.contains(CaptureRecipe.tailscaleIP), "a failed lookup does not substitute the tailnet IP")
+    expect(screen.banner?.text == "connection lost", "the connection-lost banner stays, got \(String(describing: screen.banner?.text))")
+
+    let first = LiveRoomScreen.make(
+        mirror: RoomMemoryMirror(),
+        connection: .connecting(url: url, attempt: 1),
+        requestPathExists: false,
+        started: true,
+        now: 10,
+        endpointURL: url.absoluteString
+    )
+    expect(first.connectionDetail == nil, "the first attempt is the connecting banner, not a failure line")
+    expect(first.banner?.text == "connecting", "the first attempt says connecting")
+
+    let retry = RoomConnectionFailure.detail(
+        connection: .connecting(url: url, attempt: 2),
+        urlText: url.absoluteString
+    ) ?? ""
+    expect(retry.contains(CaptureRecipe.tailscaleDNS), "a later attempt names the host, got \(retry)")
+
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let endpoint = (try? String(contentsOf: root.appendingPathComponent("Sources/LabCommandCore/RoomMemoryEndpoint.swift"), encoding: .utf8)) ?? ""
+    expect(!endpoint.contains("tailscaleIP"), "the endpoint has no tailnet IP fallback")
+    let settings = (try? String(contentsOf: root.appendingPathComponent("Sources/LabCommand/SettingsView.swift"), encoding: .utf8)) ?? ""
+    expect(settings.contains("RoomConnectionFailure"), "Settings shows the same dial failure")
+    let room = (try? String(contentsOf: root.appendingPathComponent("Sources/LabCommand/LiveRoomView.swift"), encoding: .utf8)) ?? ""
+    expect(room.contains("endpointURL"), "the Room screen passes the address into the failure line")
 }
 
 func runRoomMemoryEndpointTests() {
@@ -359,11 +625,17 @@ func runRoomMemoryEndpointTests() {
         print("  room endpoint: parse, canonical form, resolve order, save round-trip"); passed()
         testRoomMemoryCommitKeepsTheCurrentEndpoint()
         print("  room endpoint: invalid commit keeps the preference and the socket; reopen reads current"); passed()
+        testCleartextDowngradeRequiresConfirmation()
+        print("  room endpoint: cleartext switch, host allow-list, and wss to ws confirmation"); passed()
         testLiveRoomRetarget()
         print("  room endpoint: retarget swaps bridges, publishes connecting, same URL keeps bricks"); passed()
         testLiveRoomRetargetDuringHandshakeBackoffAndRapidChanges()
         print("  room endpoint: retarget during handshake and backoff; A→B→C ignores the old bridges"); passed()
     }
+    testCleartextHostPolicy()
+    print("  room endpoint: ws:// only for private, CGNAT, and .ts.net hosts"); passed()
+    testMagicDNSFailureIsVisibleOnTheRoomScreen()
+    print("  room endpoint: a failed MagicDNS dial is named on the Room screen, with no IP fallback"); passed()
     testRoomMemorySettingsSourcesAndATS()
     print("  room endpoint: Settings, AppState, live-shot pin, and ATS keys"); passed()
 }

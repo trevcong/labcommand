@@ -68,7 +68,7 @@ so time-based staleness re-renders without help from the view. It subscribes to 
   (`requestServiceId`: the bridge's id for the request service while it is advertised).
   `memoryTopics` is empty while the bridge is up but no `/room_memory/*` topic is advertised,
   which renders "Room memory not running on Spark", never an empty room.
-- `.waiting(retryIn: TimeInterval, reason: String)`: between attempts.
+- `.waiting(retryIn: TimeInterval, reason: String)`: between attempts. The Room screen keeps the "connection lost" banner and adds the host plus `reason`. There is no silent fallback from MagicDNS to the tailnet IP.
 
 ### `LiveRoomTopic` (enum)
 

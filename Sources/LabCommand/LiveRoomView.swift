@@ -16,7 +16,8 @@ struct LiveRoomPage: View {
                 started: state.roomDidStart,
                 requestPathExists: state.requestPathExists,
                 showsFixture: state.roomLaunch.fixtureMode != nil,
-                fixtureMode: state.fixture?.mode ?? state.roomLaunch.fixtureMode
+                fixtureMode: state.fixture?.mode ?? state.roomLaunch.fixtureMode,
+                endpointBlock: state.roomEndpointBlock
             )
         }
     }
@@ -34,7 +35,8 @@ private struct LiveRoomClientHost: View {
             started: state.roomDidStart,
             requestPathExists: state.requestPathExists,
             showsFixture: false,
-            fixtureMode: nil
+            fixtureMode: nil,
+            endpointBlock: state.roomEndpointBlock
         )
     }
 }
@@ -55,6 +57,7 @@ private struct LiveRoomBody: View {
     var requestPathExists: Bool
     var showsFixture: Bool
     var fixtureMode: LiveRoomFixture.Mode?
+    var endpointBlock: String? = nil
 
     @State private var enabled: Set<RoomMemory.ChangeEvent.Kind> = Set(RoomMemory.ChangeEvent.Kind.allCases)
     @State private var selection: String?
@@ -69,7 +72,9 @@ private struct LiveRoomBody: View {
             started: started,
             now: ProcessInfo.processInfo.systemUptime,
             kinds: enabled,
-            selection: selection
+            selection: selection,
+            endpointURL: url,
+            endpointBlock: endpointBlock
         )
     }
 
@@ -82,6 +87,13 @@ private struct LiveRoomBody: View {
                     .font(LabTheme.t(13))
                     .foregroundStyle(toneColor(banner.tone))
                     .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if let detail = screen.connectionDetail {
+                Text(detail)
+                    .font(LabTheme.t(13))
+                    .foregroundStyle(LabTheme.bad)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             if let restart = screen.restartBanner {

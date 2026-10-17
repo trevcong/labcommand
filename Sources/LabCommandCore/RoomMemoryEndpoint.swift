@@ -29,15 +29,36 @@ public enum RoomMemoryEndpointError: Error, Equatable, Sendable {
     }
 }
 
+/// What `commit` did. A downgrade from `wss://` to `ws://` is never `.saved` until the caller confirms it.
+public enum RoomEndpointCommitResult: Equatable, Sendable {
+    case saved
+    case rejected(String)
+    case needsCleartextConfirmation
+}
+
+/// Whether a URL may be dialed. `blocked` carries the line the Room screen shows.
+public enum RoomCleartextDecision: Equatable, Sendable {
+    case allowed
+    case blocked(String)
+}
+
 /// The room-memory WebSocket address: parse, the built-in default, and `UserDefaults`.
 ///
 /// The built-in host is `CaptureRecipe.tailscaleDNS`, port 8767. `URLSession` resolves that
 /// MagicDNS name only when Tailscale DNS is answering on this Mac. The SSH alias `spark` is not
-/// used here; it resolves inside ssh, not for a socket. The tailnet IP is not a default. A live
-/// screenshot that must show the IP sets `LABCOMMAND_ROOM_URL`.
+/// used here; it resolves inside ssh, not for a socket. The tailnet IP is not a default and not
+/// a fallback. A live screenshot that must show the IP sets `LABCOMMAND_ROOM_URL`.
+///
+/// `ws://` is cleartext. It is dialed only for a private address, Tailscale CGNAT (`100.64.0.0/10`),
+/// or a `*.ts.net` host, and only when cleartext is permitted. The saved switch defaults to off.
 public enum RoomMemoryEndpoint {
     public static let defaultsKey = "roomMemoryEndpoint"
+    public static let cleartextDefaultsKey = "roomMemoryAllowCleartextWebSocket"
     public static let environmentKey = "LABCOMMAND_ROOM_URL"
+
+    public static let cleartextWarning = "Warning: cleartext WebSocket sends room memory without encryption. ws:// is limited to private addresses, Tailscale CGNAT (100.64.0.0/10), and .ts.net hosts."
+    public static let cleartextOffNote = "Cleartext is off. A ws:// address is not used until you turn this on. wss:// is always allowed."
+    public static let downgradePrompt = "This replaces a secure wss:// address with cleartext ws://. Room memory will travel without encryption."
 
     /// `ws://<MagicDNS>:8767`. See the type discussion for when that name resolves.
     public static let defaultURL: URL = {
@@ -85,21 +106,128 @@ public enum RoomMemoryEndpoint {
         return .success(url)
     }
 
-    /// Process start only. A valid `LABCOMMAND_ROOM_URL` wins and is not written. Then a valid
-    /// saved string. Then `defaultURL`. An invalid environment value or saved string is skipped.
+    /// Private ranges (RFC1918, loopback, link-local), CGNAT `100.64.0.0/10`, or a `*.ts.net` name.
+    /// Public names and public addresses are false. `localhost` is false; use `127.0.0.1`.
+    public static func allowsCleartextHost(_ host: String) -> Bool {
+        var name = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if name.hasSuffix(".") { name.removeLast() }
+        if name.isEmpty || name.contains("%") { return false }
+        if name.hasPrefix("[") && name.hasSuffix("]") {
+            name = String(name.dropFirst().dropLast())
+        }
+        if name.hasSuffix(".ts.net") {
+            let prefix = name.dropLast(".ts.net".count)
+            return !prefix.isEmpty && !prefix.hasSuffix(".")
+        }
+        if name.contains(":") { return allowsCleartextIPv6(name) }
+        return allowsCleartextIPv4(name)
+    }
+
+    public static func cleartextDisabledMessage(url: URL) -> String {
+        "Cleartext WebSocket is off. Turn it on in Settings to connect to \(url.absoluteString), or enter a wss:// address."
+    }
+
+    public static func cleartextHostMessage(host: String) -> String {
+        "Cleartext ws:// is not allowed for \(host). Use a private address, Tailscale CGNAT (100.64.0.0/10), a .ts.net host, or wss://."
+    }
+
+    /// `wss://` is always allowed. `ws://` needs an allowed host and `allowCleartext`.
+    public static func admit(_ url: URL, allowCleartext: Bool) -> RoomCleartextDecision {
+        guard url.scheme?.lowercased() == "ws" else { return .allowed }
+        let host = url.host ?? ""
+        guard allowsCleartextHost(host) else {
+            return .blocked(cleartextHostMessage(host: host))
+        }
+        guard allowCleartext else {
+            return .blocked(cleartextDisabledMessage(url: url))
+        }
+        return .allowed
+    }
+
+    /// Process start only. A valid `LABCOMMAND_ROOM_URL` wins and is not written, except a `ws://`
+    /// value does not replace a saved `wss://` address. Then a valid saved string. Then `defaultURL`.
+    /// An invalid environment value or saved string is skipped. This does not apply the cleartext rule;
+    /// dialing does.
     public static func resolve(environment: [String: String], defaults: UserDefaults) -> URL {
+        let saved = defaults.string(forKey: defaultsKey).flatMap { raw -> URL? in
+            if case .success(let url) = parse(raw) { return url }
+            return nil
+        }
         if let raw = environment[environmentKey], case .success(let url) = parse(raw) {
+            if url.scheme == "ws", saved?.scheme == "wss" {
+                return saved ?? url
+            }
             return url
         }
-        if let raw = defaults.string(forKey: defaultsKey), case .success(let url) = parse(raw) {
-            return url
-        }
+        if let saved { return saved }
         return defaultURL
     }
 
     /// Writes the canonical string. Callers pass a URL `parse` already accepted.
     public static func save(_ url: URL, to defaults: UserDefaults) {
         defaults.set(url.absoluteString, forKey: defaultsKey)
+    }
+
+    private static func allowsCleartextIPv4(_ host: String) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        var octets: [Int] = []
+        for part in parts {
+            guard part.count <= 3, part.allSatisfy({ $0.isASCII && $0.isNumber }), let value = Int(part), (0...255).contains(value) else {
+                return false
+            }
+            octets.append(value)
+        }
+        let a = octets[0]
+        let b = octets[1]
+        if a == 10 { return true }
+        if a == 127 { return true }
+        if a == 192 && b == 168 { return true }
+        if a == 172 && (16...31).contains(b) { return true }
+        if a == 169 && b == 254 { return true }
+        if a == 100 && (64...127).contains(b) { return true }
+        return false
+    }
+
+    /// ULA `fc00::/7`, link-local `fe80::/10`, and `::1`. IPv4-mapped forms are rejected.
+    private static func allowsCleartextIPv6(_ host: String) -> Bool {
+        guard !host.contains("."), let bytes = ipv6Bytes(host), bytes.count == 16 else { return false }
+        if bytes == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] { return true }
+        if bytes[0] & 0xfe == 0xfc { return true }
+        if bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80 { return true }
+        return false
+    }
+
+    private static func ipv6Bytes(_ host: String) -> [UInt8]? {
+        let pieces = host.components(separatedBy: "::")
+        guard pieces.count <= 2 else { return nil }
+        func groups(_ text: String) -> [UInt16]? {
+            if text.isEmpty { return [] }
+            var out: [UInt16] = []
+            for group in text.split(separator: ":", omittingEmptySubsequences: false) {
+                guard !group.isEmpty, group.count <= 4, let value = UInt16(group, radix: 16) else { return nil }
+                out.append(value)
+            }
+            return out
+        }
+        let combined: [UInt16]
+        if pieces.count == 1 {
+            guard let whole = groups(pieces[0]), whole.count == 8 else { return nil }
+            combined = whole
+        } else {
+            guard let left = groups(pieces[0]), let right = groups(pieces[1]) else { return nil }
+            let missing = 8 - left.count - right.count
+            guard missing >= 1 else { return nil }
+            combined = left + Array(repeating: 0, count: missing) + right
+        }
+        guard combined.count == 8 else { return nil }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(16)
+        for group in combined {
+            bytes.append(UInt8(group >> 8))
+            bytes.append(UInt8(truncatingIfNeeded: group))
+        }
+        return bytes
     }
 }
 
@@ -110,25 +238,72 @@ public enum RoomMemoryEndpoint {
 @MainActor
 public final class RoomMemoryEndpointStore {
     public private(set) var current: URL
+    /// The saved switch. Off when the key is absent. Distinct from `cleartextPermitted`.
+    public private(set) var allowCleartext: Bool
     private let defaults: UserDefaults
+    /// This process was launched with an allowed `ws://` in `LABCOMMAND_ROOM_URL`.
+    /// Dropped once the operator sets the switch or commits a different address.
+    private var environmentCleartextGrant: Bool
+    private var userChoseCleartext = false
+
+    /// The saved switch, or a launch that named an allowed cleartext host. A later `setAllowCleartext`
+    /// wins, including turning the launch grant off.
+    public var cleartextPermitted: Bool {
+        if userChoseCleartext || allowCleartext { return allowCleartext }
+        return environmentCleartextGrant
+    }
 
     public init(environment: [String: String], defaults: UserDefaults) {
         self.defaults = defaults
+        allowCleartext = defaults.bool(forKey: RoomMemoryEndpoint.cleartextDefaultsKey)
         current = RoomMemoryEndpoint.resolve(environment: environment, defaults: defaults)
+        environmentCleartextGrant = false
+        if let raw = environment[RoomMemoryEndpoint.environmentKey],
+           case .success(let url) = RoomMemoryEndpoint.parse(raw),
+           url.absoluteString == current.absoluteString,
+           url.scheme == "ws",
+           case .allowed = RoomMemoryEndpoint.admit(url, allowCleartext: true) {
+            environmentCleartextGrant = true
+        }
+    }
+
+    public func setAllowCleartext(_ allow: Bool) {
+        userChoseCleartext = true
+        allowCleartext = allow
+        environmentCleartextGrant = false
+        defaults.set(allow, forKey: RoomMemoryEndpoint.cleartextDefaultsKey)
     }
 
     /// Validates `raw`. On success, persists it, updates `current`, and retargets `client` when
-    /// one exists. On failure, the saved preference, `current`, and `client` stay as they were.
-    /// Returns the operator-facing reason, or nil when the commit landed.
-    public func commit(_ raw: String, retargeting client: LiveRoomClient?) -> String? {
+    /// one exists. On failure or when a `wss://` to `ws://` change still needs confirmation, the
+    /// saved preference, `current`, and `client` stay as they were.
+    public func commit(
+        _ raw: String,
+        retargeting client: LiveRoomClient?,
+        confirmCleartextDowngrade: Bool = false
+    ) -> RoomEndpointCommitResult {
         switch RoomMemoryEndpoint.parse(raw) {
         case .failure(let error):
-            return error.message
+            return .rejected(error.message)
         case .success(let url):
+            if url.absoluteString == current.absoluteString { return .saved }
+            if url.scheme == "ws" {
+                switch RoomMemoryEndpoint.admit(url, allowCleartext: allowCleartext) {
+                case .blocked(let message):
+                    return .rejected(message)
+                case .allowed:
+                    break
+                }
+                if current.scheme?.lowercased() == "wss" && !confirmCleartextDowngrade {
+                    return .needsCleartextConfirmation
+                }
+            }
             RoomMemoryEndpoint.save(url, to: defaults)
             current = url
+            // The launch grant applied only to the address this process started with.
+            environmentCleartextGrant = false
             client?.retarget(url)
-            return nil
+            return .saved
         }
     }
 }

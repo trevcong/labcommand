@@ -89,6 +89,10 @@ final class AppState: ObservableObject {
     /// Resolved once, from the environment and then saved defaults. Settings reads this.
     /// It does not resolve again on appear.
     private let roomEndpoint: RoomMemoryEndpointStore
+    /// The saved cleartext switch. Off until the operator turns it on.
+    @Published private(set) var allowCleartextRoomWebSocket: Bool
+    /// Set when the current address must not be dialed. The Room screen shows this string.
+    @Published private(set) var roomEndpointBlock: String?
     let room: LiveRoomClient?
     @Published private(set) var fixture: LiveRoomFixture? {
         didSet { recomputeStatusDots() }
@@ -119,6 +123,8 @@ final class AppState: ObservableObject {
         self.roomLaunch = roomLaunch
         let endpointStore = RoomMemoryEndpointStore(environment: environment, defaults: .standard)
         self.roomEndpoint = endpointStore
+        self.allowCleartextRoomWebSocket = endpointStore.allowCleartext
+        self.roomEndpointBlock = nil
         self.service = service ?? ConnectivityService()
         self.rigIO = rigIO ?? MockMode.createRigService(isolates: launch.isolates)
         // The room gate launch and every fixture leave the lidar client dark.
@@ -152,14 +158,66 @@ final class AppState: ObservableObject {
         }
         recomputeStatusDots()
         watchRoomDots()
+        refreshRoomEndpointBlock()
     }
 
     /// The endpoint this process is using. Settings copies it into the field on appear.
     var roomEndpointURL: URL { roomEndpoint.current }
 
-    /// Saves a valid endpoint and retargets the live socket. An invalid string changes neither.
-    func commitRoomEndpoint(_ raw: String) -> String? {
-        roomEndpoint.commit(raw, retargeting: room)
+    /// The saved switch is on, or this launch named an allowed cleartext address.
+    var showsCleartextWarning: Bool {
+        allowCleartextRoomWebSocket || roomEndpoint.cleartextPermitted
+    }
+
+    func setAllowCleartextRoomWebSocket(_ allow: Bool) {
+        roomEndpoint.setAllowCleartext(allow)
+        allowCleartextRoomWebSocket = allow
+        applyRoomAdmission(startIfNeeded: true)
+    }
+
+    /// Saves a valid endpoint and retargets the live socket. An invalid string, a disallowed
+    /// cleartext host, or an unconfirmed `wss://` to `ws://` change leaves the socket alone.
+    func commitRoomEndpoint(
+        _ raw: String,
+        confirmCleartextDowngrade: Bool = false
+    ) -> RoomEndpointCommitResult {
+        let result = roomEndpoint.commit(
+            raw,
+            retargeting: room,
+            confirmCleartextDowngrade: confirmCleartextDowngrade
+        )
+        if case .saved = result {
+            applyRoomAdmission(startIfNeeded: true)
+        }
+        return result
+    }
+
+    private func refreshRoomEndpointBlock() {
+        guard let room else {
+            roomEndpointBlock = nil
+            return
+        }
+        switch RoomMemoryEndpoint.admit(room.url, allowCleartext: roomEndpoint.cleartextPermitted) {
+        case .allowed:
+            roomEndpointBlock = nil
+        case .blocked(let message):
+            roomEndpointBlock = message
+        }
+    }
+
+    /// Dials only an admitted URL. A block stops a socket that was already open.
+    private func applyRoomAdmission(startIfNeeded: Bool) {
+        refreshRoomEndpointBlock()
+        guard let room else { return }
+        if roomEndpointBlock == nil {
+            if startIfNeeded, roomLaunch.startsClient, !roomDidStart {
+                room.start()
+                roomDidStart = true
+            }
+        } else if roomDidStart {
+            room.stop()
+            roomDidStart = false
+        }
     }
 
     var roomMirror: RoomMemoryMirror {
@@ -298,9 +356,8 @@ final class AppState: ObservableObject {
                 await self?.applySnapshot(loaded)
             }
         }
-        if roomLaunch.startsClient, let room {
-            room.start()
-            roomDidStart = true
+        if roomLaunch.startsClient, room != nil {
+            applyRoomAdmission(startIfNeeded: true)
         }
         if let mode = roomLaunch.fixtureMode, LiveRoomFixture.keepsFresh(mode) {
             startFixtureClock()
