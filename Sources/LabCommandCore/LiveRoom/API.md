@@ -55,7 +55,7 @@ so time-based staleness re-renders without help from the view. It subscribes to 
 | `mirror` | `RoomMemoryMirror` | the mirrored state |
 | `log` | `[String]` | last 200 diagnostic lines, newest last |
 | `requestSyncSink` | `((RoomMemory.RequestSync) -> Bool)?` | another request path (the `:8766` relay); return true if sent |
-| `requestPath` | `LiveRoomRequestPath` | `.bridgeService(id:)`, `.bridgeChannel`, `.relay` or `.unavailable` (shown as "no request path") |
+| `requestPath` | `LiveRoomRequestPath` | `.bridgeService(id:)`, `.bridgeChannel`, `.relay` or `.unavailable` (the event column says it can't ask the Spark) |
 | `start()`, `stop()` | | |
 
 ### `LiveRoomConnection` (enum)
@@ -196,14 +196,15 @@ but only while `isStatusFresh`. Otherwise "STALE · age".
 
 ## Screen (`LiveRoomScreen.make`)
 
-`LiveRoomScreen` is pure: `make(mirror:connection:requestPathExists:started:now:kinds:selection:)`.
+`LiveRoomScreen` is pure: `make(mirror:connection:requestPathExists:started:now:kinds:selection:timeZone:)`.
+`timeZone` defaults to `.current`. Event clocks are `HH:mm:ss` in that zone; `{sec: 0, nanosec: 0}` stays `time —`.
 Besides the pip, banner, status line, canvas, markers, caption and event rows it carries:
-- `historyLine`: "history complete through #n", "no events this run", "history incomplete: n
-  missing (k lost on the Spark)" (+ " · no request path" when nothing can fetch the pending
+- `historyLine`: "all events through event n are here", "no events this run", "history incomplete: n
+  missing (k lost on the Spark)" (+ " · can't ask the Spark for them" when nothing can fetch the pending
   seqs), "history unverified (old Spark node)", or nil before any witness;
 - `restartBanner`: "Spark node restarted · events from the earlier run may be missing" while
   `continuity` is broken;
-- `earlierRows`: the archived open events, "earlier run · may be outdated";
+- `earlierRows`: the archived open events, "earlier run · latest status unknown";
 - the status line's run tag, `run …1234` (`LiveRoomScreen.runTag`, the generation's last 4 digits).
 
 `LiveRoomFixture` modes (`LABCOMMAND_LIVE_ROOM`): `map`, `status`, `stale`, `lost`, `restart`,

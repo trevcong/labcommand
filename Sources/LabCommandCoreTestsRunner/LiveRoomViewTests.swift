@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import LabCommandCore
 
@@ -145,7 +146,9 @@ private func viewScreen(
     started: Bool = true,
     now: TimeInterval = 100,
     kinds: Set<RoomMemory.ChangeEvent.Kind> = Set(RoomMemory.ChangeEvent.Kind.allCases),
-    selection: String? = nil
+    selection: String? = nil,
+    // Pin GMT unless a case passes a zone. The app's default is the user's zone.
+    timeZone: TimeZone = .gmt
 ) -> LiveRoomScreen {
     LiveRoomScreen.make(
         mirror: mirror,
@@ -154,7 +157,8 @@ private func viewScreen(
         started: started,
         now: now,
         kinds: kinds,
-        selection: selection
+        selection: selection,
+        timeZone: timeZone
     )
 }
 
@@ -236,9 +240,48 @@ func testLiveRoomEventRowsAndHistory() {
     viewFeed(&mirror, .status, viewStatus(epoch: 43, seq: 1), at: 10)
     viewFeed(&mirror, .events, viewEvent(id: 9, seq: 1, state: .candidate), at: 10)
     let row = viewScreen(mirror, path: true).openRows.first
-    expect(row?.line2.contains("uncalibrated") == true, "nil alpha is uncalibrated: \(row?.line2 ?? "")")
-    expect(row?.line2.contains("evidence —") == true, "nil evidence is evidence —: \(row?.line2 ?? "")")
-    expect(row?.line2.contains("may be outdated") == true, "an open row says may be outdated while not caught up: \(row?.line2 ?? "")")
+    expect(row?.line1.contains("checking") == true && row?.line1.contains("candidate") != true,
+           "a candidate row says checking: \(row?.line1 ?? "")")
+    expect(row?.line1.contains("8 cells") == true && row?.line1.contains("voxel") != true,
+           "the row counts cells: \(row?.line1 ?? "")")
+    expect(row?.line2.contains("false-alarm limit not calibrated") == true, "nil alpha names the missing limit: \(row?.line2 ?? "")")
+    expect(row?.line2.contains("false-alarm limit 0") != true && row?.line2.contains("<1%") != true,
+           "nil alpha is not a number: \(row?.line2 ?? "")")
+    expect(row?.line2.contains("box not measured") == true && row?.line2.contains("0%") != true,
+           "nil evidence is not a measured zero: \(row?.line2 ?? "")")
+    expect(row?.line2.contains("latest status unknown") == true && row?.line2.contains("may be outdated") != true,
+           "an open row says the latest status is unknown while not caught up: \(row?.line2 ?? "")")
+    expect(row?.line2.contains("box only") == true, "a row without a shape says box only: \(row?.line2 ?? "")")
+
+    func openLine(id: UInt64, evidence: Float? = nil, alpha: Float? = nil) -> String {
+        var mirror = viewOpened()
+        viewFeed(&mirror, .events, viewEvent(id: id, seq: 0, state: .candidate, evidence: evidence, alpha: alpha), at: 10)
+        return viewScreen(mirror).openRows.first?.line2 ?? ""
+    }
+    let five = openLine(id: 30, alpha: 0.05)
+    expect(five.contains("false-alarm limit 5%") && !five.contains("not calibrated"), "alpha 0.05 is a 5% limit: \(five)")
+    let exactZero = openLine(id: 31, alpha: 0)
+    expect(exactZero.contains("false-alarm limit 0%") && !exactZero.contains("<1%") && !exactZero.contains("not calibrated"),
+           "alpha 0 is an exact zero limit: \(exactZero)")
+    let tiny = openLine(id: 32, alpha: 0.004)
+    expect(tiny.contains("false-alarm limit <1%") && !tiny.contains("0.00") && !tiny.contains("false-alarm limit 0%"),
+           "alpha 0.004 stays a small positive limit: \(tiny)")
+    let noneSeen = openLine(id: 33, evidence: 0, alpha: 0.05)
+    expect(noneSeen.contains("0% of the box was seen") && !noneSeen.contains("box not measured"),
+           "evidence 0 is none of the box: \(noneSeen)")
+    let allSeen = openLine(id: 34, evidence: 1, alpha: 0.05)
+    expect(allSeen.contains("100% of the box was seen"), "evidence 1 is the whole box: \(allSeen)")
+    let mostSeen = openLine(id: 35, evidence: 0.875, alpha: 0.05)
+    expect(mostSeen.contains("88% of the box was seen"), "evidence 0.875 rounds to 88%: \(mostSeen)")
+
+    var terminal = viewOpened()
+    viewFeed(&terminal, .events, viewEvent(id: 20, seq: 0, state: .reverted), at: 10)
+    viewFeed(&terminal, .events, viewEvent(id: 21, seq: 1, state: .expired), at: 10)
+    let terminalRows = viewScreen(terminal).historyRows.map(\.line1)
+    expect(terminalRows.contains { $0.contains("change undone") && !$0.contains("reverted") && !$0.contains("put back") },
+           "reverted says the change was undone: \(terminalRows)")
+    expect(terminalRows.contains { $0.contains("no longer detected") && !$0.contains("expired") && !$0.contains("didn't last") },
+           "expired says it is no longer detected: \(terminalRows)")
 
     var none = viewOpened()
     viewFeed(&none, .mapBricks, viewSnapshot(epoch: 1), at: 10)
@@ -252,22 +295,23 @@ func testLiveRoomEventRowsAndHistory() {
     viewFeed(&done, .status, viewStatus(epoch: 43, seq: 1, eventsSeq: 1), at: 10)
     expect(done.eventHistory.caughtUp, "every seq through the status's events_seq: caught up")
     let doneScreen = viewScreen(done, path: true, now: 10)
-    expect(doneScreen.historyLine == "history complete through #1", "got \(String(describing: doneScreen.historyLine))")
-    expect(doneScreen.openRows.first.map { !$0.line2.contains("may be outdated") } == true, "caught up: open rows are current")
+    expect(doneScreen.historyLine == "all events through event 1 are here", "got \(String(describing: doneScreen.historyLine))")
+    expect(doneScreen.openRows.first.map { !$0.line2.contains("latest status unknown") } == true, "caught up: open rows are current")
 
     var gap = viewOpened(canRequest: true)
     viewFeed(&gap, .status, viewStatus(epoch: 1, seq: 1, eventsSeq: nil), at: 10)
     viewFeed(&gap, .events, viewEvent(id: 3, seq: 5, state: .candidate), at: 10)
     expect(gap.eventHistory.coverage == .missing(pending: [0...4], lost: []), "seq 5 first: 0-4 pending, got \(gap.eventHistory.coverage)")
     expect(viewScreen(gap, path: true).historyLine == "history incomplete: 5 missing", "got \(String(describing: viewScreen(gap).historyLine))")
-    expect(viewScreen(gap, path: false).historyLine == "history incomplete: 5 missing · no request path",
-           "no request path says so, got \(String(describing: viewScreen(gap, path: false).historyLine))")
+    expect(viewScreen(gap, path: false).historyLine == "history incomplete: 5 missing · can't ask the Spark for them",
+           "a gap with no way to ask says so, got \(String(describing: viewScreen(gap, path: false).historyLine))")
 
     // Lost on the Spark: a fallback's manifest declares 0-2 unavailable.
     guard let lost = viewLoad(.lost, now: 200) else { return }
     let lostScreen = viewScreen(lost.mirror, connection: lost.connection, path: false, started: false, now: 200)
     expect(lostScreen.historyLine == "history incomplete: 3 missing (3 lost on the Spark)",
-           "lost ranges, no request-path suffix when nothing is pending: \(String(describing: lostScreen.historyLine))")
+           "lost ranges, no ask-suffix when nothing is pending: \(String(describing: lostScreen.historyLine))")
+    expect(lostScreen.historyLine?.contains("can't ask") != true, "a fully lost gap does not offer an ask")
     expect(lost.mirror.eventHistory.coverage == .missing(pending: [], lost: [0...2]), "got \(lost.mirror.eventHistory.coverage)")
 
     var legacy = viewOpened()
@@ -292,7 +336,7 @@ func testLiveRoomRestartBanner() {
     expect(restarted.restartBanner?.text == "Spark node restarted · events from the earlier run may be missing",
            "restart banner, got \(String(describing: restarted.restartBanner))")
     expect(mirror.continuity == .broken(sinceGeneration: earlier), "continuity broken since the earlier run")
-    expect(restarted.earlierRows.count == 1 && restarted.earlierRows[0].line2.contains("earlier run · may be outdated"),
+    expect(restarted.earlierRows.count == 1 && restarted.earlierRows[0].line2.contains("earlier run · latest status unknown"),
            "the earlier run's open event is listed, got \(restarted.earlierRows)")
     expect(restarted.openRows.isEmpty && restarted.markers.isEmpty, "never drawn as a current change")
     expect(mirror.mapState == .stale(.newGeneration) && mirror.bricks.count == 1, "the earlier run's map stays, greyed")
@@ -367,8 +411,8 @@ func testLiveRoomMarkerLifecycle() {
     let waitingScreen = viewScreen(mirror, path: true, now: 50)
     expect(waitingScreen.caption == "0 changes", "the outline is not counted: \(waitingScreen.caption)")
     expect(
-        waitingScreen.historyRows.contains { $0.line2.contains("accepted · map updating") },
-        "history says the map is updating: \(waitingScreen.historyRows)"
+        waitingScreen.historyRows.contains { $0.line2.contains("saved · map updating") },
+        "history says the saved change is waiting on the map: \(waitingScreen.historyRows)"
     )
 
     viewFeed(&mirror, .mapBricks, viewSnapshot(epoch: 44, seq: 2), at: 50)
@@ -409,7 +453,7 @@ func testLiveRoomMarkerLifecycle() {
 
     guard let fixture = viewLoad(.map, now: 200) else { return }
     let full = viewScreen(fixture.mirror, connection: fixture.connection, path: false, started: false, now: 200)
-    expect(full.caption == "2 changes · 1 candidate on map", "map fixture caption, got \(full.caption)")
+    expect(full.caption == "2 changes · 1 checking", "map fixture caption, got \(full.caption)")
     let hidden = viewScreen(
         fixture.mirror,
         connection: fixture.connection,
@@ -419,7 +463,7 @@ func testLiveRoomMarkerLifecycle() {
         kinds: [.disappeared, .moved]
     )
     expect(!hidden.markers.contains { $0.kind == .appeared }, "turning appeared off removes it from the marker set")
-    expect(hidden.caption == "2 changes · 0 candidates on map", "the caption drops the filtered candidate: \(hidden.caption)")
+    expect(hidden.caption == "2 changes · 0 checking", "the caption drops the filtered checking row: \(hidden.caption)")
 }
 
 func testLiveRoomBannersAndResync() {
@@ -442,14 +486,14 @@ func testLiveRoomBannersAndResync() {
     expect(staleMap.eventHistory.coverage == .empty, "no events leaves the history known-empty")
     let resync = viewScreen(staleMap, path: false, now: 20)
     expect(
-        resync.banner?.text == "resyncing · as of epoch 43 · cannot request resync",
+        resync.banner?.text == "resyncing · as of epoch 43 · can't ask the Spark to resend the map",
         "the resync banner carries the phrase, got \(String(describing: resync.banner?.text))"
     )
     expect(resync.standaloneResync == nil, "that phrase is not also a standalone line")
 
     let lost = viewScreen(staleMap, connection: .waiting(retryIn: 5, reason: "down"), path: false, now: 20)
     expect(lost.banner?.text == "connection lost", "connection lost stays the banner, got \(String(describing: lost.banner?.text))")
-    expect(lost.standaloneResync == "cannot request resync", "complete history stands the phrase alone, got \(String(describing: lost.standaloneResync))")
+    expect(lost.standaloneResync == "can't ask the Spark to resend the map", "complete history stands the phrase alone, got \(String(describing: lost.standaloneResync))")
 
     var history = viewOpened(at: 20, canRequest: true)
     viewFeed(&history, .status, viewStatus(epoch: 1, seq: 1, eventsSeq: nil), at: 20)
@@ -458,8 +502,8 @@ func testLiveRoomBannersAndResync() {
     let suffixed = viewScreen(history, connection: .waiting(retryIn: 5, reason: "down"), path: false, now: 20)
     expect(suffixed.banner?.text == "connection lost", "the banner stays connection lost")
     expect(
-        suffixed.historyLine == "history incomplete: 4 missing · no request path",
-        "the history line says no request path, got \(String(describing: suffixed.historyLine))"
+        suffixed.historyLine == "history incomplete: 4 missing · can't ask the Spark for them",
+        "the history line says it cannot ask, got \(String(describing: suffixed.historyLine))"
     )
     expect(suffixed.standaloneResync == nil, "no map to resync: no standalone line")
 
@@ -472,7 +516,7 @@ func testLiveRoomBannersAndResync() {
     expect(unsent.isMapCurrent && unsent.eventHistory.coverage == .empty, "unsent count on a current, complete mirror")
     expect(unsentScreen.banner == nil, "fresh tracking has no banner, got \(String(describing: unsentScreen.banner))")
     expect(
-        unsentScreen.standaloneResync == "cannot request resync · 2 unsent",
+        unsentScreen.standaloneResync == "can't ask the Spark to resend the map · 2 not sent",
         "got \(String(describing: unsentScreen.standaloneResync))"
     )
 
@@ -483,14 +527,14 @@ func testLiveRoomBannersAndResync() {
     let waitingMap = viewScreen(empty, path: false, now: 40)
     expect(waitingMap.banner?.text == "Waiting for map", "an empty stale map waits, got \(String(describing: waitingMap.banner?.text))")
     expect(
-        waitingMap.standaloneResync == "cannot request resync",
+        waitingMap.standaloneResync == "can't ask the Spark to resend the map",
         "Waiting for map leaves the phrase standalone, got \(String(describing: waitingMap.standaloneResync))"
     )
 }
 
 func testLiveRoomLaunchAndFixtures() {
     let unset = LiveRoomLaunch.parse([:])
-    expect(unset == .live(opensRoom: false), "an unset variable stays on the live socket without opening Room")
+    expect(unset == .live(opensRoom: false), "an unset variable stays on the live socket and does not skip probes")
     expect(unset.startsClient && !unset.opensRoom && !unset.skipsProbes && unset.lidarAvailable, "unset launch flags")
     expect(unset.fixtureMode == nil, "unset is not a fixture")
 
@@ -524,7 +568,7 @@ func testLiveRoomLaunchAndFixtures() {
         "map status line, got \(mapScreen.statusLine)"
     )
     expect(mapScreen.pip == .good, "map pip is good, got \(mapScreen.pip)")
-    expect(mapScreen.historyLine == "history complete through #5", "map fixture history, got \(String(describing: mapScreen.historyLine))")
+    expect(mapScreen.historyLine == "all events through event 5 are here", "map fixture history, got \(String(describing: mapScreen.historyLine))")
     expect(map.mirror.eventHistory.caughtUp, "map fixture is caught up")
     let refreshed = map.refreshed(at: now + 2)
     expect(refreshed.mirror.isStatusFresh && refreshed.mirror.status?.seq == 2, "refresh feeds the next status seq")
@@ -550,11 +594,111 @@ func testLiveRoomLaunchAndFixtures() {
     expect(offScreen.banner == nil, "a socket that never started is not Waiting for map")
 }
 
+func testLiveRoomLocalClocks() {
+    let october = RoomMemory.Time(sec: 1_760_400_010, nanosec: 0)
+    let january = RoomMemory.Time(sec: 1_736_899_210, nanosec: 0)
+    let july = RoomMemory.Time(sec: 1_752_537_610, nanosec: 0)
+    guard let chicago = TimeZone(identifier: "America/Chicago") else {
+        expect(false, "America/Chicago is available")
+        return
+    }
+    let kolkata = TimeZone(secondsFromGMT: 5 * 3600 + 30 * 60)!
+    let utc = TimeZone(secondsFromGMT: 0)!
+    let minusFive = TimeZone(secondsFromGMT: -5 * 3600)!
+
+    func lines(_ stamp: RoomMemory.Time, _ zone: TimeZone) -> (open: String, history: String, earlier: String) {
+        var openMirror = viewOpened()
+        viewFeed(&openMirror, .events, viewEvent(id: 1, seq: 0, state: .candidate, stamp: stamp), at: 10)
+        let openLine = viewScreen(openMirror, timeZone: zone).openRows.first?.line1 ?? ""
+
+        var historyMirror = viewOpened()
+        viewFeed(&historyMirror, .events, viewEvent(id: 2, seq: 0, state: .accepted, stamp: stamp), at: 10)
+        let historyLine = viewScreen(historyMirror, timeZone: zone).historyRows.first?.line1 ?? ""
+
+        var earlierMirror = viewOpened(at: 10)
+        let earlierGen = LiveRoomFixture.generation - 1000
+        viewFeed(&earlierMirror, .mapBricks, viewSnapshot(epoch: 43, bricks: [viewBrick()], generation: earlierGen), at: 10)
+        viewFeed(&earlierMirror, .events, viewEvent(id: 3, seq: 0, state: .confirmed, stamp: stamp, generation: earlierGen), at: 10)
+        viewFeed(&earlierMirror, .status, viewStatus(epoch: 43, seq: 9, eventsSeq: 0, generation: earlierGen), at: 10)
+        viewFeed(&earlierMirror, .status, viewStatus(epoch: 44, seq: 0, eventsSeq: nil), at: 11)
+        let earlierLine = viewScreen(earlierMirror, now: 11, timeZone: zone).earlierRows.first?.line1 ?? ""
+        return (openLine, historyLine, earlierLine)
+    }
+
+    func expectClock(_ stamp: RoomMemory.Time, _ zone: TimeZone, _ clock: String, _ label: String) {
+        let got = lines(stamp, zone)
+        for (name, line) in [("open", got.open), ("history", got.history), ("earlier", got.earlier)] {
+            expect(line.contains(clock), "\(label) \(name) row is \(clock), got \(line)")
+            if clock != "00:00:10" {
+                expect(!line.contains("00:00:10"), "\(label) \(name) row is not the UTC clock, got \(line)")
+            }
+        }
+    }
+
+    expectClock(october, chicago, "19:00:10", "Chicago October")
+    expectClock(july, chicago, "19:00:10", "Chicago July")
+    expectClock(january, chicago, "18:00:10", "Chicago January")
+    expectClock(october, kolkata, "05:30:10", "UTC+5:30")
+    expectClock(october, utc, "00:00:10", "UTC")
+    expectClock(october, minusFive, "19:00:10", "fixed -5h")
+
+    var zero = viewOpened()
+    viewFeed(&zero, .events, viewEvent(id: 4, seq: 0, state: .candidate, stamp: RoomMemory.Time(sec: 0, nanosec: 0)), at: 10)
+    for zone in [chicago, kolkata, utc] {
+        let line = viewScreen(zero, timeZone: zone).openRows.first?.line1 ?? ""
+        expect(line.contains("time —"), "zero stamp stays time —, got \(line)")
+        expect(!line.contains("00:00:00"), "zero stamp is not midnight, got \(line)")
+    }
+}
+
+private func eventColumnLines(_ text: String, width: CGFloat) -> Int {
+    let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+    let rect = (text as NSString).boundingRect(
+        with: NSSize(width: width, height: 10_000),
+        options: [.usesLineFragmentOrigin, .usesFontLeading],
+        attributes: [.font: font]
+    )
+    let lineHeight = max(font.boundingRectForFont.height, 1)
+    return max(1, Int(ceil(rect.height / lineHeight - 0.05)))
+}
+
+func testEventColumnUncertaintyFits() {
+    let now: TimeInterval = 400
+    guard let lost = viewLoad(.lost, now: now), let restart = viewLoad(.restart, now: now) else { return }
+    let lostScreen = viewScreen(lost.mirror, connection: lost.connection, path: false, started: false, now: now)
+    let restartScreen = viewScreen(restart.mirror, connection: restart.connection, path: false, started: false, now: now, timeZone: TimeZone(identifier: "America/Chicago")!)
+    let history = lostScreen.historyLine ?? ""
+    expect(history == "history incomplete: 3 missing (3 lost on the Spark)", "lost fixture history is the full line: \(history)")
+    expect(eventColumnLines(history, width: 264) <= 2, "lost history fits the event column: \(history) lines \(eventColumnLines(history, width: 264))")
+
+    let earlier = restartScreen.earlierRows.first
+    let line2 = earlier?.line2 ?? ""
+    expect(line2.contains("earlier run · latest status unknown"), "restart fixture keeps the uncertainty: \(line2)")
+    expect(line2.contains("false-alarm limit not calibrated"), "restart fixture names the missing limit: \(line2)")
+    expect(line2.contains("88% of the box was seen"), "restart fixture says what was seen: \(line2)")
+    expect(!line2.contains("may be outdated") && !line2.contains("uncalibrated") && !line2.contains("voxel"),
+           "restart fixture drops the old words: \(line2)")
+    let lines = eventColumnLines(line2, width: 260)
+    expect(lines <= 3, "earlier-run line 2 fits three column lines, got \(lines): \(line2)")
+
+    let viewURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("Sources/LabCommand/LiveRoomView.swift")
+    let view = (try? String(contentsOf: viewURL, encoding: .utf8)) ?? ""
+    guard let marker = view.range(of: "Text(row.line2)") else {
+        expect(false, "the event row draws line 2")
+        return
+    }
+    let slice = view[marker.upperBound...].prefix(240)
+    expect(slice.contains("lineLimit(3)"), "event row line 2 allows 3 lines so the uncertainty is not clipped")
+}
+
 func runLiveRoomViewTests() {
+    testLiveRoomLocalClocks()
+    print("  LiveRoom view: event clocks are local HH:mm:ss; zero stamp stays time —"); passed()
     testLiveRoomStatusLine()
     print("  LiveRoom view: status line reads status.eventsSeq, coverage, stale age, cell"); passed()
     testLiveRoomEventRowsAndHistory()
-    print("  LiveRoom view: row words; history lines (no events, complete through #n, n missing, lost on the Spark, no request path, unverified)"); passed()
+    print("  LiveRoom view: plain row words; history lines (caught up, missing, lost on the Spark, cannot ask, unverified)"); passed()
     testLiveRoomRestartBanner()
     print("  LiveRoom view: restart banner, earlier-run rows never drawn, greyed earlier map; restart and legacy fixtures"); passed()
     testLiveRoomVoxels()
@@ -565,4 +709,6 @@ func runLiveRoomViewTests() {
     print("  LiveRoom view: banner priority and resync placement"); passed()
     testLiveRoomLaunchAndFixtures()
     print("  LiveRoom view: launch env table and offline fixtures"); passed()
+    testEventColumnUncertaintyFits()
+    print("  LiveRoom view: lost and restart copy fits the event column"); passed()
 }
