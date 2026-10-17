@@ -362,6 +362,10 @@ public struct LiveRoomMarker: Equatable, Sendable, Identifiable {
 public struct LiveRoomScreen: Equatable, Sendable {
     public var pip: LiveRoomPip
     public var banner: LiveRoomBanner?
+    /// Why the socket is not up, when that is more specific than the banner. Nil while the link is up.
+    public var connectionDetail: String?
+    /// The detail is the cleartext-off block. The Room page offers one control that opens that switch.
+    public var offersCleartextSettings: Bool
     public var statusLine: String
     /// Centered copy that replaces the voxels. Nil draws the map.
     public var canvasSentence: String?
@@ -388,9 +392,20 @@ public struct LiveRoomScreen: Equatable, Sendable {
         now: TimeInterval,
         kinds: Set<RoomMemory.ChangeEvent.Kind> = Set(RoomMemory.ChangeEvent.Kind.allCases),
         selection: String? = nil,
-        timeZone: TimeZone = .current
+        timeZone: TimeZone = .current,
+        endpointURL: String? = nil,
+        endpointBlock: String? = nil
     ) -> LiveRoomScreen {
-        let canvas = roomCanvasSentence(mirror: mirror, connection: connection, started: started)
+        var canvas = roomCanvasSentence(mirror: mirror, connection: connection, started: started)
+        let connectionDetail = RoomConnectionFailure.line(
+            connection: connection,
+            urlText: endpointURL,
+            blocked: endpointBlock
+        )
+        let offersCleartextSettings = endpointBlock.map(RoomMemoryEndpoint.offersCleartextSettings) ?? false
+        if let endpointBlock, !endpointBlock.isEmpty, canvas == "Room memory unavailable" {
+            canvas = nil
+        }
         var banner = baseBanner(mirror: mirror, connection: connection, started: started, now: now)
         let history = formatHistory(mirror: mirror, requestPathExists: requestPathExists)
         let phrase = resyncPhrase(mirror: mirror, requestPathExists: requestPathExists)
@@ -413,6 +428,8 @@ public struct LiveRoomScreen: Equatable, Sendable {
         return LiveRoomScreen(
             pip: roomPip(mirror: mirror, connection: connection),
             banner: banner,
+            connectionDetail: connectionDetail,
+            offersCleartextSettings: offersCleartextSettings,
             statusLine: statusLine(mirror: mirror, connection: connection, now: now),
             canvasSentence: canvas,
             brickOpacity: roomBrickOpacity(mirror: mirror, drawingMap: canvas == nil),
@@ -665,6 +682,9 @@ public enum LiveRoomSidecar {
         if let banner = screen.banner {
             lines.append("banner \(banner.text)")
         }
+        if let detail = screen.connectionDetail {
+            lines.append("failure \(detail)")
+        }
         if let restart = screen.restartBanner {
             lines.append("restart \(restart.text)")
         }
@@ -725,6 +745,36 @@ private func falseAlarmLimit(_ alpha: Float?) -> String {
 private func isConnected(_ connection: LiveRoomConnection) -> Bool {
     if case .connected = connection { return true }
     return false
+}
+
+/// The line under the Room banner when the socket is not up.
+public enum RoomConnectionFailure {
+    /// Nil for `.off`, the first `.connecting`, and `.connected`. A `.waiting` reason is included.
+    public static func detail(connection: LiveRoomConnection, urlText: String?) -> String? {
+        switch connection {
+        case .waiting(_, let reason):
+            let why = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            let tail = why.isEmpty ? "The connection failed." : why
+            return "Cannot reach \(target(urlText)). \(tail)"
+        case .connecting(let dial, let attempt) where attempt > 1:
+            return "Reconnecting to \(target(dial.absoluteString)) (attempt \(attempt))."
+        default:
+            return nil
+        }
+    }
+
+    /// A cleartext block wins. Otherwise the dial failure, when there is one.
+    public static func line(connection: LiveRoomConnection, urlText: String?, blocked: String?) -> String? {
+        if let blocked, !blocked.isEmpty { return blocked }
+        return detail(connection: connection, urlText: urlText)
+    }
+
+    private static func target(_ urlText: String?) -> String {
+        guard let urlText, !urlText.isEmpty else { return "the room address" }
+        guard let url = URL(string: urlText), let host = url.host, !host.isEmpty else { return urlText }
+        if let port = url.port { return "\(host):\(port)" }
+        return host
+    }
 }
 
 private func connectionWord(_ connection: LiveRoomConnection) -> String {

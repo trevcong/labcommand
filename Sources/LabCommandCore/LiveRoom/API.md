@@ -30,8 +30,9 @@ Live bridge facts (probed 2026-10-15, `ws://100.118.187.99:8767`, foxglove-bridg
 ```swift
 import LabCommandCore
 
-@StateObject var room = LiveRoomClient()            // default URL ws://100.118.187.99:8767
+@StateObject var room = LiveRoomClient(url: RoomMemoryEndpoint.defaultURL)
 room.start()                                        // connect; reconnects with backoff until stop()
+room.retarget(other)                                // running: publishes .connecting to other before returning
 room.stop()                                         // close; the mirror stays, greyed (STALE)
 
 room.connection        // LiveRoomConnection
@@ -50,7 +51,8 @@ so time-based staleness re-renders without help from the view. It subscribes to 
 
 | member | type | meaning |
 |---|---|---|
-| `init(url: URL = LiveRoomClient.defaultURL, roomId: String? = nil, publishRequests: Bool = true)` | | `roomId` nil = adopt the first room seen; `publishRequests: false` = read-only, never advertises or sends |
+| `init(url: URL, roomId: String? = nil, publishRequests: Bool = true)` | | `url` is required. The built-in address is `RoomMemoryEndpoint.defaultURL` (MagicDNS host `CaptureRecipe.tailscaleDNS`, port 8767), not a literal on the client. `roomId` nil = adopt the first room seen; `publishRequests: false` = read-only, never advertises or sends |
+| `retarget(_ url: URL)` | | Same canonical URL keeps the socket and the mirror. While running, assigns `url` and publishes `.connecting(newURL, attempt: 1)` before returning. Not `.off`. |
 | `connection` | `LiveRoomConnection` | socket state, below |
 | `mirror` | `RoomMemoryMirror` | the mirrored state |
 | `log` | `[String]` | last 200 diagnostic lines, newest last |
@@ -66,7 +68,7 @@ so time-based staleness re-renders without help from the view. It subscribes to 
   (`requestServiceId`: the bridge's id for the request service while it is advertised).
   `memoryTopics` is empty while the bridge is up but no `/room_memory/*` topic is advertised,
   which renders "Room memory not running on Spark", never an empty room.
-- `.waiting(retryIn: TimeInterval, reason: String)`: between attempts.
+- `.waiting(retryIn: TimeInterval, reason: String)`: between attempts. The Room screen keeps the "connection lost" banner and adds the host plus `reason`. There is no silent fallback from MagicDNS to the tailnet IP.
 
 ### `LiveRoomTopic` (enum)
 

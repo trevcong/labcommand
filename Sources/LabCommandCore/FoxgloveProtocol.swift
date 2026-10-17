@@ -158,19 +158,19 @@ public enum FoxgloveProtocol {
     /// Hosts to try for `ws://<host>:8765`: the IPv4 literals of `SparkSSH.hopList`,
     /// i.e. the tailnet IP, then the cached LAN hop when it is an IPv4 address. The
     /// ssh aliases and the MagicDNS name are left out; the aliases only resolve
-    /// inside ssh. Cleartext ws:// here is allowed by Info.plist's ATS block:
-    /// `NSAllowsLocalNetworking` covers LAN addresses but not the 100.x CGNAT
-    /// tailnet IP, which needs its own `NSExceptionDomains` entry (macOS honours it
-    /// for an IP literal, though Apple documents exceptions for domain names).
+    /// inside ssh. Cleartext to an IP literal is covered by Info.plist
+    /// `NSAllowsLocalNetworking` (unqualified names, `.local`, and IP addresses,
+    /// including 100.64.0.0/10). A `*.ts.net` name needs the `ts.net` exception
+    /// (`NSIncludesSubdomains` and `NSExceptionAllowsInsecureHTTPLoads`). The room
+    /// endpoint still refuses `ws://` to a public host; ATS is not that check.
     public static func streamHosts(lastLAN: String? = nil) -> [String] {
         SparkSSH.hopList(lastLAN: lastLAN).filter(isIPv4Literal)
     }
 
+    /// Strict dotted decimal only. A leading zero, a short form, or hex is not a socket host:
+    /// `inet_aton` would dial a different address than the text.
     public static func isIPv4Literal(_ host: String) -> Bool {
-        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
-        return parts.count == 4 && parts.allSatisfy { part in
-            part.count <= 3 && part.allSatisfy { $0.isASCII && $0.isNumber } && UInt8(part) != nil
-        }
+        RoomMemoryEndpoint.canonicalDottedIPv4(host) != nil
     }
 
     /// Reconnect backoff: 1 s, 2 s, 4 s … capped at 30 s. Zero failures means the
