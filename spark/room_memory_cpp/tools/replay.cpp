@@ -130,6 +130,16 @@ int main(int argc, char** argv) {
                 {"delta_period_s", std::to_string(d.delta_period_s)},
                 {"keyframe_period_s", std::to_string(d.keyframe_period_s)},
                 {"keyframe_delta_ratio", std::to_string(d.keyframe_delta_ratio)},
+                {"rhythm_enable", d.rhythm_enable ? "true" : "false"},
+                {"rhythm_cell_m", std::to_string(d.rhythm_cell_m)},
+                {"rhythm_dims", std::to_string(d.rhythm_dims)},
+                {"rhythm_period_s", std::to_string(d.rhythm_period_s)},
+                {"rhythm_publish", d.rhythm_publish ? "true" : "false"},
+                {"rhythm_dir", d.rhythm_dir},
+                {"rhythm_keep_days", std::to_string(d.rhythm_keep_days)},
+                {"rhythm_max_bytes", std::to_string(d.rhythm_max_bytes)},
+                {"rhythm_max_file_bytes", std::to_string(d.rhythm_max_file_bytes)},
+                {"rhythm_fsync_s", std::to_string(d.rhythm_fsync_s)},
                 {"rig_guard", d.rig_guard ? "true" : "false"}, {"imu_topic", d.imu_topic},
                 {"imu_shock_frac", std::to_string(d.imu_shock_frac)}, {"imu_gyro_dps", std::to_string(d.imu_gyro_dps)},
                 {"imu_quiet_s", std::to_string(d.imu_quiet_s)}, {"tilt_trigger_deg", std::to_string(d.tilt_trigger_deg)},
@@ -158,6 +168,12 @@ int main(int argc, char** argv) {
             const bool parsed = !(words >> text) ||
                                 std::from_chars(text.data(), text.data() + text.size(), generation).ec == std::errc{};
             if (!parsed) generation = 0;
+            // The previous logger still owns the rhythm directory until it flushes and joins.
+            // Opening the next engine first lets two writers append the same segment.
+            if (memory) {
+                memory->close();
+                memory.reset();
+            }
             try {
                 memory = std::make_unique<RoomMemory>(config, start, generation);
                 std::cout << "init " << msg::name(memory->state()) << " " << memory->map_epoch() << "\n";
@@ -179,6 +195,7 @@ int main(int argc, char** argv) {
             std::cout << "close " << events.size() << " " << msg::name(memory->state()) << " " << memory->map_epoch()
                       << "\n";
             for (const msg::ChangeEvent& event : events) std::cout << "event " << hex(event.to_cdr()) << "\n";
+            memory->enqueue_rhythm();
         } else if (command == "status") {
             const msg::Time stamp = time_of(words);
             double period = 0;

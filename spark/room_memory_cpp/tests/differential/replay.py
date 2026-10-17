@@ -16,14 +16,16 @@ from room_memory.messages import CDRError, RequestSync, Time
 
 _FLOATS = {"voxel_size", "window_s", "occupied_min_ratio", "free_max_ratio", "learn_max_offset_m",
            "fresh_min_fraction", "stable_min_fraction", "activity_radius_m", "delta_period_s",
-           "keyframe_period_s", "keyframe_delta_ratio", "imu_shock_frac", "imu_gyro_dps", "imu_quiet_s",
-           "tilt_trigger_deg", "pose_trigger_m", "guard_check_period_s", "check_max_s", "move_min_m", "move_min_deg",
-           "align_max_m", "align_max_deg", "align_inlier_ratio", "align_max_rms_m", "observe_min_eig",
-           "gross_inlier_ratio", "relearn_after_s", "reg_voxel_m", "src_voxel_m", "icp_max_range_m"}
+           "keyframe_period_s", "keyframe_delta_ratio", "rhythm_cell_m", "imu_shock_frac", "imu_gyro_dps",
+           "imu_quiet_s", "tilt_trigger_deg", "pose_trigger_m", "guard_check_period_s", "check_max_s",
+           "move_min_m", "move_min_deg", "align_max_m", "align_max_deg", "align_inlier_ratio",
+           "align_max_rms_m", "observe_min_eig", "gross_inlier_ratio", "relearn_after_s", "reg_voxel_m",
+           "src_voxel_m", "icp_max_range_m"}
 _INTS = {"tolerance", "min_voxels", "min_extent", "reference_windows", "recent_windows", "occupied_min_hits",
          "free_min_seen", "candidate_windows", "expire_windows", "learn_windows", "fresh_min_voxels",
-         "align_stable_windows", "reg_max_points", "src_max_points"}
-_BOOLS = {"rig_guard", "auto_relearn"}
+         "rhythm_dims", "rhythm_period_s", "rhythm_keep_days", "rhythm_max_bytes", "rhythm_max_file_bytes",
+         "rhythm_fsync_s", "align_stable_windows", "reg_max_points", "src_max_points"}
+_BOOLS = {"rhythm_enable", "rhythm_publish", "rig_guard", "auto_relearn"}
 
 
 def _config(fields, pair):
@@ -36,20 +38,32 @@ def _config(fields, pair):
         fields[key] = None if value == "none" else float(value)
     elif key == "state_dir":
         fields[key] = None if value == "none" else value
+    elif key == "rhythm_dir":
+        fields[key] = value
+    elif key in _BOOLS:
+        if value not in ("true", "True", "1", "false", "False", "0"):
+            raise ValueError(f"not a bool: {value}")
+        fields[key] = value in ("true", "True", "1")
     elif key in _FLOATS:
         fields[key] = float(value)
     elif key in _INTS:
         fields[key] = int(value)
-    elif key in _BOOLS:
-        fields[key] = {"true": True, "false": False}[value]
     else:
         raise ValueError(f"unknown config key {key}")
 
 
 def run(script):
     """Returns the replay output for ``script`` (text), one line per output."""
+    held = [None]
+    try:
+        return _run(script, held)
+    finally:
+        if held[0] is not None:
+            held[0].close()
+
+
+def _run(script, held):
     fields = {}
-    memory = None
     out = []
     for line in script.splitlines():
         words = line.split()
@@ -63,21 +77,28 @@ def run(script):
             sec, nanosec = int(args[0]), int(args[1])
             try:
                 generation = int(args[2]) if len(args) > 2 else max(1, sec * 1000 + nanosec // 1_000_000)
-                memory = RoomMemory(MemoryConfig(**fields), Time(sec, nanosec), generation)
-                out.append(f"init {memory.state.name} {memory.map_epoch}")
+                # Close the previous logger before the next engine scans the same directory.
+                if held[0] is not None:
+                    held[0].close()
+                    held[0] = None
+                started = RoomMemory(MemoryConfig(**fields), Time(sec, nanosec), generation)
             except ValueError:
                 out.append("init error")
+            else:
+                held[0] = started
+                out.append(f"init {held[0].state.name} {held[0].map_epoch}")
         elif command == "points":
-            memory.add_points(args[0], np.fromfile(args[1], dtype="<f4").reshape(-1, 3))
+            held[0].add_points(args[0], np.fromfile(args[1], dtype="<f4").reshape(-1, 3))
         elif command in ("cdr", "hex"):
             data = pathlib.Path(args[1]).read_bytes() if command == "cdr" else bytes.fromhex(args[1])
-            out.append(f"cdr {1 if memory.add_cdr(args[0], data) else 0}")
+            out.append(f"cdr {1 if held[0].add_cdr(args[0], data) else 0}")
         elif command == "close":
-            events = memory.close_window(Time(int(args[0]), int(args[1])))
-            out.append(f"close {len(events)} {memory.state.name} {memory.map_epoch}")
+            events = held[0].close_window(Time(int(args[0]), int(args[1])))
+            out.append(f"close {len(events)} {held[0].state.name} {held[0].map_epoch}")
             out += [f"event {event.to_cdr().hex()}" for event in events]
+            held[0].enqueue_rhythm()
         elif command == "status":
-            status = memory.status(Time(int(args[0]), int(args[1])), float(args[2]))
+            status = held[0].status(Time(int(args[0]), int(args[1])), float(args[2]))
             out.append(f"status {status.to_cdr().hex()}")
         elif command == "defaults":
             for field in dataclasses.fields(MemoryConfig):
@@ -86,13 +107,13 @@ def run(script):
                         else str(value).lower() if isinstance(value, bool) else str(value))
                 out.append(f"default {field.name} {text}")
         elif command == "activity":
-            out.append(f"activity {memory.activity(Time(int(args[0]), int(args[1]))).to_cdr().hex()}")
+            out.append(f"activity {held[0].activity(Time(int(args[0]), int(args[1]))).to_cdr().hex()}")
         elif command == "map":
-            message = memory.map_update(Time(int(args[0]), int(args[1])))
+            message = held[0].map_update(Time(int(args[0]), int(args[1])))
             out.append(f"map {'none' if message is None else message.hex()}")
         elif command == "sync":
             try:
-                answer = memory.sync(RequestSync.from_cdr(bytes.fromhex(args[2])), Time(int(args[0]), int(args[1])))
+                answer = held[0].sync(RequestSync.from_cdr(bytes.fromhex(args[2])), Time(int(args[0]), int(args[1])))
             except CDRError:
                 out.append("sync invalid")
             else:
@@ -101,10 +122,10 @@ def run(script):
                 out += [f"data {message.hex()}" for message in messages]
                 out.append(f"end {'none' if end is None else end.to_cdr().hex()}")
         elif command == "imu":
-            ok = memory.add_imu(bytes.fromhex(args[2]), Time(int(args[0]), int(args[1])))
+            ok = held[0].add_imu(bytes.fromhex(args[2]), Time(int(args[0]), int(args[1])))
             out.append(f"imu {1 if ok else 0}")
         elif command == "rig":
-            message = memory.rig_pose(Time(int(args[0]), int(args[1])))
+            message = held[0].rig_pose(Time(int(args[0]), int(args[1])))
             out.append(f"rig {'none' if message is None else message.to_cdr().hex()}")
         else:
             raise ValueError(f"unknown command {command}")

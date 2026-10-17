@@ -12,6 +12,17 @@ else()
   set(PHASE0_DEFAULT "${REPO_ROOT}/Tests/Fixtures/room/synthetic")
 endif()
 set(ROOM_MEMORY_PHASE0_FIXTURES "${PHASE0_DEFAULT}" CACHE PATH "Phase 0 synthetic fixtures")
+# labcommand_msgs sources. The checkout keeps them at <repo>/ros/labcommand_msgs. The image
+# copies that package to /ws/src/labcommand_msgs, and REPO_ROOT there is /ws, so the checkout
+# path is not the tree colcon built. -DROOM_MEMORY_MSGS_DIR wins; otherwise see msgs_dir.cmake.
+include("${CMAKE_CURRENT_SOURCE_DIR}/msgs_dir.cmake")
+set(_msgs_explicit "")
+if(DEFINED ROOM_MEMORY_MSGS_DIR)
+  set(_msgs_explicit "${ROOM_MEMORY_MSGS_DIR}")
+endif()
+room_memory_resolve_msgs_dir("${REPO_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}" "${_msgs_explicit}" _msgs_resolved)
+set(ROOM_MEMORY_MSGS_DIR "${_msgs_resolved}" CACHE PATH "labcommand_msgs source tree" FORCE)
+room_memory_require_msgs_dir("${ROOM_MEMORY_MSGS_DIR}")
 # Present at configure time means required: a missing directory then fails instead of skipping.
 if(IS_DIRECTORY "${ROOM_MEMORY_PHASE0_FIXTURES}")
   set(REQUIRE_PHASE0 1)
@@ -47,6 +58,18 @@ foreach(threads ${THREAD_COUNTS})
   endforeach()
 endforeach()
 add_test(NAME messages COMMAND test_messages)
+add_executable(test_rhythm test_rhythm.cpp)
+target_link_libraries(test_rhythm PRIVATE room_memory_test_support)
+add_test(NAME rhythm COMMAND test_rhythm)
+# No ROS: the node names labcommand_msgs types, and every .msg in that package is generated.
+add_executable(test_interface test_interface.cpp)
+target_link_libraries(test_interface PRIVATE room_memory_test_support)
+target_compile_definitions(test_interface PRIVATE
+  ROOM_MEMORY_MSGS_DIR="${ROOM_MEMORY_MSGS_DIR}"
+  ROOM_MEMORY_NODE_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/../node/room_memory_node.cpp")
+add_test(NAME interface COMMAND test_interface)
+add_test(NAME interface_msgs_dir
+         COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/test_msgs_dir.cmake)
 # The messages suite encodes real compressed LZFSE payloads with the same framework.
 if(ROOM_MEMORY_APPLE_LZFSE)
   target_compile_definitions(test_messages PRIVATE ROOM_MEMORY_APPLE_LZFSE)
@@ -110,6 +133,15 @@ foreach(threads IN LISTS DIFFERENTIAL_THREADS)
   list(APPEND PYTHON_TESTS differential_omp${threads})
 endforeach()
 list(APPEND PYTHON_TESTS recording_tools static_recording)
+# Full process startup, including the Activity publisher, when this build has the rclcpp node.
+# rhythm_publish stays false: that is the path that still creates Activity. Registered before the
+# Python block's return(), so a configure without ROOM_MEMORY_PYTHON still runs it.
+if(ROOM_MEMORY_BUILD_NODE)
+  add_executable(test_node_startup test_node_startup.cpp)
+  target_compile_options(test_node_startup PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME node_startup COMMAND test_node_startup $<TARGET_FILE:room_memory_node>)
+  set_tests_properties(node_startup PROPERTIES TIMEOUT 60)
+endif()
 if(NOT ROOM_MEMORY_PYTHON)
   foreach(name IN LISTS PYTHON_TESTS)
     add_test(NAME ${name} COMMAND ${CMAKE_COMMAND} -E echo

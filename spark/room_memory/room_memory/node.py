@@ -15,6 +15,10 @@ sensor per 10 s.
 With ``rig_guard`` it also feeds ``imu_topic`` (raw ``sensor_msgs/Imu``, sensor-data QoS; "" for none)
 to the guard and publishes ``RigPose`` on ``/room_memory/rig`` after each window, when ``rig_pose``
 has one (reliable, transient_local, keep-last 1).
+
+With ``rhythm_publish`` it publishes ``RhythmMinute`` on ``/room_memory/rhythm`` after each window
+(reliable, transient_local, keep-last equal to the sensor count, D45). The logger runs only when
+``rhythm_enable`` is on. Both default off.
 """
 
 import dataclasses
@@ -38,6 +42,7 @@ from .generation import GenerationError, allocate_generation
 from .memory import SENSORS, MemoryConfig, RoomMemory
 from .messages import CDRError, RequestSync, SyncTopic, Time
 from .rejectlog import RejectionLog
+from .rhythm import history_depth
 
 STATUS_TOPIC = "/room_memory/status"
 ACTIVITY_TOPIC = "/room_memory/activity"
@@ -62,13 +67,75 @@ class RoomMemoryNode(Node):
     def __init__(self, **kwargs):
         super().__init__("room_memory", **kwargs)
         defaults = MemoryConfig()
-        # Every MemoryConfig field, with its default (the launch files carry the same table).
-        params = {field.name: getattr(defaults, field.name) for field in dataclasses.fields(MemoryConfig)}
-        params["sensors"] = list(defaults.sensors)
+        params = {
+            "room_id": defaults.room_id,
+            "sensors": list(defaults.sensors),
+            "voxel_size": defaults.voxel_size,
+            "max_range": defaults.max_range,
+            "tolerance": defaults.tolerance,
+            "min_voxels": defaults.min_voxels,
+            "min_extent": defaults.min_extent,
+            "window_s": defaults.window_s,
+            "reference_windows": defaults.reference_windows,
+            "recent_windows": defaults.recent_windows,
+            "state_dir": defaults.state_dir,
+            "occupied_min_hits": defaults.occupied_min_hits,
+            "occupied_min_ratio": defaults.occupied_min_ratio,
+            "free_min_seen": defaults.free_min_seen,
+            "free_max_ratio": defaults.free_max_ratio,
+            "candidate_windows": defaults.candidate_windows,
+            "expire_windows": defaults.expire_windows,
+            "fresh_min_voxels": defaults.fresh_min_voxels,
+            "fresh_min_fraction": defaults.fresh_min_fraction,
+            "stable_min_fraction": defaults.stable_min_fraction,
+            "activity_radius_m": defaults.activity_radius_m,
+            "learn_max_offset_m": defaults.learn_max_offset_m,
+            "learn_windows": defaults.learn_windows,
+            "map_sensor": defaults.map_sensor,
+            "delta_period_s": defaults.delta_period_s,
+            "keyframe_period_s": defaults.keyframe_period_s,
+            "keyframe_delta_ratio": defaults.keyframe_delta_ratio,
+            "rhythm_enable": defaults.rhythm_enable,
+            "rhythm_cell_m": defaults.rhythm_cell_m,
+            "rhythm_dims": defaults.rhythm_dims,
+            "rhythm_period_s": defaults.rhythm_period_s,
+            "rhythm_publish": defaults.rhythm_publish,
+            "rhythm_dir": defaults.rhythm_dir,
+            "rhythm_keep_days": defaults.rhythm_keep_days,
+            "rhythm_max_bytes": defaults.rhythm_max_bytes,
+            "rhythm_max_file_bytes": defaults.rhythm_max_file_bytes,
+            "rhythm_fsync_s": defaults.rhythm_fsync_s,
+            "rig_guard": defaults.rig_guard,
+            "imu_topic": defaults.imu_topic,
+            "imu_shock_frac": defaults.imu_shock_frac,
+            "imu_gyro_dps": defaults.imu_gyro_dps,
+            "imu_quiet_s": defaults.imu_quiet_s,
+            "tilt_trigger_deg": defaults.tilt_trigger_deg,
+            "pose_trigger_m": defaults.pose_trigger_m,
+            "guard_check_period_s": defaults.guard_check_period_s,
+            "check_max_s": defaults.check_max_s,
+            "move_min_m": defaults.move_min_m,
+            "move_min_deg": defaults.move_min_deg,
+            "align_max_m": defaults.align_max_m,
+            "align_max_deg": defaults.align_max_deg,
+            "align_inlier_ratio": defaults.align_inlier_ratio,
+            "align_max_rms_m": defaults.align_max_rms_m,
+            "align_stable_windows": defaults.align_stable_windows,
+            "observe_min_eig": defaults.observe_min_eig,
+            "gross_inlier_ratio": defaults.gross_inlier_ratio,
+            "relearn_after_s": defaults.relearn_after_s,
+            "auto_relearn": defaults.auto_relearn,
+            "reg_voxel_m": defaults.reg_voxel_m,
+            "reg_max_points": defaults.reg_max_points,
+            "src_voxel_m": defaults.src_voxel_m,
+            "src_max_points": defaults.src_max_points,
+            "icp_max_range_m": defaults.icp_max_range_m,
+        }
         values = {name: self.declare_parameter(name, value).value for name, value in params.items()}
         values["sensors"] = tuple(values["sensors"])
         values["max_range"] = values["max_range"] if values["max_range"] > 0 else None
         values["state_dir"] = values["state_dir"] or None
+        values["rhythm_dir"] = values["rhythm_dir"] or ""
         self.config = MemoryConfig(**values)
         # Before any publisher: every message this process sends carries the generation. The
         # allocation holds publisher.lock until the process exits.
@@ -83,12 +150,13 @@ class RoomMemoryNode(Node):
         # 1 Hz, so a late subscriber (the bridge, when the first Mac subscribes) gets the last one at once;
         # a copy delivered again repeats its seq in its generation. Everything else is volatile: the Mac
         # gets the map and recent events by RequestSync, and a restarted node never receives an old
-        # request. Same QoS as the C++ node.
+        # request. Rhythm, when published, is transient_local with one stored minute per configured
+        # sensor (D45). Depth 1 would leave a late subscriber the newest sensor only. Same QoS as the C++ node.
         def volatile(depth):
             return QoSProfile(depth=depth, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
 
-        def latched():
-            return QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        def latched(depth=1):
+            return QoSProfile(depth=depth, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
         self.events = self.create_publisher(ChangeEventMsg, EVENTS_TOPIC, volatile(100))
         self.status = self.create_publisher(MemoryStatusMsg, STATUS_TOPIC, latched())
@@ -98,6 +166,12 @@ class RoomMemoryNode(Node):
         self.sync_map = self.create_publisher(MapBricksMsg, SYNC_MAP_TOPIC, volatile(10))
         self.sync_events = self.create_publisher(ChangeEventMsg, SYNC_EVENTS_TOPIC, volatile(200))
         self.sync_end = self.create_publisher(SyncEndMsg, SYNC_END_TOPIC, volatile(10))
+        if self.config.rhythm_publish:
+            from labcommand_msgs.msg import RhythmMinute as RhythmMinuteMsg
+            self.rhythm = self.create_publisher(
+                RhythmMinuteMsg, "/room_memory/rhythm", latched(history_depth(len(self.config.sensors))),
+            )
+            self.memory.set_rhythm_publish(lambda data: self.rhythm.publish(data))
         self.create_subscription(RequestSyncMsg, REQUEST_TOPIC, self._answer, volatile(10), raw=True)
         self.create_service(RequestSyncSrv, REQUEST_SERVICE, self._serve_request)
         for name in self.config.sensors:
@@ -144,6 +218,7 @@ class RoomMemoryNode(Node):
         message = self.memory.map_update(stamp)
         if message is not None:
             self.map.publish(message)
+        self.memory.enqueue_rhythm()
         if self.rig is not None:  # created with rig_guard only; rig_pose is None without it
             rig = self.memory.rig_pose(stamp)
             if rig is not None:
@@ -207,6 +282,12 @@ class RoomMemoryNode(Node):
         self._last_status = now
         self.status.publish(message.to_cdr())
         self.activity.publish(self.memory.activity(stamp).to_cdr())
+
+    def destroy_node(self):
+        memory = getattr(self, "memory", None)
+        if memory is not None:
+            memory.close()
+        super().destroy_node()
 
 
 def main(args=None):

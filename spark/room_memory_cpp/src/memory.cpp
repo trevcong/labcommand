@@ -669,7 +669,81 @@ RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, std::uint64_
     }
     const std::int64_t millis = start.sec * 1000 + start.nanosec / 1'000'000;
     next_event_id_ = static_cast<std::uint64_t>(millis) << 20;
+    const RhythmSettings rhythm = rhythm_settings();
+    validate_rhythm(rhythm);
     load(start);
+    if (rhythm_active(rhythm)) rhythm_ = std::make_unique<Rhythm>(rhythm);
+}
+
+RoomMemory::~RoomMemory() {
+    try {
+        close();
+    } catch (...) {
+    }
+}
+
+void RoomMemory::close() {
+    if (!rhythm_) return;
+    std::unique_ptr<Rhythm> rhythm = std::move(rhythm_);
+    rhythm->close();
+}
+
+void RoomMemory::enqueue_rhythm() {
+    if (rhythm_) rhythm_->enqueue();
+}
+
+void RoomMemory::set_rhythm_publish(Rhythm::Publish publish, std::function<bool()> publish_would_block) {
+    if (rhythm_) rhythm_->set_publish(std::move(publish), std::move(publish_would_block));
+}
+
+void RoomMemory::fail_next_rhythm_insert(const std::string& sensor) {
+    if (rhythm_) rhythm_->fail_next_insert(sensor);
+}
+
+RhythmSensorView RoomMemory::rhythm_sensor(const std::string& sensor) const {
+    return rhythm_ ? rhythm_->view(sensor) : RhythmSensorView{};
+}
+
+RhythmSettings RoomMemory::rhythm_settings() const {
+    RhythmSettings settings;
+    settings.room_id = config_.room_id;
+    settings.sensors = config_.sensors;
+    settings.voxel_size = config_.voxel_size;
+    settings.window_s = config_.window_s;
+    settings.state_dir = config_.state_dir;
+    settings.enable = config_.rhythm_enable;
+    settings.cell_m = config_.rhythm_cell_m;
+    settings.dims = static_cast<int>(config_.rhythm_dims);
+    settings.period_s = config_.rhythm_period_s;
+    settings.publish = config_.rhythm_publish;
+    settings.dir = config_.rhythm_dir;
+    settings.keep_days = config_.rhythm_keep_days;
+    settings.max_bytes = config_.rhythm_max_bytes;
+    settings.max_file_bytes = config_.rhythm_max_file_bytes;
+    settings.fsync_s = config_.rhythm_fsync_s;
+    settings.publisher_generation = publisher_generation_;
+    return settings;
+}
+
+void RoomMemory::observe_rhythm(const Channel& channel, RhythmKind kind, const Keys& occupied, const msg::Time& stamp,
+                                bool tracking) {
+    if (!rhythm_) return;
+    const std::string& name = channel.sensor.name;
+    try {
+        if (kind == RhythmKind::add) {
+            if (tracking) {
+                rhythm_->add(name, stamp.sec, occupied, map_epoch_, true, channel.residual, config_.learn_max_offset_m);
+            } else {
+                rhythm_->add(name, stamp.sec, occupied, map_epoch_);
+            }
+        } else if (kind == RhythmKind::empty) {
+            rhythm_->add_empty(name, stamp.sec, map_epoch_);
+        } else {
+            rhythm_->note_unavailable(name, stamp.sec, map_epoch_);
+        }
+    } catch (...) {
+        rhythm_->discard(name, stamp.sec, map_epoch_);
+    }
 }
 
 RoomMemory::Channel& RoomMemory::find(const std::string& sensor) {
@@ -826,17 +900,27 @@ bool RoomMemory::reference_ready(const Channel& channel) const {
     return channel.reference_windows >= config_.reference_windows && !channel.reference.occupied.empty();
 }
 
-void RoomMemory::build(Channel& channel, std::size_t frames, const std::vector<float>& points) {
+void RoomMemory::build(Channel& channel, std::size_t frames, const std::vector<float>& points,
+                       const msg::Time& stamp, bool tracking) {
     // A sensor's reference freezes once it is ready, and only windows with at least one occupied
-    // voxel count toward it.
-    if (!frames || reference_ready(channel)) return;
+    // voxel count toward it. Rhythm sees that same window: occupied cells, an empty window, or
+    // unavailable when occupancy was not evaluated (a frozen reference, no frames, or a late
+    // builder that is already ready).
+    if (!frames || reference_ready(channel)) {
+        observe_rhythm(channel, RhythmKind::unavailable, {}, stamp, tracking);
+        return;
+    }
     const OccupancyMap window = occupancy_map(points, change_);
-    if (window.occupied.empty()) return;
+    if (window.occupied.empty()) {
+        observe_rhythm(channel, RhythmKind::empty, {}, stamp, tracking);
+        return;
+    }
     const VoxelLayer observed = VoxelLayer::observe(window, change_, backend_);
     channel.stats.add(observed.occupied, observed.known);
     ++channel.reference_windows;
     set_reference(channel, channel.stats.settled(config_.settle_rule()));
     if (channel.builder) channel.builder->add(channel.window, config_.max_range);
+    observe_rhythm(channel, RhythmKind::add, window.occupied, stamp, tracking);
 }
 
 bool RoomMemory::built(std::int64_t now) const {
@@ -903,7 +987,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         // A sensor silent through the build (guard only) builds its reference when it returns,
         // while the others track.
         if (state_ == msg::MemoryState::building || channel.builder) {
-            build(channel, frames, points);
+            build(channel, frames, points, stamp, tracking);
             continue;
         }
         const Config& config = channel.config;
@@ -922,15 +1006,18 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         if (!channel.reference_index) channel.reference_index = std::make_shared<const Membership>(channel.reference.occupied);
         if (guard && channel.mode != Channel::Mode::normal) {
             // Moved (or moved while silent): no diff, tracker or learning until it is re-aligned.
+            // Points are in a stale pose, so rhythm does not count the cells as empty.
             channel.tracker.interrupt();
             if (!window.occupied.empty()) {
                 channel.shift = pose_shift(window.occupied, *channel.reference_index, config_.voxel_size);
             }
+            observe_rhythm(channel, RhythmKind::unavailable, {}, stamp, tracking);
             continue;
         }
         if (window.occupied.empty()) {
             push_recent(CellSummary{});
             channel.tracker.interrupt();
+            observe_rhythm(channel, RhythmKind::empty, {}, stamp, tracking);
             continue;
         }
         push_recent(std::move(summary));
@@ -983,6 +1070,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
             log_event(events.back());
         }
         for (const std::size_t n : channel.tracker.activity()) activity.push_back(Moving{channel.sensor.bit, report.regions[n]});
+        observe_rhythm(channel, RhythmKind::add, window.occupied, stamp, tracking);
     }
     if (dropped) ++dropped_windows_;
     last_window_dropped_ = dropped;
@@ -1039,6 +1127,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         for (Channel& channel : channels_) channel.window.clear();
         if (rig_save_pending_) save_rig();
     }
+    if (rhythm_) rhythm_->note_epoch(map_epoch_);
     return events;
 }
 

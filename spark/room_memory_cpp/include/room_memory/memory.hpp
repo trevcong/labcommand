@@ -28,6 +28,7 @@
 #include "room_memory/imu.hpp"
 #include "room_memory/key_set.hpp"
 #include "room_memory/messages.hpp"
+#include "room_memory/rhythm.hpp"
 #include "room_memory/state.hpp"
 
 namespace room_memory {
@@ -295,6 +296,20 @@ struct MemoryConfig {
     double delta_period_s = 5.0;
     double keyframe_period_s = 60.0;
     double keyframe_delta_ratio = 0.5;
+    // Rhythm log. Off unless rhythm_enable. Disk follows rhythm_dir, or state_dir when that
+    // is empty. The topic stays off unless rhythm_publish is also set. A bad rhythm value
+    // fails before any subscription; nothing is clamped. The cell and the period have to
+    // divide voxel_size and window_s only while rhythm_enable is set.
+    bool rhythm_enable = false;
+    double rhythm_cell_m = 0.5;
+    std::int64_t rhythm_dims = 2;
+    std::int64_t rhythm_period_s = 60;
+    bool rhythm_publish = false;
+    std::string rhythm_dir;
+    std::int64_t rhythm_keep_days = 90;
+    std::int64_t rhythm_max_bytes = 536870912;
+    std::int64_t rhythm_max_file_bytes = 33554432;
+    std::int64_t rhythm_fsync_s = 600;
     // The rig-pose guard (PLAN-RIGGUARD.md). Off: no check, transform, IMU or extra file, so outputs and
     // files are today's exactly. On: triggers (an IMU shock or tilt past tilt_trigger_deg,
     // pose_offset above pose_trigger_m on 2 windows, every guard_check_period_s, a saved-state
@@ -437,6 +452,7 @@ public:
     // which gives the same events and exists to measure and prove that.
     RoomMemory(MemoryConfig config, const msg::Time& start, std::uint64_t publisher_generation,
                const RayBackend* backend = nullptr, DiffScope scope = DiffScope::regions);
+    ~RoomMemory();
 
     // Queues positions (3 floats per point, meters, sensor frame) for the current window.
     void add_points(const std::string& sensor, std::span<const float> xyz);
@@ -471,6 +487,14 @@ public:
     // references inside it; the epoch file is already written, by record_epoch). No-op without
     // state_dir.
     void save(const msg::Time& stamp);
+    // Flush open rhythm bins, drain the writer, and fsync once. No-op when rhythm is off.
+    // Safe to call twice. Joins the writer while a rhythm publisher can still be alive.
+    void close();
+    // Copy finished rhythm records into the writer queue. The callback does no filesystem I/O.
+    void enqueue_rhythm();
+    void set_rhythm_publish(Rhythm::Publish publish, std::function<bool()> publish_would_block = {});
+    void fail_next_rhythm_insert(const std::string& sensor);
+    RhythmSensorView rhythm_sensor(const std::string& sensor) const;
     // Feeds one CDR sensor_msgs/Imu received at `received` to the rig guard. False when the guard is
     // off or the frame does not decode (counted in imu_failed, never thrown).
     bool add_imu(std::span<const std::uint8_t> data, const msg::Time& received);
@@ -511,7 +535,8 @@ private:
     // A built reference: its quota of windows and some settled occupancy, which tracking needs
     // (pose_offset registers on it, and without it no window may teach the reference).
     bool reference_ready(const Channel& channel) const;
-    void build(Channel& channel, std::size_t frames, const std::vector<float>& points);
+    void build(Channel& channel, std::size_t frames, const std::vector<float>& points, const msg::Time& stamp,
+               bool tracking);
     bool built(std::int64_t now) const;
     // A sensor silent through the build has not built its reference yet (guard only).
     bool building() const;
@@ -524,6 +549,10 @@ private:
     msg::MapBricks map_message(msg::MapKind kind, const msg::Time& stamp) const;
     msg::Bytes publish_map(const msg::MapBricks& message);
     void log_event(const msg::ChangeEvent& event);
+    RhythmSettings rhythm_settings() const;
+    enum class RhythmKind { add, empty, unavailable };
+    void observe_rhythm(const Channel& channel, RhythmKind kind, const Keys& occupied, const msg::Time& stamp,
+                        bool tracking);
     // Rig guard.
     struct Check {
         std::int64_t start = 0;
@@ -596,6 +625,7 @@ private:
     std::size_t delta_bytes_ = 0;
     std::deque<Logged> map_log_;
     std::deque<Logged> event_log_;
+    std::unique_ptr<Rhythm> rhythm_;
     std::map<std::uint64_t, Logged> open_latest_;  // event_id -> latest message, open events only
     std::optional<float> coverage_;
     // Rig guard, room level.

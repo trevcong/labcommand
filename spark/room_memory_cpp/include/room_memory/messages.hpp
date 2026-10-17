@@ -10,8 +10,11 @@
 // codec range-checks them, so the same values are representable and rejected. A missing
 // float measurement is an empty optional here and NaN on the wire.
 //
-// Protocol v2 appends fields at the end of MemoryStatus, MapBricks, ChangeEvent, Epoch, Activity and RequestSync
-// (protocol 1.4, 3). The layout comes from the bytes after the last legacy field: at most 3 is a
+// Protocol v2 appends fields at the end of MemoryStatus, MapBricks, ChangeEvent, Epoch, Activity,
+// RequestSync, RhythmMinute and RigPose (protocol §1.4, §3.9, §3.10, D42, D45). RhythmMinute
+// (protocol §3.10, D45) skips the common header: sensor (1 Mid-360, 2 JT128) is the field after
+// room_id, then map_epoch, seq and stamp. RigPose is protocol §3.9.
+// The layout comes from the bytes after the last legacy field: at most 3 is a
 // legacy message, padding to 8 then exactly the v2 fields (then at most 3) is v2, and anything else
 // is invalid. publisher_generation (and the RequestSync v2 fields) are empty for the legacy layout;
 // the encoders write it only when they hold one.
@@ -103,7 +106,7 @@ struct Time {
     void validate(const std::string& what) const;
 };
 
-// The four common fields that start every labcommand_msgs message.
+// The four common fields that start every labcommand_msgs message except RhythmMinute (D45).
 struct Header {
     std::string room_id;
     std::uint64_t map_epoch = 0;
@@ -231,6 +234,36 @@ struct Activity {
     void validate() const;
     Bytes to_cdr() const;
     static Activity from_cdr(std::span<const std::uint8_t> data);
+};
+
+// One minute of per-lidar region occupancy on /room_memory/rhythm (protocol §3.10, D45).
+// It skips the common header: sensor (1 Mid-360, 2 JT128) is the field after room_id.
+// Region arrays are strictly increasing in signed (ix, iy, iz).
+// publisher_generation is empty for the legacy layout; the .rhy file does not carry it.
+struct RhythmMinute {
+    std::string room_id;
+    std::int64_t sensor = 0;
+    std::uint64_t map_epoch = 0;
+    std::uint64_t seq = 0;
+    Time stamp;
+    std::int64_t windows_closed = 0;
+    std::int64_t windows_with_points = 0;
+    std::int64_t windows_unavailable = 0;
+    std::int64_t clipped = 0;
+    std::int64_t regions_dropped = 0;
+    std::int64_t pose_ok = 0;
+    std::int64_t flags = 0;
+    std::vector<std::int64_t> ix;
+    std::vector<std::int64_t> iy;
+    std::vector<std::int64_t> iz;
+    std::vector<std::int64_t> hit_windows;
+    std::vector<std::int64_t> mean_voxels;
+    std::optional<std::uint64_t> publisher_generation;
+    friend bool operator==(const RhythmMinute&, const RhythmMinute&) = default;
+
+    void validate() const;
+    Bytes to_cdr() const;
+    static RhythmMinute from_cdr(std::span<const std::uint8_t> data);
 };
 
 // The rig-pose guard (protocol 3.9): its outcome, what started the check, each sensor's result and

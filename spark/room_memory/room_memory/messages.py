@@ -1,6 +1,9 @@
 """CDR codecs for the ``labcommand_msgs`` room-memory messages, with no ROS imports.
 
-The contract is ``docs/ROOM-MEMORY-PROTOCOL.md`` (Phase 0 branch). Classic CDR (XCDR1):
+The contract is ``docs/ROOM-MEMORY-PROTOCOL.md`` (Phase 0 branch). ``RhythmMinute`` is the
+rhythm-log record in ``PLAN-RHYTHM.md`` (protocol §3.10, D45). ``RigPose`` is the rig-pose guard (protocol §3.9, D42). It skips the common header:
+``sensor`` (1 Mid-360, 2 JT128) is the field after ``room_id``, then ``map_epoch``, ``seq``
+and ``stamp``. Classic CDR (XCDR1):
 4-byte encapsulation header (``00 01`` little endian, ``00 00`` big endian), every primitive
 aligned to its own size counted from the byte after the header, strings as a ``uint32``
 length that includes the NUL, ``T[]`` as a ``uint32`` count, nested messages without
@@ -10,7 +13,7 @@ exactly what ``from_cdr`` rejects. Float fields hold binary32 values; a missing 
 measurement is ``None`` here and NaN on the wire.
 
 Protocol v2 appends fields at the end of ``MemoryStatus``, ``MapBricks``, ``ChangeEvent``,
-``Epoch``, ``Activity`` and ``RequestSync`` (protocol §1.4, §3, D38). The layout comes from the bytes after the last legacy field:
+``Epoch``, ``Activity``, ``RequestSync``, ``RhythmMinute`` and ``RigPose`` (protocol §1.4, §3.9, §3.10, D38, D42, D45). The layout comes from the bytes after the last legacy field:
 at most 3 is a legacy message, padding to 8 then exactly the v2 fields (then at most 3) is v2, and
 anything else is invalid. ``publisher_generation`` (and the ``RequestSync`` v2 fields) are
 ``None`` for the legacy layout; the encoders write it only when they hold one.
@@ -204,7 +207,7 @@ class Time:
 
 @dataclass(frozen=True)
 class Header:
-    """The four common fields that start every ``labcommand_msgs`` message."""
+    """The four common fields that start every ``labcommand_msgs`` message except ``RhythmMinute`` (D45)."""
 
     room_id: str
     map_epoch: int
@@ -250,6 +253,9 @@ class _Writer:
 
     def u16(self, value):
         self._put("<H", 2, value)
+
+    def i16(self, value):
+        self._put("<h", 2, value)
 
     def u32(self, value):
         self._put("<I", 4, value)
@@ -329,6 +335,9 @@ class _Reader:
 
     def u16(self, what):
         return self._get("H", 2, what)
+
+    def i16(self, what):
+        return self._get("h", 2, what)
 
     def u32(self, what):
         return self._get("I", 4, what)
@@ -1138,6 +1147,152 @@ class SyncEnd:
             return end
         return _decode(data, "SyncEnd", body)
 
+
+_RHYTHM_INT16 = (-(1 << 15), (1 << 15) - 1)
+_RHYTHM_REGIONS = 65535
+
+
+@dataclass(frozen=True)
+class RhythmMinute:
+    """One minute of per-lidar region occupancy on ``/room_memory/rhythm`` (protocol §3.10, D45).
+
+    It skips the common header. ``sensor`` is the file-header code (1 Mid-360, 2 JT128) and is
+    the field after ``room_id``, then ``map_epoch``, ``seq`` and ``stamp``. Region arrays are
+    strictly increasing in signed ``(ix, iy, iz)``. A loss marker carries ``sensor`` too,
+    with zero counts and flag bits 1 and 4.
+    ``publisher_generation`` is ``None`` for the legacy layout (the pinned goldens). The live
+    publisher always sets it. The ``.rhy`` file does not carry it.
+    """
+
+    room_id: str
+    sensor: int
+    map_epoch: int
+    seq: int
+    stamp: Time
+    windows_closed: int
+    windows_with_points: int
+    windows_unavailable: int
+    clipped: int
+    regions_dropped: int
+    pose_ok: int
+    flags: int
+    ix: Tuple[int, ...]
+    iy: Tuple[int, ...]
+    iz: Tuple[int, ...]
+    hit_windows: Tuple[int, ...]
+    mean_voxels: Tuple[int, ...]
+    publisher_generation: Optional[int] = None
+
+    def validate(self):
+        context = "RhythmMinute"
+        if not self.room_id:
+            raise Invalid(f"{context}: room_id is empty")
+        if "\x00" in self.room_id:
+            raise Invalid(f"{context}: room_id contains a NUL")
+        if self.sensor not in (SENSOR_MID360, SENSOR_JT128):
+            raise Invalid(f"{context}: sensor {self.sensor} is not 1 (Mid-360) or 2 (JT128)")
+        _require_int(self.map_epoch, 0, SINCE_NONE, f"{context}: map_epoch")
+        _require_int(self.seq, 0, SINCE_NONE, f"{context}: seq")
+        self.stamp.validate(f"{context}: stamp")
+        _require_generation(self.publisher_generation, f"{context}: publisher_generation")
+        for name in ("windows_closed", "windows_with_points", "windows_unavailable"):
+            _require_int(getattr(self, name), 0, 0xFFFF, f"{context}: {name}")
+        _require_int(self.clipped, 0, (1 << 32) - 1, f"{context}: clipped")
+        _require_int(self.regions_dropped, 0, (1 << 32) - 1, f"{context}: regions_dropped")
+        if self.pose_ok not in (0, 1):
+            raise Invalid(f"{context}: pose_ok {self.pose_ok} is not 0 or 1")
+        _require_int(self.flags, 0, 255, f"{context}: flags")
+        arrays = (self.ix, self.iy, self.iz, self.hit_windows, self.mean_voxels)
+        if any(len(values) != len(self.ix) for values in arrays):
+            raise Invalid(f"{context}: region array lengths disagree")
+        if len(self.ix) > _RHYTHM_REGIONS:
+            raise Invalid(f"{context}: n_regions {len(self.ix)} does not fit in uint16")
+        if self.windows_with_points == 0 and len(self.ix) != 0:
+            raise Invalid(f"{context}: a minute with no point-windows stores no regions")
+        previous = None
+        for index, region in enumerate(zip(self.ix, self.iy, self.iz, self.hit_windows, self.mean_voxels)):
+            ix, iy, iz, hits, mean = region
+            for name, value in (("ix", ix), ("iy", iy), ("iz", iz)):
+                _require_int(value, _RHYTHM_INT16[0], _RHYTHM_INT16[1], f"{context}: {name}[{index}]")
+            _require_int(hits, 1, 0xFFFF, f"{context}: hit_windows[{index}]")
+            _require_int(mean, 0, 0xFFFF, f"{context}: mean_voxels[{index}]")
+            if self.windows_with_points > 0 and hits > self.windows_with_points:
+                raise Invalid(f"{context}: hit_windows[{index}] {hits} exceeds windows_with_points")
+            current = (ix, iy, iz)
+            if previous is not None and current <= previous:
+                raise Invalid(f"{context}: regions are not strictly increasing at {index}")
+            previous = current
+
+    def to_cdr(self):
+        """CDR little endian, encapsulation header included. Raises ``Invalid``."""
+        self.validate()
+        writer = _Writer()
+        writer.string(self.room_id)
+        writer.u8(self.sensor)
+        writer.u64(self.map_epoch)
+        writer.u64(self.seq)
+        writer.time(self.stamp)
+        writer.u16(self.windows_closed)
+        writer.u16(self.windows_with_points)
+        writer.u16(self.windows_unavailable)
+        writer.u32(self.clipped)
+        writer.u32(self.regions_dropped)
+        writer.u8(self.pose_ok)
+        writer.u8(self.flags)
+        writer.u16(len(self.ix))
+        for name, values, put in (
+            ("ix", self.ix, writer.i16), ("iy", self.iy, writer.i16), ("iz", self.iz, writer.i16),
+            ("hit_windows", self.hit_windows, writer.u16), ("mean_voxels", self.mean_voxels, writer.u16),
+        ):
+            writer.u32(len(values))
+            for value in values:
+                put(value)
+        if self.publisher_generation is not None:
+            writer.u64(self.publisher_generation)
+        return bytes(writer.data)
+
+    @classmethod
+    def from_cdr(cls, data):
+        """Decodes either byte order. Raises ``Truncated`` or ``Invalid``."""
+        def body(reader):
+            room_id = reader.string("room_id")
+            sensor = reader.u8("sensor")
+            map_epoch = reader.u64("map_epoch")
+            seq = reader.u64("seq")
+            stamp = reader.time("stamp")
+            windows_closed = reader.u16("windows_closed")
+            windows_with_points = reader.u16("windows_with_points")
+            windows_unavailable = reader.u16("windows_unavailable")
+            clipped = reader.u32("clipped")
+            regions_dropped = reader.u32("regions_dropped")
+            pose_ok = reader.u8("pose_ok")
+            flags = reader.u8("flags")
+            declared = reader.u16("n_regions")
+            if declared > _RHYTHM_REGIONS:
+                raise Invalid(f"RhythmMinute: n_regions {declared} does not fit in uint16")
+
+            def series(name, read):
+                count = reader.u32(name + " length")
+                if count > _RHYTHM_REGIONS:
+                    raise Invalid(f"RhythmMinute: {name} length {count} is above {_RHYTHM_REGIONS}")
+                return tuple(read(f"{name}[{index}]") for index in range(count))
+
+            ix = series("ix", reader.i16)
+            iy = series("iy", reader.i16)
+            iz = series("iz", reader.i16)
+            hits = series("hit_windows", reader.u16)
+            means = series("mean_voxels", reader.u16)
+            if declared != len(ix):
+                raise Invalid(f"RhythmMinute: n_regions {declared} does not match ix length {len(ix)}")
+            generation = reader.u64("publisher_generation") if reader.is_v2(8, "mean_voxels") else None
+            message = cls(
+                room_id, sensor, map_epoch, seq, stamp, windows_closed, windows_with_points,
+                windows_unavailable, clipped, regions_dropped, pose_ok, flags, ix, iy, iz, hits, means,
+                generation,
+            )
+            message.validate()
+            return message
+        return _decode(data, "RhythmMinute", body)
 
 def _f32_optional(values):
     return tuple(None if value is None else f32(value) for value in values)
