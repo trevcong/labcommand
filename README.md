@@ -87,3 +87,32 @@ contract (type cap, spacing tokens, no placeholder chrome).
 `change-detect` diffs two clouds of the same sensor (`.pcd` or CDR `.bin`).
 `--json` writes the v2 parity record, and `--evidence` carves free space from
 the after cloud.
+
+## Hosted CI
+
+[Hosted gate](.github/workflows/ci.yml) runs on pull requests and pushes to
+`main`. Ubuntu 24.04 installs [the CI requirements](spark/requirements-ci.txt),
+runs pytest from `spark/`, builds the non-ROS C++ targets and runs CTest with
+the same Python interpreter. It also checks committed fixtures and compares
+the complete hand-golden `.hex` sets byte-for-byte. macOS 15 with Xcode 16.4
+runs `swift run LabCommandCoreTestsRunner` and
+`swift build -c release --product LabCommand`.
+
+The job summary reports pytest case counts and CTest entry counts separately,
+including skips and reasons. The initial pytest pass skips ROS and tests
+requiring unset C++ executable paths; CTest then runs the differential and
+recording-tool tests with those paths configured. The full static recordings
+are not in git: `static_longrun`, `static_longrun_b`, and `static_recording`
+must explicitly skip for missing datasets. Missing decoder dependencies,
+missing committed fixtures, unexpected CTest skips (including nested cases),
+and missing/invalid reports fail the gate. Verbose CTest logs retain inner
+test counts. These checks do not establish ROS, full-recording, or live-rig
+correctness, and do not launch, install, or deploy the app.
+
+Only pip downloads are cached, keyed by the requirements file. CMake and
+Swift outputs are built fresh per job. CI helper regressions can be run with:
+
+```bash
+python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+python3 .github/scripts/ci_checks.py fixtures "$PWD"
+```
