@@ -607,6 +607,20 @@ def test_a_sensor_still_building_when_the_rig_moves_starts_its_build_over():
     assert not [event for window in trace[moving:] for event in window.events]
 
 
+def test_close_window_times_the_guard_icp():
+    """window_estimates and window_estimate_ms cover the guard's ICP in the last window only: none
+    while building or between checks, and time in each window that checks."""
+    memory = guarded(guard_check_period_s=5.0)
+    counts = []
+    for second in range(1, REFERENCE_WINDOWS + 13):
+        drive(memory, [rooms.Pose()], second)
+        counts.append((memory.window_estimates, memory.window_estimate_ms))
+    assert counts[:REFERENCE_WINDOWS - 1] == [(0, 0.0)] * (REFERENCE_WINDOWS - 1)
+    checked = [(n, ms) for n, ms in counts if n]
+    assert checked and all(ms > 0 for _, ms in checked)
+    assert (0, 0.0) in counts[REFERENCE_WINDOWS:]  # a window between checks
+
+
 def test_too_few_points_to_register_is_never_move_evidence():
     """Astra's repro: sparse windows, rejected for fewer than MIN_SOURCE_POINTS, after a baseline and
     with no IMU, end checks INCONCLUSIVE; they never enter RIG_MOVED or relearn."""

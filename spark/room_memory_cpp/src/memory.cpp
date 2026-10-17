@@ -6,6 +6,7 @@
 #include <zlib.h>
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -855,6 +856,8 @@ bool RoomMemory::building() const {
 
 std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
     std::vector<msg::ChangeEvent> events;
+    window_estimates_ = 0;
+    window_estimate_ms_ = 0.0;
     // Every activity region of this window, all sensors.
     struct Moving {
         std::int64_t bit;
@@ -1454,6 +1457,14 @@ std::optional<rig::Mat3> RoomMemory::rotation_prior(const Channel& channel) cons
 }
 
 msg::RigChannel RoomMemory::estimate(Channel& channel, const std::optional<rig::Pose>& seed_from_last) {
+    const auto start = std::chrono::steady_clock::now();
+    const msg::RigChannel result = align_channel(channel, seed_from_last);
+    ++window_estimates_;
+    window_estimate_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    return result;
+}
+
+msg::RigChannel RoomMemory::align_channel(Channel& channel, const std::optional<rig::Pose>& seed_from_last) {
     const double limit = config_.max_range ? *config_.max_range : config_.icp_max_range_m;
     const std::vector<double> source = rig::source_cloud(channel.window, limit, config_.src_voxel_m,
                                                          static_cast<std::size_t>(config_.src_max_points));

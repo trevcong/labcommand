@@ -36,6 +36,20 @@ A nudged tripod must not flag the whole room. The node detects a rig move (Mid-3
 
 **7. Parity.** Guard off: C++/Python byte-identical. Guard on, never re-aligned: `MemoryStatus`, events and MapBricks byte-identical, `RigPose` outcomes exact. **v1 relaxation:** `RigPose` floats within 0.1 mm / 0.001°; after a re-align, events match by kind/sensor/position within 5 cm.
 
+## Measured: ICP time per window
+
+The nodes run `close_window`, and so the guard's ICP, in the window timer on the default single-threaded executor: while a check aligns, status, activity and `RequestSync` callbacks wait. `room_memory_bag rig_guard=true` replays both static recordings (both lidars, otherwise node defaults) and times it per window (`window_estimate_ms`; both nodes also log it on every window that runs ICP). The recordings have no `/livox/imu`, so every estimate seeds with the ±10° yaw sweep, the costliest path. Release build on the Mac (Apple M5 Max, 18 cores), 2026-10-16; not yet measured on the Spark.
+
+| OpenMP threads | ICP per window (2 estimates), median / p95 / max | whole window, median / p95 / max |
+|---|---|---|
+| 1 | 120 / 145 / 687 ms | 139 / 166 / 702 ms |
+| 18 (default) | 42 / 46 / 105 ms | 48 / 52 / 111 ms |
+
+- Each recording: 24 of ~300 windows run ICP (the periodic checks, 2 or 3 windows each), 48 estimates; `static5m-b` is within 3 ms of `static5m`. Windows without ICP: 20 ms median on one thread, 6 ms on 18.
+- Steady state is ~60 ms per estimate on one thread and ~21 ms on 18: within the 150 ms per-check budget.
+- The first check after a build costs 5× more (687 ms on one thread, 105 ms on 18), and a restart's startup check does too: `RegistrationCloud` computes its normals and correspondence grids lazily, on first use. On one thread that holds the executor for 0.7 s once, inside `window_s`. Follow-up: compute them when the cloud is built or loaded.
+- Not measured: windows while RIG_MOVED (one estimate per moved sensor per window); the recordings hold no move.
+
 ## Tests
 
 - **Unit** (ctest `guard`, `memory`, `messages`; pytest `test_guard.py`, same cases): convergence grid (≤ 0.30 m, 10° yaw, 3° tilt) to 5 mm / 0.05°, with 20 % outliers; corridor/plane → `REJECTED`, never RIG_MOVED; IMU shock/tilt/gap; state machine incl. hold and expiry; relearn; `rig_shifted` golden (+5 cm → 0 regions after re-align); codec goldens.

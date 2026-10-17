@@ -155,6 +155,9 @@ class RoomMemoryNode(Node):
             f"window {elapsed_ms:.1f} ms wall, {cpu_ms:.1f} ms cpu, {len(events)} event messages, "
             f"state {self.memory.state.name}"
         )
+        if self.memory.window_estimates:
+            self.get_logger().info(f"rig guard: {self.memory.window_estimates} ICP estimates, "
+                                   f"{self.memory.window_estimate_ms:.1f} ms of the window")
         if elapsed_ms > self.config.window_s * 1000:
             self.get_logger().warning(f"window took {elapsed_ms:.0f} ms, longer than window_s")
 

@@ -246,6 +246,10 @@ private:
         const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         RCLCPP_INFO(get_logger(), "window %.1f ms wall, %.1f ms cpu, %zu event messages, map %zu B, state %s", elapsed,
                     cpu_ms() - cpu, events.size(), map ? map->size() : std::size_t{0}, msg::name(memory_->state()));
+        if (memory_->window_estimates() > 0) {
+            RCLCPP_INFO(get_logger(), "rig guard: %lld ICP estimates, %.1f ms of the window",
+                        static_cast<long long>(memory_->window_estimates()), memory_->window_estimate_ms());
+        }
         if (elapsed > memory_->config().window_s * 1000) {
             RCLCPP_WARN(get_logger(), "window took %.0f ms, longer than window_s", elapsed);
         }

@@ -13,6 +13,7 @@ import math
 import operator
 import pathlib
 import re
+import time
 import zlib
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -1009,6 +1010,10 @@ class RoomMemory:
         # The rig files on disk lag the guard: a write failed (disk full, permissions). The guard runs
         # on from memory and close_window retries every window; rig_save_failed counts the failed
         # attempts (a failed relearn archive included) and rig_save_error is the last one's message.
+        # Measurement only, in no output: the guard's ICP estimates in the last close_window and their
+        # wall time in ms (source cloud, seed with its yaw sweep, alignment).
+        self.window_estimates = 0
+        self.window_estimate_ms = 0.0
         self.rig_save_pending = False
         self.rig_save_failed = 0
         self.rig_save_error = None
@@ -1201,6 +1206,7 @@ class RoomMemory:
 
     def close_window(self, stamp):
         """Integrates the queued frames. Returns the ``ChangeEvent`` messages to publish, in order."""
+        self.window_estimates, self.window_estimate_ms = 0, 0.0
         events = []
         activity = []  # (sensor bit, region) of every activity region, all sensors
         dropped = False
@@ -1507,7 +1513,16 @@ class RoomMemory:
         return R
 
     def _estimate(self, channel, seed_from_last=False):
-        """ICP of this window against the channel's cloud: (estimate or None, RigChannel result)."""
+        """ICP of this window against the channel's cloud: (estimate or None, RigChannel result),
+        timed into ``window_estimate_ms``."""
+        start = time.perf_counter()
+        try:
+            return self._align_channel(channel, seed_from_last)
+        finally:
+            self.window_estimates += 1
+            self.window_estimate_ms += (time.perf_counter() - start) * 1000
+
+    def _align_channel(self, channel, seed_from_last):
         config = self.config
         limit = config.max_range if config.max_range is not None else config.icp_max_range_m
         source = rig.source_cloud(channel.window, limit, config.src_voxel_m, config.src_max_points)

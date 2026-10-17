@@ -478,6 +478,11 @@ public:
     // MOVED while a channel is moved, CHECKING during a check, else the last decision.
     msg::RigOutcome rig_outcome() const;
     std::int64_t imu_failed() const { return imu_failed_; }
+    // Measurement only, in no output: the guard's ICP estimates in the last close_window and their
+    // wall time (source cloud, seed with its yaw sweep, alignment). close_window runs on the node's
+    // single-threaded executor, so this time holds every other callback.
+    std::int64_t window_estimates() const { return window_estimates_; }
+    double window_estimate_ms() const { return window_estimate_ms_; }
     // The rig files on disk lag the guard: a write failed (disk full, permissions). The guard runs on
     // from memory and close_window retries every window; rig_save_failed counts the failed
     // attempts (a failed relearn archive included) and rig_save_error is the last one's message.
@@ -535,6 +540,7 @@ private:
     void guard_step(std::int64_t now, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
     std::optional<rig::Mat3> rotation_prior(const Channel& channel) const;
     msg::RigChannel estimate(Channel& channel, const std::optional<rig::Pose>& seed_from_last = std::nullopt);
+    msg::RigChannel align_channel(Channel& channel, const std::optional<rig::Pose>& seed_from_last);
     void decide(std::int64_t now, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
     void enter_moved(std::int64_t now, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
     void channel_moved(Channel& channel, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
@@ -581,6 +587,8 @@ private:
     // Rig guard, room level.
     std::optional<ImuDetector> detector_;
     std::int64_t imu_failed_ = 0;
+    std::int64_t window_estimates_ = 0;
+    double window_estimate_ms_ = 0.0;
     bool rig_save_pending_ = false;
     std::int64_t rig_save_failed_ = 0;
     std::string rig_save_error_;

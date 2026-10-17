@@ -2071,6 +2071,32 @@ TEST(the_rig_state_round_trips_and_a_restart_checks_the_pose) {
     CHECK_EQ(trace[0].rig->causes, msg::kCauseStartup);
 }
 
+TEST(close_window_times_the_guard_icp) {
+    // window_estimates and window_estimate_ms cover the guard's ICP in the last window only: none
+    // while building or between checks, and time in each window that checks.
+    MemoryConfig config = guarded_config();
+    config.guard_check_period_s = 5.0;
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+    std::vector<std::pair<std::int64_t, double>> counts;
+    for (std::int64_t second = 1; second < kGuardReferenceWindows + 13; ++second) {
+        drive(memory, repeat(rig::Pose{}, 1), second);
+        counts.emplace_back(memory.window_estimates(), memory.window_estimate_ms());
+    }
+    for (std::int64_t n = 0; n + 1 < kGuardReferenceWindows; ++n) {
+        CHECK(counts[static_cast<std::size_t>(n)].first == 0 && counts[static_cast<std::size_t>(n)].second == 0.0);
+    }
+    bool checked = false, between = false;
+    for (std::size_t n = static_cast<std::size_t>(kGuardReferenceWindows); n < counts.size(); ++n) {
+        if (counts[n].first > 0) {
+            checked = true;
+            CHECK(counts[n].second > 0.0);
+        } else {
+            between = between || counts[n].second == 0.0;
+        }
+    }
+    CHECK(checked && between);
+}
+
 TEST(a_frame_add_imu_cannot_decode_is_counted_never_thrown) {
     // add_imu rejects what decode_imu cannot read and counts it; with the guard off it reads nothing.
     RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
