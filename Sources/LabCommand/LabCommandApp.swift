@@ -241,9 +241,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     private func installStatusItem() {
+        // A menu-bar extra stays narrow. The tooltip and the menu carry the full name.
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "LabCommand"
-        item.button?.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
+        let button = item.button
+        button?.title = "LAB"
+        button?.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
+        button?.toolTip = "LabCommand"
+        button?.setAccessibilityLabel("LabCommand")
         item.menu = makeStatusMenu()
         statusItem = item
         rebuildStatusMenu()
@@ -258,6 +262,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func rebuildStatusMenu() {
         guard let menu = statusItem?.menu else { return }
         menu.removeAllItems()
+        menu.addItem(header("LabCommand"))
+        menu.addItem(.separator())
         let rig = appState.rig
         let dots = appState.statusDots
         menu.addItem(header("Mid-360  \(dots.mid360.state.displayLabel)"))
