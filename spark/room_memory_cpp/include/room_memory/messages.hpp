@@ -267,4 +267,59 @@ struct SyncEnd {
     static SyncEnd from_cdr(std::span<const std::uint8_t> data);
 };
 
+// One operator action, Mac -> Spark (protocol 3.6, D46). event_id and expected_state are both
+// set (an event action) or both empty (EVENT_NONE and STATE_NONE on the wire).
+enum class OperatorActionKind : std::uint8_t {
+    acknowledge = 0,
+    accept = 1,
+    dismiss = 2,
+    label = 3,
+    mark_ground_truth = 4,
+    pause = 5,
+    resume = 6,
+    rereference = 7,
+    confirm = 8,
+};
+inline constexpr std::uint64_t kEventNone = ~std::uint64_t{0};
+inline constexpr std::uint8_t kStateNone = 255;
+inline constexpr std::size_t kOperatorTextMaxBytes = 256;
+inline constexpr std::size_t kOperatorIdMaxBytes = 64;
+
+const char* name(OperatorActionKind action);
+
+struct OperatorAction {
+    Header header;
+    OperatorActionKind action = OperatorActionKind::acknowledge;
+    std::optional<std::uint64_t> event_id;
+    std::optional<EventState> expected_state;
+    std::uint64_t expected_generation = 0;  // never GENERATION_UNKNOWN
+    std::string text;                        // "" = none
+    std::string operator_id;
+    std::string action_id;                   // a lowercase UUID, 36 characters
+    friend bool operator==(const OperatorAction&, const OperatorAction&) = default;
+
+    void validate() const;
+    Bytes to_cdr() const;
+    static OperatorAction from_cdr(std::span<const std::uint8_t> data);
+};
+
+// The OperatorAction service's response (D46): what the node did with the action. The effect
+// itself is observed on the wire.
+enum class OperatorOutcome : std::uint8_t {
+    applied = 0,
+    invalid = 1,
+    wrong_room = 2,
+    stale_generation = 3,
+    stale_epoch = 4,
+    unknown_event = 5,
+    state_mismatch = 6,
+    not_tracking = 7,
+    unsupported = 8,
+    storage_failed = 9,
+    target_changed = 10,
+    rig_unsettled = 11,
+};
+
+const char* name(OperatorOutcome outcome);
+
 }  // namespace room_memory::msg

@@ -1024,4 +1024,140 @@ SyncEnd SyncEnd::from_cdr(std::span<const std::uint8_t> data) {
     });
 }
 
+// MARK: OperatorAction
+
+const char* name(OperatorActionKind action) {
+    switch (action) {
+        case OperatorActionKind::acknowledge: return "ACKNOWLEDGE";
+        case OperatorActionKind::accept: return "ACCEPT";
+        case OperatorActionKind::dismiss: return "DISMISS";
+        case OperatorActionKind::label: return "LABEL";
+        case OperatorActionKind::mark_ground_truth: return "MARK_GROUND_TRUTH";
+        case OperatorActionKind::pause: return "PAUSE";
+        case OperatorActionKind::resume: return "RESUME";
+        case OperatorActionKind::rereference: return "REREFERENCE";
+        case OperatorActionKind::confirm: return "CONFIRM";
+    }
+    return "UNKNOWN";
+}
+
+const char* name(OperatorOutcome outcome) {
+    switch (outcome) {
+        case OperatorOutcome::applied: return "APPLIED";
+        case OperatorOutcome::invalid: return "INVALID";
+        case OperatorOutcome::wrong_room: return "WRONG_ROOM";
+        case OperatorOutcome::stale_generation: return "STALE_GENERATION";
+        case OperatorOutcome::stale_epoch: return "STALE_EPOCH";
+        case OperatorOutcome::unknown_event: return "UNKNOWN_EVENT";
+        case OperatorOutcome::state_mismatch: return "STATE_MISMATCH";
+        case OperatorOutcome::not_tracking: return "NOT_TRACKING";
+        case OperatorOutcome::unsupported: return "UNSUPPORTED";
+        case OperatorOutcome::storage_failed: return "STORAGE_FAILED";
+        case OperatorOutcome::target_changed: return "TARGET_CHANGED";
+        case OperatorOutcome::rig_unsettled: return "RIG_UNSETTLED";
+    }
+    return "UNKNOWN";
+}
+
+namespace {
+
+constexpr int kOperatorActions = 9;
+
+// 8-4-4-4-12 lowercase hex digits.
+bool lowercase_uuid(const std::string& text) {
+    if (text.size() != 36) return false;
+    for (std::size_t n = 0; n < text.size(); ++n) {
+        const char c = text[n];
+        if (n == 8 || n == 13 || n == 18 || n == 23) {
+            if (c != '-') return false;
+        } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void require_text(const std::string& text, std::size_t low, std::size_t high, const std::string& what) {
+    if (text.size() < low || text.size() > high) {
+        throw Invalid(what + " is " + str(std::uint64_t{text.size()}) + " bytes, outside " + str(std::uint64_t{low}) +
+                      "..." + str(std::uint64_t{high}));
+    }
+    if (text.find('\0') != std::string::npos) throw Invalid(what + " contains a NUL");
+    if (!valid_utf8(text)) throw Invalid(what + " is not UTF-8");
+}
+
+}  // namespace
+
+void OperatorAction::validate() const {
+    const std::string context = "OperatorAction";
+    header.validate(context);
+    if (header.stamp == Time{}) throw Invalid(context + ": stamp {0, 0} is invalid here (a mark needs its time)");
+    require_enum(action, kOperatorActions, context + ": action");
+    if (event_id == kEventNone) throw Invalid(context + ": event_id (2^64 - 1 is EVENT_NONE; use nullopt)");
+    if (event_id.has_value() != expected_state.has_value()) {
+        throw Invalid(context + ": event_id and expected_state are both set or both EVENT_NONE / STATE_NONE");
+    }
+    if (expected_state) require_enum(*expected_state, 5, context + ": expected_state");
+    const bool event_action = action == OperatorActionKind::acknowledge || action == OperatorActionKind::accept ||
+                              action == OperatorActionKind::dismiss || action == OperatorActionKind::label ||
+                              action == OperatorActionKind::confirm;
+    const bool room_action = action == OperatorActionKind::pause || action == OperatorActionKind::resume ||
+                             action == OperatorActionKind::rereference;
+    if (event_action && !event_id) throw Invalid(context + ": " + name(action) + " needs an event_id");
+    if (room_action && event_id) throw Invalid(context + ": " + name(action) + " is room-level; event_id must be EVENT_NONE");
+    if (expected_state) {
+        const EventState state = *expected_state;
+        const bool open = state == EventState::candidate || state == EventState::confirmed;
+        const bool allowed = action == OperatorActionKind::confirm  ? state == EventState::candidate
+                             : action == OperatorActionKind::accept  ? state == EventState::confirmed
+                             : action == OperatorActionKind::dismiss ? open
+                                                                     : true;
+        if (!allowed) {
+            throw Invalid(context + ": " + name(action) + " cannot expect state " +
+                          str(std::int64_t{static_cast<std::uint8_t>(state)}));
+        }
+    }
+    if (expected_generation == kGenerationUnknown) {
+        throw Invalid(context + ": expected_generation (0 is GENERATION_UNKNOWN) 0 is outside 1..." + str(kUint64Max));
+    }
+    require_text(text, 0, kOperatorTextMaxBytes, context + ": text");
+    if ((action == OperatorActionKind::label || action == OperatorActionKind::mark_ground_truth) && text.empty()) {
+        throw Invalid(context + ": " + name(action) + " needs text");
+    }
+    require_text(operator_id, 1, kOperatorIdMaxBytes, context + ": operator_id");
+    if (!lowercase_uuid(action_id)) throw Invalid(context + ": action_id is not a lowercase UUID (36 characters)");
+}
+
+Bytes OperatorAction::to_cdr() const {
+    validate();
+    Writer writer;
+    writer.header(header);
+    writer.u8(static_cast<std::uint8_t>(action));
+    writer.u64(event_id.value_or(kEventNone));
+    writer.u8(expected_state ? static_cast<std::uint8_t>(*expected_state) : kStateNone);
+    writer.u64(expected_generation);
+    writer.string(text);
+    writer.string(operator_id);
+    writer.string(action_id);
+    return writer.take();
+}
+
+OperatorAction OperatorAction::from_cdr(std::span<const std::uint8_t> data) {
+    return decode<OperatorAction>(data, "OperatorAction", [](Reader& reader) {
+        OperatorAction a;
+        a.header = reader.header("");
+        a.action = read_enum<OperatorActionKind>(reader.u8("action"), kOperatorActions, "OperatorAction: action");
+        const std::uint64_t event = reader.u64("event_id");
+        const std::uint8_t state = reader.u8("expected_state");
+        if (event != kEventNone) a.event_id = event;
+        if (state != kStateNone) a.expected_state = read_enum<EventState>(state, 5, "OperatorAction: expected_state");
+        a.expected_generation = reader.u64("expected_generation");
+        a.text = reader.string("text");
+        a.operator_id = reader.string("operator_id");
+        a.action_id = reader.string("action_id");
+        a.validate();
+        return a;
+    });
+}
+
 }  // namespace room_memory::msg

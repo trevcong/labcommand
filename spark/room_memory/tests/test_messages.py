@@ -118,6 +118,26 @@ def sync_end_map_replay():
     return m.SyncEnd(head("lab", 45, 2), G, TOKEN_C, m.SyncTopic.MAP_BRICKS, 13, ((11, 13),))
 
 
+# The operator goldens (D46): an accept of event (G << 20) + 3 as the §3.6 example, a dismiss with a
+# note, and a confirm (big endian, decode-only).
+OPERATOR_EVENT = (G << 20) + 3
+
+
+def operator_accept():
+    return m.OperatorAction(head("lab", 43, 0), m.OperatorActionKind.ACCEPT, OPERATOR_EVENT, m.EventState.CONFIRMED, G,
+                            "", "trevor", "0e8a3b5c-7721-4d90-b406-5913c2ae6f01")
+
+
+def operator_dismiss():
+    return m.OperatorAction(head("lab", 43, 1, m.Time(1760400012, 0)), m.OperatorActionKind.DISMISS, OPERATOR_EVENT + 1,
+                            m.EventState.CANDIDATE, G, "left on purpose", "astra", "5a1e7c3d-9b02-4f61-8e33-c4d5e6f70819")
+
+
+def operator_confirm():
+    return replace(operator_accept(), header=head("lab", 43, 2, m.Time(1760400011, 500000000)),
+                   action=m.OperatorActionKind.CONFIRM, expected_state=m.EventState.CANDIDATE)
+
+
 # name: (type, value, encoder reproduces the bytes)
 GOLDENS = {
     "memory_status_le.hex": (m.MemoryStatus, memory_status, True),
@@ -148,6 +168,9 @@ GOLDENS = {
     "epoch_v2_le.hex": (m.Epoch, lambda: replace(epoch(), publisher_generation=G), True),
     "epoch_v2_be.hex": (m.Epoch, lambda: replace(epoch(), publisher_generation=G), False),
     "activity_v2_le.hex": (m.Activity, lambda: replace(activity(), publisher_generation=G), True),
+    "operator_action_le.hex": (m.OperatorAction, operator_accept, True),
+    "operator_action_text_le.hex": (m.OperatorAction, operator_dismiss, True),
+    "operator_action_be.hex": (m.OperatorAction, operator_confirm, False),
 }
 # v2 goldens whose cut at the legacy length (+ up to 3 bytes) is a valid legacy message.
 V2_EXTENDS_LEGACY = {name for name in GOLDENS if "_v2_" in name}
@@ -509,3 +532,66 @@ def test_sync_end_sizes_and_patches():
     data[4 + 32:4 + 40] = bytes(8)
     with pytest.raises(m.Invalid, match="GENERATION_UNKNOWN"):
         m.SyncEnd.from_cdr(bytes(data))
+
+
+# MARK: OperatorAction (D46)
+
+
+def test_operator_action_sizes():
+    assert len(operator_accept().to_cdr()) == 129
+    assert len(operator_dismiss().to_cdr()) == 141
+    assert m.OperatorAction.from_cdr(operator_confirm().to_cdr()) == operator_confirm()
+
+
+@pytest.mark.parametrize("change", [
+    {"header": head("lab", 43, 0, m.Time(0, 0))},
+    {"action": 9},
+    {"expected_state": None},
+    {"event_id": None},
+    {"event_id": m.EVENT_NONE},
+    {"expected_state": 5},
+    {"expected_state": m.EventState.CANDIDATE},  # ACCEPT needs CONFIRMED
+    {"action": m.OperatorActionKind.CONFIRM},  # CONFIRM needs CANDIDATE
+    {"action": m.OperatorActionKind.DISMISS, "expected_state": m.EventState.EXPIRED},
+    {"action": m.OperatorActionKind.PAUSE},  # room-level with an event
+    {"action": m.OperatorActionKind.LABEL, "expected_state": m.EventState.CANDIDATE},  # LABEL needs text
+    {"expected_generation": 0},
+    {"text": "x" * 257},
+    {"text": "a\udcff"},
+    {"text": "a\x00b"},
+    {"operator_id": ""},
+    {"operator_id": "x" * 65},
+    {"action_id": "0E8A3B5C-7721-4D90-B406-5913C2AE6F01"},
+    {"action_id": "0e8a3b5c77214d90b4065913c2ae6f01"},
+    {"action_id": "0e8a3b5c-7721-4d90-b406-5913c2ae6f0g"},
+    {"header": head("", 43, 0)},
+])
+def test_operator_action_rejections(change):
+    with pytest.raises(m.Invalid):
+        replace(operator_accept(), **change).to_cdr()
+
+
+def test_operator_action_limits_and_room_actions():
+    limits = replace(operator_accept(), text="x" * 256, operator_id="y" * 64)
+    assert m.OperatorAction.from_cdr(limits.to_cdr()) == limits
+    room = replace(operator_accept(), action=m.OperatorActionKind.REREFERENCE, event_id=None, expected_state=None)
+    data = room.to_cdr()
+    assert m.OperatorAction.from_cdr(data) == room
+    assert data[4 + 40:4 + 48] == b"\xff" * 8 and data[4 + 48] == 0xFF
+    mark = replace(room, action=m.OperatorActionKind.MARK_GROUND_TRUTH, text="chair moved at 12:00")
+    assert m.OperatorAction.from_cdr(mark.to_cdr()) == mark
+
+
+@pytest.mark.parametrize("at, value, match", [
+    (32, b"\x09", "action"),
+    (48, b"\xff", "both set"),
+    (48, b"\x07", "expected_state"),
+    (56, bytes(8), "GENERATION_UNKNOWN"),
+    (24, bytes(8), "stamp"),
+    (88, b"A", "UUID"),
+])
+def test_operator_action_decoder_rejections(at, value, match):
+    data = bytearray(hexfile("operator_action_le.hex"))
+    data[4 + at:4 + at + len(value)] = value
+    with pytest.raises(m.Invalid, match=match):
+        m.OperatorAction.from_cdr(bytes(data))

@@ -1,0 +1,29 @@
+# labcommand_msgs/OperatorAction ACTION_ACCEPT, CDR little endian (protocol 3.6, D46). Derived by hand.
+# The section 3.6 example: room "lab", empty text, operator_id "trevor", a 36-character action_id.
+# Covers: action at pos 32 then 7 pad bytes; expected_state at pos 48 then 7; the empty text is
+# length 1 (the NUL) and 3 pad bytes; one pad byte after operator_id. 129 bytes on the wire.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+04 00 00 00                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   room_id "lab\0"
+2b 00 00 00 00 00 00 00     # pos 8   map_epoch 43
+00 00 00 00 00 00 00 00     # pos 16  seq 0
+8a 92 ed 68                 # pos 24  stamp.sec 1760400010
+80 b2 e6 0e                 # pos 28  stamp.nanosec 250000000
+01                          # pos 32  action ACCEPT
+00 00 00 00 00 00 00        # pos 33  pad to 8
+03 00 00 40 44 00 9e 19     # pos 40  event_id 1845913190400000003
+01                          # pos 48  expected_state CONFIRMED
+00 00 00 00 00 00 00        # pos 49  pad to 8
+00 44 04 e0 99 01 00 00     # pos 56  expected_generation 1760400000000
+01 00 00 00                 # pos 64  text length 1
+00                          # pos 68  text "\0"
+00 00 00                    # pos 69  pad to 4
+07 00 00 00                 # pos 72  operator_id length 7
+74 72 65 76 6f 72 00        # pos 76  operator_id "trevor\0"
+00                          # pos 83  pad to 4
+25 00 00 00                 # pos 84  action_id length 37
+30 65 38 61 33 62 35 63     # pos 88  action_id "0e8a3b5c"
+2d 37 37 32 31 2d 34 64     # pos 96    "-7721-4d"
+39 30 2d 62 34 30 36 2d     # pos 104   "90-b406-"
+35 39 31 33 63 32 61 65     # pos 112   "5913c2ae"
+36 66 30 31 00              # pos 120   "6f01\0"

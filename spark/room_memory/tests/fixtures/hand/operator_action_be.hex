@@ -1,0 +1,28 @@
+# labcommand_msgs/OperatorAction ACTION_CONFIRM, CDR big endian (protocol 3.6, D46). Decode-only.
+# Derived by hand. operator_action_le.hex's layout with every integer reversed; the strings are not.
+# Covers: ACTION_CONFIRM (8), expected_state CANDIDATE, seq 2. 129 bytes on the wire.
+00 00 00 00                 # encapsulation CDR_BE, options 0
+00 00 00 04                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   room_id "lab\0"
+00 00 00 00 00 00 00 2b     # pos 8   map_epoch 43
+00 00 00 00 00 00 00 02     # pos 16  seq 2
+68 ed 92 8b                 # pos 24  stamp.sec 1760400011
+1d cd 65 00                 # pos 28  stamp.nanosec 500000000
+08                          # pos 32  action CONFIRM
+00 00 00 00 00 00 00        # pos 33  pad to 8
+19 9e 00 44 40 00 00 03     # pos 40  event_id 1845913190400000003
+00                          # pos 48  expected_state CANDIDATE
+00 00 00 00 00 00 00        # pos 49  pad to 8
+00 00 01 99 e0 04 44 00     # pos 56  expected_generation 1760400000000
+00 00 00 01                 # pos 64  text length 1
+00                          # pos 68  text "\0"
+00 00 00                    # pos 69  pad to 4
+00 00 00 07                 # pos 72  operator_id length 7
+74 72 65 76 6f 72 00        # pos 76  operator_id "trevor\0"
+00                          # pos 83  pad to 4
+00 00 00 25                 # pos 84  action_id length 37
+30 65 38 61 33 62 35 63     # pos 88  action_id "0e8a3b5c"
+2d 37 37 32 31 2d 34 64     # pos 96    "-7721-4d"
+39 30 2d 62 34 30 36 2d     # pos 104   "90-b406-"
+35 39 31 33 63 32 61 65     # pos 112   "5913c2ae"
+36 66 30 31 00              # pos 120   "6f01\0"
