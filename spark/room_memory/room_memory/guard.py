@@ -27,7 +27,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from .core.change_detection import contains, pack, unpack
+from .core.change_detection import LIMIT, contains, in_range, pack, unpack
 
 F32 = np.float32
 
@@ -61,6 +61,12 @@ NORMAL_PLANARITY = 0.2
 SWEEP_STEP_DEG = 1.0
 JACOBI_SWEEPS = 50
 _OFFSETS = tuple((di, dj, dk) for di in (-1, 0, 1) for dj in (-1, 0, 1) for dk in (-1, 0, 1))
+_OFFSET_ARRAY = np.array(_OFFSETS, dtype=np.int64)
+# pack(i + di, j + dj, k + dk) - pack(i, j, k) for each offset, wherever all six lanes pack.
+_KEY_SHIFTS = (_OFFSET_ARRAY[:, 0] << 42) + (_OFFSET_ARRAY[:, 1] << 21) + _OFFSET_ARRAY[:, 2]
+# TargetGrid.nearest and the normals measure (query, candidate) pairs in chunks of about this many.
+_PAIR_CHUNK = 1 << 20
+_NO_INDEX = np.iinfo(np.int64).max
 
 
 # MARK: Poses
@@ -338,11 +344,54 @@ def jacobi_eigh(matrix):
 # MARK: Target grids
 
 
+def _runs(starts, counts):
+    """The concatenated ranges ``starts[n] .. starts[n] + counts[n] - 1``."""
+    total = int(counts.sum())
+    return np.repeat(starts - (np.cumsum(counts) - counts), counts) + np.arange(total)
+
+
+def _as_float64(points):
+    """``points`` as binary64. A float64 array is returned as itself, so ``is`` still selects the
+    kept-column path. Any other dtype is cast: binary32 ``floor(p / cell)`` can disagree."""
+    points = np.asarray(points)
+    if points.dtype == np.float64:
+        return points
+    return np.ascontiguousarray(points, dtype=np.float64)
+
+
+def _cell_range_error(cell):
+    return ValueError(
+        f"cell index floor(p / {cell:g}) +/- 1 must lie in {-LIMIT}..{LIMIT - 1} "
+        "so every neighbour packs into a 21-bit key")
+
+
+def _outside_cell_range(floored):
+    """True when a floor index is non-finite or +/- 1 falls outside ``-LIMIT .. LIMIT-1``."""
+    return not np.isfinite(floored).all() or (floored < -LIMIT + 1).any() or (floored > LIMIT - 2).any()
+
+
+def _require_cell_range(points, cell):
+    """Target points are stored under their cell keys, so each must be finite and in range.
+    A non-finite query is not stored; ``nearest`` leaves those rows to ``pack``."""
+    if len(points) == 0:
+        return
+    with np.errstate(over="ignore", invalid="ignore"):
+        floored = np.floor(points / cell)
+    if _outside_cell_range(floored):
+        raise _cell_range_error(cell)
+
+
 class TargetGrid:
     """A cell table over the target points: per cell (sorted keys) the start and count of its kept
-    indices (every k-th of the cell's points in target order, at most ``cap``)."""
+    indices (every k-th of the cell's points in target order, at most ``cap``).
+
+    Points are cast to binary64. ``floor(p / cell) +/- 1`` must lie in ``-LIMIT .. LIMIT-1`` on
+    every axis, the range that packs into a 21-bit key; outside it the neighbour table and the
+    cell pruning are not exact, so construction raises ``ValueError``."""
 
     def __init__(self, points, cell, cap):
+        points = _as_float64(points)
+        _require_cell_range(points, cell)
         self.cell = cell
         keys = _cells(points, cell)
         order = np.argsort(keys, kind="stable")
@@ -354,30 +403,113 @@ class TargetGrid:
         self.start = np.concatenate([[0], np.cumsum(kept)[:-1]]).astype(np.int64)
         offsets = np.arange(int(kept.sum())) - np.repeat(self.start, kept)
         self.indices = order[np.repeat(first, kept) + offsets * np.repeat(step, kept)]
+        # The kept points' coordinates in kept order, one contiguous array per axis, for nearest().
+        self._points = points
+        self._kept = [np.ascontiguousarray(points[self.indices, axis]) for axis in range(3)]
+        self._table = None
+
+    def _find(self, keys):
+        """The cell index of each key, -1 where the grid has no such cell."""
+        at = np.minimum(np.searchsorted(self.keys, keys), len(self.keys) - 1)
+        return np.where(self.keys[at] == keys, at, -1)
+
+    def _neighbours(self):
+        """``(27, cells)``: each cell's neighbours (offset order, -1 where empty), built on first use.
+        Only read for cells whose lanes +- 1 pack, where a neighbour's key is the key plus a constant."""
+        if self._table is None:
+            with np.errstate(over="ignore"):
+                self._table = self._find(self.keys[None, :] + _KEY_SHIFTS[:, None])
+        return self._table
+
+    def _around(self, queries, q, radius, prune):
+        """``(counts, starts)``, each ``(len(queries), 27)``: the kept slots of each query's neighbour
+        cells in offset order, a count of 0 where the grid has no such cell or, with ``prune``, where
+        the cell's box is provably farther than ``radius``. ``q`` is the queries' binary64 columns."""
+        queries = _as_float64(queries)
+        with np.errstate(over="ignore", invalid="ignore"):
+            floored = np.floor(queries / self.cell)
+        # key + constant is the neighbour key only while every lane of the index +/- 1 packs, and the
+        # box prune uses those indices. A finite query outside that range would search the wrong cells.
+        finite = np.isfinite(queries).all(axis=1)
+        if finite.any() and _outside_cell_range(floored[finite]):
+            raise _cell_range_error(self.cell)
+        base = floored.astype(np.int64)
+        # The grid cells (or -1) of the 27 neighbours, found once per distinct query cell. Where every
+        # lane of base +- 1 packs, a neighbour's key is the cell's key plus a constant: an occupied
+        # cell reads them from the neighbour table, an empty one searches its 27 keys. A non-finite
+        # query has no cell and searches its own exact pack() keys.
+        lanes = (base[:, 0], base[:, 1], base[:, 2])
+        packs = in_range(*(lane - 1 for lane in lanes)) & in_range(*(lane + 1 for lane in lanes))
+        good, bad = np.nonzero(packs)[0], np.nonzero(~packs)[0]
+        cells, inverse = np.unique(pack(*(lane[good] for lane in lanes)), return_inverse=True)
+        lookup = np.empty(len(queries), dtype=np.int64)
+        lookup[good] = inverse.reshape(-1)
+        lookup[bad] = len(cells) + np.arange(len(bad))
+        own = self._find(cells)
+        empty = own < 0
+        cell_of = np.empty((len(_OFFSETS), len(cells) + len(bad)), dtype=np.int64)
+        cell_of[:, :len(cells)][:, ~empty] = self._neighbours()[:, own[~empty]]
+        cell_of[:, :len(cells)][:, empty] = self._find(cells[empty][None, :] + _KEY_SHIFTS[:, None])
+        cell_of[:, len(cells):] = self._find(pack(*(lane[bad][None, :] + _OFFSET_ARRAY[:, axis, None]
+                                                    for axis, lane in enumerate(lanes))))
+        counts = np.where(cell_of >= 0, self.count[cell_of], 0)[:, lookup].T
+        starts = self.start[cell_of][:, lookup].T
+        if not prune:
+            return counts, starts
+        # A neighbour cell is left out when its box is provably farther than radius from the query
+        # (every point in it would be dropped as outside anyway); the margins dwarf the rounding of
+        # floor(p / cell), even in binary32, and of the distances, so no point within radius is left
+        # out. Only for the points the grid was built on: other coordinates need not lie in its cells.
+        gaps = []
+        with np.errstate(invalid="ignore", over="ignore"):  # non-finite queries: NaN gaps never prune
+            for axis in range(3):
+                low = base[:, axis] * self.cell
+                margin = 1e-6 * (1.0 + np.abs(q[axis]))
+                below = np.maximum(q[axis] - low - margin, 0.0)
+                above = np.maximum((low + self.cell) - q[axis] - margin, 0.0)
+                gaps.append(np.stack([below * below, np.zeros(len(queries)), above * above], axis=1))
+            box = (gaps[0][:, :, None, None] + gaps[1][:, None, :, None]) + gaps[2][:, None, None, :]
+            far = box.reshape(len(queries), len(_OFFSETS)) * (1.0 - 1e-6) > radius * radius
+        return np.where(far, 0, counts), starts
 
     def nearest(self, queries, points, radius):
-        """For each binary64 query, the nearest kept target within ``radius`` in the 27 cells around
-        it (ties to the lower target index): (index or -1, squared distance or inf)."""
+        """For each query, the nearest kept target within ``radius`` in the 27 cells around it (ties
+        to the lower target index): (index or -1, squared distance or inf).
+
+        Queries and ``points`` are cast to binary64. A finite query whose ``floor(p / cell) +/- 1``
+        falls outside ``-LIMIT .. LIMIT-1`` raises ``ValueError``."""
+        queries = _as_float64(queries)
         best = np.full(len(queries), np.inf)
         best_index = np.full(len(queries), -1, dtype=np.int64)
         if not len(queries) or not len(self.keys):
             return best_index, best
-        base = np.floor(queries / self.cell).astype(np.int64)
-        for di, dj, dk in _OFFSETS:
-            keys = pack(base[:, 0] + di, base[:, 1] + dj, base[:, 2] + dk)
-            at = np.minimum(np.searchsorted(self.keys, keys), len(self.keys) - 1)
-            found = self.keys[at] == keys
-            starts = np.where(found, self.start[at], 0)
-            counts = np.where(found, self.count[at], 0)
-            for slot in range(int(counts.max(initial=0))):
-                valid = slot < counts
-                rows = np.nonzero(valid)[0]
-                target = self.indices[starts[rows] + slot]
-                delta = queries[rows] - points[target]
-                d2 = (delta[:, 0] * delta[:, 0] + delta[:, 1] * delta[:, 1]) + delta[:, 2] * delta[:, 2]
-                better = (d2 < best[rows]) | ((d2 == best[rows]) & (target < best_index[rows]))
-                best[rows[better]] = d2[better]
-                best_index[rows[better]] = target[better]
+        if points is not self._points:
+            points = _as_float64(points)
+        q = [np.ascontiguousarray(queries[:, axis], dtype=np.float64) for axis in range(3)]
+        kept = self._kept if points is self._points else None
+        counts, starts = self._around(queries, q, radius, prune=kept is not None)
+        # Every (query, candidate) pair, grouped by query, in chunks of about _PAIR_CHUNK pairs. Each
+        # target lies in one cell, so the old scan's rule (a smaller d2, or an equal d2 and a lower
+        # index, replaces the best; NaN and inf never do) picks the least (d2, index) of the candidates.
+        n = counts.sum(axis=1)
+        rows = np.nonzero(n)[0]
+        ends = np.cumsum(n[rows])
+        cuts = np.searchsorted(ends, np.arange(_PAIR_CHUNK, int(ends[-1]) if len(ends) else 0, _PAIR_CHUNK))
+        for chunk in np.split(rows, np.unique(cuts)):
+            if not len(chunk):
+                continue
+            size = n[chunk]
+            slot = _runs(starts[chunk].reshape(-1), counts[chunk].reshape(-1))
+            target = self.indices[slot]
+            d = [np.repeat(q[axis][chunk], size) - (kept[axis][slot] if kept else points[target, axis])
+                 for axis in range(3)]
+            d2 = (d[0] * d[0] + d[1] * d[1]) + d[2] * d[2]
+            group = np.cumsum(size) - size
+            low = np.fmin.reduceat(d2, group)
+            pick = np.minimum.reduceat(np.where(d2 == np.repeat(low, size), target, _NO_INDEX), group)
+            hit = low < np.inf
+            best[chunk[hit]] = low[hit]
+            best_index[chunk[hit]] = pick[hit]
         outside = best > radius * radius
         best_index[outside] = -1
         best[outside] = np.inf
@@ -433,6 +565,11 @@ class RegistrationCloud:
         return self._grids[next((level for level in GRID_LEVELS if level >= radius), GRID_LEVELS[-1])]
 
 
+# The products in the normals' second moments: xx xy xz yy yz zz.
+_SQUARE_ROWS = np.array([0, 0, 0, 1, 1, 2])
+_SQUARE_COLUMNS = np.array([0, 1, 2, 1, 2, 2])
+
+
 def _normals(points, radius):
     n = len(points)
     normals = np.full((n, 3), np.nan)
@@ -442,24 +579,38 @@ def _normals(points, radius):
     count = np.zeros(n)
     s = np.zeros((n, 3))
     ss = np.zeros((n, 6))  # xx xy xz yy yz zz
-    base = np.floor(points / radius).astype(np.int64)
     r2 = radius * radius
-    for di, dj, dk in _OFFSETS:
-        keys = pack(base[:, 0] + di, base[:, 1] + dj, base[:, 2] + dk)
-        at = np.minimum(np.searchsorted(grid.keys, keys), len(grid.keys) - 1)
-        found = grid.keys[at] == keys
-        starts = np.where(found, grid.start[at], 0)
-        counts = np.where(found, grid.count[at], 0)
-        for slot in range(int(counts.max(initial=0))):
-            rows = np.nonzero(slot < counts)[0]
-            other = points[grid.indices[starts[rows] + slot]]
-            delta = points[rows] - other
-            near = ((delta[:, 0] * delta[:, 0] + delta[:, 1] * delta[:, 1]) + delta[:, 2] * delta[:, 2]) <= r2
-            rows, other = rows[near], other[near]
-            count[rows] += 1.0
-            s[rows] += other
-            x, y, z = other[:, 0], other[:, 1], other[:, 2]
-            ss[rows] += np.stack([x * x, x * y, x * z, y * y, y * z, z * z], axis=1)
+    # Each point's sums run over its neighbours within radius in offset order, then slot order, each
+    # term added in turn to 0.0 (as the C++ engine adds them). A cell whose box is farther than
+    # radius is left out: its points would all fail ``near``. Per chunk of points, the candidates
+    # are measured at once; then pass j adds every point's j-th near neighbour, with the points in
+    # decreasing order of their neighbour count, so the points a pass adds to are a prefix.
+    columns = [np.ascontiguousarray(points[:, axis]) for axis in range(3)]
+    around, origins = grid._around(points, columns, radius, prune=True)
+    size = around.sum(axis=1)
+    ends = np.cumsum(size)
+    cuts = np.searchsorted(ends, np.arange(_PAIR_CHUNK, int(ends[-1]), _PAIR_CHUNK))
+    for chunk in np.split(np.arange(n), np.unique(cuts)):
+        if not len(chunk):
+            continue
+        slot = _runs(origins[chunk].reshape(-1), around[chunk].reshape(-1))
+        d = [np.repeat(columns[axis][chunk], size[chunk]) - grid._kept[axis][slot] for axis in range(3)]
+        near = ((d[0] * d[0] + d[1] * d[1]) + d[2] * d[2]) <= r2
+        owner = np.repeat(np.arange(len(chunk)), size[chunk])[near]
+        other = np.stack([grid._kept[axis][slot[near]] for axis in range(3)], axis=1)
+        found = np.bincount(owner, minlength=len(chunk))
+        first = np.cumsum(found) - found
+        order = np.argsort(-found, kind="stable")
+        descending = -found[order]
+        sums, squares = np.zeros((len(chunk), 3)), np.zeros((len(chunk), 6))
+        for j in range(int(found.max(initial=0))):
+            m = int(np.searchsorted(descending, -j))
+            term = other[first[order[:m]] + j]
+            sums[:m] += term
+            squares[:m] += term[:, _SQUARE_ROWS] * term[:, _SQUARE_COLUMNS]
+        count[chunk[order]] = found[order]
+        s[chunk[order]] = sums
+        ss[chunk[order]] = squares
     rows = np.nonzero(count >= NORMAL_MIN_POINTS)[0]
     if not len(rows):
         return normals
