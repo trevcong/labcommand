@@ -4,7 +4,7 @@ Log each lidar's occupied fraction per region once a minute, for a later fit of 
 
 ## Where
 
-Both nodes in this checkout are the protocol v2 engine (Activity, pose residual, `publisher_generation`): `spark/room_memory` and `spark/room_memory_cpp`. Differential tests compare those two. The `.rhy` layout is unchanged. `RhythmMinute` ends with `publisher_generation` (protocol §1.4, §3.9, D44); the hand codec omits it on the legacy layout. The labcommand-spark worktree is not edited.
+Both nodes in this checkout are the protocol v2 engine (Activity, pose residual, `publisher_generation`): `spark/room_memory` and `spark/room_memory_cpp`. Differential tests compare those two. The `.rhy` layout is unchanged. `RhythmMinute` ends with `publisher_generation` (protocol §1.4, §3.9, D45); the hand codec omits it on the legacy layout. The labcommand-spark worktree is not edited.
 
 Mac `close_window` without the logger is ~16.5 ms per 1 s window (one thread, both sensors). No SSH. Clouds and status share that thread, so the callback only enqueues. One writer does `write`, `fsync`, rotate, and prune.
 
@@ -48,7 +48,7 @@ Before spin, scan the open append file only (≤32 MiB) and truncate to the last
 
 ## Topic
 
-`labcommand_msgs/RhythmMinute` on `/room_memory/rhythm` (protocol §3.9, D44), from the writer: reliable, transient local, keep-last equal to the number of configured sensors. Depth 1 kept only the newest message, so a late subscriber saw one lidar. It skips the common header: `sensor` is the field after `room_id`. Record fields minus the pad, plus `room_id`, `sensor` (u8 immediately after `room_id`: 1 Mid-360, 2 JT128, the file-header codes), `map_epoch`, `seq`, and the minute `stamp`. Every message carries `sensor`, including a loss marker. The live publisher stamps `publisher_generation` (never 0), the same field other v2 Spark→Mac messages end with. Absent, the hand codec keeps the legacy layout so the pinned goldens stay. The `.rhy` record layout stays unchanged and does not carry the generation; the two lidars share this topic and use different frames.
+`labcommand_msgs/RhythmMinute` on `/room_memory/rhythm` (protocol §3.9, D45), from the writer: reliable, transient local, keep-last equal to the number of configured sensors. Depth 1 kept only the newest message, so a late subscriber saw one lidar. It skips the common header: `sensor` is the field after `room_id`. Record fields minus the pad, plus `room_id`, `sensor` (u8 immediately after `room_id`: 1 Mid-360, 2 JT128, the file-header codes), `map_epoch`, `seq`, and the minute `stamp`. Every message carries `sensor`, including a loss marker. The live publisher stamps `publisher_generation` (never 0), the same field other v2 Spark→Mac messages end with. Absent, the hand codec keeps the legacy layout so the pinned goldens stay. The `.rhy` record layout stays unchanged and does not carry the generation; the two lidars share this topic and use different frames.
 
 ## Config
 
