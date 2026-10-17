@@ -1,0 +1,8 @@
+# Hosted non-ROS gate: room_memory/setup.py runtime/test requirements,
+# plus the decoder packages needed by the committed MCAP excerpt tests.
+# Keep decoder dependencies installed so missing packages cannot look like absent datasets.
+setuptools==80.9.0
+numpy==2.0.2
+pytest==8.4.2
+mcap==1.4.0
+zstandard==0.25.0
