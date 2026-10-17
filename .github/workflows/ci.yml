@@ -18,13 +18,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      REPORTS: ${{ runner.temp }}/ci-reports
-      CPP_BUILD: ${{ runner.temp }}/room-memory-build
-      ROOM_MEMORY_RECORDING: ${{ runner.temp }}/absent-recordings/static5m
-      ROOM_MEMORY_RECORDING_B: ${{ runner.temp }}/absent-recordings/static5m-b
       PYTHONDONTWRITEBYTECODE: '1'
       PYTEST_ADDOPTS: -rs
     steps:
+      - name: Initialize runner paths
+        run: |
+          echo "REPORTS=$RUNNER_TEMP/ci-reports" >> "$GITHUB_ENV"
+          echo "CPP_BUILD=$RUNNER_TEMP/room-memory-build" >> "$GITHUB_ENV"
+          echo "ROOM_MEMORY_RECORDING=$RUNNER_TEMP/absent-recordings/static5m" >> "$GITHUB_ENV"
+          echo "ROOM_MEMORY_RECORDING_B=$RUNNER_TEMP/absent-recordings/static5m-b" >> "$GITHUB_ENV"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
