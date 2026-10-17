@@ -22,7 +22,7 @@ A recording preview is `<UTC yyyyMMdd'T'HHmmss'Z'>_DUAL_<code>_<tag>`. The recor
 
 Menus, still wired. Capture: ⌘↩ start or restart, ⌘⇧R record, ⌘. stop, ⌘⇧D diagnose (switches to Rig). View: ⌘R refresh, enabled on Rig or in focus mode, and ⌘⇧F focus.
 
-The Spark chip follows the room socket while that socket is connected, and the command-center probe otherwise. The lidar chips take their point rate from a fresh room status, and from the probe when that status is stale.
+The Spark chip follows the room socket while that socket is connected, and the command-center probe otherwise. The lidar chips take their state and rate from a fresh room status, and from the probe when that status is stale.
 
 ## Build
 
@@ -47,7 +47,7 @@ The node subscribes to `/livox/lidar` and `/lidar_points` with sensor-data QoS a
 
 The C++ launch file also starts foxglove_bridge on **8767**. The topic whitelist is `^/room_memory/.*`. Services are limited to `/room_memory/sync/request`. Client publishing stays off unless `foxglove_client_publish:=true`. Raw clouds do not leave through 8767. The Python launch file does not start this bridge. Neither node publishes `/room_memory/epoch`.
 
-`rig_guard` defaults to false. With `rig_guard:=true` the node publishes `RigPose` on `/room_memory/rig` (reliable, transient_local, on change and every 10 seconds). `state_dir` defaults to `~/room-memory`. An empty or missing directory stops the node. References are saved there. With the guard, registration clouds and `rig_state` are saved there too. The event log is not.
+`rig_guard` defaults to false. With `rig_guard:=true` the node publishes `RigPose` on `/room_memory/rig` (reliable, transient_local, on change and every 10 seconds). `state_dir` defaults to `~/room-memory`. An empty `state_dir` value, or a directory that does not exist, stops the node; it never creates one. References are saved in `<state_dir>/<room_id>/`. With the guard, registration clouds and `rig_state` are saved there too. The event log is not.
 
 **Protocol.** [docs/ROOM-MEMORY-PROTOCOL.md](docs/ROOM-MEMORY-PROTOCOL.md) is classic CDR. The Mac mirror follows §5 (publisher generation, `RequestSync`, `SyncEnd`). The `.msg` files are in `ros/labcommand_msgs/`. `OperatorAction` is a `.msg` only: no codec and no node handler (§3.6, §9).
 
@@ -65,7 +65,7 @@ The Rig tab is a separate path. It opens two SSH tunnels: Foxglove **8765** for 
 
 **A request path exists only when the bridge offers one.** This repo's C++ launch file advertises `/room_memory/sync/request`. When the running image does not, the client counts the request unsent and the event column says it cannot ask the Spark (`can't ask the Spark for them`). Protocol §9 records that the deployed image was still the pre-D39 image when that section was written. This page describes the code. It does not claim the lab image was checked.
 
-**CI is not a live-rig proof.** The Ubuntu job skips ROS tests (`test_node.py` needs `rclpy` and `labcommand_msgs`) and `rosbags`. From `spark/`, pytest also collects the C++ differential and recording tests; they skip while `ROOM_MEMORY_OFFLINE`, `ROOM_MEMORY_REPLAY`, and `ROOM_MEMORY_BAG` are unset. CTest runs those with the paths set. `static_longrun`, `static_longrun_b`, and `static_recording` must skip, because the full recordings are not in git. Unexpected CTest skips, including nested ones, fail the gate. The Mac job runs the Swift test runner and a release build of the app. It does not launch or install it.
+**CI is not a live-rig proof.** The Ubuntu job skips ROS tests (`test_node.py` needs `rclpy` and `labcommand_msgs`) and `rosbags`. From `spark/`, pytest also collects the C++ differential and recording tests. `differential/test_differential.py` skips unless both `ROOM_MEMORY_OFFLINE` and `ROOM_MEMORY_REPLAY` are set. `recording/test_static_recording.py` skips while `ROOM_MEMORY_BAG` is unset, and at collection when `mcap` cannot be imported. Most of `recording/test_tools.py` runs in that pass; only `test_statuses_tick_every_second_independently_of_the_window` waits on `ROOM_MEMORY_BAG`. CTest runs the differential and recording-tool tests with those paths set. `static_longrun`, `static_longrun_b`, and `static_recording` must skip, because the full recordings are not in git. Unexpected CTest skips, including nested ones, fail the gate. The Mac job runs the Swift test runner and a release build of the app. It does not launch or install it.
 
 ## Tests
 
@@ -74,15 +74,15 @@ Mac, from the repo root:
 ```bash
 swift run LabCommandCoreTestsRunner
 swift run change-detect -- before.pcd after.pcd
-swift run change-detect -- --evidence --json before.bin after.bin
+swift run change-detect --evidence --json before.bin after.bin
 ```
 
-`change-detect` diffs two clouds of the same sensor (`.pcd` or CDR `.bin`). It does not align them. `--json` prints the JSON record and exits. `--evidence` carves free space from the after cloud.
+`change-detect` diffs two clouds of the same sensor (`.pcd` or CDR `.bin`). It does not align them. `--json` prints the JSON record and exits. `--evidence` carves free space from the after cloud. Those flags belong before the two paths: the tool treats every argument after a `--` as a path, and `swift run` passes that `--` through.
 
-Spark. `spark/.venv-local` is gitignored. When that interpreter exists, CMake uses it for the differential tests. There is no `spark/pytest.ini`. Collection from `spark/` includes `room_memory/tests`, `room_memory_bench/tests`, and the C++ `tests/differential` and `tests/recording` trees. Those C++ tests skip until the binaries exist, which is what the first Ubuntu pytest step does too.
+Spark. `spark/.venv-local` is gitignored. When that interpreter exists, CMake uses it for the differential tests. There is no `spark/pytest.ini`. Collection from `spark/` includes `room_memory/tests`, `room_memory_bench/tests`, and the C++ `tests/differential` and `tests/recording` trees. `test_differential.py` skips unless both `ROOM_MEMORY_OFFLINE` and `ROOM_MEMORY_REPLAY` are set. `test_static_recording.py` skips while `ROOM_MEMORY_BAG` is unset, and at collection when `mcap` cannot be imported. Most of `test_tools.py` runs without those binaries; only `test_statuses_tick_every_second_independently_of_the_window` waits on `ROOM_MEMORY_BAG`. That is what the first Ubuntu pytest step does too. Create the venv with Python 3.12, the version CI installs. `spark/requirements-ci.txt` pins `numpy==2.0.2`.
 
 ```bash
-python3 -m venv spark/.venv-local
+python3.12 -m venv spark/.venv-local
 spark/.venv-local/bin/python -m pip install -r spark/requirements-ci.txt
 (cd spark && .venv-local/bin/python -m pytest -q -rs)
 ```
@@ -94,7 +94,7 @@ python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 python3 .github/scripts/ci_checks.py fixtures "$PWD"
 ```
 
-Local C++ tests need CMake 3.20 or newer, a C++20 compiler, zlib, and libzstd (the recording reader; Homebrew `zstd` on macOS). OpenMP defaults on (`ROOM_MEMORY_OPENMP`). Apple Clang has no OpenMP runtime, so install Homebrew `libomp` before configuring. The block below is the local run. `build/` is a local artifact. Do not commit it.
+Local C++ tests need CMake 3.20 or newer, a C++20 compiler, and zlib. libzstd is optional locally (the recording reader; Homebrew `zstd` on macOS); CI requires it. OpenMP defaults on (`ROOM_MEMORY_OPENMP`). Apple Clang has no OpenMP runtime, so install Homebrew `libomp` before configuring. The block below is the local run. `build/` is a local artifact. Do not commit it.
 
 ```bash
 cmake -S spark/room_memory_cpp -B build/room_memory_cpp \
@@ -121,12 +121,12 @@ Only pip downloads are cached, keyed by the requirements file. CMake and Swift o
 
 | Path | What it is |
 |---|---|
-| [docs/ROOM-MEMORY-PROTOCOL.md](docs/ROOM-MEMORY-PROTOCOL.md) | Wire protocol, including D30 and D34–D44 |
+| [docs/ROOM-MEMORY-PROTOCOL.md](docs/ROOM-MEMORY-PROTOCOL.md) | Wire protocol, including D30 and D34–D44. §9: the Mac does not subscribe to `/room_memory/rig` |
 | [Sources/LabCommandCore/LiveRoom/API.md](Sources/LabCommandCore/LiveRoom/API.md) | Mac mirror: client, mirror, screen strings |
 | [docs/CHANGE-DETECTION.md](docs/CHANGE-DETECTION.md) | Occupancy diff shared by Swift, Python, and C++ |
-| [spark/room_memory_cpp/PLAN.md](spark/room_memory_cpp/PLAN.md) | Production node, windows, guard, what is not published |
+| [spark/room_memory_cpp/PLAN.md](spark/room_memory_cpp/PLAN.md) | Production C++ node and windows. `Epoch` is not published. Its `rig_guard` note points at [PLAN-RIGGUARD.md](PLAN-RIGGUARD.md) |
 | [spark/room_memory/PLAN.md](spark/room_memory/PLAN.md) | Python oracle |
-| [PLAN-RIGGUARD.md](PLAN-RIGGUARD.md) | Rig-bump guard on the Spark. v1 is phases 1–2. The Mac does not subscribe to `/room_memory/rig` |
+| [PLAN-RIGGUARD.md](PLAN-RIGGUARD.md) | Rig-bump guard on the Spark. v1 is phases 1–2. A Mac `RigPose` display is later |
 | [PLAN-PUBGEN.md](PLAN-PUBGEN.md) | Publisher generations and the mirror's restart rules |
 | [design-refs/DESIGN-VISION.md](design-refs/DESIGN-VISION.md) | Visual contract the design tests pin |
 | [.github/workflows/ci.yml](.github/workflows/ci.yml) | Hosted gate |
