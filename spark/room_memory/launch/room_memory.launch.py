@@ -42,7 +42,7 @@ ARGUMENTS = {
     "delta_period_s": ("5.0", float),
     "keyframe_period_s": ("60.0", float),
     "keyframe_delta_ratio": ("0.5", float),
-    "rhythm_enable": ("true", bool),
+    "rhythm_enable": ("false", bool),
     "rhythm_cell_m": ("0.5", float),
     "rhythm_dims": ("2", int),
     "rhythm_period_s": ("60", int),

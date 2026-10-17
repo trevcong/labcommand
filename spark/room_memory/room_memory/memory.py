@@ -781,9 +781,10 @@ class MemoryConfig:
     delta_period_s: float = 5.0
     keyframe_period_s: float = 60.0
     keyframe_delta_ratio: float = 0.5
-    # Rhythm log. Disk follows rhythm_dir, or state_dir when that is empty. The topic stays off
-    # unless rhythm_publish is set. A bad value fails before any subscription; nothing is clamped.
-    rhythm_enable: bool = True
+    # Rhythm log. Off unless rhythm_enable. Disk follows rhythm_dir, or state_dir when that
+    # is empty. The topic stays off unless rhythm_publish is also set. A bad value fails
+    # before any subscription; nothing is clamped.
+    rhythm_enable: bool = False
     rhythm_cell_m: float = 0.5
     rhythm_dims: int = 2
     rhythm_period_s: int = 60

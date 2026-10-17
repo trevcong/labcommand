@@ -272,12 +272,15 @@ def test_node_declares_rhythm_dir_and_the_cpp_logger_is_built():
 
 def test_an_empty_window_returns_and_a_directory_records_it(tmp_path):
     """``close_window`` used to raise AttributeError before it could return, because ``_rhythm``
-    was never initialized. With a directory the same empty window is one unavailable minute."""
+    was never initialized. With the logger on, the same empty window is one unavailable minute.
+    A state directory alone does not turn the logger on."""
     quiet = RoomMemory(MemoryConfig(state_dir=None, sensors=("mid360",)), START, GENERATION)
     assert quiet._rhythm is None and quiet.close_window(Time(60, 0)) == []
+    parked = RoomMemory(MemoryConfig(state_dir=str(tmp_path), sensors=("mid360",)), START, GENERATION)
+    assert parked._rhythm is None
 
     memory = RoomMemory(MemoryConfig(
-        sensors=("mid360",), state_dir=str(tmp_path), max_range=None,
+        sensors=("mid360",), state_dir=str(tmp_path), max_range=None, rhythm_enable=True,
         rhythm_keep_days=0, rhythm_fsync_s=0,
     ), START, GENERATION)
     try:
@@ -296,20 +299,24 @@ def test_an_empty_window_returns_and_a_directory_records_it(tmp_path):
     assert record["with_points"] == 0 and record["regions"] == () and record["flags"] & FLAG_UNAVAILABLE
 
 
-def test_defaults_record_and_do_not_publish_and_off_allocates_nothing(tmp_path):
+def test_defaults_are_off_and_do_not_publish(tmp_path):
     defaults = MemoryConfig()
-    assert defaults.rhythm_enable is True and defaults.rhythm_publish is False
+    assert defaults.rhythm_enable is False and defaults.rhythm_publish is False
     assert defaults.rhythm_cell_m == 0.5 and defaults.rhythm_dims == 2 and defaults.rhythm_period_s == 60
     assert defaults.rhythm_dir == "" and defaults.rhythm_keep_days == 90
     assert defaults.rhythm_max_bytes == 536870912 and defaults.rhythm_max_file_bytes == 33554432
     assert defaults.rhythm_fsync_s == 600
     assert rhythm_active(MemoryConfig(state_dir=None)) is False
-    assert rhythm_active(MemoryConfig(state_dir=None, rhythm_publish=True)) is True
+    assert rhythm_active(MemoryConfig(state_dir=str(tmp_path))) is False
+    assert rhythm_active(MemoryConfig(state_dir=None, rhythm_publish=True)) is False
+    assert rhythm_active(MemoryConfig(state_dir=None, rhythm_enable=True, rhythm_publish=True)) is True
     assert rhythm_active(MemoryConfig(state_dir=str(tmp_path), rhythm_enable=False)) is False
     quiet = RoomMemory(MemoryConfig(state_dir=None), START, GENERATION)
     disabled = RoomMemory(MemoryConfig(state_dir=str(tmp_path), rhythm_enable=False), START, GENERATION)
     assert quiet._rhythm is None and disabled._rhythm is None
-    publish_only = RoomMemory(MemoryConfig(state_dir=None, rhythm_publish=True, rhythm_keep_days=0), START, GENERATION)
+    publish_only = RoomMemory(MemoryConfig(
+        state_dir=None, rhythm_enable=True, rhythm_publish=True, rhythm_keep_days=0,
+    ), START, GENERATION)
     try:
         assert publish_only._rhythm is not None and publish_only._rhythm.writer.directory is None
     finally:

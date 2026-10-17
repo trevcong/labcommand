@@ -41,7 +41,7 @@ struct RhythmSettings {
     double voxel_size = 0.05;
     double window_s = 1.0;
     std::optional<std::string> state_dir = std::string("~/room-memory");
-    bool enable = true;
+    bool enable = false;
     double cell_m = 0.5;
     int dims = 2;
     std::int64_t period_s = 60;

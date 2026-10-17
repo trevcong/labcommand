@@ -1,6 +1,6 @@
 # Room rhythm log (baseline v1)
 
-Log each lidar's occupied fraction per region once a minute, for a later fit of the daily rhythm. Bin keys `close_window` already built. Disk on with a directory; topic off unless `rhythm_publish`.
+Log each lidar's occupied fraction per region once a minute, for a later fit of the daily rhythm. Bin keys `close_window` already built. Off unless `rhythm_enable`. With it on, disk follows a directory; the topic stays off unless `rhythm_publish`.
 
 ## Where
 
@@ -56,7 +56,7 @@ Before spin, scan the open append file only (≤32 MiB) and truncate to the last
 
 | parameter | default | rule |
 |---|---|---|
-| `rhythm_enable` | true | off: no logger |
+| `rhythm_enable` | false | off: no logger |
 | `rhythm_cell_m` | 0.5 | float32 ÷ `voxel_size` ∈ 1…64 |
 | `rhythm_dims` | 2 | 2 or 3 |
 | `rhythm_period_s` | 60 | 1…65535; ÷ `window_s` ∈ 1…3600 |
@@ -67,7 +67,7 @@ Before spin, scan the open append file only (≤32 MiB) and truncate to the last
 | `rhythm_max_file_bytes` | 33554432 | 0 off; else ≥ 65536 and ≤ the byte cap |
 | `rhythm_fsync_s` | 600 | 0: no periodic fsync |
 
-Default `~/room-memory` records and does not publish. Reference save/load still follows `state_dir` only.
+Default `~/room-memory` does not record and does not publish. `rhythm_enable` turns the logger on; an empty `rhythm_dir` then uses `state_dir`. Reference save/load still follows `state_dir` only.
 
 ## Retention
 

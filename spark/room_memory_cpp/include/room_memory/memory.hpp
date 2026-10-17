@@ -283,9 +283,10 @@ struct MemoryConfig {
     double delta_period_s = 5.0;
     double keyframe_period_s = 60.0;
     double keyframe_delta_ratio = 0.5;
-    // Rhythm log. Disk follows rhythm_dir, or state_dir when that is empty. The topic stays off
-    // unless rhythm_publish is set. A bad value fails before any subscription; nothing is clamped.
-    bool rhythm_enable = true;
+    // Rhythm log. Off unless rhythm_enable. Disk follows rhythm_dir, or state_dir when that
+    // is empty. The topic stays off unless rhythm_publish is also set. A bad value fails
+    // before any subscription; nothing is clamped.
+    bool rhythm_enable = false;
     double rhythm_cell_m = 0.5;
     std::int64_t rhythm_dims = 2;
     std::int64_t rhythm_period_s = 60;
