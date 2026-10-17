@@ -24,7 +24,7 @@ import numpy as np
 from . import guard as rig
 from . import state as rig_files
 from .core import Config, OccupancyMap, Region, cast_rays, decode_pointcloud2, diff, occupancy_map
-from .core.change_detection import contains, in_range, pack, unpack, validate
+from .core.change_detection import _Membership, contains, in_range, pack, unpack, validate
 from .imu import ImuDetector
 from .messages import (
     CAUSE_IMU_SHOCK,
@@ -213,15 +213,20 @@ class VoxelStats:
         self.keys, self.hits, self.seen = _EMPTY_KEYS, _EMPTY_COUNTS, _EMPTY_COUNTS
 
     def add(self, occupied, known):
-        """Counts one window: every voxel of ``known`` once in seen, those of ``occupied`` also in hits."""
-        keys = np.union1d(self.keys, known)
-        hits = np.zeros(len(keys), dtype=np.uint32)
-        seen = np.zeros(len(keys), dtype=np.uint32)
-        old = np.searchsorted(keys, self.keys)
-        hits[old], seen[old] = self.hits, self.seen
-        new = np.searchsorted(keys, known)
-        hits[new] += contains(occupied, known).astype(np.uint32)
-        seen[new] += np.uint32(1)
+        """Counts one window: every voxel of ``known`` once in seen, those of ``occupied`` also in hits.
+        Both are sorted unique keys."""
+        # A merge of the two sorted key sets: the keys of known not yet counted go in before the
+        # first larger counted key, so known[n] lands at at[n] plus the new keys before it.
+        at = np.searchsorted(self.keys, known)
+        fresh = np.ones(len(known), dtype=bool)
+        if len(self.keys):
+            fresh = self.keys[np.minimum(at, len(self.keys) - 1)] != known
+        keys = np.insert(self.keys, at[fresh], known[fresh])
+        hits = np.insert(self.hits, at[fresh], np.uint32(0))
+        seen = np.insert(self.seen, at[fresh], np.uint32(0))
+        where = at + (np.cumsum(fresh) - fresh)
+        hits[where[np.searchsorted(known, occupied)[contains(known, occupied)]]] += np.uint32(1)
+        seen[where] += np.uint32(1)
         self.keys, self.hits, self.seen = keys, hits, seen
 
     def settled(self, rule):
@@ -268,14 +273,19 @@ def pose_shift(recent, reference_occupied, voxel_size):
     through that count and its two neighbours (not at the ends of the range). Adding it to the
     recent points moves them onto the reference. None when no shift overlaps at all."""
     r = POSE_SEARCH_VOXELS
+    if not len(reference_occupied):
+        return None
     lanes = unpack(recent)
+    # Index-triple membership (a dense grid over the reference's box): the same count as looking up
+    # the packed keys, since every triple that packs has its own key.
+    reference = _Membership(reference_occupied)
     shifts = []
     for axis in range(3):
         counts = []
         for shift in range(-r, r + 1):
             moved = [lane + shift if n == axis else lane for n, lane in enumerate(lanes)]
             ok = in_range(*moved)
-            counts.append(int(contains(reference_occupied, pack(*(lane[ok] for lane in moved))).sum()))
+            counts.append(len(reference.marked([lane[ok] for lane in moved])))
         # The peak; on ties the shift nearest zero, the negative one first.
         best = 0
         for step in range(1, r + 1):
