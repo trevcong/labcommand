@@ -3,6 +3,7 @@
 Python codec and rosbags encode the same values to the same bytes, and a rosbag2 written and read
 back by rosbags carries them unchanged. Skipped without rosbags (the gate's venv has none)."""
 
+import inspect
 import itertools
 import math
 import pathlib
@@ -26,6 +27,9 @@ GENERATION = "uint64 publisher_generation"
 # builtin_interfaces/Time, the one type RigPose uses, is the same in every ROS 2 store; older
 # rosbags have no Jazzy one.
 STORE = getattr(Stores, "ROS2_JAZZY", Stores.ROS2_HUMBLE)
+# rosbags 0.10 and later require the rosbag2 format version (8 is Humble's and Jazzy's); 0.9 writes
+# version 8 and takes no such argument.
+WRITER_ARGS = {"version": 8} if "version" in inspect.signature(Writer).parameters else {}
 
 
 def typestore(v2):
@@ -137,7 +141,7 @@ def test_rosbag2_round_trip(tmp_path, name):
     v2 = "_v2_" in name
     golden = hexfile(name)
     path = tmp_path / "bag"
-    with Writer(path) as writer:
+    with Writer(path, **WRITER_ARGS) as writer:
         connection = writer.add_connection(TOPIC, TYPE, typestore=STORES[v2])
         writer.write(connection, 1_760_400_010_250_000_000, golden)
     with Reader(path) as reader:
