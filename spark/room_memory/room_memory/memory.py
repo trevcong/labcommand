@@ -1018,6 +1018,7 @@ class RoomMemory:
         self.rig_save_pending = False
         self.rig_save_failed = 0
         self.rig_save_error = None
+        self._epoch_due = False  # map_epoch not yet in the epoch file (_save_rig)
         self._references_due = None  # a save's references header, not yet written (_save_rig)
         self._archive_due = None  # the relearned frame's prev/ name, not yet archived
         self._gravity = None  # the newest window's gravity
@@ -1092,6 +1093,8 @@ class RoomMemory:
         # before it names a message after it. Saved at once, so the next restart moves on again.
         self.map_epoch = epoch + 1
         self.save(start)
+        if self._epoch_due:  # nothing carries the new epoch yet: a start that cannot record it stops here
+            raise RuntimeError(self.rig_save_error)
         self.state = MemoryState.TRACKING
         if self.config.rig_guard:
             # The rig may have moved while the node was off.
@@ -1131,31 +1134,35 @@ class RoomMemory:
         commit, the references inside it). No-op without ``state_dir``."""
         if self.config.state_dir is None:
             return
-        # The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
-        save_epoch(epoch_path(self.config.state_dir, self.config.room_id), self.map_epoch)
-        if self._building():
-            return  # a frame commits whole: until every sensor built, the last committed one stays on disk
         header = Header(self.config.room_id, self.map_epoch, 0, stamp)
         if self.config.rig_guard:
-            self._references_due = header
+            # A frame commits whole: until every sensor built, the last committed one stays on disk.
+            self._epoch_due = True
+            if not self._building():
+                self._references_due = header
             self._save_rig()
             return
+        # The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
+        save_epoch(epoch_path(self.config.state_dir, self.config.room_id), self.map_epoch)
         for name, path in self._paths().items():
             save_reference(path, self.channels[name].reference, header, self.config.voxel_size)
 
     def _save_rig(self):
-        """One ordered commit: the relearned frame's archive, the registration clouds not yet written,
-        the references a save left due, then ``rig_state`` (last: it names the clouds). A new frame's
-        clouds go before its references and carry its ``frame_epoch``, so a commit cut short leaves
-        either the old frame whole or clouds the old ``rig_state``'s CRCs refuse: never one frame's
-        references with another's poses. A failure (disk full, permissions) never leaves
-        ``close_window``: the guard keeps its state in memory, the files on disk stay the last set
-        written, and ``close_window`` retries until a save goes through. (The epoch file is written
-        ahead: a high-water mark only.)"""
+        """One ordered commit: the epoch file (first: it never lags behind an epoch in use), the
+        relearned frame's archive, the registration clouds not yet written, the references a save left
+        due, then ``rig_state`` (last: it names the clouds). A new frame's clouds go before its
+        references and carry its ``frame_epoch``, so a commit cut short leaves either the old frame
+        whole or clouds the old ``rig_state``'s CRCs refuse: never one frame's references with
+        another's poses. A failure (disk full, permissions) never leaves ``close_window``: the guard
+        keeps its state in memory, the files on disk stay the last set written, and ``close_window``
+        retries until a save goes through."""
         if self.config.state_dir is None:
             return
         try:
             room = _room_dir(self.config.state_dir, self.config.room_id)
+            if self._epoch_due:
+                save_epoch(epoch_path(self.config.state_dir, self.config.room_id), self.map_epoch)
+                self._epoch_due = False
             if self._archive_due is not None:
                 files = ["map_epoch", "rig_state"] + [path.name for path in self._paths().values()]
                 files += [rig_files.registration_name(name) for name in self.channels]

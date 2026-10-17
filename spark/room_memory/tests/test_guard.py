@@ -13,7 +13,7 @@ import pytest
 from room_memory import guard as g
 from room_memory.core import Config, decode_pointcloud2, occupancy_map
 from room_memory import state as rig_files
-from room_memory.memory import MemoryConfig, RoomMemory, load_reference, pose_shift
+from room_memory.memory import MemoryConfig, RoomMemory, load_epoch, load_reference, pose_shift
 from room_memory.messages import (CAUSE_IMU_SHOCK, CAUSE_IMU_TILT, CAUSE_PERIODIC, CAUSE_POSE_OFFSET, CAUSE_STARTUP,
                                   SENSOR_JT128, SENSOR_MID360, EventKind, EventState, ImuSample, MemoryState,
                                   RigChannel, RigOutcome, Time)
@@ -755,6 +755,32 @@ def test_a_failed_relearn_archive_holds_the_old_frame_until_it_goes_through(tmp_
     assert archive.name.endswith(f"-frame-{old_frame}")
     assert {name: (archive / name).read_bytes() for name in old_files} == old_files
     assert rig_files.parse_rig_state((room / "rig_state").read_bytes(), "rig_state").frame_epoch == memory._frame_epoch
+
+
+def test_a_failed_epoch_write_never_leaves_close_window_and_retries(tmp_path):
+    """The rebuild's new epoch goes into the epoch file inside the guarded commit, first: when that
+    write fails (here a directory where its temp file goes, as a full disk would) the rebuild still
+    completes, nothing of the new frame reaches disk, and the next window retries. A start that
+    cannot record its epoch stops: nothing carries that epoch yet."""
+    memory, step, old_frame, old_files = relearned(tmp_path, [])
+    room = tmp_path / "lab"
+    assert not memory.rig_save_pending  # the archive went through
+    old_epoch = load_epoch(room / "map_epoch")
+    (room / "map_epoch.tmp").mkdir()
+    rebuild(memory, step)
+    assert memory.rig_save_pending and "map_epoch.tmp" in memory.rig_save_error
+    failed = memory.rig_save_failed
+    assert failed >= 1 and memory.map_epoch > old_epoch == load_epoch(room / "map_epoch")
+    assert {name: (room / name).read_bytes() for name in old_files} == old_files
+    step()
+    assert memory.rig_save_pending and memory.rig_save_failed > failed
+    with pytest.raises(RuntimeError, match="map_epoch.tmp"):
+        guarded(tmp_path)
+    (room / "map_epoch.tmp").rmdir()
+    step()
+    assert not memory.rig_save_pending and load_epoch(room / "map_epoch") == memory.map_epoch
+    assert rig_files.parse_rig_state((room / "rig_state").read_bytes(), "rig_state").frame_epoch == memory._frame_epoch
+    assert guarded(tmp_path).map_epoch == memory.map_epoch + 1
 
 
 def test_a_failed_archive_leaves_no_partial_archive(tmp_path):

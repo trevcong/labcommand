@@ -2204,6 +2204,39 @@ TEST(a_failed_relearn_archive_holds_the_old_frame_until_it_goes_through) {
     CHECK(saved_rig_state(run.room).frame_epoch > run.old_frame);
 }
 
+TEST(a_failed_epoch_write_never_leaves_close_window_and_retries) {
+    // The rebuild's new epoch goes into the epoch file inside the guarded commit, first: when that
+    // write fails (here a directory where its temp file goes, as a full disk would) the rebuild still
+    // completes, nothing of the new frame reaches disk, and the next window retries. A start that
+    // cannot record its epoch stops: nothing carries that epoch yet.
+    Relearned run({});
+    RoomMemory& memory = *run.memory;
+    CHECK(!memory.rig_save_pending());  // the archive went through
+    const std::filesystem::path epoch_file = run.room / "map_epoch";
+    const std::optional<std::uint64_t> old_epoch = load_epoch(epoch_file);
+    std::filesystem::create_directory(run.room / "map_epoch.tmp");
+    run.rebuild();
+    CHECK(memory.rig_save_pending() && memory.rig_save_error().find("map_epoch.tmp") != std::string::npos);
+    const std::int64_t failed = memory.rig_save_failed();
+    CHECK(failed >= 1 && old_epoch && memory.map_epoch() > *old_epoch && load_epoch(epoch_file) == old_epoch);
+    CHECK(run.files() == run.old_files);
+    run.step();
+    CHECK(memory.rig_save_pending() && memory.rig_save_failed() > failed);
+    std::string refused;
+    try {
+        RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
+    } catch (const std::runtime_error& error) {
+        refused = error.what();
+    }
+    CHECK(refused.find("map_epoch.tmp") != std::string::npos);
+    std::filesystem::remove(run.room / "map_epoch.tmp");
+    run.step();
+    CHECK(!memory.rig_save_pending() && load_epoch(epoch_file) == std::optional<std::uint64_t>{memory.map_epoch()});
+    CHECK(saved_rig_state(run.room).frame_epoch > run.old_frame);
+    RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
+    CHECK_EQ(restarted.map_epoch(), memory.map_epoch() + 1);
+}
+
 TEST(a_new_frame_cut_short_never_loads_with_the_old_frames_poses) {
     // Codex's repro: the rebuilt frame's commit fails part way. With its registration cloud
     // unwritable a restart loads the old frame whole; with rig_state unwritable it refuses the set.

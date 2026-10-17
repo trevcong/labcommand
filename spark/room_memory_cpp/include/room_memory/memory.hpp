@@ -594,6 +594,7 @@ private:
     bool rig_save_pending_ = false;
     std::int64_t rig_save_failed_ = 0;
     std::string rig_save_error_;
+    bool epoch_due_ = false;                     // map_epoch_ not yet in the epoch file (save_rig)
     std::optional<msg::Header> references_due_;  // a save's references, not yet written (save_rig)
     std::optional<std::string> archive_due_;     // the relearned frame's prev/ name, not yet archived
     std::optional<rig::Vec3d> gravity_;  // the newest window's gravity

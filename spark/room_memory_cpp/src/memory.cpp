@@ -759,6 +759,8 @@ void RoomMemory::load(const msg::Time& start) {
     // before it names a message after it. Saved at once, so the next restart moves on again.
     map_epoch_ = epoch + 1;
     save(start);
+    // Nothing carries the new epoch yet: a start that cannot record it stops here.
+    if (epoch_due_) throw std::runtime_error(rig_save_error_);
     state_ = msg::MemoryState::tracking;
     // The rig may have moved while the node was off.
     if (config_.rig_guard) start_check(nanoseconds(start), msg::kCauseStartup);
@@ -767,14 +769,15 @@ void RoomMemory::load(const msg::Time& start) {
 void RoomMemory::save(const msg::Time& stamp) {
     if (!config_.state_dir) return;
     const msg::Header header{config_.room_id, map_epoch_, 0, stamp};
-    // The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
-    save_epoch(epoch_path(*config_.state_dir, config_.room_id), map_epoch_);
-    if (building()) return;  // a frame commits whole: until every sensor built, the last committed one stays on disk
     if (config_.rig_guard) {
-        references_due_ = header;
+        // A frame commits whole: until every sensor built, the last committed one stays on disk.
+        epoch_due_ = true;
+        if (!building()) references_due_ = header;
         save_rig();
         return;
     }
+    // The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
+    save_epoch(epoch_path(*config_.state_dir, config_.room_id), map_epoch_);
     const std::vector<std::filesystem::path> all = paths();
     for (std::size_t n = 0; n < all.size(); ++n) {
         save_reference(all[n], channels_[n].reference, header, static_cast<float>(config_.voxel_size));
@@ -1824,16 +1827,20 @@ void RoomMemory::load_rig(const std::filesystem::path& room, const std::filesyst
 }
 
 void RoomMemory::save_rig() {
-    // One ordered commit: the relearned frame's archive, the registration clouds not yet written,
-    // the references a save left due, then rig_state (last: it names the clouds). A new frame's
-    // clouds go before its references and carry its frame_epoch, so a commit cut short leaves either
-    // the old frame whole or clouds the old rig_state's CRCs refuse: never one frame's references
-    // with another's poses. A failure (disk full, permissions) never leaves close_window: the guard
-    // keeps its state in memory, the files on disk stay the last set written, and close_window
-    // retries until a save goes through. (The epoch file is written ahead: a high-water mark only.)
+    // One ordered commit: the epoch file (first: it never lags behind an epoch in use), the relearned
+    // frame's archive, the registration clouds not yet written, the references a save left due, then
+    // rig_state (last: it names the clouds). A new frame's clouds go before its references and carry
+    // its frame_epoch, so a commit cut short leaves either the old frame whole or clouds the old
+    // rig_state's CRCs refuse: never one frame's references with another's poses. A failure (disk
+    // full, permissions) never leaves close_window: the guard keeps its state in memory, the files on
+    // disk stay the last set written, and close_window retries until a save goes through.
     if (!config_.state_dir) return;
     try {
         const std::filesystem::path room = room_dir(*config_.state_dir, config_.room_id);
+        if (epoch_due_) {
+            save_epoch(epoch_path(*config_.state_dir, config_.room_id), map_epoch_);
+            epoch_due_ = false;
+        }
         if (archive_due_) {
             std::vector<std::string> files{"map_epoch", "rig_state"};
             for (const std::filesystem::path& path : paths()) files.push_back(path.filename().string());
