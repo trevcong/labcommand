@@ -181,6 +181,10 @@ TEST(node_types_are_generated) {
     if (activity == std::string::npos || rhythm_gate == std::string::npos || activity > rhythm_gate) {
         throw harness::Failure("Activity publisher must be created before the rhythm_publish gate");
     }
+    // Depth 1 keeps only the newest message. Both lidars share /room_memory/rhythm.
+    if (source.find("latched_qos(room_memory::history_depth(config.sensors.size()))") == std::string::npos) {
+        throw harness::Failure("rhythm publisher must keep one minute per configured sensor");
+    }
     const auto generated = types_generated_by(harness::read_text(kMsgs / "CMakeLists.txt"));
     for (const std::string& name : named) {
         if (!generated.count(name)) {

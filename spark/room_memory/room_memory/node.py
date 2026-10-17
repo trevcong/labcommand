@@ -32,6 +32,7 @@ from .generation import GenerationError, allocate_generation
 from .memory import SENSORS, MemoryConfig, RoomMemory
 from .messages import CDRError, RequestSync, SyncTopic, Time
 from .rejectlog import RejectionLog
+from .rhythm import history_depth
 
 STATUS_TOPIC = "/room_memory/status"
 ACTIVITY_TOPIC = "/room_memory/activity"
@@ -113,12 +114,13 @@ class RoomMemoryNode(Node):
         # 1 Hz, so a late subscriber (the bridge, when the first Mac subscribes) gets the last one at once;
         # a copy delivered again repeats its seq in its generation. Everything else is volatile: the Mac
         # gets the map and recent events by RequestSync, and a restarted node never receives an old
-        # request. Same QoS as the C++ node.
+        # request. Rhythm, when published, is transient_local with one stored minute per configured
+        # sensor. Depth 1 would leave a late subscriber the newest sensor only. Same QoS as the C++ node.
         def volatile(depth):
             return QoSProfile(depth=depth, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
 
-        def latched():
-            return QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        def latched(depth=1):
+            return QoSProfile(depth=depth, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
         self.events = self.create_publisher(ChangeEventMsg, EVENTS_TOPIC, volatile(100))
         self.status = self.create_publisher(MemoryStatusMsg, STATUS_TOPIC, latched())
@@ -130,7 +132,9 @@ class RoomMemoryNode(Node):
         self.sync_end = self.create_publisher(SyncEndMsg, SYNC_END_TOPIC, volatile(10))
         if self.config.rhythm_publish:
             from labcommand_msgs.msg import RhythmMinute as RhythmMinuteMsg
-            self.rhythm = self.create_publisher(RhythmMinuteMsg, "/room_memory/rhythm", latched())
+            self.rhythm = self.create_publisher(
+                RhythmMinuteMsg, "/room_memory/rhythm", latched(history_depth(len(self.config.sensors))),
+            )
             self.memory.set_rhythm_publish(lambda data: self.rhythm.publish(data))
         self.create_subscription(RequestSyncMsg, REQUEST_TOPIC, self._answer, volatile(10), raw=True)
         self.create_service(RequestSyncSrv, REQUEST_SERVICE, self._serve_request)

@@ -157,6 +157,12 @@ Snapshot drive(RoomMemory& memory, bool fail_mid360) {
 
 }  // namespace
 
+TEST(rhythm_history_depth_is_one_minute_per_sensor) {
+    CHECK_EQ(room_memory::history_depth(1), std::size_t{1});
+    CHECK_EQ(room_memory::history_depth(2), std::size_t{2});
+    CHECK_THROWS(std::invalid_argument, room_memory::history_depth(0));
+}
+
 TEST(crc_of_rhy1_is_the_shared_constant) {
     const std::uint8_t magic[] = {'R', 'H', 'Y', '1'};
     CHECK_EQ(room_memory::rhythm_crc32(magic), std::uint32_t{0x046E226A});
@@ -459,13 +465,15 @@ TEST(rhythm_on_matches_rhythm_off_and_a_throw_drops_only_that_bin) {
 }
 
 // An empty window used to be unreachable once the engine touched an uninitialized logger.
-// With a directory it is one unavailable minute; with the logger off it still returns.
+// With the logger on, a directory records one unavailable minute. The default is off, so a
+// state directory alone still returns and writes nothing.
 TEST(an_empty_window_returns_and_records_one_unavailable_minute) {
     TempDir dir;
     MemoryConfig config;
     config.sensors = {"mid360"};
     config.max_range = std::nullopt;
     config.state_dir = dir.path.string();
+    config.rhythm_enable = true;
     config.rhythm_keep_days = 0;
     config.rhythm_fsync_s = 0;
     {

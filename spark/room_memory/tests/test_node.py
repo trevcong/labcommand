@@ -10,6 +10,7 @@ pytest.importorskip("labcommand_msgs.msg")
 from labcommand_msgs.msg import Activity as ActivityMsg  # noqa: E402
 from labcommand_msgs.msg import MemoryStatus as MemoryStatusMsg  # noqa: E402
 from labcommand_msgs.msg import RequestSync as RequestSyncMsg  # noqa: E402
+from labcommand_msgs.msg import RhythmMinute as RhythmMinuteMsg  # noqa: E402
 from labcommand_msgs.srv import RequestSync as RequestSyncSrv  # noqa: E402
 from rclpy.parameter import Parameter  # noqa: E402
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy  # noqa: E402
@@ -18,7 +19,7 @@ from rclpy.serialization import deserialize_message, serialize_message  # noqa: 
 from room_memory.generation import GenerationError, generation_path  # noqa: E402
 from room_memory.memory import SENSORS  # noqa: E402
 from room_memory.messages import (  # noqa: E402
-    Activity, Header, MemoryState, MemoryStatus, RequestSync, SyncEnd, SyncTopic,
+    Activity, Header, MemoryState, MemoryStatus, RequestSync, RhythmMinute, SyncEnd, SyncTopic, Time,
 )
 from room_memory.node import (  # noqa: E402
     ACTIVITY_TOPIC, EVENTS_TOPIC, REQUEST_SERVICE, STATUS_TOPIC, SYNC_END_TOPIC, RoomMemoryNode,
@@ -198,6 +199,45 @@ def test_service_answers_like_the_topic(node, monkeypatch):
     assert [topic for topic, _ in order] == ["end"]
     end = SyncEnd.from_cdr(order[0][1])
     assert end.token == TOKEN_A and end.publisher_generation == node.generation.generation
+
+
+def test_a_late_subscriber_gets_each_sensors_minute(tmp_path):
+    """The topic keeps one minute per configured sensor. Depth 1 delivered only the newest."""
+    rclpy.init()
+    node = RoomMemoryNode(parameter_overrides=[
+        Parameter("state_dir", value=str(tmp_path)),
+        Parameter("sensors", value=["mid360", "jt128"]),
+        Parameter("max_range", value=0.0),
+        Parameter("rhythm_enable", value=True),
+        Parameter("rhythm_publish", value=True),
+    ])
+    try:
+        profile = node.rhythm.qos_profile
+        assert profile.depth == 2
+        assert profile.reliability == ReliabilityPolicy.RELIABLE
+        assert profile.durability == DurabilityPolicy.TRANSIENT_LOCAL
+        for sensor, seq in ((1, 0), (2, 1)):
+            minute = RhythmMinute(
+                "lab", sensor, 1, seq, Time(60, 0), 60, 1, 0, 0, 0, 1, 0,
+                (0,), (0,), (0,), (1,), (1,), node.generation.generation,
+            )
+            node.rhythm.publish(minute.to_cdr())
+        received = []
+        node.create_subscription(
+            RhythmMinuteMsg, "/room_memory/rhythm", received.append,
+            QoSProfile(depth=2, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL),
+            raw=True,
+        )
+        for _ in range(50):
+            rclpy.spin_once(node, timeout_sec=0.1)
+            if len(received) >= 2:
+                break
+        assert sorted(RhythmMinute.from_cdr(data).sensor for data in received) == [1, 2]
+    finally:
+        node.destroy_node()
+        node.generation.release()
+        rclpy.shutdown()
 
 
 def test_service_refuses_another_room(node, monkeypatch):

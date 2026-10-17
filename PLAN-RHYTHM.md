@@ -48,7 +48,7 @@ Before spin, scan the open append file only (≤32 MiB) and truncate to the last
 
 ## Topic
 
-`labcommand_msgs/RhythmMinute` on `/room_memory/rhythm`, from the writer: reliable, keep-last 1, transient local. Record fields minus the pad, plus `room_id`, `sensor` (u8 immediately after `room_id`: 1 Mid-360, 2 JT128, the file-header codes), `map_epoch`, `seq`, and the minute `stamp`. Every message carries `sensor`, including a loss marker. The live publisher stamps `publisher_generation` (never 0), the same field other v2 Spark→Mac messages end with. Absent, the hand codec keeps the legacy layout so the pinned goldens stay. The `.rhy` record layout stays unchanged and does not carry the generation; the two lidars share this topic and use different frames.
+`labcommand_msgs/RhythmMinute` on `/room_memory/rhythm`, from the writer: reliable, transient local, keep-last equal to the number of configured sensors. Depth 1 kept only the newest message, so a late subscriber saw one lidar. Record fields minus the pad, plus `room_id`, `sensor` (u8 immediately after `room_id`: 1 Mid-360, 2 JT128, the file-header codes), `map_epoch`, `seq`, and the minute `stamp`. Every message carries `sensor`, including a loss marker. The live publisher stamps `publisher_generation` (never 0), the same field other v2 Spark→Mac messages end with. Absent, the hand codec keeps the legacy layout so the pinned goldens stay. The `.rhy` record layout stays unchanged and does not carry the generation; the two lidars share this topic and use different frames.
 
 ## Config
 

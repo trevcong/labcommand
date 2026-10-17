@@ -39,6 +39,7 @@ from room_memory.rhythm import (
     _Table,
     encode_header,
     header_identity,
+    history_depth,
     parse_record,
     rhythm_active,
     scan_records,
@@ -297,6 +298,20 @@ def test_an_empty_window_returns_and_a_directory_records_it(tmp_path):
     record = parse_record(data[identity["header_bytes"]:offset])
     assert minute == 60 and record["unavailable"] == 1 and record["closed"] == 0
     assert record["with_points"] == 0 and record["regions"] == () and record["flags"] & FLAG_UNAVAILABLE
+
+
+def test_rhythm_history_depth_is_one_minute_per_sensor():
+    """Depth 1 kept only the newest message. Both lidars share ``/room_memory/rhythm``."""
+    assert history_depth(1) == 1 and history_depth(2) == 2
+    with pytest.raises(ValueError, match="history depth"):
+        history_depth(0)
+    with pytest.raises(ValueError):
+        history_depth(True)
+    package = pathlib.Path(__file__).resolve().parents[1]
+    node = (package / "room_memory" / "node.py").read_text()
+    assert "latched(history_depth(len(self.config.sensors)))" in node
+    cpp = (package.parent / "room_memory_cpp" / "node" / "room_memory_node.cpp").read_text()
+    assert "latched_qos(room_memory::history_depth(config.sensors.size()))" in cpp
 
 
 def test_defaults_are_off_and_do_not_publish(tmp_path):

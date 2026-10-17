@@ -144,9 +144,12 @@ public:
         // 1 Hz, so a late subscriber (the bridge, when the first Mac subscribes) gets the last one at once;
         // a copy delivered again repeats its seq in its generation. Everything else is volatile: the Mac
         // gets the map and recent events by RequestSync, and a restarted node never receives an old
-        // request. Rhythm, when published, is the same latched full-state QoS as status. Same QoS as node.py.
+        // request. Rhythm, when published, is transient_local with one stored minute per configured
+        // sensor. Depth 1 would leave a late subscriber the newest sensor only. Same QoS as node.py.
         const auto volatile_qos = [](std::size_t depth) { return rclcpp::QoS(depth).reliable().durability_volatile(); };
-        const auto latched_qos = [] { return rclcpp::QoS(1).reliable().transient_local(); };
+        const auto latched_qos = [](std::size_t depth = 1) {
+            return rclcpp::QoS(rclcpp::KeepLast(depth)).reliable().transient_local();
+        };
         events_ = create_generic_publisher(kEventsTopic, kEventType, volatile_qos(100));
         status_ = create_generic_publisher(kStatusTopic, "labcommand_msgs/msg/MemoryStatus", latched_qos());
         activity_ = create_generic_publisher(kActivityTopic, "labcommand_msgs/msg/Activity", latched_qos());
@@ -155,7 +158,9 @@ public:
         sync_events_ = create_generic_publisher(kSyncEventsTopic, kEventType, volatile_qos(200));
         sync_end_ = create_generic_publisher(kSyncEndTopic, "labcommand_msgs/msg/SyncEnd", volatile_qos(10));
         if (config.rhythm_publish) {
-            rhythm_pub_ = create_generic_publisher("/room_memory/rhythm", "labcommand_msgs/msg/RhythmMinute", latched_qos());
+            rhythm_pub_ = create_generic_publisher(
+                "/room_memory/rhythm", "labcommand_msgs/msg/RhythmMinute",
+                latched_qos(room_memory::history_depth(config.sensors.size())));
             auto publisher = rhythm_pub_;
             memory_->set_rhythm_publish([publisher](std::span<const std::uint8_t> bytes) {
                 publisher->publish(serialized(msg::Bytes(bytes.begin(), bytes.end())));

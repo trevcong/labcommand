@@ -144,6 +144,17 @@ def rhythm_active(config):
     return rhythm_directory(config) is not None or config.rhythm_publish
 
 
+def history_depth(sensor_count):
+    """Keep-last depth of ``/room_memory/rhythm``: one stored minute per configured sensor.
+
+    Depth 1 keeps only the newest message. Both lidars publish on this one topic, so a
+    subscriber that joins late would otherwise see a single sensor's minute.
+    """
+    if isinstance(sensor_count, bool) or not isinstance(sensor_count, int) or sensor_count < 1:
+        raise ValueError("rhythm history depth needs a sensor count >= 1")
+    return sensor_count
+
+
 def _f32_bits(value):
     return struct.pack("<f", np.float32(value))
 

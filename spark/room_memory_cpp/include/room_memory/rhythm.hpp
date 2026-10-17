@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -121,6 +122,12 @@ void validate_rhythm(const RhythmSettings& settings);
 std::optional<std::filesystem::path> rhythm_directory(const RhythmSettings& settings);
 // False when rhythm is off, or when there is nowhere to put a bin.
 bool rhythm_active(const RhythmSettings& settings);
+// Keep-last depth of /room_memory/rhythm: one stored minute per configured sensor.
+// Depth 1 keeps only the newest message, so a late subscriber misses the other lidar.
+inline std::size_t history_depth(std::size_t sensor_count) {
+    if (sensor_count < 1) throw std::invalid_argument("rhythm history depth needs a sensor count >= 1");
+    return sensor_count;
+}
 
 std::uint32_t rhythm_crc32(std::span<const std::uint8_t> data);
 std::vector<std::uint8_t> encode_header(int sensor, int dims, int voxels, double voxel_size, double cell_m,
