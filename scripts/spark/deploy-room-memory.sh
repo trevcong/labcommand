@@ -4,6 +4,9 @@
 # lidar-dual, or ptp-master, and does not delete ~/room-memory.
 # --dry-run prints the archive pipeline and the remote script. --self-test checks the
 # guard and failure order with local stand-ins. Neither talks to the Spark.
+# OpenSSH joins its command arguments and the remote login shell parses that
+# string. The script is one single-quoted word after `bash -c`, so `set -euo pipefail`
+# applies to the whole remote script. An unquoted `bash -c "$remote"` does not.
 set -euo pipefail
 
 HOST="spark"
@@ -52,6 +55,13 @@ reject_forbidden() {
       exit 2
     fi
   done
+}
+
+# One single-quoted literal for a remote POSIX shell. ' inside the text is '\'' .
+shell_quote() {
+  local s=$1
+  s=${s//\'/\'\\\'\'}
+  printf "'%s'" "$s"
 }
 
 # One remote bash script. stdin is the git archive. The image tag replaces __SHORT__.
@@ -157,11 +167,17 @@ self_test() {
   head_short=$(git -C "$repo" rev-parse --short=7 HEAD)
   [[ "$first_short" != "$head_short" ]] || fail "the two commits share a short hash"
 
-  local out
+  local out expected_dry
   out=$(ROOM_MEMORY_REPO="$repo" "$script" --dry-run --sha "$first" --host spark)
-  [[ "$out" == *"git archive --format=tar.gz ${first} | ssh spark bash -s"* ]] || fail "archive rev is not the --sha commit"
+  expected_dry=$(printf 'git archive --format=tar.gz %s | ssh spark bash -c %s\n' \
+    "$first" "$(shell_quote "$(render_remote "$first_short")")")
+  if [[ "$out" != "$expected_dry" ]]; then
+    printf 'dry-run mismatch\n--- got ---\n%s\n--- expected ---\n%s\n' "$out" "$expected_dry" >&2
+    fail "dry-run is not the quoted archive pipeline"
+  fi
   [[ "$out" == *"labcommand/room-memory-cpp:${first_short}"* ]] || fail "image tag is not --short=7 of the --sha commit"
   [[ "$out" != *"labcommand/room-memory-cpp:${head_short}"* ]] || fail "image tag followed HEAD instead of --sha"
+  [[ "$out" == "git archive --format=tar.gz ${first} | ssh spark bash -c '"* ]] || fail "remote script is not one quoted bash -c argument"
 
   echo dirty >>"$repo/file"
   cat >"$bin/ssh" <<EOS
@@ -178,11 +194,26 @@ EOS
   [[ "$code" -ne 0 ]] || fail "a dirty worktree was archived"
   [[ ! -e "$work/marker" ]] || fail "dirty --dry-run invoked ssh"
 
+  # OpenSSH sends one string: the command arguments joined by a single space.
+  # The remote login shell then evaluates that string. Running only the last
+  # argument would hide `bash -c` losing every word after the first.
   cat >"$bin/ssh" <<'EOS'
 #!/bin/bash
-printf '%s\n' "$*" >>"${SSH_LOG:?}"
-last="${@: -1}"
-exec bash -c "$last"
+if [[ $# -lt 1 ]]; then
+  echo "ssh: missing host" >&2
+  exit 2
+fi
+shift
+joined=""
+for arg in "$@"; do
+  if [[ -n "$joined" ]]; then
+    joined="${joined} ${arg}"
+  else
+    joined=$arg
+  fi
+done
+printf '%s\n' "$joined" >>"${SSH_LOG:?}"
+exec bash -c "$joined"
 EOS
   cat >"$bin/docker" <<'EOS'
 #!/bin/bash
@@ -218,6 +249,21 @@ exit 0
 EOS
   chmod +x "$bin/ssh" "$bin/docker"
 
+  # The stub joins like OpenSSH. Three words — bash, -c, and an unquoted script —
+  # become `bash -c set -euo pipefail` plus the rest of the script, with no errexit.
+  # A stub that executes only the last argument would stop at `false` and fail this.
+  local probe_script probe_out probe_code
+  probe_script=$(printf '%s\n' 'set -euo pipefail' 'false' 'echo reached-probe')
+  : >"$ssh_log"
+  set +e
+  PATH="$bin:$PATH" SSH_LOG="$ssh_log" "$bin/ssh" spark bash -c "$probe_script" >"$work/probe.out" 2>"$work/probe.err"
+  probe_code=$?
+  set -e
+  probe_out=$(cat "$work/probe.out")
+  [[ "$probe_code" -eq 0 ]] || fail "unquoted ssh join kept errexit (exit ${probe_code}); the stub is not OpenSSH"
+  [[ "$probe_out" == *reached-probe* ]] || fail "unquoted ssh join did not run past a failure"
+  [[ "$(head -n 1 "$ssh_log")" == "bash -c set -euo pipefail" ]] || fail "unquoted ssh join was not logged as the remote shell sees it"
+
   run_mode() {
     : >"$ssh_log"
     : >"$docker_log"
@@ -235,6 +281,7 @@ EOS
   [[ "$code" -ne 0 ]] || fail "build failure still exited 0"
   has build || fail "build failure never built"
   lacks stop && lacks rm && lacks run || fail "build failure still replaced the container"
+  [[ "$(head -n 1 "$ssh_log")" == "bash -c 'set -euo pipefail" ]] || fail "deploy ssh command is not one quoted bash -c script"
 
   run_mode ps-fail
   [[ "$code" -ne 0 ]] || fail "ps failure still exited 0"
@@ -291,11 +338,15 @@ fi
 SHORT=$(git rev-parse --short=7 "$REV")
 remote=$(render_remote "$SHORT")
 reject_forbidden "$remote"
+# Quote for the remote shell. ssh joins `bash -c` and this word with a space;
+# the quotes put the whole script in bash -c's command string, where errexit
+# stops a failed image build before stop/rm/run.
+quoted=$(shell_quote "$remote")
+reject_forbidden "$quoted"
 
 if [[ "$DRY" -eq 1 ]]; then
-  printf 'git archive --format=tar.gz %s | ssh %s bash -s\n' "$REV" "$HOST"
-  printf '%s\n' "$remote"
+  printf 'git archive --format=tar.gz %s | ssh %s bash -c %s\n' "$REV" "$HOST" "$quoted"
   exit 0
 fi
 
-git archive --format=tar.gz "$REV" | ssh "$HOST" bash -c "$remote"
+git archive --format=tar.gz "$REV" | ssh "$HOST" bash -c "$quoted"
