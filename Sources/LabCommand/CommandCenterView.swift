@@ -23,10 +23,10 @@ struct CommandCenterView: View {
 
     private var topBar: some View {
         HStack(spacing: 20) {
-            Text("Lab")
+            Text("LabCommand")
                 .font(LabTheme.t(13, .semibold))
                 .foregroundStyle(LabTheme.text)
-                .accessibilityLabel("Lab")
+                .accessibilityLabel("LabCommand")
             Text("room memory")
                 .font(LabTheme.t(12))
                 .foregroundStyle(LabTheme.faint)
@@ -91,7 +91,6 @@ struct CommandCenterView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .keyboardShortcut(KeyEquivalent(Character(d.shortcutKey)), modifiers: .command)
         .accessibilityLabel(d.label)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
@@ -419,7 +418,7 @@ struct CommandCenterView: View {
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(state.missionEvents.suffix(5).reversed())) { event in
                     HStack(alignment: .top, spacing: 6) {
-                        Text(event.at.formatted(date: .omitted, time: .standard))
+                        Text(MissionLog.clock.string(from: event.at))
                             .font(LabTheme.mono(10))
                             .foregroundStyle(LabTheme.faint)
                         Text(event.text)

@@ -266,11 +266,11 @@ func testLiveViewBadge() {
     // 2026-10-14 10:42:13 UTC.
     let capturedAt = Date(timeIntervalSince1970: 1_791_974_533)
     let snapshot = LiveViewMode.snapshotBadge(capturedAt: capturedAt, points: [.mid360: 19_912, .jt128: 60_000], timeZone: utc)
-    expect(snapshot == "SNAPSHOT 10:42:13 · Mid-360 19.9k pts · JT128 60k pts", "snapshot badge, got \(snapshot)")
+    expect(snapshot == "SNAPSHOT 2026-10-14 10:42:13 · Mid-360 19.9k pts · JT128 60k pts", "snapshot badge, got \(snapshot)")
     let partial = LiveViewMode.snapshotBadge(capturedAt: capturedAt, points: [.mid360: 850], timeZone: utc)
-    expect(partial == "SNAPSHOT 10:42:13 · Mid-360 850 pts · JT128 no frame", "a timed-out sensor reads missing, got \(partial)")
+    expect(partial == "SNAPSHOT 2026-10-14 10:42:13 · Mid-360 850 pts · JT128 no frame", "a timed-out sensor reads missing, got \(partial)")
     let local = LiveViewMode.snapshotBadge(capturedAt: capturedAt, points: [:], timeZone: TimeZone(secondsFromGMT: -5 * 3600)!)
-    expect(local.hasPrefix("SNAPSHOT 05:42:13"), "capture time is in the given zone, got \(local)")
+    expect(local.hasPrefix("SNAPSHOT 2026-10-14 05:42:13"), "capture time is the local date in the given zone, got \(local)")
     expect(LiveViewMode.snapshotSummary([.jt128: 60_000]) == "Mid-360 no frame, JT128 60k pts", "snapshot log summary")
     let capturing = LiveViewMode.capturingBadge([.init(label: "Mid-360", points: 19_912, hz: nil)])
     expect(capturing == "SNAPSHOT · capturing… · Mid-360 19.9k pts", "capturing badge, got \(capturing)")
@@ -321,7 +321,7 @@ func runFoxgloveProtocolTests() {
     testStreamHostRotation()
     print("  Foxglove: rounds start at the last working host (tailnet until one works); the rest only right after it fails"); passed()
     testLiveViewBadge()
-    print("  live view: OFF / SNAPSHOT hh:mm:ss / LIVE badges, counts + Hz + time left, SAMPLE wording"); passed()
+    print("  live view: OFF / SNAPSHOT yyyy-MM-dd HH:mm:ss / LIVE badges, counts + Hz + time left, SAMPLE wording"); passed()
     testArrivalRate()
     print("  live view: arrival rate over a 2 s window; rolling per-second count decays to 0"); passed()
 }

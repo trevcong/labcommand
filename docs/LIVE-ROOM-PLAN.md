@@ -187,7 +187,7 @@ Event history is not a banner. It is the history line on the event list, specifi
 - **Restart.** While `continuity` is `broken`, a second line under the banner: `Spark node restarted · events from the earlier run may be missing` (`LabTheme.warn`). It never heals within the launch, because a retired generation has no final bound on the wire. The earlier run's open events are listed as `earlier run · latest status unknown`, never drawn on the map.
 - **Legacy.** A Spark node without publisher generations renders the map `stale(.unverified)`: banner `unverified · Spark node predates publisher generations` (`LabTheme.warn`), after rig-moved and before the map-stale line. Bricks draw dimmed, markers never draw, and no request is sent.
 
- `{sec: 0, nanosec: 0}` renders `time —` in every zone. Other stamps render `HH:mm:ss` in the user's zone (`LiveViewMode.clock`). No date is appended.
+ `{sec: 0, nanosec: 0}` renders `time —` in every zone. Other stamps render `yyyy-MM-dd HH:mm:ss` in the user's zone (`LiveViewMode.clock`).
 
 Bricks, whenever `!isMapCurrent` and the dictionary is not empty, draw at 35% opacity. That covers a stale status while `mapState` is still `.current`, and a `.stale` map. Markers do not draw in either case. When the map is current, bricks are full opacity even if the state is building or rig-moved; the marker rule is what hides the overlays.
 
@@ -308,11 +308,11 @@ Right column, 280pt, well background, two sections. Slice 2.
 Each row is two lines of 11pt mono, wrapping inside the column (about 256pt of text after padding). No horizontal scroller. Line 1 allows 2 lines. Line 2 allows 3, so an earlier-run row can name the box, the false-alarm limit, the sensors, and that the latest status is unknown.
 
 ```
-● appeared · checking · 8 cells · 19:00:10
+● appeared · checking · 8 cells · 2025-10-13 19:00:10
 box not measured · false-alarm limit 5% · Mid-360 · box only
 ```
 
-- Line 1: kind-colored pip, kind, state, cell count, `HH:mm:ss` in the user's zone.
+- Line 1: kind-colored pip, kind, state, cell count, `yyyy-MM-dd HH:mm:ss` in the user's zone.
 - Line 2, `LabTheme.dim`: how much of the box was seen, the calibrated false-alarm limit, sensors, then `box only` or `saved · map updating` or `latest status unknown` when those apply.
 - Kind words: `appeared`, `disappeared`, `moved`.
 - State words: `checking`, `confirmed`, `saved`, `change undone`, `no longer detected`. The wire enum stays `.candidate`.

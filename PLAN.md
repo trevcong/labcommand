@@ -137,7 +137,7 @@ Turning a kind off rebuilds the filtered list and clamps `count` to the new leng
 SwiftUI, docked under the canvas inside the existing `pointCloudCanvas` `VStack` in `CommandCenterView`. The scrubber is shown only in snapshot mode, including a configuration error and a load failure.
 
 - A `Slider` whose state comes from `ChangeOverlay.slider`. When `filteredCount > 0` the range is `0...filteredCount`, the control is enabled, and `count == 0` is a real position on that range (nothing drawn yet, the thumb at the start). When `filteredCount == 0` the control is disabled, the value is 0, and the bound range is `0...1` so SwiftUI still has a non-empty range. That disabled state covers an empty timeline and a nonempty timeline whose filter matches nothing.
-- End labels are the before stamp and the after stamp, formatted by `ChangeOverlay.clock` as `HH:mm:ss` with an explicit time zone (the view passes `.current`; tests pass a fixed zone). Missing stamps read `A` and `B`.
+- End labels are the before stamp and the after stamp, formatted by `ChangeOverlay.clock` as `yyyy-MM-dd HH:mm:ss` with an explicit time zone (the view passes `.current`; tests pass a fixed zone). Missing stamps read `A` and `B`.
 - Three kind chips, colored with the core RGB, each `kind · count`. An unobserved chip appears only when the timeline contains one. Chip counts are the full timeline, not the revealed prefix.
 - One monospaced caption from `ChangeOverlay.caption`. Counts use a singular noun at 1. The gap is `String(format:)` with the POSIX locale, two fractional digits. The word unavailable is not involved. No Hz. Unknown voxels are never described as rejected or as below the cluster cut.
 

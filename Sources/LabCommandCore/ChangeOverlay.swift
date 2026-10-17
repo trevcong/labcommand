@@ -59,12 +59,12 @@ public enum ChangeOverlay: Sendable {
         "Could not load \(sensor.label) \(file) (\(reason))."
     }
 
-    /// `HH:mm:ss` in `timeZone`. A missing stamp uses `missing` (`A` or `B`).
+    /// `yyyy-MM-dd HH:mm:ss` in `timeZone`. A missing stamp uses `missing` (`A` or `B`).
     public static func clock(_ date: Date?, missing: String, timeZone: TimeZone = .current) -> String {
         guard let date else { return missing }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "HH:mm:ss"
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         formatter.timeZone = timeZone
         return formatter.string(from: date)
     }

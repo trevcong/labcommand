@@ -33,7 +33,7 @@ public enum LiveViewMode: String, Sendable {
         ([LiveViewMode.snapshot.rawValue, "capturing…"] + parts(readings)).joined(separator: " · ")
     }
 
-    /// "SNAPSHOT 10:42:13 · Mid-360 19.9k pts · JT128 no frame". Every sensor is
+    /// "SNAPSHOT 2026-10-14 10:42:13 · Mid-360 19.9k pts · JT128 no frame". Every sensor is
     /// listed, so one that timed out reads as missing rather than silently absent.
     public static func snapshotBadge(
         capturedAt: Date,
@@ -90,12 +90,12 @@ public enum LiveViewMode: String, Sendable {
         return "\(thousands)k pts"
     }
 
-    /// "10:42:13", 24-hour, in `timeZone`.
+    /// "2026-10-14 10:42:13", the local date and 24-hour time, in `timeZone`.
     public static func clock(_ date: Date, timeZone: TimeZone = .current) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = timeZone
-        formatter.dateFormat = "HH:mm:ss"
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return formatter.string(from: date)
     }
 
