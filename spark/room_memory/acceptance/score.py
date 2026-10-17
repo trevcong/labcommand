@@ -186,16 +186,43 @@ def _coverage(scenario, messages, fresh, meta, expected):
             "dropped": dropped}
 
 
-def _dropped_windows(messages, t0, t1, reasons):
-    """Windows the node dropped in one interval, from its status counter deltas.
+def _session_dropped_windows(messages, meta, reasons):
+    """Change in ``dropped_windows`` from ready through ``session_end``.
 
-    ``dropped_windows`` counts since node start, so only an increase is new. Each
-    publisher generation with a status sample in the interval is its own run, from
-    its last sample at or before ``t0`` to its first at or after ``t1``. A restart's
-    reset to 0 is never a decrease. A generation that first appears inside the
-    interval after an earlier one is a restart, so its counter started at 0 there.
-    This does not depend on a coverage chain: a restart or gap that makes the
-    interval unverifiable must not hide its drops. Positive Hz does not cover this:
+    Per publisher generation. A drop during setup, or in a gap between scenarios,
+    sits in neither interval, so the per-interval total stays zero and that
+    interval keeps its exposure. Full acceptance still requires this session
+    change to be zero. The first generation's first sample is a historical
+    baseline when nothing was sampled at or before ready, so a steady nonzero
+    count is not a new drop. A later generation starts at 0. The span stops at
+    ``session_end`` and does not take a sample from after it.
+    """
+    ready = meta.get("ready") if isinstance(meta.get("ready"), dict) else None
+    ready_ns = None if ready is None else ready.get("receipt_mono_ns")
+    end_ns = meta.get("end_ns")
+    if _bad_stamp(ready_ns) or _bad_stamp(end_ns) or end_ns < ready_ns:
+        reasons.append("dropped_windows_unknown")
+        return 0
+    return _dropped_windows(
+        messages, ready_ns, end_ns, reasons, historical_baseline=True, close_after=False,
+    )
+
+
+def _bad_stamp(value):
+    return not isinstance(value, int) or isinstance(value, bool)
+
+
+def _dropped_windows(messages, t0, t1, reasons, historical_baseline=False, close_after=True):
+    """Windows the node dropped from ``t0`` to ``t1``, per publisher generation.
+
+    ``dropped_windows`` counts since node start, so only an increase is new. The
+    baseline is the last status sample at or before ``t0``. If the interval has
+    no such sample, the first sample inside it is not the baseline: the counter
+    is measured from 0, so a drop already stored on that sample is counted.
+    ``historical_baseline`` is only for the whole session, whose first generation
+    may already hold a steady count when the log's first status is after ready.
+    A later generation always starts at 0, so a restart's reset is not a decrease.
+    This does not depend on a coverage chain. Positive Hz does not cover it:
     both publishers count rejected frames toward Hz.
     """
     samples = [
@@ -216,11 +243,17 @@ def _dropped_windows(messages, t0, t1, reasons):
     for generation in generations:
         own = [sample for sample in samples if sample.get("publisher_generation") == generation]
         before = [sample for sample in own if sample["receipt_mono_ns"] <= t0]
-        after = [sample for sample in own if sample["receipt_mono_ns"] >= t1]
+        if close_after:
+            after = [sample for sample in own if sample["receipt_mono_ns"] >= t1]
+            hi = after[0]["receipt_mono_ns"] if after else t1
+        else:
+            hi = t1
         lo = before[-1]["receipt_mono_ns"] if before else t0
-        hi = after[0]["receipt_mono_ns"] if after else t1
         run = [sample for sample in own if lo <= sample["receipt_mono_ns"] <= hi]
-        previous = None if before or generation == first_generation else 0
+        # No sample at or before t0: do not adopt the first in-span sample.
+        # The session's first generation is the exception, and only when asked.
+        historical = historical_baseline and generation == first_generation
+        previous = None if before or historical else 0
         for sample in run:
             value = sample["message"].get("dropped_windows")
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -717,8 +750,10 @@ def _finish(rows, events, assigned, messages, fresh, compatible, meta, ignored, 
     for row in rows:
         row.pop("_change_done", None)
     lost = [row["id"] for row in rows if any(reason in LOST_WINDOW_REASONS for reason in row["coverage_reasons"])]
+    session_reasons = []
+    session_dropped = _session_dropped_windows(messages, meta, session_reasons)
     result, exit_code, acceptance = _decide(
-        protocol, rows, misses, non_idle, rate_pass, activity_as_change, split_move, lost,
+        protocol, rows, misses, non_idle, rate_pass, activity_as_change, split_move, lost, session_reasons,
     )
     product, product_note = _confirmed_bar(
         confirmed_count, exposure, protocol, threshold, messages, static_intervals,
@@ -751,6 +786,8 @@ def _finish(rows, events, assigned, messages, fresh, compatible, meta, ignored, 
         "person_unverified": unverified,
         "split_move": split_move,
         "dropped_windows": sum(row["dropped_windows"] for row in rows),
+        "session_dropped_windows": session_dropped,
+        "session_window_reasons": session_reasons,
         "lost_window_scenarios": lost,
         "seq_gaps": sum(1 for row in rows for reason in row["coverage_reasons"] if reason.endswith("_seq_gap")),
         "detection_delay_basis": "receipt_mono",
@@ -812,7 +849,7 @@ def _protocol_complete(rows, compatible, meta):
     return True
 
 
-def _decide(protocol, rows, misses, non_idle, rate_pass, activity_as_change, split_move, lost):
+def _decide(protocol, rows, misses, non_idle, rate_pass, activity_as_change, split_move, lost, session_reasons):
     hard = bool(misses or non_idle or activity_as_change or split_move or rate_pass is False)
     if not protocol:
         return ("fail" if hard else "inconclusive"), 2, "denied"
@@ -831,9 +868,11 @@ def _decide(protocol, rows, misses, non_idle, rate_pass, activity_as_change, spl
                 unverified = True
     if failed:
         return "fail", 1, "denied"
-    # A scenario outside the protocol set, such as restore_reference, still denies
-    # the session when the node dropped windows in it.
-    if unverified or lost or rate_pass is not True:
+    # Lost windows deny full acceptance even when every protocol scenario is
+    # verifiable: a drop inside restore_reference, or any nonzero change from
+    # ready to session_end (setup, or a gap between scenarios).
+    session_lost = any(reason in LOST_WINDOW_REASONS for reason in session_reasons)
+    if unverified or lost or session_lost or rate_pass is not True:
         return "inconclusive", 2, "denied"
     return "pass", 0, "full_candidate"
 

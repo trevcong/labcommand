@@ -15,6 +15,12 @@ This command does not ssh, publish, or restart anything. It does not dial the
 Spark while the tests run. The operator runs it later, on the machine whose
 `docker` can already see the room-memory container.
 
+## Still deferred
+
+`evaluate.py`, the `acceptance_replay` ctest, and the `bag_stream.py` flags
+(`--rig-move`, `--imu-synth`, `--drop`, `--strip-imu`) are still deferred.
+This harness does not add them and does not run them.
+
 ## Run
 
 From the repository root. `acceptance/__main__.py` does not edit `sys.path`;
@@ -118,19 +124,33 @@ interval are unverifiable.
 
 Nonzero Hz does not prove the detector ran: both nodes count every received
 frame toward Hz, rejected frames included, and drop a window whose frames were
-all rejected. An hour of `degraded` status at 10 Hz can hold no processed window. The counter is per node process and counts since its
-start, so the score uses only its increase within one interval, per publisher
-generation. This is counted even when a restart or gap makes the interval
-unverifiable. A generation that first appears inside an interval after an
-earlier one is a restart, so its count starts at 0 there. A steady nonzero
-count from earlier in the run, drops between two intervals, and a restart's
-reset to 0 do not count. An increase is `dropped_windows`; a decrease within a generation
+all rejected. An hour of `degraded` status at 10 Hz can hold no processed window.
+The counter is per node process and counts since its start. Each publisher
+generation is its own run.
+
+Inside one scenario, the baseline is the last status sample at or before `t0`.
+Only the increase after that baseline is new. If the interval has no status
+sample at or before `t0`, the first sample inside it is not the baseline: the
+count is measured from 0, so a drop already stored on that sample is not missed.
+A generation that first appears inside the interval after an earlier one is a
+restart, so its count starts at 0. A steady nonzero count is history when a
+sample at or before `t0` already shows it. A restart's reset to 0 is not a
+decrease. An increase is `dropped_windows`; a decrease within a generation
 (`dropped_windows_regressed`) and a missing count (`dropped_windows_unknown`)
-are unverifiable too. The report lists the lost windows per scenario and in
-`dropped_windows`, and names the scenarios in `lost_window_scenarios`. Any
-such scenario denies full acceptance, `restore_reference` included. That time is
-not exposure and is not a zero-false-alarm pass. `session_end` is in the log
-so an offline score sees the same interruption.
+are unverifiable too. That time is not exposure and is not a zero-false-alarm
+pass. The report lists those windows per scenario and in `dropped_windows`, and
+names the scenarios in `lost_window_scenarios`. Any such scenario denies full
+acceptance, `restore_reference` included. This is counted even when a restart
+or a gap already makes the interval unverifiable.
+
+The same counter is also read across the whole session, from subscription ready
+through `session_end`, per publisher generation. A nonzero change denies full
+acceptance. That includes a drop in a gap between scenarios and a drop during
+setup, before the first watch. Those drops stay out of the neighboring
+scenarios, so the scenarios keep their exposure. A steady historical count, and
+a restart's reset to 0, still do not count. The session total is
+`session_dropped_windows`. `session_end` is in the log so an offline score sees
+the same interruption.
 
 The recorder stays up after the last watch until a fresh status sample and a
 fresh activity sample have both arrived at or after that watch, and until the
@@ -145,10 +165,13 @@ so this wait is usually the last watch only.
 `score` is a pure function of the log and the marks. Exit 0 means
 `g5_acceptance` is `full_candidate`: reference confirmed, every protocol
 scenario complete and verifiable, three true detections, both person scenarios
-showed activity and no candidate, and idle candidate alarms per verifiable
-hour are at most `--max-false-alarms-per-hour` (default 1). Exit 1 is a
+showed activity and no candidate, idle candidate alarms per verifiable
+hour are at most `--max-false-alarms-per-hour` (default 1), and
+`dropped_windows` did not change from ready through `session_end`. Exit 1 is a
 complete session that fails that candidate bar. Exit 2 is inconclusive or
-diagnostic, including a shortened sit or hour.
+diagnostic, including a shortened sit or hour and a session that lost windows
+outside a scenario. Exit 3 means `score` raised. The traceback is on stderr.
+Exit 3 is not exit 1: a crash is not a scored fail.
 
 A miss with activity somewhere in the window is `miss_with_activity_observed`.
 `change_as_activity` is only activity that overlaps the labeled target after

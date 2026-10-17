@@ -27,6 +27,8 @@ def render_markdown(report):
         f"person_unverified: {report['person_unverified']}",
         f"split_move: {report['split_move']}",
         f"dropped_windows: {report['dropped_windows']}",
+        f"session_dropped_windows: {report['session_dropped_windows']}",
+        f"session_window_reasons: {', '.join(report['session_window_reasons']) or 'none'}",
         f"lost_window_scenarios: {', '.join(report['lost_window_scenarios']) or 'none'}",
         f"confirmed_count: {report['confirmed_count']}",
         f"detection_delay_basis: {report['detection_delay_basis']}",

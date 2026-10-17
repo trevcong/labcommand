@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from acceptance.log import load_jsonl, write_jsonl
 from acceptance.score import score
 from acceptance.transport import ros2_exec_command, stamp_record
@@ -290,6 +292,33 @@ def test_score_cli_writes_json_and_markdown(tmp_path):
     assert "true_detections: 1" in markdown
     assert load_jsonl(log_path)[0]["schema"] == "room-memory-acceptance-log-v1"
     assert (tmp_path / "report.md").is_file()
+
+
+def test_an_exception_in_score_exits_3_not_the_scored_fail_code(tmp_path):
+    from acceptance.__main__ import EXIT_SCORE_EXCEPTION
+    from acceptance.__main__ import main
+    from acceptance.tests.support import stream
+
+    messages = stream(0, 5)
+    # Complete, but no t0: score raises. That must not look like exit 1.
+    mark = {
+        "schema": "room-memory-acceptance-marks-v1",
+        "clock": "receipt_mono",
+        "expected_sensors": [1, 2],
+        "reference_setup": {},
+        "scenarios": [{"id": "baseline_idle", "class": "idle", "completion": "complete"}],
+    }
+    with pytest.raises(KeyError):
+        score(messages, mark)
+    log_path = tmp_path / "topics.jsonl"
+    marks_path = tmp_path / "marks.json"
+    write_jsonl(log_path, messages)
+    marks_path.write_text(json.dumps(mark))
+    code = main(["score", "--log", str(log_path), "--marks", str(marks_path), "--out", str(tmp_path)])
+    assert code == EXIT_SCORE_EXCEPTION
+    assert code == 3
+    assert code != 1
+    assert not (tmp_path / "report.json").exists()
 
 
 def test_score_matches_loaded_fixture(tmp_path):

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from acceptance.log import TopicLog
@@ -36,6 +37,8 @@ from acceptance.transport import stamp_record
 # second is for the event line that follows the status advertising events_seq.
 TAIL_GRACE_NS = 1_000_000_000
 _WATCHED = ("complete", "shortened")
+# 0 is full_candidate, 1 is a scored fail, 2 is inconclusive. A crash is not 1.
+EXIT_SCORE_EXCEPTION = 3
 
 
 def main(argv=None):
@@ -66,10 +69,14 @@ def main(argv=None):
 
 
 def _score(args):
-    messages = load_jsonl(args.log)
-    marks = json.loads(Path(args.marks).read_text(encoding="utf-8"))
-    report = score(messages, marks, max_false_alarms_per_hour=args.max_false_alarms_per_hour)
-    write_report(report, args.out)
+    try:
+        messages = load_jsonl(args.log)
+        marks = json.loads(Path(args.marks).read_text(encoding="utf-8"))
+        report = score(messages, marks, max_false_alarms_per_hour=args.max_false_alarms_per_hour)
+        write_report(report, args.out)
+    except Exception:
+        traceback.print_exc()
+        return EXIT_SCORE_EXCEPTION
     return report["exit_code"]
 
 
@@ -295,8 +302,14 @@ def _finalize(out, records, lock, proc, state, clock, args, writer):
     stderr = proc.stderr.read() if proc is not None and proc.stderr else ""
     if stderr:
         (out / "transport.stderr.log").write_text(stderr, encoding="utf-8")
-    report = score(rows, marks, max_false_alarms_per_hour=args.max_false_alarms_per_hour)
-    write_report(report, out)
+    try:
+        report = score(rows, marks, max_false_alarms_per_hour=args.max_false_alarms_per_hour)
+        write_report(report, out)
+    except Exception:
+        traceback.print_exc()
+        state["exit_code"] = EXIT_SCORE_EXCEPTION
+        state["marks"] = marks
+        return
     state["exit_code"] = report["exit_code"]
     state["marks"] = marks
 

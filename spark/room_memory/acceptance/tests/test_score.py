@@ -599,12 +599,8 @@ def test_an_unchanged_historical_dropped_count_keeps_coverage():
     assert steady["g5_acceptance"] == "full_candidate"
     assert steady["credited_idle_exposure_s"] == 3660
     assert steady["dropped_windows"] == 0
+    assert steady["session_dropped_windows"] == 0
     assert steady["lost_window_scenarios"] == []
-
-    # Drops between two intervals are in neither interval's status chain.
-    between = _score(*_perfect(dropped_at=lambda t: 0 if t < 75 else 3))
-    assert between["g5_acceptance"] == "full_candidate"
-    assert between["exit_code"] == 0
 
     # A restart between intervals resets the counter in a new generation.
     restarted = _score(*_perfect(
@@ -613,7 +609,69 @@ def test_an_unchanged_historical_dropped_count_keeps_coverage():
     ))
     assert _row(restarted, "hour_idle")["coverage"] == "verifiable"
     assert restarted["g5_acceptance"] == "full_candidate"
+    assert restarted["session_dropped_windows"] == 0
     assert restarted["credited_idle_exposure_s"] == 3660
+
+
+def test_a_drop_in_the_gap_between_scenarios_is_not_full_acceptance():
+    # t=705 is after person_sit (ends 700) and before restore_reference (starts 710).
+    # Each interval's baseline is the last sample at or before its own t0, so neither
+    # interval sees the step. Exposure stays. The session total does not.
+    report = _score(*_perfect(dropped_at=lambda t: 0 if t < 705 else 1))
+    assert report["g5_acceptance"] != "full_candidate"
+    assert report["g5_acceptance"] == "denied"
+    assert report["exit_code"] == 2
+    assert report["candidate_result"] == "inconclusive"
+    assert report["protocol_complete"] is True
+    assert report["session_dropped_windows"] == 1
+    assert report["session_window_reasons"] == ["dropped_windows"]
+    assert report["dropped_windows"] == 0
+    assert report["lost_window_scenarios"] == []
+    assert report["credited_idle_exposure_s"] == 3660
+    assert _row(report, "person_sit")["coverage"] == "verifiable"
+    assert _row(report, "person_sit")["dropped_windows"] == 0
+    assert _row(report, "restore_reference")["coverage"] == "verifiable"
+    assert _row(report, "restore_reference")["dropped_windows"] == 0
+    assert "session_dropped_windows: 1" in report["markdown"]
+
+
+def test_a_drop_during_setup_is_not_full_acceptance():
+    # ready at t=7, first watch at t=10. The counter steps at t=9, while the
+    # operator is still confirming the reference. baseline_idle's baseline is the
+    # sample at t=10, which already includes the drop.
+    report = _score(*_perfect(dropped_at=lambda t: 0 if t < 9 else 2))
+    assert report["g5_acceptance"] != "full_candidate"
+    assert report["exit_code"] == 2
+    assert report["session_dropped_windows"] == 2
+    assert report["dropped_windows"] == 0
+    assert report["lost_window_scenarios"] == []
+    assert report["credited_idle_exposure_s"] == 3660
+    assert report["protocol_complete"] is True
+    assert _row(report, "baseline_idle")["coverage"] == "verifiable"
+    assert _row(report, "baseline_idle")["dropped_windows"] == 0
+    assert "dropped_windows" not in _row(report, "baseline_idle")["coverage_reasons"]
+
+
+def test_interval_without_a_status_at_or_before_t0_does_not_hide_an_earlier_drop():
+    # The first status is inside the interval and already reports 4 dropped windows.
+    # There is no sample at or before t0, so that 4 is not a historical baseline.
+    missed = _score(
+        stream(5, 30, dropped_at=lambda t: 4, ready_s=0, session_end_s=31),
+        marks([scenario("baseline_idle", "idle", 1, 20, protocol=60, actual=19, completion="shortened")]),
+    )
+    row = _row(missed, "baseline_idle")
+    assert row["dropped_windows"] == 4
+    assert "dropped_windows" in row["coverage_reasons"]
+    assert row["coverage"] == "unverifiable"
+    assert missed["g5_acceptance"] != "full_candidate"
+
+    # The same count is history when a sample at or before t0 already shows it.
+    held = _score(
+        stream(0, 30, dropped_at=lambda t: 4),
+        marks([scenario("baseline_idle", "idle", 1, 20, protocol=60, actual=19, completion="shortened")]),
+    )
+    assert _row(held, "baseline_idle")["dropped_windows"] == 0
+    assert "dropped_windows" not in _row(held, "baseline_idle")["coverage_reasons"]
 
 
 def test_a_dropped_count_that_regresses_or_is_missing_is_unverifiable():
@@ -663,6 +721,8 @@ def test_perfect_session_passes_candidates_and_does_not_pass_confirmed_bar():
     assert report["exit_code"] == 0
     assert report["g5_acceptance"] == "full_candidate"
     assert report["candidate_result"] == "pass"
+    assert report["session_dropped_windows"] == 0
+    assert report["session_window_reasons"] == []
     assert report["confirmed_product_bar"] == "not_evaluated"
     assert report["confirmed_count"] == 0
     assert report["true_detections"] == 3
