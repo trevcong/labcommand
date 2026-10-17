@@ -4,7 +4,7 @@ import LabCommandCore
 // Fixture loading and decoder round-trip tests.
 // Tests FAIL (not skip) when fixtures are missing — fixtures must be present for tests to pass.
 
-private func fixturesPath() -> String? {
+func fixturesPath() -> String? {
     let fm = FileManager.default
     let searchPaths = [
         "fixtures/api",
@@ -21,14 +21,14 @@ private func fixturesPath() -> String? {
     return nil
 }
 
-private func loadFixture(_ name: String) -> String? {
+func loadFixture(_ name: String) -> String? {
     guard let base = fixturesPath() else { return nil }
     let path = URL(fileURLWithPath: base).appendingPathComponent("\(name).json").path
     guard let data = FileManager.default.contents(atPath: path) else { return nil }
     return String(data: data, encoding: .utf8)
 }
 
-private func requireFixture(_ name: String) -> String {
+func requireFixture(_ name: String) -> String {
     guard let json = loadFixture(name) else {
         fputs("FAIL: fixtures/api/\(name).json not found — run tests from repo root\n", stderr)
         exit(1)
