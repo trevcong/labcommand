@@ -116,9 +116,11 @@ func testRoomFirstShell() {
            "window titles are declared on Dest")
     expect(state.contains("static var navCases: [Dest] { [.liveRoom, .settings, .workspace] }"),
            "nav order is Room, Settings, Rig")
-    expect(state.contains("case .liveRoom: return \"1\""), "Room is ⌘1")
-    expect(state.contains("case .settings: return \"2\""), "Settings stays ⌘2")
-    expect(state.contains("case .workspace: return \"3\""), "Rig is ⌘3")
+    expect(state.contains("navCases.firstIndex(of: self)"), "the shortcut is the tab's place in nav order")
+    expect(state.contains("String(index + 1)"), "the first tab is ⌘1 and the third is ⌘3")
+    expect(!chrome.contains("KeyEquivalent(Character(d.shortcutKey))"),
+           "nav buttons do not also register ⌘1 and ⌘3")
+    expect(app.contains("keyEquivalent: d.shortcutKey"), "the View menu carries the tab shortcuts")
     expect(state.contains("var dest: Dest = .liveRoom"), "a normal launch opens on Room")
     expect(state.contains("launch.isolates && !roomLaunch.opensRoom"), "snapshot isolation is the Rig exception")
     expect(state.contains("dest = .workspace"), "the snapshot tool still has a Rig assignment")

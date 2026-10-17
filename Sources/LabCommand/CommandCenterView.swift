@@ -91,7 +91,6 @@ struct CommandCenterView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .keyboardShortcut(KeyEquivalent(Character(d.shortcutKey)), modifiers: .command)
         .accessibilityLabel(d.label)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }

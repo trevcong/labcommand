@@ -194,6 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let viewMenu = NSMenu(title: "View")
         viewItem.submenu = viewMenu
 
+        // ⌘1 is the first tab in navCases. The buttons do not register these keys too.
         for (idx, d) in Dest.navCases.enumerated() {
             let item = NSMenuItem(
                 title: d.label,
