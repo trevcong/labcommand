@@ -24,6 +24,8 @@
 #include <vector>
 
 #include <labcommand_msgs/msg/request_sync.hpp>
+#include <labcommand_msgs/msg/operator_action.hpp>
+#include <labcommand_msgs/srv/operator_action.hpp>
 #include <labcommand_msgs/srv/request_sync.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/serialization.hpp>
@@ -45,6 +47,8 @@ constexpr const char* kEventsTopic = "/room_memory/events";
 constexpr const char* kMapTopic = "/room_memory/map_bricks";
 constexpr const char* kRequestTopic = "/room_memory/request_sync";
 constexpr const char* kRequestService = "/room_memory/sync/request";
+constexpr const char* kOperatorTopic = "/room_memory/operator";
+constexpr const char* kOperatorService = "/room_memory/operator/action";
 constexpr const char* kSyncMapTopic = "/room_memory/sync/map_bricks";
 constexpr const char* kSyncEventsTopic = "/room_memory/sync/events";
 constexpr const char* kSyncEndTopic = "/room_memory/sync/end";
@@ -113,6 +117,11 @@ public:
         config.delta_period_s = declare_parameter<double>("delta_period_s", defaults.delta_period_s);
         config.keyframe_period_s = declare_parameter<double>("keyframe_period_s", defaults.keyframe_period_s);
         config.keyframe_delta_ratio = declare_parameter<double>("keyframe_delta_ratio", defaults.keyframe_delta_ratio);
+        config.suppress_clear_windows =
+            declare_parameter<std::int64_t>("suppress_clear_windows", defaults.suppress_clear_windows);
+        // Operator actions change durable state, and neither the :8767 port nor the ROS domain authenticates
+        // a caller: no service and no topic subscription unless asked (D46).
+        const bool operator_actions = declare_parameter<bool>("operator_actions", false);
         // Before any publisher: every message this process sends carries the generation. The
         // allocation holds publisher.lock until the process exits. The wall clock, not now(),
         // which may be sim time.
@@ -152,6 +161,21 @@ public:
                 request_serialization_.serialize_message(&request->request, &message);
                 response->accepted = answer(message);
             });
+        // Operator actions (D46), both paths behind the one flag: without it any peer on the ROS domain could
+        // confirm, dismiss or accept. Every callback runs on the one spin thread, as do the window and
+        // status timers and the requests, so RoomMemory needs no lock; a multi-threaded executor would.
+        if (operator_actions) {
+            operator_topic_ = create_generic_subscription(
+                kOperatorTopic, "labcommand_msgs/msg/OperatorAction", volatile_qos(10),
+                [this](std::shared_ptr<const rclcpp::SerializedMessage> message) { act(*message); });
+            operator_service_ = create_service<labcommand_msgs::srv::OperatorAction>(
+                kOperatorService, [this](const std::shared_ptr<labcommand_msgs::srv::OperatorAction::Request> request,
+                                         std::shared_ptr<labcommand_msgs::srv::OperatorAction::Response> response) {
+                    rclcpp::SerializedMessage message;
+                    operator_serialization_.serialize_message(&request->action, &message);
+                    response->outcome = static_cast<std::uint8_t>(act(message));
+                });
+        }
         for (const std::string& name : memory_->config().sensors) {
             const room_memory::Sensor& sensor = memory_->channel(name).sensor;
             subscriptions_.push_back(create_generic_subscription(
@@ -192,10 +216,22 @@ private:
         const std::vector<msg::ChangeEvent> events = memory_->close_window(now_stamp);
         for (const msg::ChangeEvent& event : events) events_->publish(serialized(event.to_cdr()));
         const std::optional<msg::Bytes> map = memory_->map_update(now_stamp);
-        if (map) map_->publish(serialized(*map));
+        if (map) {
+            map_->publish(serialized(*map));
+            // An accept's ACCEPTED goes out right after the map message that carries it (protocol 4.2).
+            for (const msg::ChangeEvent& event : memory_->accepted_after_map(now_stamp)) {
+                events_->publish(serialized(event.to_cdr()));
+                RCLCPP_INFO(get_logger(), "event %llu ACCEPTED with map_epoch %llu",
+                            static_cast<unsigned long long>(event.event_id),
+                            static_cast<unsigned long long>(event.header.map_epoch));
+            }
+        }
         const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         RCLCPP_INFO(get_logger(), "window %.1f ms wall, %.1f ms cpu, %zu event messages, map %zu B, state %s", elapsed,
                     cpu_ms() - cpu, events.size(), map ? map->size() : std::size_t{0}, msg::name(memory_->state()));
+        if (const auto& error = memory_->storage_error()) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000, "storage: %s", error->c_str());
+        }
         if (elapsed > memory_->config().window_s * 1000) {
             RCLCPP_WARN(get_logger(), "window took %.0f ms, longer than window_s", elapsed);
         }
@@ -208,6 +244,28 @@ private:
         const msg::Time now_stamp = stamp();
         status_->publish(serialized(memory_->status(now_stamp, period).to_cdr()));
         activity_->publish(serialized(memory_->activity(now_stamp).to_cdr()));
+    }
+
+    /// Decodes and applies one operator action, publishes its events and logs it with its outcome.
+    msg::OperatorOutcome act(const rclcpp::SerializedMessage& message) {
+        const rcl_serialized_message_t& raw = message.get_rcl_serialized_message();
+        msg::OperatorAction action;
+        try {
+            action = msg::OperatorAction::from_cdr(std::span<const std::uint8_t>(raw.buffer, raw.buffer_length));
+        } catch (const msg::CDRError& error) {
+            RCLCPP_WARN(get_logger(), "OperatorAction dropped (INVALID): %s", error.what());
+            return msg::OperatorOutcome::invalid;
+        }
+        const RoomMemory::OperatorResult result = memory_->operate(action, stamp());
+        for (const msg::ChangeEvent& event : result.events) events_->publish(serialized(event.to_cdr()));
+        const std::string event_id = action.event_id ? std::to_string(*action.event_id) : std::string("NONE");
+        const std::string note = action.text.empty() ? std::string() : " note '" + action.text + "'";
+        const char* repeat = result.repeat ? (result.repeat_differs ? " (repeat, payload differs)" : " (repeat)") : "";
+        RCLCPP_INFO(get_logger(), "OperatorAction %s action_id %s operator '%s'%s event %s: %s%s, %zu event messages",
+                    msg::name(action.action), action.action_id.c_str(), action.operator_id.c_str(), note.c_str(),
+                    event_id.c_str(), msg::name(result.outcome), repeat, result.events.size());
+        if (const auto& error = memory_->storage_error()) RCLCPP_WARN(get_logger(), "storage: %s", error->c_str());
+        return result.outcome;
     }
 
     /// Publishes the answer and its SyncEnd; false when the request was dropped.
@@ -253,6 +311,9 @@ private:
     std::shared_ptr<rclcpp::GenericSubscription> requests_;
     rclcpp::Service<labcommand_msgs::srv::RequestSync>::SharedPtr request_service_;
     rclcpp::Serialization<labcommand_msgs::msg::RequestSync> request_serialization_;
+    std::shared_ptr<rclcpp::GenericSubscription> operator_topic_;
+    rclcpp::Service<labcommand_msgs::srv::OperatorAction>::SharedPtr operator_service_;
+    rclcpp::Serialization<labcommand_msgs::msg::OperatorAction> operator_serialization_;
     std::vector<std::shared_ptr<rclcpp::GenericSubscription>> subscriptions_;
     rclcpp::TimerBase::SharedPtr window_timer_;
     rclcpp::TimerBase::SharedPtr status_timer_;

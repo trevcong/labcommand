@@ -16,7 +16,12 @@ struct LiveRoomPage: View {
                 started: state.roomDidStart,
                 requestPathExists: state.requestPathExists,
                 showsFixture: state.roomLaunch.fixtureMode != nil,
-                fixtureMode: state.fixture?.mode ?? state.roomLaunch.fixtureMode
+                fixtureMode: state.fixture?.mode ?? state.roomLaunch.fixtureMode,
+                recorder: .once(state.roomMirror),
+                desk: LiveRoomOperator(),
+                operatorPath: false,
+                act: nil,
+                retry: nil
             )
         }
     }
@@ -34,7 +39,12 @@ private struct LiveRoomClientHost: View {
             started: state.roomDidStart,
             requestPathExists: state.requestPathExists,
             showsFixture: false,
-            fixtureMode: nil
+            fixtureMode: nil,
+            recorder: room.timelineRecorder,
+            desk: room.operatorDesk,
+            operatorPath: room.operatorPath,
+            act: { kind, entry in _ = room.act(kind, on: entry) },
+            retry: { actionId in _ = room.retry(actionId: actionId) }
         )
     }
 }
@@ -55,11 +65,20 @@ private struct LiveRoomBody: View {
     var requestPathExists: Bool
     var showsFixture: Bool
     var fixtureMode: LiveRoomFixture.Mode?
+    var recorder: LiveRoomTimelineRecorder
+    var desk: LiveRoomOperator
+    var operatorPath: Bool
+    /// Nil in fixture mode: nothing to send to.
+    var act: ((LiveRoomOperator.Kind, LiveRoomEvent) -> Void)?
+    var retry: ((String) -> Void)?
 
     @State private var enabled: Set<RoomMemory.ChangeEvent.Kind> = Set(RoomMemory.ChangeEvent.Kind.allCases)
     @State private var selection: String?
     @State private var historyOpen = false
     @State private var canvas: CanvasPixels?
+    @State private var timelineWindow: TimeInterval = LiveRoomTimeline.windows[1]
+    /// The timeline's right edge while it does not follow now.
+    @State private var timelineEnd: Double?
 
     private var screen: LiveRoomScreen {
         LiveRoomScreen.make(
@@ -75,6 +94,7 @@ private struct LiveRoomBody: View {
 
     var body: some View {
         let screen = screen
+        let halo = LiveRoomTimeline.halo(selection: selection, mirror: mirror)
         VStack(alignment: .leading, spacing: 8) {
             header(screen)
             if let banner = screen.banner {
@@ -93,12 +113,15 @@ private struct LiveRoomBody: View {
             }
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 8) {
-                    canvasStack(screen)
+                    canvasStack(screen, halo: halo)
                     Text(screen.statusLine)
                         .font(LabTheme.mono(11))
                         .foregroundStyle(LabTheme.dim)
                         .lineLimit(1)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    LiveRoomActionBar(mirror: mirror, selection: selection, desk: desk, operatorPath: operatorPath,
+                                      locationNote: halo.note, act: act, retry: retry)
+                    timelineSection
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 eventColumn(screen)
@@ -110,6 +133,32 @@ private struct LiveRoomBody: View {
         .background(LabTheme.bg)
         .onAppear { writeSidecar(screen) }
         .onChange(of: sidecarText(screen)) { _, _ in writeSidecar(screen) }
+        .onChange(of: selection) { _, id in
+            // Picked on the timeline: show its row, even when it is in the closed history.
+            if let id, screen.historyRows.contains(where: { $0.id == id }) { historyOpen = true }
+        }
+    }
+
+    /// Redrawn every second so "now" moves while no message arrives.
+    private var timelineSection: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            LiveRoomTimelineView(
+                timeline: timeline(now: ProcessInfo.processInfo.systemUptime),
+                selection: $selection,
+                window: $timelineWindow,
+                follow: Binding(
+                    get: { timelineEnd == nil },
+                    set: { follow in
+                        timelineEnd = follow ? nil : timeline(now: ProcessInfo.processInfo.systemUptime).end
+                    }
+                )
+            )
+        }
+    }
+
+    private func timeline(now: TimeInterval) -> LiveRoomTimeline {
+        LiveRoomTimeline.make(mirror: mirror, recorder: recorder, window: timelineWindow, end: timelineEnd,
+                              selection: selection, kinds: enabled, timeZone: .current, now: now)
     }
 
     private func header(_ screen: LiveRoomScreen) -> some View {
@@ -153,14 +202,14 @@ private struct LiveRoomBody: View {
     }
 
     @ViewBuilder
-    private func canvasStack(_ screen: LiveRoomScreen) -> some View {
+    private func canvasStack(_ screen: LiveRoomScreen, halo: LiveRoomTimeline.Halo) -> some View {
         ZStack {
             if screen.canvasSentence == "Room memory unavailable" {
                 LabTheme.bg
             } else {
                 RoomMapView(
                     mirror: mirror,
-                    markers: screen.markers,
+                    markers: LiveRoomTimeline.markers(screen.markers, with: halo),
                     opacity: screen.brickOpacity,
                     drawMap: screen.canvasSentence == nil,
                     onCanvasRect: { x, y, w, h in
@@ -322,7 +371,14 @@ private struct LiveRoomBody: View {
 
     private func sidecarText(_ screen: LiveRoomScreen) -> String {
         let rect = canvas.map { ($0.x, $0.y, $0.w, $0.h) }
+        let selected = LiveRoomOperator.entry(for: selection, mirror: mirror)
+        let buttons = LiveRoomOperator.buttons(for: selected?.entry, earlier: selected?.earlier ?? false, mirror: mirror,
+                                               operatorPath: operatorPath && act != nil,
+                                               pending: selected.flatMap { desk.latest(for: $0.entry.event.eventId) })
+        let below = LiveRoomTimeline.sidecarLines(timeline: timeline(now: ProcessInfo.processInfo.systemUptime),
+                                                  halo: LiveRoomTimeline.halo(selection: selection, mirror: mirror), buttons: buttons)
         return LiveRoomSidecar.render(screen: screen, connection: connection, url: url, canvas: rect)
+            + below.map { $0 + "\n" }.joined()
     }
 
     private func writeSidecar(_ screen: LiveRoomScreen) {

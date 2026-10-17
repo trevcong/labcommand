@@ -13,7 +13,10 @@
 //   status <sec> <nanosec> <period_s>
 //   activity <sec> <nanosec>    the Activity message
 //   defaults                    every MemoryConfig default, one "default <key> <value>" line each
-//   map <sec> <nanosec>         map_update
+//   map <sec> <nanosec>         map_update, then an "event" line per ACCEPTED it released
+//   operator <sec> <nanosec> <hex>
+//                               operate with a CDR OperatorAction: "operator <OUTCOME>" ("operator
+//                               INVALID" when it does not decode), then its "event" lines
 //   sync <sec> <nanosec> <hex>  sync with a CDR RequestSync: "sync <n>", the answer's messages as
 //                               "data" lines, then "end <SyncEnd hex>" ("end none" for another room)
 #include <algorithm>
@@ -128,6 +131,7 @@ int main(int argc, char** argv) {
                 {"delta_period_s", std::to_string(d.delta_period_s)},
                 {"keyframe_period_s", std::to_string(d.keyframe_period_s)},
                 {"keyframe_delta_ratio", std::to_string(d.keyframe_delta_ratio)},
+                {"suppress_clear_windows", std::to_string(d.suppress_clear_windows)},
             };
             for (const auto& [key, value] : fields) std::cout << "default " << key << " " << value << "\n";
         } else if (command == "start") {
@@ -168,8 +172,29 @@ int main(int argc, char** argv) {
         } else if (command == "activity") {
             std::cout << "activity " << hex(memory->activity(time_of(words)).to_cdr()) << "\n";
         } else if (command == "map") {
-            const std::optional<msg::Bytes> message = memory->map_update(time_of(words));
+            const msg::Time stamp = time_of(words);
+            const std::optional<msg::Bytes> message = memory->map_update(stamp);
             std::cout << "map " << (message ? hex(*message) : "none") << "\n";
+            if (message) {
+                for (const msg::ChangeEvent& event : memory->accepted_after_map(stamp)) {
+                    std::cout << "event " << hex(event.to_cdr()) << "\n";
+                }
+            }
+        } else if (command == "operator") {
+            const msg::Time stamp = time_of(words);
+            std::string value;
+            words >> value;
+            std::optional<msg::OperatorAction> action;
+            try {
+                action = msg::OperatorAction::from_cdr(unhex(value));
+            } catch (const msg::CDRError&) {
+                std::cout << "operator INVALID\n";
+            }
+            if (action) {
+                const RoomMemory::OperatorResult result = memory->operate(*action, stamp);
+                std::cout << "operator " << msg::name(result.outcome) << "\n";
+                for (const msg::ChangeEvent& event : result.events) std::cout << "event " << hex(event.to_cdr()) << "\n";
+            }
         } else if (command == "sync") {
             const msg::Time stamp = time_of(words);
             std::string value;

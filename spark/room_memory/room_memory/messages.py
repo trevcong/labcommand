@@ -17,6 +17,7 @@ anything else is invalid. ``publisher_generation`` (and the ``RequestSync`` v2 f
 """
 
 import math
+import re
 import struct
 import zlib
 from dataclasses import dataclass
@@ -35,6 +36,10 @@ HZ_UNAVAILABLE = 0xFFFF
 SINCE_NONE = (1 << 64) - 1
 EVENTS_SEQ_NONE = (1 << 64) - 1
 SEQ_NONE = (1 << 64) - 1  # SyncEnd.bound when nothing was published on the topic in this generation
+EVENT_NONE = (1 << 64) - 1  # OperatorAction.event_id of a room-level action
+STATE_NONE = 255  # OperatorAction.expected_state when event_id is EVENT_NONE
+OPERATOR_TEXT_MAX_BYTES = 256
+OPERATOR_ID_MAX_BYTES = 64
 GENERATION_UNKNOWN = 0  # RequestSync.expected_generation only; invalid in every Spark -> Mac message
 UINT64_MAX = (1 << 64) - 1
 TOKEN_BYTES = 16
@@ -102,6 +107,37 @@ class MemoryState(IntEnum):
     RIG_MOVED = 2
     DEGRADED = 3
     PAUSED = 4
+
+
+class OperatorActionKind(IntEnum):
+    """``OperatorAction.action`` (protocol §3.6, D46)."""
+
+    ACKNOWLEDGE = 0
+    ACCEPT = 1
+    DISMISS = 2
+    LABEL = 3
+    MARK_GROUND_TRUTH = 4
+    PAUSE = 5
+    RESUME = 6
+    REREFERENCE = 7
+    CONFIRM = 8
+
+
+class OperatorOutcome(IntEnum):
+    """The ``OperatorAction`` service's response (D46): what the node did with the action."""
+
+    APPLIED = 0
+    INVALID = 1
+    WRONG_ROOM = 2
+    STALE_GENERATION = 3
+    STALE_EPOCH = 4
+    UNKNOWN_EVENT = 5
+    STATE_MISMATCH = 6
+    NOT_TRACKING = 7
+    UNSUPPORTED = 8
+    STORAGE_FAILED = 9
+    TARGET_CHANGED = 10
+    RIG_UNSETTLED = 11
 
 
 class SyncTopic(IntEnum):
@@ -1101,3 +1137,98 @@ class SyncEnd:
             end.validate()
             return end
         return _decode(data, "SyncEnd", body)
+
+
+_EVENT_ACTIONS = {OperatorActionKind.ACKNOWLEDGE, OperatorActionKind.ACCEPT, OperatorActionKind.DISMISS,
+                  OperatorActionKind.LABEL, OperatorActionKind.CONFIRM}
+_ROOM_ACTIONS = {OperatorActionKind.PAUSE, OperatorActionKind.RESUME, OperatorActionKind.REREFERENCE}
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _require_text(text, low, high, what):
+    if not isinstance(text, str):
+        raise Invalid(f"{what} is not a string")
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeError:
+        raise Invalid(f"{what} is not UTF-8") from None
+    if not low <= size <= high:
+        raise Invalid(f"{what} is {size} bytes, outside {low}...{high}")
+    if "\x00" in text:
+        raise Invalid(f"{what} contains a NUL")
+
+
+@dataclass(frozen=True)
+class OperatorAction:
+    """One operator action, Mac → Spark (protocol §3.6, D46). ``event_id`` and ``expected_state``
+    are both set (an event action) or both ``None`` (``EVENT_NONE`` and ``STATE_NONE`` on the wire)."""
+
+    header: Header
+    action: OperatorActionKind
+    event_id: Optional[int]
+    expected_state: Optional[EventState]
+    expected_generation: int  # never GENERATION_UNKNOWN
+    text: str  # "" = none
+    operator_id: str
+    action_id: str  # a lowercase UUID, 36 characters
+
+    def validate(self):
+        context = "OperatorAction"
+        self.header.validate(context)
+        if self.header.stamp == Time(0, 0):
+            raise Invalid(f"{context}: stamp {{0, 0}} is invalid here (a mark needs its time)")
+        action = _enum(OperatorActionKind, self.action, f"{context}: action")
+        if self.event_id is not None:
+            _require_int(self.event_id, 0, EVENT_NONE - 1, f"{context}: event_id ({EVENT_NONE} is EVENT_NONE; use None)")
+        if (self.event_id is None) != (self.expected_state is None):
+            raise Invalid(f"{context}: event_id and expected_state are both set or both EVENT_NONE / STATE_NONE")
+        state = None if self.expected_state is None else _enum(EventState, self.expected_state, f"{context}: expected_state")
+        if action in _EVENT_ACTIONS and self.event_id is None:
+            raise Invalid(f"{context}: {action.name} needs an event_id")
+        if action in _ROOM_ACTIONS and self.event_id is not None:
+            raise Invalid(f"{context}: {action.name} is room-level; event_id must be EVENT_NONE")
+        if state is not None:
+            allowed = {
+                OperatorActionKind.CONFIRM: {EventState.CANDIDATE},
+                OperatorActionKind.ACCEPT: {EventState.CONFIRMED},
+                OperatorActionKind.DISMISS: {EventState.CANDIDATE, EventState.CONFIRMED},
+            }.get(action)
+            if allowed is not None and state not in allowed:
+                raise Invalid(f"{context}: {action.name} cannot expect state {int(state)}")
+        _require_int(self.expected_generation, 1, UINT64_MAX, f"{context}: expected_generation (0 is GENERATION_UNKNOWN)")
+        _require_text(self.text, 0, OPERATOR_TEXT_MAX_BYTES, f"{context}: text")
+        if action in (OperatorActionKind.LABEL, OperatorActionKind.MARK_GROUND_TRUTH) and not self.text:
+            raise Invalid(f"{context}: {action.name} needs text")
+        _require_text(self.operator_id, 1, OPERATOR_ID_MAX_BYTES, f"{context}: operator_id")
+        if not isinstance(self.action_id, str) or not _UUID.fullmatch(self.action_id):
+            raise Invalid(f"{context}: action_id is not a lowercase UUID (36 characters)")
+
+    def to_cdr(self):
+        """CDR little endian, encapsulation header included. Raises ``Invalid``."""
+        self.validate()
+        writer = _Writer()
+        writer.header(self.header)
+        writer.u8(self.action)
+        writer.u64(EVENT_NONE if self.event_id is None else self.event_id)
+        writer.u8(STATE_NONE if self.expected_state is None else self.expected_state)
+        writer.u64(self.expected_generation)
+        writer.string(self.text)
+        writer.string(self.operator_id)
+        writer.string(self.action_id)
+        return bytes(writer.data)
+
+    @classmethod
+    def from_cdr(cls, data):
+        """Decodes either byte order. Raises ``Truncated`` or ``Invalid``."""
+        def body(reader):
+            header = reader.header("")
+            action = _enum(OperatorActionKind, reader.u8("action"), "OperatorAction: action")
+            event = reader.u64("event_id")
+            state = reader.u8("expected_state")
+            expected_state = None if state == STATE_NONE else _enum(EventState, state, "OperatorAction: expected_state")
+            generation = reader.u64("expected_generation")
+            value = cls(header, action, None if event == EVENT_NONE else event, expected_state, generation,
+                        reader.string("text"), reader.string("operator_id"), reader.string("action_id"))
+            value.validate()
+            return value
+        return _decode(data, "OperatorAction", body)

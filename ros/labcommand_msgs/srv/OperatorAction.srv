@@ -1,0 +1,23 @@
+# labcommand_msgs/OperatorAction service: carries one OperatorAction to the room-memory node through
+# the :8767 bridge's services capability (protocol D46), on /room_memory/operator/action. The node
+# offers it, and subscribes to the /room_memory/operator topic, only with operator_actions:=true.
+# Contract: docs/ROOM-MEMORY-PROTOCOL.md in the LabCommand repo (section 3.6).
+#
+# The request is exactly one OperatorAction, so its CDR has the message's layout. The response
+# acknowledges: the effect is observed on the wire (a ChangeEvent, or a map message then ACCEPTED).
+
+OperatorAction action
+---
+uint8 OUTCOME_APPLIED=0           # acted (or logged, for ACKNOWLEDGE); a repeat of an applied action_id
+uint8 OUTCOME_INVALID=1           # did not decode or validate
+uint8 OUTCOME_WRONG_ROOM=2
+uint8 OUTCOME_STALE_GENERATION=3  # expected_generation is not this process
+uint8 OUTCOME_STALE_EPOCH=4       # ACCEPT on a map_epoch the node no longer publishes, or while an accept waits for its map
+uint8 OUTCOME_UNKNOWN_EVENT=5     # not an open event of this process
+uint8 OUTCOME_STATE_MISMATCH=6    # the event is no longer in expected_state (a held accept counts as ACCEPTED)
+uint8 OUTCOME_NOT_TRACKING=7      # memory is not TRACKING
+uint8 OUTCOME_UNSUPPORTED=8       # LABEL, MARK_GROUND_TRUTH, PAUSE, RESUME, REREFERENCE
+uint8 OUTCOME_STORAGE_FAILED=9    # the durable write installed nothing; nothing changed; a retry may act
+uint8 OUTCOME_TARGET_CHANGED=10   # the change no longer has the shape the operator saw, or no fresh support
+uint8 OUTCOME_RIG_UNSETTLED=11    # ACCEPT while the rig pose is unknown or past learn_max_offset_m
+uint8 outcome

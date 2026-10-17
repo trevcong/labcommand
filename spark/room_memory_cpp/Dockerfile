@@ -8,8 +8,10 @@
 #
 # --net=host and --ipc=host let DDS discovery and shared memory reach the lidar drivers. The
 # launch file also starts a foxglove_bridge on :8767 that relays only /room_memory/* and exposes
-# only the node's /room_memory/sync/request service, for the Mac's RequestSync (protocol D39); it
-# cannot publish (launch argument foxglove_bridge:=false turns it off).
+# only the node's /room_memory/sync/request service, for the Mac's RequestSync (protocol D39), plus
+# /room_memory/operator/action with operator_actions:=true (D46, off by default; without it the node has
+# neither that service nor a /room_memory/operator subscription); it cannot publish
+# (launch argument foxglove_bridge:=false turns it off).
 # CPU_FLAGS defaults to the build machine's CPU; set it (e.g. -march=armv9-a) when the image
 # is built on a different host than the one it runs on.
 FROM ros:jazzy-ros-base

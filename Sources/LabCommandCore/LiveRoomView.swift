@@ -75,6 +75,9 @@ public struct LiveRoomFixture: Equatable, Sendable {
     public static let generation: UInt64 = 1_760_400_000_000
     /// The run before it in `restart` mode: an hour earlier.
     static let earlierGeneration: UInt64 = generation - 3_600_000
+    /// The status clock: just after the newest event (1_760_400_012), on the same Spark clock, so
+    /// the timeline's "now" sits next to the fixture's events.
+    static let statusSec: Int32 = 1_760_400_015
 
     public var mode: Mode
     public var mirror: RoomMemoryMirror
@@ -111,7 +114,7 @@ public struct LiveRoomFixture: Equatable, Sendable {
                 // Another Mac's fallback: seqs 0-2 fell out of the Spark's log before anyone fetched them.
                 fixture.feed(.syncEnd, try lostSyncEnd().encodedCDR(), at: at)
             }
-            fixture.feed(.status, try trackingStatus(seq: 1, stamp: RoomMemory.Time(sec: 1, nanosec: 0), eventsSeq: 5,
+            fixture.feed(.status, try trackingStatus(seq: 1, stamp: RoomMemory.Time(sec: statusSec, nanosec: 0), eventsSeq: 5,
                                                      generation: generation).encodedCDR(), at: at)
             if mode == .stale {
                 _ = fixture.mirror.tick(at: now)
@@ -121,13 +124,13 @@ public struct LiveRoomFixture: Equatable, Sendable {
             _ = fixture.mirror.connectionOpened(at: now - 1, canRequest: false)
             fixture.feed(.mapBricks, try snapshot(root: root, generation: earlierGeneration), at: now - 1)
             fixture.feed(.events, try retagged(goldenBytes(name: "change_event_moved_mask_v2_le", root: root), earlierGeneration), at: now - 1)
-            fixture.feed(.status, try trackingStatus(seq: 40, stamp: RoomMemory.Time(sec: 1, nanosec: 0), eventsSeq: 3,
+            fixture.feed(.status, try trackingStatus(seq: 40, stamp: RoomMemory.Time(sec: statusSec - 1, nanosec: 0), eventsSeq: 3,
                                                      generation: earlierGeneration).encodedCDR(), at: now - 1)
             // The node restarted: its status counts from 0 again under a higher generation, no events yet.
             fixture.statusEventsSeq = nil
             fixture.statusSeq = 0
             fixture.feed(.mapBricks, try snapshot(root: root, generation: generation, seq: 0), at: now)
-            fixture.feed(.status, try trackingStatus(seq: 0, stamp: RoomMemory.Time(sec: 2, nanosec: 0), eventsSeq: nil,
+            fixture.feed(.status, try trackingStatus(seq: 0, stamp: RoomMemory.Time(sec: statusSec, nanosec: 0), eventsSeq: nil,
                                                      generation: generation).encodedCDR(), at: now)
             return fixture
         case .legacy:
@@ -137,7 +140,7 @@ public struct LiveRoomFixture: Equatable, Sendable {
             fixture.feed(.mapBricks, try goldenBytes(name: "map_bricks_snapshot_zlib_le", root: root), at: now)
             fixture.feed(.events, try goldenBytes(name: "change_event_moved_mask_le", root: root), at: now)
             fixture.feed(.events, try goldenBytes(name: "change_event_appeared_le", root: root), at: now)
-            fixture.feed(.status, try trackingStatus(seq: 1, stamp: RoomMemory.Time(sec: 1, nanosec: 0), eventsSeq: nil,
+            fixture.feed(.status, try trackingStatus(seq: 1, stamp: RoomMemory.Time(sec: statusSec, nanosec: 0), eventsSeq: nil,
                                                      generation: nil).encodedCDR(), at: now)
             return fixture
         }
@@ -157,7 +160,7 @@ public struct LiveRoomFixture: Equatable, Sendable {
         guard Self.keepsFresh(mode) else { return self }
         var copy = self
         let seq = statusSeq &+ 1
-        let stamp = RoomMemory.Time(sec: 1, nanosec: UInt32(seq % 1_000_000_000))
+        let stamp = RoomMemory.Time(sec: Self.statusSec, nanosec: UInt32(seq % 1_000_000_000))
         guard let payload = try? Self.trackingStatus(seq: seq, stamp: stamp, eventsSeq: statusEventsSeq,
                                                      generation: statusGeneration).encodedCDR() else {
             return self
@@ -754,7 +757,8 @@ private func kindWord(_ kind: RoomMemory.ChangeEvent.Kind) -> String {
     }
 }
 
-private func stateName(_ state: RoomMemory.ChangeEvent.State) -> String {
+/// The Room's word for a state: the event rows, the timeline and the action bar all print it.
+func stateName(_ state: RoomMemory.ChangeEvent.State) -> String {
     switch state {
     case .candidate: return "checking"
     case .confirmed: return "confirmed"

@@ -17,6 +17,7 @@ from room_memory.memory import (
     VoxelLayer,
     VoxelStats,
     epoch_path,
+    load_epoch,
     load_reference,
     map_delta,
     pose_offset,
@@ -817,6 +818,28 @@ def test_learning_budget_flushes_on_the_next_due_tick_then_freezes():
     assert all(e.state != EventState.CANDIDATE for e in memory.close_window(stamp(10)))
     frozen = feed(memory, room, 12)
     assert frozen.kind == MapKind.SNAPSHOT and frozen.header.map_epoch == 2 and frozen.bricks == learned
+
+
+def test_a_failed_map_save_after_a_settle_is_retried_on_the_next_due_tick(tmp_path):
+    """A save that fails on the tick that spends the budget: the settled wall is not lost with the
+    counts. Nothing goes out until the save succeeds, and then the wall does, at the next epoch."""
+    room, partial = partial_room()
+    memory = mid360_memory(tmp_path, reference_windows=1, learn_windows=1, delta_period_s=3.0, keyframe_period_s=4.0,
+                           keyframe_delta_ratio=100.0)
+    opening = feed(memory, partial, 0)
+    assert opening.header.map_epoch == 1
+    assert feed(memory, room, 1) is None and feed(memory, room, 2) is None
+    epoch_file = epoch_path(str(tmp_path), memory.config.room_id)
+    epoch_file.unlink()
+    epoch_file.mkdir()  # every save fails, for root as well
+    assert feed(memory, room, 3) is None and memory.storage_error and memory.map_epoch == 1
+    assert len(memory.channels["mid360"].stats.keys) == 0  # the budget is spent
+    assert feed(memory, room, 4) is None and memory.map_epoch == 1
+    epoch_file.rmdir()
+    saved = feed(memory, room, 5)
+    learned = memory.channels["mid360"].reference.to_bricks()
+    assert saved.header.map_epoch == 2 and saved.bricks == learned and len(learned) > len(opening.bricks)
+    assert load_epoch(epoch_file) == 2 and memory.storage_error is None
 
 
 def test_an_empty_tracking_window_consumes_the_learn_budget():

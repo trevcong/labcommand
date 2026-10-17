@@ -1183,6 +1183,31 @@ TEST(learning_budget_flushes_on_the_next_due_tick_then_freezes) {
           frozen->bricks == learned);
 }
 
+// A save that fails on the tick that spends the budget: the settled wall is not lost with the
+// counts. Nothing goes out until the save succeeds, and then the wall does, at the next epoch.
+TEST(a_failed_map_save_after_a_settle_is_retried_on_the_next_due_tick) {
+    TempDir dir;
+    const Cloud room = scenes::room_shell();
+    const Cloud partial = partial_shell(room);
+    MemoryConfig config = budget_config();
+    config.state_dir = dir.path.string();
+    RoomMemory memory(config, kStart, kGeneration);
+    const auto opening = feed(memory, &partial, 0);
+    CHECK(opening && opening->header.map_epoch == 1);
+    CHECK(!feed(memory, &room, 1) && !feed(memory, &room, 2));
+    const std::filesystem::path epoch_file = epoch_path(dir.path.string(), config.room_id);
+    std::filesystem::remove(epoch_file);
+    std::filesystem::create_directory(epoch_file);  // every save fails, for root as well
+    CHECK(!feed(memory, &room, 3) && memory.storage_error() && memory.map_epoch() == 1);
+    CHECK(memory.channel("mid360").stats.keys.empty());  // the budget is spent
+    CHECK(!feed(memory, &room, 4) && memory.map_epoch() == 1);
+    std::filesystem::remove_all(epoch_file);
+    const auto saved = feed(memory, &room, 5);
+    const auto learned = memory.channel("mid360").reference.to_bricks();
+    CHECK(saved && saved->header.map_epoch == 2 && saved->bricks == learned && learned.size() > opening->bricks.size());
+    CHECK(load_epoch(epoch_file) == 2 && !memory.storage_error());
+}
+
 TEST(an_empty_tracking_window_consumes_the_learn_budget) {
     const Cloud room = scenes::room_shell();
     const Cloud partial = partial_shell(room);

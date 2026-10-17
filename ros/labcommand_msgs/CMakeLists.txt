@@ -16,6 +16,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SeqRange.msg"
   "msg/SyncEnd.msg"
   "srv/RequestSync.srv"
+  "srv/OperatorAction.srv"
   DEPENDENCIES builtin_interfaces
 )
 

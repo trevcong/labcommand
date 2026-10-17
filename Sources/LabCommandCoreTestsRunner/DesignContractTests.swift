@@ -143,5 +143,13 @@ func testRoomFirstShell() {
     for phrase in banned {
         expect(!room.contains(phrase), "room screen still prints \(phrase)")
     }
+    // The timeline and the action bar print events too, in the same words.
+    for path in ["Sources/LabCommandCore/LiveRoomTimeline.swift", "Sources/LabCommandCore/LiveRoom/LiveRoomOperator.swift"] {
+        let source = repoFile(path)
+        expect(!source.isEmpty, "\(path) is readable from the repo root")
+        for phrase in banned + ["\"accepted", "\"reverted\"", "\"expired\""] {
+            expect(!source.contains(phrase), "\(path) still prints \(phrase)")
+        }
+    }
     expect(room.contains("case .candidate:"), "the wire state stays .candidate")
 }

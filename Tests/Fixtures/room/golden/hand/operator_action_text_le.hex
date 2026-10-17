@@ -1,0 +1,28 @@
+# labcommand_msgs/OperatorAction ACTION_DISMISS with a note, CDR little endian (protocol 3.6, D46).
+# Derived by hand. Covers: a 15-byte text (length 16) that ends aligned; operator_id "astra" and its
+# 2 pad bytes before action_id; expected_state CANDIDATE (a dismiss before confirmation). 141 bytes.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+04 00 00 00                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   room_id "lab\0"
+2b 00 00 00 00 00 00 00     # pos 8   map_epoch 43
+01 00 00 00 00 00 00 00     # pos 16  seq 1
+8c 92 ed 68                 # pos 24  stamp.sec 1760400012
+00 00 00 00                 # pos 28  stamp.nanosec 0
+02                          # pos 32  action DISMISS
+00 00 00 00 00 00 00        # pos 33  pad to 8
+04 00 00 40 44 00 9e 19     # pos 40  event_id 1845913190400000004
+00                          # pos 48  expected_state CANDIDATE
+00 00 00 00 00 00 00        # pos 49  pad to 8
+00 44 04 e0 99 01 00 00     # pos 56  expected_generation 1760400000000
+10 00 00 00                 # pos 64  text length 16
+6c 65 66 74 20 6f 6e 20     # pos 68  text "left on "
+70 75 72 70 6f 73 65 00     # pos 76    "purpose\0"
+06 00 00 00                 # pos 84  operator_id length 6
+61 73 74 72 61 00           # pos 88  operator_id "astra\0"
+00 00                       # pos 94  pad to 4
+25 00 00 00                 # pos 96  action_id length 37
+35 61 31 65 37 63 33 64     # pos 100 action_id "5a1e7c3d"
+2d 39 62 30 32 2d 34 66     # pos 108   "-9b02-4f"
+36 31 2d 38 65 33 33 2d     # pos 116   "61-8e33-"
+63 34 64 35 65 36 66 37     # pos 124   "c4d5e6f7"
+30 38 31 39 00              # pos 132   "0819\0"

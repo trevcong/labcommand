@@ -14,7 +14,10 @@ lidar containers' bridge on :8765 is not touched. The Mac's ``RequestSync`` goes
 socket as the node's ``/room_memory/sync/request`` service (protocol D39): the bridge offers
 ``services`` with a ``service_whitelist`` of that one name. Every other node's services, the
 lidar drivers' parameter services included, stay hidden; the bridge enforces this whitelist
-(the default is ``.*``, so it must be set). Client publishing stays off unless
+(the default is ``.*``, so it must be set). ``operator_actions:=true`` (off by default) has the node
+subscribe to ``/room_memory/operator`` and offer ``/room_memory/operator/action``, and adds the service
+to the whitelist (protocol D46): an action changes durable state, and neither the port nor the ROS
+domain authenticates a caller. Without it the node has neither, so no peer can act. Client publishing stays off unless
 ``foxglove_client_publish:=true``: foxglove_bridge parses ``client_topic_whitelist`` but does not
 enforce it (3.4.1 through 3.6.2), so client publishing would let any client that reaches the port
 publish on any topic.
@@ -57,10 +60,21 @@ ARGUMENTS = {
     "delta_period_s": ("5.0", float),
     "keyframe_period_s": ("60.0", float),
     "keyframe_delta_ratio": ("0.5", float),
+    "suppress_clear_windows": ("30", int),
 }
 
-# The node's RequestSync service, the only one the bridge exposes (D39).
+# Node parameters that are not MemoryConfig fields (ARGUMENTS mirrors MemoryConfig exactly).
+NODE_ARGUMENTS = {
+    # The operator topic and service change durable state, and no caller is authenticated: off unless asked (D46).
+    "operator_actions": ("false", bool),
+}
+
+# The node's RequestSync service, which the bridge always exposes (D39).
 REQUEST_SERVICE = "/room_memory/sync/request"
+# The node's operator service (D46): it changes durable state, so the node offers it (and subscribes to
+# the /room_memory/operator topic) and the bridge exposes it only with operator_actions:=true.
+OPERATOR_SERVICE = "/room_memory/operator/action"
+OPERATOR_SERVICE_PATTERN = "^/room_memory/operator/action$"
 # connectionGraph is read-only (topic names, no data). services carries RequestSync through the
 # service whitelist below; clientPublish is added only by foxglove_client_publish:=true.
 BRIDGE_CAPABILITIES = ["connectionGraph", "services"]
@@ -77,8 +91,12 @@ BRIDGE_ARGUMENTS = {
 def generate_launch_description():
     parameters = {
         name: ParameterValue(LaunchConfiguration(name), value_type=kind) if kind else LaunchConfiguration(name)
-        for name, (_, kind) in ARGUMENTS.items()
+        for name, (_, kind) in {**ARGUMENTS, **NODE_ARGUMENTS}.items()
     }
+    service_whitelist = PythonExpression([
+        repr(BRIDGE_SERVICE_WHITELIST + [OPERATOR_SERVICE_PATTERN]), " if '", LaunchConfiguration("operator_actions"),
+        "'.lower() == 'true' else ", repr(BRIDGE_SERVICE_WHITELIST),
+    ])
     capabilities = PythonExpression([
         repr(["clientPublish"] + BRIDGE_CAPABILITIES), " if '", LaunchConfiguration("foxglove_client_publish"),
         "'.lower() == 'true' else ", repr(BRIDGE_CAPABILITIES),
@@ -91,12 +109,12 @@ def generate_launch_description():
             "address": LaunchConfiguration("foxglove_address"),
             "topic_whitelist": ["^/room_memory/.*"],
             "client_topic_whitelist": ["^/room_memory/request_sync$"],
-            "service_whitelist": BRIDGE_SERVICE_WHITELIST,
+            "service_whitelist": ParameterValue(service_whitelist, value_type=List[str]),
             "capabilities": ParameterValue(capabilities, value_type=List[str]),
         }],
     )
     return LaunchDescription(
-        [DeclareLaunchArgument(name, default_value=default) for name, (default, _) in ARGUMENTS.items()]
+        [DeclareLaunchArgument(name, default_value=default) for name, (default, _) in {**ARGUMENTS, **NODE_ARGUMENTS}.items()]
         + [DeclareLaunchArgument(name, default_value=default) for name, default in BRIDGE_ARGUMENTS.items()]
         + [Node(package="room_memory_cpp", executable="room_memory_node", name="room_memory", output="screen",
                 parameters=[parameters]),

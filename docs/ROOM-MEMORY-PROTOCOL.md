@@ -1,6 +1,6 @@
 # Room memory protocol, v1 (Spark `room_memory` → LabCommand Mac)
 
-Status: draft for PR 0.1. Codex has not signed it off. Trevor decided D5, D9 and D19 on 2026-10-14 (§8); he has not answered Q1–Q5 (end of this doc). PR #13 added D23–D24 (the `seq` rule and durability), D25 (`OperatorAction`), D26 (the events high-water mark, `MemoryStatus.events_seq`) and D27 (the events fallback header, `EventsFallback`) as proposals. PR #14 (the Spark node, merged before it) added D28–D33 and §3.7 (`Activity`). `pubgen` (PLAN-PUBGEN, approved by Astra) adds protocol v2: D34 (publisher generations), D35 (`RequestSync` token and expected generation), D36 (`SyncEnd`, which supersedes D27 and D26's request mark) and D37 (the generation-scoped mirror, which supersedes D23's restart cases); its follow-up adds D38 (the generation on `Activity` and `Epoch`). Issue #21 adds D39 (`RequestSync` as a service through the :8767 bridge). §5 is the single normative statement of the resync rules. Sources: `RESEARCH_BRIEF.md` §2.2–§2.5 (2026-10-14). The `.msg` files are in `ros/labcommand_msgs/msg/`. The Swift codecs are `Sources/LabCommandCore/RoomMemoryMessages.swift` and `RoomMemoryCDR.swift`.
+Status: draft for PR 0.1. Codex has not signed it off. Trevor decided D5, D9 and D19 on 2026-10-14 (§8); he has not answered Q1–Q6 (end of this doc). PR #13 added D23–D24 (the `seq` rule and durability), D25 (`OperatorAction`), D26 (the events high-water mark, `MemoryStatus.events_seq`) and D27 (the events fallback header, `EventsFallback`) as proposals. PR #14 (the Spark node, merged before it) added D28–D33 and §3.7 (`Activity`). `pubgen` (PLAN-PUBGEN, approved by Astra) adds protocol v2: D34 (publisher generations), D35 (`RequestSync` token and expected generation), D36 (`SyncEnd`, which supersedes D27 and D26's request mark) and D37 (the generation-scoped mirror, which supersedes D23's restart cases); its follow-up adds D38 (the generation on `Activity` and `Epoch`). Issue #21 adds D39 (`RequestSync` as a service through the :8767 bridge). D46 makes `OperatorAction` concrete: confirm, dismiss and accept, a service behind `operator_actions:=true`, suppressions and the held ACCEPTED. §5 is the single normative statement of the resync rules. Sources: `RESEARCH_BRIEF.md` §2.2–§2.5 (2026-10-14). The `.msg` files are in `ros/labcommand_msgs/msg/`. The Swift codecs are `Sources/LabCommandCore/RoomMemoryMessages.swift` and `RoomMemoryCDR.swift`.
 
 The Spark does all perception and keeps the memory. The Mac mirrors the reference map, the event list and the timeline, and renders them. It never infers a change itself. Five Spark → Mac topics carry the state, three sync topics carry answers to the Mac's resync requests, and two Mac → Spark topics carry those requests and the operator's actions. How they travel between the Spark and the Mac is open (§2, D28, Q5): a dedicated foxglove_bridge on :8767 in the room-memory container, or the existing foxglove_bridge on :8765 with the requests relayed over the ssh-authenticated command-center API on :8766.
 
@@ -92,12 +92,12 @@ Topic names are a proposal for PR 2.4 (D18):
 | `/room_memory/activity` | Spark → Mac | `Activity` | 1 Hz, with each status (D33) | reliable, **transient_local**, keep-last 1 |
 | `/room_memory/epoch` | Spark → Mac | `Epoch` | 0.2 Hz | reliable, **transient_local**, keep-last 1 |
 | `/room_memory/request_sync` | Mac → Spark | `RequestSync` | on (re)connect and on a gap, ≤ 1 per topic per 5 s | reliable, **volatile**, keep-last 10 |
-| `/room_memory/operator` | Mac → Spark | `OperatorAction` | one per operator action | reliable, **volatile**, keep-last 10 |
+| `/room_memory/operator` | Mac → Spark | `OperatorAction` | one per operator action; subscribed only with `operator_actions:=true` (D46) | reliable, **volatile**, keep-last 10 |
 | `/room_memory/sync/map_bricks` | Spark → Mac | `MapBricks` | answers to `TOPIC_MAP_BRICKS` requests | reliable, **volatile**, keep-last 10 |
 | `/room_memory/sync/events` | Spark → Mac | `ChangeEvent` | answers to `TOPIC_EVENTS` requests | reliable, **volatile**, keep-last 200 |
 | `/room_memory/sync/end` | Spark → Mac | `SyncEnd` | one manifest per answered `RequestSync`, after the answer's messages (§5, D36) | reliable, **volatile**, keep-last 10 |
 
-**Who publishes.** The room-memory node publishes the eight Spark → Mac topics and is the only subscriber of the two Mac → Spark topics. The Mac originates `RequestSync` and `OperatorAction`. `RequestSync` reaches the node as the `/room_memory/sync/request` service, which the :8767 bridge exposes over the Mac's own socket (D39), or on the `request_sync` topic from a relay. How `OperatorAction` reaches it is still open (D28, Q5, below): an ssh-authenticated relay on the command-center API (`docs/phase3-live-integration.md`, P11) is the candidate. Every path carries the CDR bytes unchanged.
+**Who publishes.** The room-memory node publishes the eight Spark → Mac topics and is the only subscriber of the two Mac → Spark topics. The Mac originates `RequestSync` and `OperatorAction`. `RequestSync` reaches the node as the `/room_memory/sync/request` service, which the :8767 bridge exposes over the Mac's own socket (D39), or on the `request_sync` topic from a relay. `OperatorAction` reaches it as the `/room_memory/operator/action` service through the same bridge, or on the `operator` topic from a relay, and both exist only when the node runs with `operator_actions:=true` (D46). Without the flag the node does not subscribe to the topic, so no peer on the ROS domain can act. The ssh-authenticated relay of P11 is still the safer path, and both are off by default (Q6). Every path carries the CDR bytes unchanged.
 
 **Durability (D24).** Every publisher and subscriber declares durability explicitly.
 - **`status`, `activity` and `epoch` are transient_local, depth 1.** A subscriber that joins late gets the last message published, then the live stream. That subscriber may be foxglove_bridge when the first Mac subscribes. All three are full-state messages, so a copy delivered twice is harmless: §5's `seq` rule ignores it.
@@ -105,7 +105,7 @@ Topic names are a proposal for PR 2.4 (D18):
   - `map_bricks` and `events`: the Mac gets the map and the recent events by `RequestSync` (§5).
   - The sync topics, `sync/end` included: an answer is for the requests outstanding when it is sent, not for a later subscriber.
   - `request_sync` and `operator`: a restarted node must not receive a stored request or action again. A replayed `OperatorAction` would act twice.
-- **The nodes match this.** The Python node (`spark/room_memory`) and the C++ node (`spark/room_memory_cpp`) declare every topic's durability: `status` and `activity` transient_local with depth 1, the others volatile (`docs/phase3-live-integration.md` §2.5). Neither publishes `epoch` yet: its counts are of CONFIRMED events (D13), nothing reaches CONFIRMED before PR 2.3, and cumulative counts "since the room was created" also need saving across restarts. The topic's QoS above is the rule for when it is published.
+- **The nodes match this.** The Python node (`spark/room_memory`) and the C++ node (`spark/room_memory_cpp`) declare every topic's durability: `status` and `activity` transient_local with depth 1, the others volatile (`docs/phase3-live-integration.md` §2.5). Neither publishes `epoch` yet: its counts are of CONFIRMED events (D13), which only an operator confirm (D46) produces before PR 2.3, and cumulative counts "since the room was created" also need saving across restarts. The topic's QoS above is the rule for when it is published.
 - In ROS 2 a volatile subscriber still receives from a transient_local publisher. A transient_local subscriber receives nothing from a volatile one.
 
 **Transport (D28, open: Q5).** Two options are on the table, and Trevor has not chosen. Both carry the same CDR bytes, and the node answers whatever arrives on `/room_memory/request_sync` or its `/room_memory/sync/request` service the same way, so the protocol does not depend on the choice.
@@ -372,12 +372,7 @@ Trevor's D19 gives `RequestSync{room_id, since_epoch, since_seq, stamp}`. The co
 
 ### 3.6 `OperatorAction`: one operator action, Mac → Spark
 
-Proposed in PR #13 (D25). It is published on `/room_memory/operator` (§2), and the room-memory node is its only subscriber.
-
-**Out of scope for protocol v2.** This section and `OperatorAction.msg` are a proposal. Protocol v2 (D34–D38) defines no codec, golden or handler for it, in any language, and its tests do not cover it. Codecs and goldens are Phase 3 stage S5, written together with the node's handler, for three reasons:
-- **Nothing would use them.** No node subscribes to `/room_memory/operator`, and the Mac has no operator UI that sends an action.
-- **No transport.** D39 carries `RequestSync` only. How an `OperatorAction` reaches the node is open (D28, Q5), and the bridge offers no `clientPublish` (§2).
-- **The layout is not final.** An action is compare-and-set on `map_epoch` and `expected_state`, but not on the publisher generation. A REREFERENCE, PAUSE or RESUME sent just before a restart could act on the new process, whose `map_epoch` can equal the old one when no references were saved (§1.4). S5 decides whether the message gets an `expected_generation` (as `RequestSync` has, D35) before any bytes are frozen in a golden. The wire size below was computed by hand from §1.1, not encoded.
+Proposed in PR #13 (D25), made concrete by D46. The Mac sends it as the request of the node's `/room_memory/operator/action` service (`labcommand_msgs/srv/OperatorAction`) through the :8767 bridge, the D39 pattern. A relay publishes it on `/room_memory/operator` (§2). The node is its only handler. The service and the node's subscription to the topic exist only when the node runs with `operator_actions:=true` (default off). It changes durable state, and neither :8767 nor the ROS domain authenticates a caller (Q6).
 
 ```
 uint8 ACTION_ACKNOWLEDGE=0
@@ -388,6 +383,7 @@ uint8 ACTION_MARK_GROUND_TRUTH=4
 uint8 ACTION_PAUSE=5
 uint8 ACTION_RESUME=6
 uint8 ACTION_REREFERENCE=7
+uint8 ACTION_CONFIRM=8
 uint64 EVENT_NONE=18446744073709551615
 uint8 STATE_NONE=255
 string room_id
@@ -397,41 +393,59 @@ builtin_interfaces/Time stamp
 uint8 action
 uint64 event_id
 uint8 expected_state
+uint64 expected_generation
 string text
 string operator_id
 string action_id
 ```
 
-The common fields of §1.4 are the message's header. `std_msgs/Header` is not used: it would break "common fields first" (D2) and add a dependency.
+The common fields of §1.4 are the message's header. `std_msgs/Header` is not used: it would break "common fields first" (D2) and add a dependency. There is no legacy layout: the message exists only in this form (D46), like `SyncEnd`.
 
 | field | type | unit | valid | missing on the wire | rendering when missing / invalid |
 |---|---|---|---|---|---|
-| `map_epoch` | `uint64` | epoch | the epoch of the map the operator was shown | cannot be missing | ACCEPT or REREFERENCE on another epoch than the node's published one: refused and logged |
+| `map_epoch` | `uint64` | epoch | the epoch of the map the operator was shown | cannot be missing | ACCEPT on another epoch than the node's published one: refused (STALE_EPOCH) |
 | `seq` | `uint64` | count | this client's action counter, +1 per action, from 0 | cannot be missing | — |
 | `stamp` | `builtin_interfaces/Time` | s, ns | when the operator acted; the time of a MARK_GROUND_TRUTH mark | cannot be missing | `{0, 0}`: *invalid* here, unlike §1.4, because a mark needs its time |
 | `action` | `uint8` | enum | `ACTION_*` | cannot be missing | other value: *invalid* |
-| `event_id` | `uint64` | id | the target event for ACKNOWLEDGE, ACCEPT, DISMISS and LABEL; an event or `EVENT_NONE` for MARK_GROUND_TRUTH; `EVENT_NONE` for PAUSE, RESUME and REREFERENCE | `EVENT_NONE` | the wrong one of the two for the action: *invalid*; an id the node does not know: refused and logged |
-| `expected_state` | `uint8` | enum | the `ChangeEvent.STATE_*` the operator saw, when `event_id` is set; `STATE_NONE` when it is not | `STATE_NONE` | set when `event_id` is not, or the reverse: *invalid*. ACCEPT or DISMISS whose event is no longer in that state on the node, counting an accept not yet published: refused and logged |
+| `event_id` | `uint64` | id | the target event for ACKNOWLEDGE, ACCEPT, DISMISS, LABEL and CONFIRM; an event or `EVENT_NONE` for MARK_GROUND_TRUTH; `EVENT_NONE` for PAUSE, RESUME and REREFERENCE | `EVENT_NONE` | the wrong one of the two for the action: *invalid*; an id that is not open in this process: refused (UNKNOWN_EVENT) |
+| `expected_state` | `uint8` | enum | the `ChangeEvent.STATE_*` the operator saw, when `event_id` is set; `STATE_NONE` when it is not. CONFIRM expects CANDIDATE, ACCEPT expects CONFIRMED, DISMISS either | `STATE_NONE` | set when `event_id` is not, or the reverse, or a state the action cannot expect: *invalid*. An event no longer in that state on the node, counting an accept not yet published as ACCEPTED: refused (STATE_MISMATCH) |
+| `expected_generation` | `uint64` | id | the `publisher_generation` the operator saw (D34) | cannot be missing | `0`: *invalid*. Another generation than the node's: refused (STALE_GENERATION), so nothing sent before a restart acts on the new process |
 | `text` | `string` | — | UTF-8, no NUL, ≤ 256 bytes; the label for LABEL, the description for MARK_GROUND_TRUTH, an optional note otherwise | `""` = no text | empty on LABEL or MARK_GROUND_TRUTH: *invalid* |
 | `operator_id` | `string` | — | non-empty UTF-8, no NUL, ≤ 64 bytes; the name the operator gave the app | cannot be missing | empty: *invalid*. It is self-asserted, not authenticated |
-| `action_id` | `string` | — | a client-generated UUID, 36 lowercase characters | cannot be missing | other format: *invalid*. A repeated `action_id` is ignored, so a retried send acts once |
+| `action_id` | `string` | — | a client-generated UUID, 36 lowercase characters | cannot be missing | other format: *invalid*. A repeated `action_id` returns its first outcome and acts once |
 
 | action | target | effect on the Spark | what the Mac sees next |
 |---|---|---|---|
-| ACKNOWLEDGE | an event, any state | the event log records that the operator saw it; no state change | nothing on the wire in v1 |
-| ACCEPT | a CONFIRMED event | §4.2 "operator accept": CONFIRMED → ACCEPTED, the reference absorbs the change and `map_epoch` bumps | a delta or snapshot that carries the change, then the ACCEPTED transition with that message's `map_epoch` (§4.2) |
-| DISMISS | a CONFIRMED event | §4.2 "operator revert": CONFIRMED → REVERTED; the reference is unchanged | the REVERTED transition |
-| LABEL | an event | the event log stores `text` as the label of the event's region | nothing on the wire in v1 |
-| MARK_GROUND_TRUTH | an event, or none | the event log stores a ground-truth mark at `stamp` with `text`, for scoring | nothing on the wire |
-| PAUSE | the room | §4.1 any → PAUSED | `MemoryStatus.state` PAUSED |
-| RESUME | the room | §4.1 PAUSED → the state the guard check gives | `MemoryStatus.state` |
-| REREFERENCE | the room | re-baselining: §4.1 "operator re-references the room", RIG_MOVED → BUILDING; the new reference bumps `map_epoch`. §4.1 has no re-reference from other states, so there it is refused | `MemoryStatus.state` BUILDING, then a snapshot |
+| CONFIRM | a CANDIDATE event | §4.2 "operator confirm": CANDIDATE → CONFIRMED | the CONFIRMED transition |
+| DISMISS | a CANDIDATE or CONFIRMED event | §4.2 "operator dismiss": → REVERTED. The reference is unchanged. The change is **suppressed**: regions of its kind and shape there (a move's halves included) are dropped, until windows have seen the place back at the reference state `suppress_clear_windows` (30) times | the REVERTED transition |
+| ACCEPT | a CONFIRMED event | §4.2 "operator accept": CONFIRMED → ACCEPTED. Its sensor's reference absorbs the geometry the event's last transition published, written to disk at once. `map_epoch` bumps on the next due map message | a delta or snapshot that carries the change (empty for the non-map sensor, D30), then the ACCEPTED transition with that message's `map_epoch` (§4.2) |
+| ACKNOWLEDGE | an open event | logged; no state change | nothing on the wire |
+| LABEL, MARK_GROUND_TRUTH, PAUSE, RESUME, REREFERENCE | — | not implemented: refused (UNSUPPORTED), logged | nothing |
 
-- **No reply message.** The outcome is what the Spark already publishes. ACKNOWLEDGE, LABEL and MARK_GROUND_TRUTH change nothing on the wire, so other Macs do not see them in v1. Showing them would need a field in `ChangeEvent`, which is a breaking change.
-- **Compare-and-set.** `map_epoch` is compared with the epoch the node has published, not one it holds back. `expected_state` is compared with the node's own state of the event. That includes an accept whose ACCEPTED transition is still waiting for its map message (§4.2), so a second operator cannot dismiss an event that was already accepted. A refused action changes nothing. The node logs every action with its `action_id`, `operator_id`, arrival time and outcome.
-- **Validation is symmetric (D16).** The node drops an *invalid* action and logs it. The Mac's encoder refuses to write one.
+- **The response acknowledges.** `uint8 outcome` is the call's response: one of the outcome constants below. The effect is observed on the wire, as for `RequestSync` (D39). An action is finished by its transition, which may arrive before the response, after it, or without one.
 
-**Wire size.** 117 B for "lab" with an empty `text`, `operator_id` "trevor" and a 36-character `action_id`. Each string adds its UTF-8 length and up to 3 bytes of alignment.
+  | value | outcome | when |
+  |---|---|---|
+  | 0 | APPLIED | the action took effect, or a repeat of one that did |
+  | 1 | INVALID | did not decode or validate |
+  | 2 | WRONG_ROOM | another room |
+  | 3 | STALE_GENERATION | another process |
+  | 4 | STALE_EPOCH | an ACCEPT whose epoch is not the published one, or while another accept waits for its map |
+  | 5 | UNKNOWN_EVENT | not an open event of this process |
+  | 6 | STATE_MISMATCH | the event is no longer in `expected_state` |
+  | 7 | NOT_TRACKING | memory is not TRACKING |
+  | 8 | UNSUPPORTED | an action the node does not implement |
+  | 9 | STORAGE_FAILED | the durable write installed nothing; nothing changed; a retry may act |
+  | 10 | TARGET_CHANGED | the change is not what the operator saw: unmatched or without points in the channel's last window, not supported by that window's own evidence, or no longer the shape of its last published transition |
+  | 11 | RIG_UNSETTLED | an ACCEPT while the sensor's pose residual is unknown or above `learn_max_offset_m` (0.02 m), so a moved rig is never absorbed |
+
+- **Compare-and-set.** Every action names the generation it was made for. ACCEPT also names the published `map_epoch`, not one the node holds back. `expected_state` is compared with the node's own state of the event, an accept still waiting for its map counting as ACCEPTED. A refused action changes nothing.
+- **What an action acts on (D46).** Each open event keeps the geometry of its last published transition. CONFIRM publishes the current one, and DISMISS and ACCEPT use what was published, never geometry the operator was not shown. The tracker may refine an open region without a new transition, so CONFIRM and ACCEPT also need that region to still have the published shape.
+- **Durable first.** A dismiss writes the sensor's suppressions file, and an accept writes its reference, before anything changes in memory. A write that fails before its rename installs nothing and answers STORAGE_FAILED. If the file was installed but its directory could not be synced, the action applies: a restart reads the new file.
+- **Idempotent.** The node keeps the last 256 action ids with their outcomes. A repeat returns the first outcome and acts once, also when its payload differs (logged). STORAGE_FAILED is not kept, so a retry with the same id may act. After a restart, the generation fence refuses the retry. Once the ring has dropped an id, a retry is judged afresh: an event the first attempt moved on gives STATE_MISMATCH or UNKNOWN_EVENT, which the Mac reports as "outcome unknown", not as a refusal.
+- **Validation is symmetric (D16).** The node drops an *invalid* action (INVALID) and logs it. The Mac's encoder refuses to write one. Every action is logged with its `action_id`, `operator_id`, note and outcome.
+
+**Wire size.** 129 B for "lab" with an empty `text`, `operator_id` "trevor" and a 36-character `action_id` (`operator_action_le.hex`). Each string adds its UTF-8 length and up to 3 bytes of alignment.
 
 ### 3.7 `Activity`: transient motion next to the rig, 1 Hz
 
@@ -546,11 +560,13 @@ The Spark owns both machines. The Mac renders them. Event transitions are judged
 | from | to | trigger | Mac rendering of the new state |
 |---|---|---|---|
 | — | CANDIDATE | disagreement between the reference and recent layers where both have evidence that stays *settled* for `candidate_windows` (40) consecutive windows: each window's own evidence supports it (`fresh_min_voxels` 3 and `fresh_min_fraction` 0.5 of its voxels, both poses of a move), it keeps its shape (`stable_min_fraction` 0.9 of its voxels within `tolerance` of where they were when the count started, and back), and no activity region (§3.7) is within `activity_radius_m` (1.0 m). A stale window, a lost shape, nearby activity or a window without points starts the count again. Anything shorter sends nothing (D31, D33) | dashed outline, "candidate"; not counted as a change |
-| CANDIDATE | CONFIRMED | persists ≥ T_commit (start at 5 s; tuned in PR 2.3) | solid overlay; counted; arrow for MOVED |
+| CANDIDATE | CONFIRMED | operator confirm (D46); later also persists ≥ T_commit (start at 5 s; tuned in PR 2.3) | solid overlay; counted; arrow for MOVED |
+| CANDIDATE | REVERTED | operator dismiss (D46): the change is suppressed (§3.6) | removed from the overlay; history only |
 | CANDIDATE | EXPIRED | gone before T_commit (walk-through): no matching region for `expire_windows` (3) consecutive windows; superseded by a MOVED pairing; or memory left TRACKING for RIG_MOVED | removed from the overlay; history only |
 | CONFIRMED | ACCEPTED | operator accept; the reference absorbs it and `map_epoch` bumps. The Spark publishes ACCEPTED only after the `map_bricks` message that carries the change, with that message's `map_epoch` | history entry. Once the mirror's epoch is ≥ the event's `map_epoch`: overlay removed, and the map shows the new state. Until then: region outlined "accepted · map updating", not counted as a change |
-| CONFIRMED | REVERTED | the region returned to the reference state, or operator revert | removed; history only |
+| CONFIRMED | REVERTED | the region was *seen* back at the reference state: unmatched for `expire_windows` and a window's own evidence agrees with the reference over the published voxels (an appearance's voxels traversed free, a disappearance's occupied again, both for a move); or operator dismiss (D46) | removed; history only |
 
+- **CONFIRMED never expires** (D46). A confirmed region that is occluded, unobserved or only partly undone (a move with one half put back) stays CONFIRMED until it is seen back at the reference state or the operator acts. Losing it is not evidence that the scene is restored.
 - ACCEPTED, REVERTED and EXPIRED are terminal. Only CONFIRMED renders as a change. CANDIDATE renders as a candidate, and REVERTED or EXPIRED never render as a change.
 - An event's `kind` never changes. Moved pairing happens before confirmation: the paired CANDIDATEs go EXPIRED, and a new MOVED event starts at CANDIDATE (D17).
 - A Mac that connects mid-session accepts any state as the first one it sees for an `event_id`. The same holds for the first message about an `event_id` after a gap in `events` (§5): the transitions in between may be lost.
@@ -663,7 +679,7 @@ These extend the app's existing contract (missing ≠ zero, a running container 
 | MapBricks delta, 25 cm box added | ≤ 0.2 Hz, on reference change | 380 B (v2, from the measured 367 B legacy size) | < 0.1 KB/s |
 | MapBricks snapshot | TRACKING start, every `keyframe_period_s` (D29), and the answer to a request that cannot be replayed | 52,863–59,024 B (measured legacy, see below; v2 adds 8–15 B) | — |
 | RequestSync (Mac → Spark) | on (re)connect and on a gap | 84 B (exact; legacy 53 B) | — |
-| OperatorAction (Mac → Spark) | per operator action | 117 B (exact, for the §3.6 example) | — |
+| OperatorAction (Mac → Spark) | per operator action | 129 B (exact, for the §3.6 example; `operator_action_le.hex`) | — |
 | SyncEnd | one per answered request | 84 B with no ranges, + 16 B per range (+ 4 B padding per non-empty list; §3.8) | — |
 
 **Measured on the real 5-minute static recording** `static5m` (`spark/room_memory_cpp/PLAN.md`), both lidars, node defaults, the JT128's reference as the map, before protocol v2 (v2 adds 8 B per status, 12 B per activity and up to 15 B per map message): 0.89 KB/s mean over all room-memory topics. Tracking teaches the reference nothing (`learn_windows` 0), so there are no deltas, and Trevor's motion next to the rig is activity, not events.
@@ -800,6 +816,7 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **D25. `OperatorAction`** (PR #13; Phase 3's P6). It needs Trevor's and Codex's review. §3.6 defines it, with `ros/labcommand_msgs/msg/OperatorAction.msg`.
   - The actions asked for (acknowledge, dismiss, re-baseline, label) and Phase 3's earlier list map onto the existing transitions. Acknowledge and label are log-only. Dismiss is §4.2's "operator revert". Re-baseline is §4.1's "operator re-references the room". Pause and resume are §4.1's operator pause and resume. Accept is §4.2's "operator accept". Mark ground truth is for PR 3.2's scoring.
   - The common fields serve as the header, not `std_msgs/Header` (D2).
+  - *Amended by D46:* `ACTION_CONFIRM` and `expected_generation`, the service, and DISMISS of a CANDIDATE.
   - `operator_id` is self-asserted. Neither the bridge's client-publish path nor Phase 3's ssh relay can tell which person sent an action.
   - **ACCEPTED follows its map message** (§4.2). If ACCEPTED went out first, every Mac would remove the overlay while its map still lacked the change. A delta can wait 5 s for the 0.2 Hz slot (§2), and longer behind Phase 3's byte bucket (`docs/phase3-live-integration.md` §3.3). So the node publishes ACCEPTED right after the message that carries the change. The Mac also removes the overlay only once its mirror's epoch is ≥ the event's `map_epoch`. `expected_state` is compared with the node's own state, so an accept still waiting for its map message cannot also be dismissed.
   - Open: re-referencing outside RIG_MOVED, and showing labels and acknowledgements on other Macs. Both would change §4.1 or `ChangeEvent`.
@@ -829,10 +846,23 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **D37. The generation-scoped mirror** (supersedes D23's restart cases and its residual). One active generation state, installed on the first validated message of a higher generation (a deviation from Astra's table, which quarantined messages until the generation's status: installing early loses nothing, PLAN-PUBGEN §4.5), retrieval by token and manifest, and the `EventHistory` projection (coverage, freshness, continuity, caughtUp). Legacy wire: shown, unverified, never current, no requests. PLAN-PUBGEN §4.4 lists the invariants; the Swift runner checks them after every input of 2,000 seeded traces against an independent reference model, with the ten Codex findings and Astra's pair as regression seeds (PLAN-PUBGEN §6).
 - **D38. `Activity` and `Epoch` carry the publisher generation** (the PR #18 follow-up to D34). Both are transient_local, and their `seq` restarts at 0 with each process. So `seq` alone cannot tell a restarted node's message from a stored copy: a Mac holding `Activity` seq 50 of the old run would drop the new run's 0, 1, … as copies until they passed 50. Like every Spark → Mac message, they now end with `uint64 publisher_generation` (padding to 8, then 8 bytes; layout from the trailing bytes, §1.1), and the Mac scopes them to the generation (§5.3). They never fix a connection's layout: a PR #18 node publishes v2 status, map and events next to legacy `Activity`, whose stored transient_local copy usually arrives first, and letting it decide would run the Mac in legacy mode against a v2 node. Rollout as D34, the Mac first: against a PR #18 node it drops the legacy `Activity` and counts it, which costs nothing it showed before. `Epoch` gets the field before any node publishes it, so it is never deployed without it.
 - **D39. `RequestSync` is a service call through the :8767 bridge** (issue #21). Live on c5518eb the bridge offered `connectionGraph` only, so the Mac could not send `RequestSync` and an event gap stayed open ("history incomplete · no request path"). Client publishing cannot be turned on safely: foxglove_bridge does not enforce `client_topic_whitelist` (3.4.1 through 3.6.2), so a client could publish on any topic. The bridge does enforce `service_whitelist` (it advertises, and lets a client call, only matching services). So both nodes offer `/room_memory/sync/request`, type `labcommand_msgs/srv/RequestSync` (request: one `RequestSync request`; response: `bool accepted`, false when it did not decode or names another room), and the launch file gives the bridge `services` with `service_whitelist` `^/room_memory/sync/request$`. The whitelist must be set: its default is `.*`, which would expose every node's parameter services. The request is one nested `RequestSync`, so its CDR has the message's layout, and the Mac sends its `RequestSync` bytes as the call payload (encoding `cdr`, ws-protocol binary op 0x02). The answer still goes out on the sync topics with its `SyncEnd`: the response is an acknowledgement, not the answer, so D36 is unchanged. The `request_sync` topic stays for a relay. Rollout: the Mac first (against an older node it finds no service and reports "no request path" as before), then the room-memory image. This answers Q5 for `RequestSync` on the :8767 option; `OperatorAction` and the :8765 option stay open.
+- **D46. Operator actions: confirm, dismiss, accept** (§3.6, §4.2). The Mac sends an `OperatorAction` as the request of the node's `/room_memory/operator/action` service (`labcommand_msgs/srv/OperatorAction`: one action in, `uint8 outcome` back), the D39 pattern. The response acknowledges; the effect is the Spark's next transition or map message.
+  - **Message.** `ACTION_CONFIRM` (8) and `uint64 expected_generation` are added after `expected_state`, so an action sent before a restart cannot act on the new process (the §3.6 hazard D25 left open). It has no legacy layout and is 129 B for the §3.6 example.
+  - **Opt-in.** The node offers the service, and the bridge whitelists it, only with `operator_actions:=true` (default off). It changes durable state through a port without authentication (Q6). The `/room_memory/operator` topic, for a relay, is behind the same flag: without it the node does not subscribe, because any peer on the ROS domain could publish there (review of PR #31). A relay therefore needs `operator_actions:=true` too.
+  - **Lifecycle.**
+    - CONFIRM is the only path to CONFIRMED until T_commit.
+    - DISMISS also applies to a CANDIDATE (a new §4.2 row). It stores a durable per-sensor suppression (`<state_dir>/<room_id>/suppressed-<sensor>`). The suppression drops regions of the dismissed kind and shape (a move's halves included) and lifts after `suppress_clear_windows` (30) windows that saw the place back at the reference state. A different shape at the same place still alerts. A start without references removes the file.
+    - ACCEPT absorbs the geometry the event's last transition published into its sensor's reference, written at once. The ACCEPTED is held until a map message built from that reference is published, and retried on the next due tick if the map save fails.
+    - CONFIRMED never expires. It reverts only when seen back at the reference state.
+  - **Gates.** Each event action needs TRACKING, the open event in the shown state and, for CONFIRM and ACCEPT, the region still matched in its sensor's last window with points and still the published shape. That window must also, on its own, support the target (the current region for CONFIRM, the published one for ACCEPT) with the `fresh_min_voxels` / `fresh_min_fraction` thresholds: occupied where it appeared, traversed where it disappeared, both poses of a move. A match alone is not enough, because the recent layer keeps a region matched for `recent_windows` windows after the object left or went out of view. ACCEPT also needs the published `map_epoch`, no other accept waiting, and a pose residual ≤ `learn_max_offset_m`. Once rig-guard (D40–D43) lands, its CHECKING and RIG_MOVED states refuse too.
+  - **Durability.** The effect is durable before it is committed. A write that installs nothing answers STORAGE_FAILED and changes nothing. A failed suppression lift is retried every window. Every `ChangeEvent` the engine returns, from `close_window`, `operate` or `accepted_after_map`, is logged before the call returns, so a durable event log (D45) commits at the end of each of these calls, not only `close_window`. The order is: effect durable, then the event logged and committed, then returned and published.
+  - **Idempotence.** The last 256 action ids answer from memory; the generation fence covers a retry across a restart.
+  - **The Mac.** It changes no mirror state on send. It follows each action until its transition arrives. A timeout, a disconnect, a bridge failure, an unreadable answer or a restart makes the outcome *unknown*. A retry repeats the same id, in the same generation only.
+  - **Rollout.** The Mac first: against a node without the service it hides nothing and disables the buttons ("this Spark can't take actions"). Then the image, with the flag off. Turning it on is Trevor's decision.
 
 ## 9. Verification status
 
-- **Hand goldens.** `Tests/Fixtures/room/golden/hand/*.hex` were written byte by byte from these rules, with every span annotated. There are 27, the same files in `spark/room_memory/tests/fixtures/hand`: the 14 legacy ones (11 little endian and 3 big endian, covering §3.1–§3.5 and two `Activity`s, active and idle with NaN geometry), and 13 protocol v2 ones (9 little endian, 4 big endian: `MemoryStatus`, `MapBricks` LE/BE, `ChangeEvent` with and without a mask, `RequestSync` LE/BE, three `SyncEnd`s, `Epoch` LE/BE and `Activity`), each v2 one repeating its legacy twin's values with the new fields appended and one publisher generation throughout. `OperatorAction` has none: it is out of scope for protocol v2 (§3.6). `scripts/check-shared-goldens.sh` requires every shared file to be identical in both fixture directories. Swift, Python and C++ decode all 27. The tests check:
+- **Hand goldens.** `Tests/Fixtures/room/golden/hand/*.hex` were written byte by byte from these rules, with every span annotated. There are 30, the same files in `spark/room_memory/tests/fixtures/hand`: the 14 legacy ones (11 little endian and 3 big endian, covering §3.1–§3.5 and two `Activity`s, active and idle with NaN geometry), and 13 protocol v2 ones (9 little endian, 4 big endian: `MemoryStatus`, `MapBricks` LE/BE, `ChangeEvent` with and without a mask, `RequestSync` LE/BE, three `SyncEnd`s, `Epoch` LE/BE and `Activity`), each v2 one repeating its legacy twin's values with the new fields appended and one publisher generation throughout, and 3 `OperatorAction` ones (D46: an accept and a dismiss with a note little endian, a confirm big endian). `scripts/check-shared-goldens.sh` requires every shared file to be identical in both fixture directories. Swift, Python and C++ decode all 30. The tests check:
   - The Swift decoder reads the 14 legacy goldens to the expected values. The big-endian `MapBricks` golden has a little-endian payload inside a big-endian message.
   - The encoder reproduces the 9 uncompressed little-endian legacy goldens exactly, and every little-endian v2 one.
   - For the zlib and LZFSE goldens, which hold a hand-built stored block and an uncompressed LZFSE block:
@@ -847,16 +877,21 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **No independent CDR cross-check yet.** No offline ROS 2 CDR library (`rosbags`, `mcap_ros2`) is installed on this Mac, and none was installed for this PR. So the hand goldens have only been checked against the Swift codec, which follows the same rules.
 - **Spark goldens: not produced.** `scripts/spark/make_room_memory_goldens.py` serializes the 9 little-endian v2 values with `rclpy` after a `colcon build` of `labcommand_msgs` in the Jazzy container. Running it is a Spark task. The follow-up test then requires each Spark file to decode to the same value as its hand golden, which confirms D4.
 - **`colcon build` of `labcommand_msgs`: not run.** There is no ROS 2 on the Mac.
-- **`OperatorAction` (§3.6, D25): out of scope for protocol v2, the `.msg` only.** There is no codec in Swift, Python or C++, no hand golden and no node handler, by decision (§3.6): they are Phase 3 stage S5, together with the generation question. The 117 B wire size was computed by hand from §1.1, not encoded.
+- **`OperatorAction` (§3.6, D46): implemented.**
+  - The Swift, Python and C++ codecs decode its three goldens, reproduce the two little-endian ones (129 B for the §3.6 example), and refuse the same D16 rules.
+  - The engine (`operator.cpp`, `operator.py`) has unit tests in both languages, write faults injected before and after the rename included. The differential suite drives confirm → accept, dismiss → suppress → lift, a restart with suppressions, every refusal, an accept across a keyframe, and the confirmed lifecycle through both engines, byte for byte, state files included.
+  - The Mac's client, outcome model and buttons are tested against a fake bridge.
+  - Not run here: both nodes' service wiring and the `.srv` generation, which need ROS 2.
 - **Protocol v2 (D34–D38): implemented** in the Python oracle, the C++ node and the Swift codec and mirror. The Python, C++ and Swift codecs decode every v2 golden and reproduce the little-endian ones. The differential tests compare Python and C++ byte for byte, `SyncEnd`s included, on every §5.2 answer case, a session across two generations, and the legacy `RequestSync` answer. The ROS node wiring (`node.py`, `room_memory_node.cpp`) needs ROS 2 and was not run on the Mac.
 - **The Spark side of §5 is implemented** in `spark/room_memory_cpp` (the node) and in the Python oracle `spark/room_memory`. Both nodes declare D24's durability on every topic; the rclpy test for it (`test_node.py`) and the C++ node need ROS 2 and were not run on the Mac. Not implemented: the `epoch` topic (§2). D39 (issue #21) was checked in a local build of the image (colcon build and test, then `test_node.py` in the container) and end to end against its foxglove_bridge 3.6.0: the bridge advertised only `/room_memory/sync/request` of the container's 16 services, and `LiveRoomClient` called it and received the node's `SyncEnd`. The deployed Spark runs the image from before D39 until it is rebuilt, so the Mac there still has no request path (§5.3).
 
-## 10. Open questions for Trevor (brief §5, Q1–Q4, and Q5)
+## 10. Open questions for Trevor (brief §5, Q1–Q4, Q5 and Q6)
 
-Q1–Q4 are copied from the brief and left unanswered. Q5 was added by PR #14.
+Q1–Q4 are copied from the brief and left unanswered. Q5 was added by PR #14, Q6 by D46.
 
 1. **Is the rig static for v1?** If it will move between sessions, relocalization (and place recognition) moves from optional to required.
 2. **Room and targets:** room size, smallest object that must be detected (5 cm? 10 cm?), acceptable latency (seconds vs minutes), acceptable false events per hour. These set voxel size, T_commit and the PR 3.2 bar.
 3. **HDC's role.** Your own record (exp119/122/123, exp113, D-33) says a superposed memory is not a cheaper map, and HDC is parked. Should the app be HDC-free with HDC kept only as an optional RT3 comparison, or do you want to reopen HDC? This brief assumes the former.
 4. **Fixtures:** may the 12 Oct box takes (`*ROBOT_box_*`, `*speedybee_box_*` on the Spark) be copied to the Mac as golden fixtures? This brief did not access the Spark.
-5. **Transport (D28).** A dedicated foxglove_bridge on :8767 in the room-memory container, or the existing bridge on :8765 with requests relayed over the ssh-authenticated command-center API on :8766? Both stay in this doc until you choose (§2). For `RequestSync` on :8767, D39 (issue #21) chose a whitelisted service call, not client publishing; a relay still works through `requestSyncSink` if you prefer :8766.
+5. **Transport (D28).** A dedicated foxglove_bridge on :8767 in the room-memory container, or the existing bridge on :8765 with requests relayed over the ssh-authenticated command-center API on :8766? Both stay in this doc until you choose (§2). For `RequestSync` on :8767, D39 (issue #21) chose a whitelisted service call, not client publishing; a relay still works through `requestSyncSink` if you prefer :8766. D46 does the same for `OperatorAction`, behind `operator_actions:=true`, which also gates the relay's `operator` topic.
+6. **Operator actions on an unauthenticated port (D46).** The `/room_memory/operator/action` service and the `/room_memory/operator` subscription ship off. Turn it on for the tailnet-bound :8767 bridge, or wait for the ssh relay (P11)? Also open: is Confirm → Accept (two steps) the right accept flow, is `suppress_clear_windows` = 30 a good default, and should `operator_id` come from a Settings field (it is the macOS user name, or the `operatorName` default)?

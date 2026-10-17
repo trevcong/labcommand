@@ -6,6 +6,9 @@
 references, ``map_epoch`` and the publisher generation), and an empty or missing one stops the node;
 an empty ``map_sensor`` publishes the JT128's reference when it is configured, else the first
 sensor's. The defaults are ``MemoryConfig``'s, measured on the static recording.
+``operator_actions:=true`` (off by default) has the node subscribe to ``/room_memory/operator`` and
+offer ``/room_memory/operator/action`` (protocol D46); without it neither exists, because an
+operator action changes durable state and no caller on the ROS domain is authenticated.
 """
 
 from launch import LaunchDescription
@@ -42,16 +45,23 @@ ARGUMENTS = {
     "delta_period_s": ("5.0", float),
     "keyframe_period_s": ("60.0", float),
     "keyframe_delta_ratio": ("0.5", float),
+    "suppress_clear_windows": ("30", int),
+}
+
+# Node parameters that are not MemoryConfig fields (ARGUMENTS mirrors MemoryConfig exactly).
+NODE_ARGUMENTS = {
+    # The operator topic and service change durable state: off unless asked (D46).
+    "operator_actions": ("false", bool),
 }
 
 
 def generate_launch_description():
     parameters = {
         name: ParameterValue(LaunchConfiguration(name), value_type=kind) if kind else LaunchConfiguration(name)
-        for name, (_, kind) in ARGUMENTS.items()
+        for name, (_, kind) in {**ARGUMENTS, **NODE_ARGUMENTS}.items()
     }
     return LaunchDescription(
-        [DeclareLaunchArgument(name, default_value=default) for name, (default, _) in ARGUMENTS.items()]
+        [DeclareLaunchArgument(name, default_value=default) for name, (default, _) in {**ARGUMENTS, **NODE_ARGUMENTS}.items()]
         + [Node(package="room_memory", executable="room_memory_node", name="room_memory", output="screen",
                 parameters=[parameters])]
     )

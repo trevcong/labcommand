@@ -268,10 +268,49 @@ SyncEnd sync_end_map_replay() {
     return e;
 }
 
+// The operator goldens (D46): an accept of event (kG << 20) + 3 as the section 3.6 example, a
+// dismiss with a note, and a confirm (big endian, decode-only).
+constexpr std::uint64_t kOperatorEvent = (kG << 20) + 3;
+
+OperatorAction operator_accept() {
+    OperatorAction a;
+    a.header = head("lab", 43, 0);
+    a.action = OperatorActionKind::accept;
+    a.event_id = kOperatorEvent;
+    a.expected_state = EventState::confirmed;
+    a.expected_generation = kG;
+    a.operator_id = "trevor";
+    a.action_id = "0e8a3b5c-7721-4d90-b406-5913c2ae6f01";
+    return a;
+}
+
+OperatorAction operator_dismiss() {
+    OperatorAction a;
+    a.header = head("lab", 43, 1, Time{1760400012, 0});
+    a.action = OperatorActionKind::dismiss;
+    a.event_id = kOperatorEvent + 1;
+    a.expected_state = EventState::candidate;
+    a.expected_generation = kG;
+    a.text = "left on purpose";
+    a.operator_id = "astra";
+    a.action_id = "5a1e7c3d-9b02-4f61-8e33-c4d5e6f70819";
+    return a;
+}
+
+OperatorAction operator_confirm() {
+    OperatorAction a = operator_accept();
+    a.header = head("lab", 43, 2, Time{1760400011, 500000000});
+    a.action = OperatorActionKind::confirm;
+    a.expected_state = EventState::candidate;
+    return a;
+}
+
 // The v2 field a legacy cut lacks: publisher_generation, or RequestSync.expected_generation.
 template <typename T>
 std::optional<std::uint64_t> generation_of(const T& value) {
     if constexpr (std::is_same_v<T, RequestSync>) {
+        return value.expected_generation;
+    } else if constexpr (std::is_same_v<T, OperatorAction>) {
         return value.expected_generation;
     } else if constexpr (std::is_same_v<T, SyncEnd>) {
         return value.publisher_generation;
@@ -331,6 +370,9 @@ const std::map<std::string, Golden>& goldens() {
         {"epoch_v2_le.hex", golden<Epoch>(epoch_v2, true)},
         {"epoch_v2_be.hex", golden<Epoch>(epoch_v2, false)},
         {"activity_v2_le.hex", golden<Activity>(activity_v2, true)},
+        {"operator_action_le.hex", golden<OperatorAction>(operator_accept, true)},
+        {"operator_action_text_le.hex", golden<OperatorAction>(operator_dismiss, true)},
+        {"operator_action_be.hex", golden<OperatorAction>(operator_confirm, false)},
     };
     return table;
 }
@@ -397,7 +439,7 @@ TEST(every_hand_golden_is_covered) {
         CHECK(goldens().count(entry.path().filename().string()) == 1);
     }
     CHECK_EQ(files, goldens().size());
-    CHECK_EQ(files, std::size_t{27});
+    CHECK_EQ(files, std::size_t{30});
 }
 
 TEST(hand_goldens_match_the_swift_copies) {
@@ -823,6 +865,93 @@ TEST(sync_end_sizes_and_patches) {
     data = hexfile("sync_end_events_empty_le.hex");
     std::memset(data.data() + 4 + 32, 0, 8);
     CHECK_THROWS_MATCH(Invalid, "GENERATION_UNKNOWN", SyncEnd::from_cdr(data));
+}
+
+// MARK: OperatorAction (D46)
+
+TEST(operator_action_sizes) {
+    CHECK_EQ(operator_accept().to_cdr().size(), std::size_t{129});
+    CHECK_EQ(operator_dismiss().to_cdr().size(), std::size_t{141});
+    CHECK(OperatorAction::from_cdr(operator_confirm().to_cdr()) == operator_confirm());
+}
+
+// One case per validation rule (D16): the encoder refuses each, and the decoder rejects the
+// golden patched to the same value.
+TEST(operator_action_rejections) {
+    const std::vector<std::function<void(OperatorAction&)>> changes = {
+        [](OperatorAction& a) { a.header.stamp = Time{0, 0}; },
+        [](OperatorAction& a) { a.action = static_cast<OperatorActionKind>(9); },
+        [](OperatorAction& a) { a.expected_state.reset(); },
+        [](OperatorAction& a) { a.event_id.reset(); },
+        [](OperatorAction& a) { a.event_id = kEventNone; },
+        [](OperatorAction& a) { a.expected_state = static_cast<EventState>(5); },
+        [](OperatorAction& a) { a.expected_state = EventState::candidate; },  // ACCEPT needs CONFIRMED
+        [](OperatorAction& a) {
+            a.action = OperatorActionKind::confirm;  // CONFIRM needs CANDIDATE
+        },
+        [](OperatorAction& a) {
+            a.action = OperatorActionKind::dismiss;
+            a.expected_state = EventState::expired;
+        },
+        [](OperatorAction& a) {
+            a.action = OperatorActionKind::pause;  // room-level with an event
+        },
+        [](OperatorAction& a) {
+            a.action = OperatorActionKind::label;  // LABEL needs text
+            a.expected_state = EventState::candidate;
+        },
+        [](OperatorAction& a) { a.expected_generation = kGenerationUnknown; },
+        [](OperatorAction& a) { a.text = std::string(257, 'x'); },
+        [](OperatorAction& a) { a.text = "a\xff"; },
+        [](OperatorAction& a) { a.text = std::string("a\0b", 3); },
+        [](OperatorAction& a) { a.operator_id = ""; },
+        [](OperatorAction& a) { a.operator_id = std::string(65, 'x'); },
+        [](OperatorAction& a) { a.action_id = "0E8A3B5C-7721-4D90-B406-5913C2AE6F01"; },
+        [](OperatorAction& a) { a.action_id = "0e8a3b5c77214d90b4065913c2ae6f01"; },
+        [](OperatorAction& a) { a.action_id = "0e8a3b5c-7721-4d90-b406-5913c2ae6f0g"; },
+        [](OperatorAction& a) { a.header.room_id = ""; },
+    };
+    for (const auto& change : changes) {
+        OperatorAction a = operator_accept();
+        change(a);
+        CHECK_THROWS(Invalid, a.to_cdr());
+    }
+    // Limits are inclusive.
+    OperatorAction a = operator_accept();
+    a.text = std::string(256, 'x');
+    a.operator_id = std::string(64, 'y');
+    CHECK(OperatorAction::from_cdr(a.to_cdr()) == a);
+    // Room-level actions carry EVENT_NONE and STATE_NONE; MARK_GROUND_TRUTH may name an event or none.
+    a = operator_accept();
+    a.action = OperatorActionKind::rereference;
+    a.event_id.reset();
+    a.expected_state.reset();
+    CHECK(OperatorAction::from_cdr(a.to_cdr()) == a);
+    const Bytes room = a.to_cdr();
+    CHECK(slice(room, 4 + 40, 4 + 48) == Bytes(8, 0xFF));
+    CHECK_EQ(room[4 + 48], std::uint8_t{0xFF});
+    a.action = OperatorActionKind::mark_ground_truth;
+    a.text = "chair moved at 12:00";
+    CHECK(OperatorAction::from_cdr(a.to_cdr()) == a);
+    // The decoder: patched goldens.
+    Bytes data = hexfile("operator_action_le.hex");
+    data[4 + 32] = 9;
+    CHECK_THROWS_MATCH(Invalid, "action", OperatorAction::from_cdr(data));
+    data = hexfile("operator_action_le.hex");
+    data[4 + 48] = 0xFF;  // STATE_NONE with an event
+    CHECK_THROWS_MATCH(Invalid, "both set", OperatorAction::from_cdr(data));
+    data = hexfile("operator_action_le.hex");
+    data[4 + 48] = 7;
+    CHECK_THROWS(Invalid, OperatorAction::from_cdr(data));
+    data = hexfile("operator_action_le.hex");
+    std::memset(data.data() + 4 + 56, 0, 8);
+    CHECK_THROWS_MATCH(Invalid, "GENERATION_UNKNOWN", OperatorAction::from_cdr(data));
+    data = hexfile("operator_action_le.hex");
+    std::memset(data.data() + 4 + 24, 0, 8);
+    CHECK_THROWS_MATCH(Invalid, "stamp", OperatorAction::from_cdr(data));
+    data = hexfile("operator_action_le.hex");
+    data[4 + 88] = 'A';
+    CHECK_THROWS_MATCH(Invalid, "UUID", OperatorAction::from_cdr(data));
 }
 
 TEST(room_id_must_be_utf8) {

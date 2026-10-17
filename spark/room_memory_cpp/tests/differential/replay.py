@@ -1,6 +1,9 @@
 """The Python oracle side of ``room_memory_replay``: runs the same script through
 ``room_memory.memory.RoomMemory`` and prints the same lines (see tools/replay.cpp).
 
+``operator <sec> <nanosec> <hex>`` prints ``operator <OUTCOME>`` and the action's ``event`` lines;
+``map`` adds an ``event`` line per ACCEPTED it released.
+
 ``start <sec> <nanosec> [generation]``: the generation defaults to the start time in ms (at least
 1), the allocator's wall-clock floor, so successive starts take rising generations. ``sync``
 prints ``sync <n>``, the answer's messages as ``data`` lines, then ``end <SyncEnd hex>`` (``end
@@ -12,13 +15,14 @@ import pathlib
 import numpy as np
 
 from room_memory.memory import MemoryConfig, RoomMemory
-from room_memory.messages import CDRError, RequestSync, Time
+from room_memory.messages import CDRError, OperatorAction, RequestSync, Time
 
 _FLOATS = {"voxel_size", "window_s", "occupied_min_ratio", "free_max_ratio", "learn_max_offset_m",
            "fresh_min_fraction", "stable_min_fraction", "activity_radius_m", "delta_period_s",
            "keyframe_period_s", "keyframe_delta_ratio"}
 _INTS = {"tolerance", "min_voxels", "min_extent", "reference_windows", "recent_windows", "occupied_min_hits",
-         "free_min_seen", "candidate_windows", "expire_windows", "learn_windows", "fresh_min_voxels"}
+         "free_min_seen", "candidate_windows", "expire_windows", "learn_windows", "fresh_min_voxels",
+         "suppress_clear_windows"}
 
 
 def _config(fields, pair):
@@ -80,8 +84,20 @@ def run(script):
         elif command == "activity":
             out.append(f"activity {memory.activity(Time(int(args[0]), int(args[1]))).to_cdr().hex()}")
         elif command == "map":
-            message = memory.map_update(Time(int(args[0]), int(args[1])))
+            stamp = Time(int(args[0]), int(args[1]))
+            message = memory.map_update(stamp)
             out.append(f"map {'none' if message is None else message.hex()}")
+            if message is not None:
+                out += [f"event {event.to_cdr().hex()}" for event in memory.accepted_after_map(stamp)]
+        elif command == "operator":
+            try:
+                action = OperatorAction.from_cdr(bytes.fromhex(args[2]))
+            except CDRError:
+                out.append("operator INVALID")
+            else:
+                outcome, events, _, _ = memory.operate(action, Time(int(args[0]), int(args[1])))
+                out.append(f"operator {outcome.name}")
+                out += [f"event {event.to_cdr().hex()}" for event in events]
         elif command == "sync":
             try:
                 answer = memory.sync(RequestSync.from_cdr(bytes.fromhex(args[2])), Time(int(args[0]), int(args[1])))

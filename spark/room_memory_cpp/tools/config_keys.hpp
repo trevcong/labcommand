@@ -85,6 +85,8 @@ inline void configure(MemoryConfig& config, const std::string& key, const std::s
         config.keyframe_period_s = real(value);
     } else if (key == "keyframe_delta_ratio") {
         config.keyframe_delta_ratio = real(value);
+    } else if (key == "suppress_clear_windows") {
+        config.suppress_clear_windows = integer(value);
     } else {
         throw std::runtime_error("unknown config key " + key);
     }
