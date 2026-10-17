@@ -15,6 +15,7 @@ import re
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 CPP_LAUNCH = ROOT / "spark/room_memory_cpp/launch/room_memory_cpp.launch.py"
 REQUEST_SERVICE = "/room_memory/sync/request"
+NAME_OBJECT_SERVICE = "/room_memory/objects/name"
 
 
 def _module_constants(path):
@@ -52,13 +53,19 @@ def test_bridge_offers_the_request_service():
     assert parameters["capabilities"] == "ParameterValue(capabilities, value_type=List[str])"
 
 
-def test_service_whitelist_admits_only_the_request_service():
+def test_service_whitelist_admits_the_request_and_name_services():
     # The bridge's default is ".*": every node's services, parameter services included.
-    (pattern,) = _module_constants(CPP_LAUNCH)["BRIDGE_SERVICE_WHITELIST"]
-    assert re.fullmatch(pattern, REQUEST_SERVICE)
+    patterns = _module_constants(CPP_LAUNCH)["BRIDGE_SERVICE_WHITELIST"]
+    assert patterns == ["^/room_memory/sync/request$", "^/room_memory/objects/name$"]
+    assert _module_constants(CPP_LAUNCH)["NAME_OBJECT_SERVICE"] == NAME_OBJECT_SERVICE
+    assert re.fullmatch(patterns[0], REQUEST_SERVICE)
+    assert re.fullmatch(patterns[1], NAME_OBJECT_SERVICE)
+    assert not re.fullmatch(patterns[0], NAME_OBJECT_SERVICE)
+    assert not re.fullmatch(patterns[1], REQUEST_SERVICE)
     for other in ("/room_memory/sync/request_x", "/x/room_memory/sync/request", "/room_memory/request_sync",
-                  "/room_memory/set_parameters", "/hesai_ros_driver_node/set_parameters", "/lidar/sync/request"):
-        assert not re.search(pattern, other), other
+                  "/room_memory/set_parameters", "/hesai_ros_driver_node/set_parameters", "/lidar/sync/request",
+                  "/room_memory/objects/name_x", "/room_memory/objects/rename", "/x/room_memory/objects/name"):
+        assert not any(re.search(pattern, other) for pattern in patterns), other
 
 
 def test_client_publish_stays_opt_in():
