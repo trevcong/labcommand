@@ -11,7 +11,9 @@
 // float measurement is an empty optional here and NaN on the wire.
 //
 // Protocol v2 appends fields at the end of MemoryStatus, MapBricks, ChangeEvent, Epoch, Activity,
-// RequestSync and RhythmMinute (protocol 1.4, 3). The layout comes from the bytes after the last legacy field: at most 3 is a
+// RequestSync and RhythmMinute (protocol §1.4, §3.9, D44). RhythmMinute skips the common header:
+// sensor (1 Mid-360, 2 JT128) is the field after room_id, then map_epoch, seq and stamp.
+// The layout comes from the bytes after the last legacy field: at most 3 is a
 // legacy message, padding to 8 then exactly the v2 fields (then at most 3) is v2, and anything else
 // is invalid. publisher_generation (and the RequestSync v2 fields) are empty for the legacy layout;
 // the encoders write it only when they hold one.
@@ -91,7 +93,7 @@ struct Time {
     void validate(const std::string& what) const;
 };
 
-// The four common fields that start every labcommand_msgs message.
+// The four common fields that start every labcommand_msgs message except RhythmMinute (D44).
 struct Header {
     std::string room_id;
     std::uint64_t map_epoch = 0;
@@ -221,8 +223,9 @@ struct Activity {
     static Activity from_cdr(std::span<const std::uint8_t> data);
 };
 
-// One minute of per-lidar region occupancy on /room_memory/rhythm. sensor is the file-header
-// code (1 Mid-360, 2 JT128). Region arrays are strictly increasing in signed (ix, iy, iz).
+// One minute of per-lidar region occupancy on /room_memory/rhythm (protocol §3.9, D44).
+// It skips the common header: sensor (1 Mid-360, 2 JT128) is the field after room_id.
+// Region arrays are strictly increasing in signed (ix, iy, iz).
 // publisher_generation is empty for the legacy layout; the .rhy file does not carry it.
 struct RhythmMinute {
     std::string room_id;

@@ -145,7 +145,7 @@ public:
         // a copy delivered again repeats its seq in its generation. Everything else is volatile: the Mac
         // gets the map and recent events by RequestSync, and a restarted node never receives an old
         // request. Rhythm, when published, is transient_local with one stored minute per configured
-        // sensor. Depth 1 would leave a late subscriber the newest sensor only. Same QoS as node.py.
+        // sensor (D44). Depth 1 would leave a late subscriber the newest sensor only. Same QoS as node.py.
         const auto volatile_qos = [](std::size_t depth) { return rclcpp::QoS(depth).reliable().durability_volatile(); };
         const auto latched_qos = [](std::size_t depth = 1) {
             return rclcpp::QoS(rclcpp::KeepLast(depth)).reliable().transient_local();

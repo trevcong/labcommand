@@ -115,7 +115,7 @@ class RoomMemoryNode(Node):
         # a copy delivered again repeats its seq in its generation. Everything else is volatile: the Mac
         # gets the map and recent events by RequestSync, and a restarted node never receives an old
         # request. Rhythm, when published, is transient_local with one stored minute per configured
-        # sensor. Depth 1 would leave a late subscriber the newest sensor only. Same QoS as the C++ node.
+        # sensor (D44). Depth 1 would leave a late subscriber the newest sensor only. Same QoS as the C++ node.
         def volatile(depth):
             return QoSProfile(depth=depth, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
 

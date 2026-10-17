@@ -1,7 +1,9 @@
 """CDR codecs for the ``labcommand_msgs`` room-memory messages, with no ROS imports.
 
 The contract is ``docs/ROOM-MEMORY-PROTOCOL.md`` (Phase 0 branch). ``RhythmMinute`` is the
-rhythm-log record in ``PLAN-RHYTHM.md``: the same CDR rules, with sensor code 1 or 2. Classic CDR (XCDR1):
+rhythm-log record in ``PLAN-RHYTHM.md`` (protocol §3.9, D44). It skips the common header:
+``sensor`` (1 Mid-360, 2 JT128) is the field after ``room_id``, then ``map_epoch``, ``seq``
+and ``stamp``. Classic CDR (XCDR1):
 4-byte encapsulation header (``00 01`` little endian, ``00 00`` big endian), every primitive
 aligned to its own size counted from the byte after the header, strings as a ``uint32``
 length that includes the NUL, ``T[]`` as a ``uint32`` count, nested messages without
@@ -11,7 +13,7 @@ exactly what ``from_cdr`` rejects. Float fields hold binary32 values; a missing 
 measurement is ``None`` here and NaN on the wire.
 
 Protocol v2 appends fields at the end of ``MemoryStatus``, ``MapBricks``, ``ChangeEvent``,
-``Epoch``, ``Activity``, ``RequestSync`` and ``RhythmMinute`` (protocol §1.4, §3, D38). The layout comes from the bytes after the last legacy field:
+``Epoch``, ``Activity``, ``RequestSync`` and ``RhythmMinute`` (protocol §1.4, §3.9, D38, D44). The layout comes from the bytes after the last legacy field:
 at most 3 is a legacy message, padding to 8 then exactly the v2 fields (then at most 3) is v2, and
 anything else is invalid. ``publisher_generation`` (and the ``RequestSync`` v2 fields) are
 ``None`` for the legacy layout; the encoders write it only when they hold one.
@@ -175,7 +177,7 @@ class Time:
 
 @dataclass(frozen=True)
 class Header:
-    """The four common fields that start every ``labcommand_msgs`` message."""
+    """The four common fields that start every ``labcommand_msgs`` message except ``RhythmMinute`` (D44)."""
 
     room_id: str
     map_epoch: int
@@ -1116,11 +1118,12 @@ _RHYTHM_REGIONS = 65535
 
 @dataclass(frozen=True)
 class RhythmMinute:
-    """One minute of per-lidar region occupancy on ``/room_memory/rhythm``.
+    """One minute of per-lidar region occupancy on ``/room_memory/rhythm`` (protocol §3.9, D44).
 
-    ``sensor`` is the file-header code (1 Mid-360, 2 JT128) and is the first field after
-    ``room_id``. Region arrays are strictly increasing in signed ``(ix, iy, iz)``. A loss
-    marker carries ``sensor`` too, with zero counts and flag bits 1 and 4.
+    It skips the common header. ``sensor`` is the file-header code (1 Mid-360, 2 JT128) and is
+    the field after ``room_id``, then ``map_epoch``, ``seq`` and ``stamp``. Region arrays are
+    strictly increasing in signed ``(ix, iy, iz)``. A loss marker carries ``sensor`` too,
+    with zero counts and flag bits 1 and 4.
     ``publisher_generation`` is ``None`` for the legacy layout (the pinned goldens). The live
     publisher always sets it. The ``.rhy`` file does not carry it.
     """

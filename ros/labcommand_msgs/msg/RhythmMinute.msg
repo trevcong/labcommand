@@ -1,5 +1,6 @@
 # labcommand_msgs/RhythmMinute: one minute of per-lidar region occupancy.
-# Topic /room_memory/rhythm. sensor is the file-header code and sits immediately after room_id.
+# Topic /room_memory/rhythm (protocol §3.9, D44). Skips the common header: sensor, the
+# file-header code, sits immediately after room_id, then map_epoch, seq and stamp.
 # 1 Mid-360, 2 JT128. Flag bits: 0 partial, 1 discontinuity, 2 unavailable, 3 overflow, 4 lost.
 
 uint8 SENSOR_MID360=1
