@@ -307,7 +307,20 @@ public struct LiveRoomOperator: Sendable, Equatable {
         }
     }
 
-    static func stateWord(_ state: RoomMemory.ChangeEvent.State) -> String {
+    /// One line about the selected event: kind, state and size.
+    public static func summary(_ entry: LiveRoomEvent) -> String {
+        let event = entry.event
+        let kind: String
+        switch event.kind {
+        case .appeared: kind = "Appeared"
+        case .disappeared: kind = "Disappeared"
+        case .moved: kind = "Moved"
+        }
+        let voxels = event.voxelCount == 1 ? "1 voxel" : "\(event.voxelCount) voxels"
+        return "\(kind) · \(stateWord(event.state)) · \(voxels)"
+    }
+
+    public static func stateWord(_ state: RoomMemory.ChangeEvent.State) -> String {
         switch state {
         case .candidate: return "checking"
         case .confirmed: return "confirmed"
