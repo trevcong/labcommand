@@ -899,7 +899,7 @@ Activity Activity::from_cdr(std::span<const std::uint8_t> data) {
 void RequestSync::validate() const {
     const std::string context = "RequestSync";
     header.validate(context);
-    require_enum(topic, 2, context + ": topic");
+    require_enum(topic, 3, context + ": topic");
     if (expected_generation.has_value() != token.has_value()) {
         throw Invalid(context + ": expected_generation and request_token are both set (v2) or both absent (legacy)");
     }
@@ -933,7 +933,7 @@ RequestSync RequestSync::from_cdr(std::span<const std::uint8_t> data) {
         r.header = reader.header("");
         const std::uint64_t since_epoch = reader.u64("since_epoch");
         const std::uint64_t since_seq = reader.u64("since_seq");
-        r.topic = read_enum<SyncTopic>(reader.u8("topic"), 2, "RequestSync: topic");
+        r.topic = read_enum<SyncTopic>(reader.u8("topic"), 3, "RequestSync: topic");
         if ((since_epoch == kSinceNone) != (since_seq == kSinceNone)) {
             throw Invalid("RequestSync: since_epoch and since_seq must both be SINCE_NONE or neither");
         }
@@ -985,7 +985,7 @@ void SyncEnd::validate() const {
     const std::string context = "SyncEnd";
     header.validate(context);
     require_generation(publisher_generation, context + ": publisher_generation");
-    require_enum(topic, 2, context + ": topic");
+    require_enum(topic, 3, context + ": topic");
     if (bound == kSeqNone) throw Invalid(context + ": bound (2^64 - 1 is SEQ_NONE; use nullopt)");
     require_ranges(delivered, bound, context + ": delivered");
     require_ranges(unavailable, bound, context + ": unavailable");
@@ -1014,7 +1014,7 @@ SyncEnd SyncEnd::from_cdr(std::span<const std::uint8_t> data) {
         e.header = reader.header("");
         e.publisher_generation = reader.u64("publisher_generation");
         e.token = reader.token("request_token");
-        e.topic = read_enum<SyncTopic>(reader.u8("topic"), 2, "SyncEnd: topic");
+        e.topic = read_enum<SyncTopic>(reader.u8("topic"), 3, "SyncEnd: topic");
         const std::uint64_t bound = reader.u64("bound");
         if (bound != kSeqNone) e.bound = bound;
         e.delivered = reader.ranges("delivered");

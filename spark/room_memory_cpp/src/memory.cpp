@@ -621,6 +621,13 @@ RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, std::uint64_
     const std::int64_t millis = start.sec * 1000 + start.nanosec / 1'000'000;
     next_event_id_ = static_cast<std::uint64_t>(millis) << 20;
     load(start);
+    if (config_.state_dir) {
+        EventLogLimits limits;
+        limits.total_bytes = config_.event_log_bytes;
+        limits.segment_bytes = config_.event_segment_bytes;
+        limits.age_ns = config_.event_log_age_ns;
+        durable_events_ = EventLog::open(room_dir(*config_.state_dir, config_.room_id), limits, config_.event_log_io);
+    }
 }
 
 RoomMemory::Channel& RoomMemory::find(const std::string& sensor) {
@@ -883,11 +890,27 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         ++map_epoch_;
         save(stamp);
     }
+    if (durable_events_) {
+        const std::vector<EvictedEvent> dropped = durable_events_->commit();
+        if (!dropped.empty()) {
+            std::vector<std::uint64_t> seqs;
+            seqs.reserve(dropped.size());
+            for (const EvictedEvent& event : dropped) {
+                if (event.generation == publisher_generation_) seqs.push_back(event.seq);
+            }
+            std::sort(seqs.begin(), seqs.end());
+            std::erase_if(event_log_, [&](const Logged& entry) { return std::binary_search(seqs.begin(), seqs.end(), entry.seq); });
+        }
+    }
     return events;
 }
 
 void RoomMemory::log_event(const msg::ChangeEvent& event) {
     Logged entry{event.header.seq, event.header.map_epoch, event.to_cdr()};
+    if (durable_events_) {
+        durable_events_->append(publisher_generation_, event.header.seq, event.header.map_epoch, nanoseconds(event.header.stamp),
+                                entry.bytes);
+    }
     if (event.state == msg::EventState::candidate || event.state == msg::EventState::confirmed) {
         open_latest_[event.event_id] = entry;
     } else {
@@ -981,6 +1004,23 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
 RoomMemory::SyncAnswer RoomMemory::sync(const msg::RequestSync& request, const msg::Time& stamp) {
     SyncAnswer answer;
     if (request.header.room_id != config_.room_id) return answer;
+    // Archive names one generation and is not a live SINCE_NONE of this process (D45).
+    if (request.topic == msg::SyncTopic::event_archive) {
+        const std::uint64_t generation = request.expected_generation.value_or(msg::kGenerationUnknown);
+        if (!durable_events_ || generation == msg::kGenerationUnknown) return answer;
+        const std::optional<EventReplay> replay = durable_events_->replay_archive(generation, request.since);
+        if (!replay) return answer;
+        answer.messages = replay->messages;
+        msg::SyncEnd& end = answer.end.emplace();
+        end.header = msg::Header{config_.room_id, map_epoch_, sync_end_seq_++, stamp};
+        end.publisher_generation = generation;
+        end.token = request.token.value_or(msg::kZeroToken);
+        end.topic = msg::SyncTopic::event_archive;
+        end.bound = replay->bound;
+        end.delivered = replay->delivered;
+        end.unavailable = replay->unavailable;
+        return answer;
+    }
     const std::uint64_t expected = request.expected_generation.value_or(msg::kGenerationUnknown);
     const std::optional<msg::RequestSync::Since> since =
         expected == publisher_generation_ ? request.since : std::nullopt;
@@ -1010,6 +1050,21 @@ RoomMemory::SyncAnswer RoomMemory::sync(const msg::RequestSync& request, const m
             messages.push_back(snapshot.to_cdr());
             delivered = {{*bound, *bound}};
         }
+    } else if (durable_events_) {
+        std::vector<EventPiece> cache;
+        cache.reserve(event_log_.size());
+        for (const Logged& entry : event_log_) cache.push_back(EventPiece{entry.seq, entry.map_epoch, &entry.bytes});
+        std::vector<EventPiece> open;
+        open.reserve(open_latest_.size());
+        for (const auto& [id, entry] : open_latest_) {
+            (void)id;
+            open.push_back(EventPiece{entry.seq, entry.map_epoch, &entry.bytes});
+        }
+        const EventReplay replay = durable_events_->replay_current(publisher_generation_, event_seq_, since, cache, open);
+        messages = replay.messages;
+        bound = replay.bound;
+        delivered = replay.delivered;
+        unavailable = replay.unavailable;
     } else {
         if (event_seq_) bound = event_seq_ - 1;
         const auto at = since_index(event_log_);

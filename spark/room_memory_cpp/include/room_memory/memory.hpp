@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "room_memory/change_detection.hpp"
+#include "room_memory/eventlog.hpp"
 #include "room_memory/key_set.hpp"
 #include "room_memory/messages.hpp"
 
@@ -282,6 +283,12 @@ struct MemoryConfig {
     double delta_period_s = 5.0;
     double keyframe_period_s = 60.0;
     double keyframe_delta_ratio = 0.5;
+    // Durable event log under state_dir (D45). Ignored without state_dir, and not a replay config key.
+    // event_log_io outlives this RoomMemory; null uses the real filesystem.
+    std::uint64_t event_log_bytes = std::uint64_t{32} << 20;
+    std::uint64_t event_segment_bytes = std::uint64_t{4} << 20;
+    std::int64_t event_log_age_ns = 7LL * 24 * 60 * 60 * 1'000'000'000LL;
+    EventLogIo* event_log_io = nullptr;
 
     // The core config: evidence on, sensor origin (0, 0, 0) in each sensor's frame.
     Config change_config() const;
@@ -379,9 +386,11 @@ public:
     // Later ticks do not settle, and a keyframe of the unchanged map does not bump map_epoch.
     std::optional<msg::Bytes> map_update(const msg::Time& stamp);
     // The answer to one RequestSync (protocol section 5) and its SyncEnd; nothing for another
-    // room_id. `since` counts only when expected_generation is this generation; otherwise (a
-    // legacy request included, as generation 0 with an all-zero token) the request is answered
-    // as SINCE_NONE.
+    // room_id. On map and live events, `since` counts only when expected_generation is this
+    // generation; otherwise (a legacy request included) the request is answered as SINCE_NONE.
+    // TOPIC_EVENT_ARCHIVE names expected_generation and, once that generation has been committed,
+    // resends its durable records. SyncEnd.publisher_generation is that generation. An unknown
+    // generation, generation 0, a legacy archive request, or no state_dir yields no end.
     SyncAnswer sync(const msg::RequestSync& request, const msg::Time& stamp);
     // Writes every sensor's reference and the room's epoch file with the current map_epoch.
     // No-op without state_dir.
@@ -448,6 +457,7 @@ private:
     std::deque<Logged> map_log_;
     std::deque<Logged> event_log_;
     std::map<std::uint64_t, Logged> open_latest_;  // event_id -> latest message, open events only
+    std::optional<EventLog> durable_events_;       // set when state_dir is set; the deque is its tail cache
     std::optional<float> coverage_;
 };
 

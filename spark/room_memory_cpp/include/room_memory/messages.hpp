@@ -75,7 +75,7 @@ enum class MapKind : std::uint8_t { snapshot = 0, delta = 1 };
 enum class EventKind : std::uint8_t { appeared = 0, disappeared = 1, moved = 2 };
 enum class EventState : std::uint8_t { candidate = 0, confirmed = 1, accepted = 2, reverted = 3, expired = 4 };
 enum class MemoryState : std::uint8_t { building = 0, tracking = 1, rig_moved = 2, degraded = 3, paused = 4 };
-enum class SyncTopic : std::uint8_t { map_bricks = 0, events = 1 };
+enum class SyncTopic : std::uint8_t { map_bricks = 0, events = 1, event_archive = 2 };
 
 const char* name(MemoryState state);
 const char* name(Compression compression);

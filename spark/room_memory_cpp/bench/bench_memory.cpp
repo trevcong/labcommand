@@ -10,12 +10,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <stdexcept>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #if defined(_OPENMP)
@@ -58,15 +60,84 @@ double median(std::vector<double> values) {
     return n % 2 ? values[n / 2] : (values[n / 2 - 1] + values[n / 2]) / 2;
 }
 
+double ms_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+// Persistence cost, separate from the frame benchmark so the Python event-byte compare stays
+// on a run with state_dir unset. Prints milliseconds and does not assert a time.
+int bench_event_log() {
+    std::string pattern = (std::filesystem::temp_directory_path() / "event-log-bench-XXXXXX").string();
+    if (!::mkdtemp(pattern.data())) throw std::runtime_error("mkdtemp failed");
+    const std::filesystem::path room = pattern;
+    const auto cleanup = [&] { std::filesystem::remove_all(room); };
+    try {
+        msg::Bytes cdr(1024, 7);
+        EventLogLimits single;
+        EventLog singles = EventLog::open(room / "single", single);
+        std::filesystem::create_directory(room / "single");
+        std::vector<double> samples;
+        for (int n = 0; n < 40; ++n) {
+            singles.append(1, static_cast<std::uint64_t>(n), 1, n, cdr);
+            const auto start = std::chrono::steady_clock::now();
+            singles.commit();
+            samples.push_back(ms_since(start));
+        }
+        std::printf("event-log single-record commit median %.3f ms (n=%zu)\n", median(samples), samples.size());
+
+        EventLogLimits rotating;
+        rotating.segment_bytes = 256 * 1024;
+        rotating.total_bytes = std::uint64_t{8} << 20;
+        std::filesystem::create_directory(room / "rotate");
+        EventLog rotated = EventLog::open(room / "rotate", rotating);
+        rotated.append(1, 0, 1, 0, msg::Bytes(rotating.segment_bytes, 1));
+        rotated.commit();
+        rotated.append(1, 1, 1, 1, cdr);
+        const auto roll_start = std::chrono::steady_clock::now();
+        rotated.commit();
+        std::printf("event-log rotating commit %.3f ms\n", ms_since(roll_start));
+
+        EventLogLimits filled;
+        filled.segment_bytes = std::uint64_t{1} << 20;
+        filled.total_bytes = std::uint64_t{16} << 20;
+        std::filesystem::create_directory(room / "fill");
+        EventLog fill = EventLog::open(room / "fill", filled);
+        constexpr int kBatch = 512;
+        constexpr int kBatches = 8;  // about 4 MiB of payloads, a few segment fsyncs
+        std::uint64_t seq = 0;
+        for (int batch = 0; batch < kBatches; ++batch) {
+            for (int n = 0; n < kBatch; ++n) {
+                const std::uint64_t id = seq++;
+                fill.append(1, id, 1, static_cast<std::int64_t>(id), cdr);
+            }
+            fill.commit();
+        }
+        const auto replay_start = std::chrono::steady_clock::now();
+        const EventReplay replay = fill.replay_current(1, seq, std::nullopt, {}, {});
+        const double replay_ms = ms_since(replay_start);
+        std::size_t bytes = 0;
+        const auto walk_start = std::chrono::steady_clock::now();
+        for (const msg::Bytes& message : replay.messages) bytes += message.size();
+        std::printf("event-log replay %zu messages, %zu B, %.3f ms (read + assemble), walk %.3f ms\n",
+                    replay.messages.size(), bytes, replay_ms, ms_since(walk_start));
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+    cleanup();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
+    if (std::find(args.begin(), args.end(), "--event-log") != args.end()) return bench_event_log();
     const auto flag = std::find(args.begin(), args.end(), "--full-diff");
     const bool full = flag != args.end();
     if (full) args.erase(flag);
     if (args.empty()) {
-        std::fprintf(stderr, "bench_memory <frames_dir> [windows] [--full-diff]\n");
+        std::fprintf(stderr, "bench_memory <frames_dir> [windows] [--full-diff]\nbench_memory --event-log\n");
         return 2;
     }
     const std::string dir = args[0];
