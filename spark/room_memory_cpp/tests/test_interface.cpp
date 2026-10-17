@@ -31,14 +31,23 @@ std::set<std::string> types_named_by(const std::string& source) {
     std::set<std::string> names;
     const std::string key = "labcommand_msgs/msg/";
     for (std::size_t pos = 0; (pos = source.find(key, pos)) != std::string::npos;) {
+        // Publisher type strings are quoted. The generated header include
+        // (<labcommand_msgs/msg/request_sync.hpp>) is not a .msg name.
+        if (pos == 0 || source[pos - 1] != '"') {
+            pos += key.size();
+            continue;
+        }
         pos += key.size();
         std::size_t end = pos;
         while (end < source.size() &&
                (std::isalnum(static_cast<unsigned char>(source[end])) || source[end] == '_')) {
             ++end;
         }
-        if (end == pos) throw harness::Failure("empty type name after " + key);
+        if (end == pos || end >= source.size() || source[end] != '"') {
+            throw harness::Failure("type name after " + key + " is not a quoted Name");
+        }
         names.insert(source.substr(pos, end - pos));
+        pos = end;
     }
     return names;
 }
