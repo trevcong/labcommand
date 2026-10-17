@@ -4,7 +4,12 @@ Operator script, read-only recording, and an offline score for a live room-memor
 The score is a candidate score. It is not the CONFIRMED product bar in
 `docs/phase3-live-integration.md` §7.5 / Q3 (false CONFIRMED events per hour in a
 static room, proposed ≤ 1/h). Today's node emits `CANDIDATE`. A run with no
-`CONFIRMED` message leaves `confirmed_product_bar` as `not_evaluated`.
+`CONFIRMED` message leaves `confirmed_product_bar` as `not_evaluated`. When
+`CONFIRMED` messages are present on a complete verifiable run, each one received
+during a static interval counts toward that rate. The candidate does not have to
+be in the log. Events are volatile, so a candidate can be published before the
+subscription starts. That confirmation is still a static-room alarm. It is not
+excused by the missing line, and it is not a zero-false-alarm pass.
 
 This command does not ssh, publish, or restart anything. It does not dial the
 Spark while the tests run. The operator runs it later, on the machine whose
@@ -25,8 +30,13 @@ PYTHONPATH=spark/room_memory python3 -m acceptance run --transport ros2 --contai
 `ros2_subscribe.py` on stdin. That process subscribes to `/room_memory/status`,
 `/room_memory/events`, and `/room_memory/activity`. Status and activity are
 reliable transient_local depth 1. Events are reliable volatile depth 100.
-It does not create a publisher, a client, or a service. Stopping the harness
-signals that child PID only.
+It does not create a publisher, a client, or a service. Jazzy's `Node`
+constructor would otherwise advertise `/parameter_events`, enable rosout, start
+the parameter services, and publish parameter events while it declares
+`use_sim_time` and `start_type_description_service`. The subscriber turns rosout,
+the parameter services, and the logger service off, forces those two parameters
+off, and does not advertise `/parameter_events`. Stopping the harness signals
+that child PID only.
 
 `--scenarios` is a comma-separated subset. `--watch-s` shortens the baseline and
 the three change watches. `--sit-s`, `--walk-s`, and `--hour-s` shorten those
@@ -73,6 +83,8 @@ skip
 
 Kind plus time without a label is a temporal match, not a true detection.
 Another sensor is corroboration only when it matches that sensor's own target.
+That sensor can corroborate a labeled target once. A later candidate from the
+same sensor, including the next expiry cycle, is a false alarm.
 Separate sensor frames are not compared. `skip` withholds full acceptance.
 A line that is not `region`, `event`, or `skip` is asked again. The recording
 stays up. Ctrl-C stops the script and still writes `topics.jsonl`, `marks.json`,

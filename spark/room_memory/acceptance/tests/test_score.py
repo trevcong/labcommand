@@ -89,6 +89,39 @@ def test_kind_and_time_without_a_label_is_a_temporal_match():
     assert report["g5_acceptance"] == "denied"
 
 
+def test_one_sensor_corroborates_a_target_once():
+    cycles = [event(60, "appeared", 1, PLACE, sensor=1)]
+    for index in range(5):
+        event_id = 10 + index
+        cycles.append(event(70 + index, "appeared", event_id, PLACE, sensor=2))
+        cycles.append(event(70.4 + index, "appeared", event_id, PLACE, sensor=2, state="expired"))
+    messages = stream(9, 131, cycles)
+    mark = marks([scenario(
+        "box_placed", "change", 10, 130, kind="appeared", protocol=120,
+        change_done=10, clear=20, targets=[target(1, PLACE), target(2, PLACE)],
+    )])
+    report = _score(messages, mark)
+    assert report["true_detections"] == 1
+    assert [item["event_id"] for item in _dispositions(report, "corroboration")] == [10]
+    assert sorted(item["event_id"] for item in _dispositions(report, "false_alarm")) == [11, 12, 13, 14]
+    assert report["false_alarms"] == 4
+
+    session_cycles = []
+    for index in range(5):
+        event_id = 30 + index
+        session_cycles.append(event(160 + index * 2, "appeared", event_id, PLACE, sensor=2))
+        session_cycles.append(event(160.4 + index * 2, "appeared", event_id, PLACE, sensor=2, state="expired"))
+    session = _score(*_perfect(
+        extra_events=session_cycles,
+        place_targets=[target(1, PLACE), target(2, PLACE)],
+    ))
+    assert session["true_detections"] == 3
+    assert [item["event_id"] for item in _dispositions(session, "corroboration")] == [30]
+    assert session["false_alarms"] == 4
+    assert session["g5_acceptance"] != "full_candidate"
+    assert session["exit_code"] == 1
+
+
 def test_other_sensor_is_not_automatic_corroboration():
     messages = stream(9, 131, [
         event(60, "appeared", 1, PLACE, sensor=1),
@@ -473,6 +506,38 @@ def test_not_tracking_is_inconclusive():
     assert report["idle_false_candidate_alarms_per_hour"] is None
 
 
+def test_static_confirmations_count_without_a_captured_candidate():
+    outside = [
+        event(131, "appeared", 1, PLACE, state="confirmed"),
+        event(261, "disappeared", 2, REMOVE, state="confirmed"),
+        event(391, "moved", 3, MOVE_DEST, from_centroid=MOVE_FROM, state="confirmed"),
+    ]
+    labeled = _score(*_perfect(extra_events=outside))
+    assert labeled["confirmed_count"] == 3
+    assert labeled["false_alarms"] == 0
+    assert labeled["confirmed_product_bar"] == "pass"
+    assert labeled["g5_acceptance"] == "full_candidate"
+    assert labeled["exit_code"] == 0
+
+    # The candidates were published before the volatile subscription. Only the
+    # later CONFIRMED lines are in the log, during the idle hour.
+    one = _score(*_perfect(extra_events=[event(1000, "appeared", 50, FAR, state="confirmed")]))
+    assert one["false_alarms"] == 0
+    assert one["confirmed_count"] == 1
+    assert one["confirmed_product_bar"] == "pass"
+    assert one["idle_false_candidate_alarms_per_hour"] == 0
+
+    two = _score(*_perfect(extra_events=[
+        event(1000, "appeared", 50, FAR, state="confirmed"),
+        event(2000, "appeared", 51, FAR, state="confirmed"),
+    ]))
+    assert two["false_alarms"] == 0
+    assert two["confirmed_count"] == 2
+    assert two["confirmed_product_bar"] == "fail"
+    assert two["g5_acceptance"] == "full_candidate"
+    assert "before the subscription" in two["confirmed_product_bar_note"]
+
+
 def test_perfect_session_passes_candidates_and_does_not_pass_confirmed_bar():
     report = _score(*_perfect())
     assert report["exit_code"] == 0
@@ -557,12 +622,13 @@ def pytest_rate(count, exposure_s):
     return count * 3600 / exposure_s
 
 
-def _perfect(drop_place=False, extra_idle=()):
+def _perfect(drop_place=False, extra_idle=(), extra_events=(), place_targets=None):
     events = []
     if not drop_place:
         events.append(event(130, "appeared", 1, PLACE))
     events.append(event(260, "disappeared", 2, REMOVE))
     events.append(event(390, "moved", 3, MOVE_DEST, from_centroid=MOVE_FROM))
+    events.extend(extra_events)
     events.extend(extra_idle)
     def active(t):
         return (80 <= t < 90) or (470 <= t < 490) or (580 <= t <= 700)
@@ -571,7 +637,8 @@ def _perfect(drop_place=False, extra_idle=()):
     rows = [
         scenario("baseline_idle", "idle", 10, 70, protocol=60),
         scenario("box_placed", "change", 80, 200, kind="appeared", protocol=120, change_done=80, clear=90,
-                 targets=[target(1, PLACE)], prerequisites=["reference_setup"]),
+                 targets=[target(1, PLACE)] if place_targets is None else place_targets,
+                 prerequisites=["reference_setup"]),
         scenario("box_removed", "change", 210, 330, kind="disappeared", protocol=120, change_done=210, clear=220,
                  targets=[target(1, REMOVE)], prerequisites=["reference_setup"]),
         scenario("box_moved", "change", 340, 460, kind="moved", protocol=120, change_done=340, clear=350,

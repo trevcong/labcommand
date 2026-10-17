@@ -4,6 +4,11 @@ Run inside the room-memory container, on stdin. This process does not advertise,
 and it does not create a publisher, client, or service. QoS matches the node:
 status and activity are reliable transient_local depth 1, events are reliable
 volatile depth 100.
+
+Jazzy's ``Node`` constructor advertises ``/parameter_events``, turns on rosout,
+starts the parameter services, and publishes parameter events while ``TimeSource``
+and ``TypeDescriptionService`` declare parameters. Those side effects are suppressed
+from the constructor call onward. Subscriptions are created only after that.
 """
 
 import json
@@ -16,6 +21,7 @@ from labcommand_msgs.msg import Activity
 from labcommand_msgs.msg import ChangeEvent
 from labcommand_msgs.msg import MemoryStatus
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy
 from rclpy.qos import QoSProfile
 from rclpy.qos import ReliabilityPolicy
@@ -81,15 +87,45 @@ def xyz(values):
     return numbers
 
 
+class _DroppedPublisher:
+    """Replaces the parameter-event publisher ``Node`` builds during ``__init__``.
+
+    ``publish`` discards the message. The object is not a middleware publisher,
+    so declaring ``use_sim_time`` and ``start_type_description_service`` does not
+    advertise ``/parameter_events``.
+    """
+
+    def publish(self, *_args, **_kwargs):
+        return None
+
+
 class Reader(Node):
     def __init__(self):
-        super().__init__("room_memory_acceptance_subscribe")
+        super().__init__(
+            "room_memory_acceptance_subscribe",
+            enable_rosout=False,
+            start_parameter_services=False,
+            enable_logger_service=False,
+            parameter_overrides=[
+                Parameter("use_sim_time", Parameter.Type.BOOL, False),
+                Parameter("start_type_description_service", Parameter.Type.BOOL, False),
+            ],
+        )
         self.saw_status = False
         self.saw_activity = False
         self.subs = []
         self.subs.append(self.create_subscription(MemoryStatus, "/room_memory/status", self.on_status, latched_qos()))
         self.subs.append(self.create_subscription(Activity, "/room_memory/activity", self.on_activity, latched_qos()))
         self.subs.append(self.create_subscription(ChangeEvent, "/room_memory/events", self.on_event, volatile_qos()))
+
+    def create_publisher(self, *_args, **_kwargs):
+        return _DroppedPublisher()
+
+    def create_client(self, *_args, **_kwargs):
+        raise RuntimeError("room-memory acceptance subscriber does not create clients")
+
+    def create_service(self, *_args, **_kwargs):
+        raise RuntimeError("room-memory acceptance subscriber does not create services")
 
     def matched(self):
         return all(sub.get_publisher_count() > 0 for sub in self.subs)

@@ -45,6 +45,10 @@ CONFIRMED_PARTIAL_NOTE = (
     "CONFIRMED messages were seen, but the static intervals are not a full verifiable "
     "baseline plus hour, so the CONFIRMED product bar is not evaluated."
 )
+CONFIRMED_RATE_NOTE = (
+    "Each CONFIRMED message received during a verifiable static interval counts, "
+    "including when its candidate was published before the subscription."
+)
 
 
 def score(messages, marks, max_false_alarms_per_hour=1.0):
@@ -386,11 +390,20 @@ def _score_change(scenario, row, events, assigned):
     if matched:
         primary = matched[0]
         assigned[id(primary)] = _disposition(primary, "true_detection", scenario["id"])
+        credited = {}
         primary_sensor = (primary.get("message") or {}).get("sensors")
+        _credit(credited, _match_keys(primary, scenario, targets, associations), primary_sensor)
         for other in matched[1:]:
-            other_sensor = (other.get("message") or {}).get("sensors")
-            if other_sensor != primary_sensor and _matches_change(other, scenario, targets, associations):
+            sensor = (other.get("message") or {}).get("sensors")
+            fresh = [
+                key for key in _match_keys(other, scenario, targets, associations)
+                if sensor not in credited.get(key, ())
+            ]
+            # A sensor corroborates each labeled target once. The next candidate
+            # from that sensor is a separate detection, not more evidence.
+            if sensor != primary_sensor and fresh:
                 assigned[id(other)] = _disposition(other, "corroboration", scenario["id"])
+                _credit(credited, fresh, sensor)
             else:
                 assigned[id(other)] = _disposition(other, "false_alarm", scenario["id"])
         for event in window:
@@ -464,13 +477,28 @@ def _activities_in(scenario, messages):
     return found
 
 
-def _matches_change(event, scenario, targets, associations):
+def _credit(credited, keys, sensor):
+    for key in keys:
+        credited.setdefault(key, set()).add(sensor)
+
+
+def _match_keys(event, scenario, targets, associations):
     body = event.get("message") or {}
-    if body.get("kind") != scenario.get("kind"):
-        return False
-    if any(_matches_assoc(event, item, scenario.get("kind")) for item in associations):
-        return True
-    return any(_matches_target(body, target, scenario.get("kind")) for target in targets)
+    kind = scenario.get("kind")
+    if body.get("kind") != kind:
+        return []
+    keys = []
+    for index, association in enumerate(associations):
+        if _matches_assoc(event, association, kind):
+            keys.append(("association", index))
+    for index, target in enumerate(targets):
+        if _matches_target(body, target, kind):
+            keys.append(("target", index))
+    return keys
+
+
+def _matches_change(event, scenario, targets, associations):
+    return bool(_match_keys(event, scenario, targets, associations))
 
 
 def _matches_assoc(event, association, kind):
@@ -569,6 +597,7 @@ def _disposition(event, name, scenario_id):
 
 def _finish(rows, events, assigned, messages, fresh, compatible, meta, ignored, confirmed_count, threshold):
     exposure = 0.0
+    static_intervals = []
     for row in rows:
         scenario = row.pop("_scenario")
         row.pop("_gaps", None)
@@ -578,6 +607,7 @@ def _finish(rows, events, assigned, messages, fresh, compatible, meta, ignored, 
             _apply_confusion(row, scenario, messages)
         if row["id"] in IDLE_IDS and row["coverage"] == "verifiable":
             exposure += span
+            static_intervals.append((scenario["t0_mono_ns"], scenario["t1_mono_ns"]))
         alarms = [
             item for item in assigned.values()
             if item["scenario"] == row["id"] and item["disposition"] in ("false_alarm", "activity_as_change")
@@ -629,7 +659,7 @@ def _finish(rows, events, assigned, messages, fresh, compatible, meta, ignored, 
         protocol, rows, misses, non_idle, rate_pass, activity_as_change, split_move,
     )
     product, product_note = _confirmed_bar(
-        confirmed_count, candidates, events, exposure, rate_pass, protocol, threshold, messages, rows,
+        confirmed_count, exposure, protocol, threshold, messages, static_intervals,
     )
     report = {
         "schema": "room-memory-acceptance-report-v1",
@@ -742,27 +772,28 @@ def _decide(protocol, rows, misses, non_idle, rate_pass, activity_as_change, spl
     return "pass", 0, "full_candidate"
 
 
-def _confirmed_bar(confirmed_count, candidates, events, exposure, rate_pass, protocol, threshold, messages, rows):
+def _confirmed_bar(confirmed_count, exposure, protocol, threshold, messages, static_intervals):
     if confirmed_count == 0:
         return "not_evaluated", CONFIRMED_NOTE
-    if not protocol or exposure <= 0:
+    if not protocol or exposure <= 0 or not static_intervals:
         return "not_evaluated", CONFIRMED_PARTIAL_NOTE
-    false_ids = {
-        (item["publisher_generation"], item["event_id"])
-        for item in candidates
-        if item["disposition"] in ("false_alarm", "activity_as_change")
-    }
     false_confirmed = 0
     for message in messages:
         if message.get("topic") != EVENTS or (message.get("message") or {}).get("state") != "confirmed":
             continue
-        key = (message.get("publisher_generation"), (message.get("message") or {}).get("event_id"))
-        if key in false_ids:
+        receipt = message.get("receipt_mono_ns")
+        if receipt is None:
+            continue
+        if any(start <= receipt <= end for start, end in static_intervals):
             false_confirmed += 1
     rate = false_confirmed * 3600.0 / exposure
     if rate <= threshold:
-        return "pass", "CONFIRMED false-alarm rate is within the proposed static-room bar."
-    return "fail", "CONFIRMED false-alarm rate is above the proposed static-room bar."
+        return "pass", (
+            "CONFIRMED false-alarm rate is within the proposed static-room bar. " + CONFIRMED_RATE_NOTE
+        )
+    return "fail", (
+        "CONFIRMED false-alarm rate is above the proposed static-room bar. " + CONFIRMED_RATE_NOTE
+    )
 
 
 def _clock(messages, fresh):
