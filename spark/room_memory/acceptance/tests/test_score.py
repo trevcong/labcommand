@@ -549,6 +549,51 @@ def test_dropped_windows_outside_the_protocol_scenarios_still_deny():
     assert report["exit_code"] == 2
 
 
+def test_a_restart_inside_an_interval_does_not_hide_dropped_windows():
+    # The restart breaks the status chain, so restore_reference is unverifiable for
+    # its generation change. The new process still drops ten windows after it.
+    messages, mark = _perfect(
+        generation_at=lambda t: 4 if t < 740 else 5,
+        dropped_at=lambda t: 7 if t < 740 else max(0, min(10, t - 740)),
+    )
+    report = _score(messages, mark)
+    restore = _row(report, "restore_reference")
+    assert "generation_change" in restore["coverage_reasons"]
+    assert "dropped_windows" in restore["coverage_reasons"]
+    assert restore["dropped_windows"] == 10
+    assert _row(report, "hour_idle")["coverage"] == "verifiable"
+    assert report["dropped_windows"] == 10
+    assert report["lost_window_scenarios"] == ["restore_reference"]
+    assert report["g5_acceptance"] == "denied"
+    assert report["exit_code"] == 2
+
+    # Drops before the restart, in a generation with no closing sample, count too.
+    before = _score(*_perfect(
+        generation_at=lambda t: 4 if t < 740 else 5,
+        dropped_at=lambda t: (7 if t < 715 else 9) if t < 740 else 0,
+    ))
+    assert _row(before, "restore_reference")["dropped_windows"] == 2
+    assert before["lost_window_scenarios"] == ["restore_reference"]
+    assert before["g5_acceptance"] == "denied"
+
+    # A new process that drops before its first status still counts from 0.
+    first = _score(*_perfect(
+        generation_at=lambda t: 4 if t < 740 else 5,
+        dropped_at=lambda t: 7 if t < 740 else 3,
+    ))
+    assert _row(first, "restore_reference")["dropped_windows"] == 3
+    assert first["g5_acceptance"] == "denied"
+
+    # A clean restart inside the interval is unverifiable but loses no windows.
+    clean = _score(*_perfect(
+        generation_at=lambda t: 4 if t < 740 else 5,
+        dropped_at=lambda t: 7 if t < 740 else 0,
+    ))
+    assert _row(clean, "restore_reference")["dropped_windows"] == 0
+    assert clean["lost_window_scenarios"] == []
+    assert clean["g5_acceptance"] == "full_candidate"
+
+
 def test_an_unchanged_historical_dropped_count_keeps_coverage():
     steady = _score(*_perfect(dropped_at=lambda t: 7))
     assert steady["g5_acceptance"] == "full_candidate"

@@ -119,10 +119,12 @@ interval are unverifiable.
 Nonzero Hz does not prove the detector ran: both nodes count every received
 frame toward Hz, rejected frames included, and drop a window whose frames were
 all rejected. An hour of `degraded` status at 10 Hz can hold no processed window. The counter is per node process and counts since its
-start, so the score uses only its increase within one interval, which is already
-one publisher generation. A steady nonzero count from earlier in the run, drops
-between two intervals, and a restart's reset to 0 between intervals do not
-count. An increase is `dropped_windows`; a decrease within a generation
+start, so the score uses only its increase within one interval, per publisher
+generation. This is counted even when a restart or gap makes the interval
+unverifiable. A generation that first appears inside an interval after an
+earlier one is a restart, so its count starts at 0 there. A steady nonzero
+count from earlier in the run, drops between two intervals, and a restart's
+reset to 0 do not count. An increase is `dropped_windows`; a decrease within a generation
 (`dropped_windows_regressed`) and a missing count (`dropped_windows_unknown`)
 are unverifiable too. The report lists the lost windows per scenario and in
 `dropped_windows`, and names the scenarios in `lost_window_scenarios`. Any

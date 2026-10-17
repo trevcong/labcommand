@@ -174,8 +174,8 @@ def _coverage(scenario, messages, fresh, meta, expected):
             else:
                 continue
             break
-        dropped = _dropped_windows(status_chain, reasons)
         _event_coverage(messages, status_chain[0], status_chain[-1], t0, t1, reasons)
+    dropped = _dropped_windows(messages, t0, t1, reasons)
     if not status_chain and not any(reason.startswith("no_fresh") or reason == "stale_or_unfresh" for reason in reasons):
         reasons.append("stale_or_unfresh")
     unique = []
@@ -186,27 +186,56 @@ def _coverage(scenario, messages, fresh, meta, expected):
             "dropped": dropped}
 
 
-def _dropped_windows(chain, reasons):
-    """Windows the node dropped across one status chain, from its counter deltas.
+def _dropped_windows(messages, t0, t1, reasons):
+    """Windows the node dropped in one interval, from its status counter deltas.
 
-    ``dropped_windows`` counts since node start, so only an increase inside the chain
-    is new. ``_chain`` keeps one publisher generation, so the first sample is the
-    baseline and a restart's reset to 0 between intervals never counts. Positive Hz
-    does not cover this: both publishers count rejected frames toward Hz.
+    ``dropped_windows`` counts since node start, so only an increase is new. Each
+    publisher generation with a status sample in the interval is its own run, from
+    its last sample at or before ``t0`` to its first at or after ``t1``. A restart's
+    reset to 0 is never a decrease. A generation that first appears inside the
+    interval after an earlier one is a restart, so its counter started at 0 there.
+    This does not depend on a coverage chain: a restart or gap that makes the
+    interval unverifiable must not hide its drops. Positive Hz does not cover this:
+    both publishers count rejected frames toward Hz.
     """
+    samples = [
+        message for message in messages
+        if message.get("topic") == STATUS and isinstance(message.get("message"), dict)
+        and message.get("receipt_mono_ns") is not None
+    ]
+    samples.sort(key=lambda item: item["receipt_mono_ns"])
+    first_generation = samples[0].get("publisher_generation") if samples else None
+    generations = []
+    for sample in samples:
+        generation = sample.get("publisher_generation")
+        if t0 <= sample["receipt_mono_ns"] <= t1 and generation not in generations:
+            generations.append(generation)
     total = 0
-    previous = None
-    for sample in chain:
-        value = (sample.get("message") or {}).get("dropped_windows")
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            reasons.append("dropped_windows_unknown")
-            return total
-        if previous is not None:
-            if value < previous:
-                reasons.append("dropped_windows_regressed")
-            elif value > previous:
-                total += value - previous
-        previous = value
+    unknown = False
+    regressed = False
+    for generation in generations:
+        own = [sample for sample in samples if sample.get("publisher_generation") == generation]
+        before = [sample for sample in own if sample["receipt_mono_ns"] <= t0]
+        after = [sample for sample in own if sample["receipt_mono_ns"] >= t1]
+        lo = before[-1]["receipt_mono_ns"] if before else t0
+        hi = after[0]["receipt_mono_ns"] if after else t1
+        run = [sample for sample in own if lo <= sample["receipt_mono_ns"] <= hi]
+        previous = None if before or generation == first_generation else 0
+        for sample in run:
+            value = sample["message"].get("dropped_windows")
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                unknown = True
+                break
+            if previous is not None:
+                if value < previous:
+                    regressed = True
+                elif value > previous:
+                    total += value - previous
+            previous = value
+    if unknown:
+        reasons.append("dropped_windows_unknown")
+    if regressed:
+        reasons.append("dropped_windows_regressed")
     if total:
         reasons.append("dropped_windows")
     return total
