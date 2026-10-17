@@ -3,13 +3,25 @@
 #include <fcntl.h>
 #include <pwd.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <stdio.h>
+#endif
+#if defined(__linux__)
+#include <sys/syscall.h>
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE 1
+#endif
+#endif
 
 #include <array>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <iterator>
 #include <new>
+#include <sstream>
 #include <stdexcept>
 
 #include "parallel.hpp"
@@ -23,6 +35,55 @@ constexpr std::int64_t kInt16Low = -(1 << 15);
 constexpr std::int64_t kInt16High = (1 << 15) - 1;
 
 Key brick_key(const Index3& v) { return pack(v.i >> 3, v.j >> 3, v.k >> 3); }
+
+bool quarantine_stamp_ok(const std::string& stamp) {
+    if (stamp.size() != 16 || stamp[8] != 'T' || stamp.back() != 'Z') return false;
+    for (std::size_t n = 0; n < stamp.size(); ++n) {
+        if (n == 8 || n + 1 == stamp.size()) continue;
+        if (stamp[n] < '0' || stamp[n] > '9') return false;
+    }
+    return true;
+}
+
+std::string quarantine_stamp_now() {
+    const std::time_t now = std::time(nullptr);
+    std::tm tm{};
+    if (::gmtime_r(&now, &tm) == nullptr) return "19700101T000000Z";
+    char buf[32];
+    if (std::strftime(buf, sizeof buf, "%Y%m%dT%H%M%SZ", &tm) == 0) return "19700101T000000Z";
+    return buf;
+}
+
+void append_note(std::string& note, const std::string& text) {
+    if (text.empty()) return;
+    if (!note.empty()) note.push_back(' ');
+    note += text;
+}
+
+// Moves the directory entry to `<filename>.quarantine-<stamp>` in the same directory, or to
+// `.<n>` when that name is already taken. Never replaces an existing entry and never deletes.
+std::optional<std::filesystem::path> quarantine_entry(const std::filesystem::path& path, const std::string& stamp,
+                                                      std::string& error) {
+    const std::filesystem::path parent = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
+    const std::string base = path.filename().string() + ".quarantine-" + stamp;
+    for (int attempt = 1; attempt <= kQuarantineNameAttempts; ++attempt) {
+        const std::string name = attempt == 1 ? base : base + "." + std::to_string(attempt);
+        const std::filesystem::path dest = parent / name;
+        const EntryInspection existing = inspect_directory_entry(dest);
+        if (existing.presence == EntryPresence::error) {
+            error = "cannot inspect quarantine name " + dest.string() + ": " + existing.detail;
+            return std::nullopt;
+        }
+        if (existing.presence == EntryPresence::present) continue;
+        const std::error_code renamed = rename_noreplace(path, dest);
+        if (!renamed) return dest;
+        if (renamed == std::errc::file_exists) continue;
+        error = "cannot quarantine " + path.string() + " -> " + dest.string() + ": " + renamed.message();
+        return std::nullopt;
+    }
+    error = "cannot quarantine " + path.string() + ": every quarantine name for " + stamp + " is taken";
+    return std::nullopt;
+}
 
 bool plain_name(const std::string& text) {
     const auto ok = [](char c, bool first) {
@@ -375,8 +436,30 @@ void save_epoch(const std::filesystem::path& path, std::uint64_t epoch) {
     write_atomic(path, std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
 }
 
-std::optional<std::uint64_t> load_epoch(const std::filesystem::path& path) {
-    if (!std::filesystem::exists(path)) return std::nullopt;
+EntryInspection inspect_directory_entry(const std::filesystem::path& path) {
+    std::error_code error;
+    const std::filesystem::file_status status = std::filesystem::symlink_status(path, error);
+    if (error) {
+        if (error == std::errc::no_such_file_or_directory) return {EntryPresence::absent, {}};
+        return {EntryPresence::error, path.string() + ": " + error.message()};
+    }
+    if (status.type() == std::filesystem::file_type::not_found) return {EntryPresence::absent, {}};
+    return {EntryPresence::present, {}};
+}
+
+std::error_code rename_noreplace(const std::filesystem::path& from, const std::filesystem::path& to) {
+#if defined(__APPLE__)
+    if (::renamex_np(from.c_str(), to.c_str(), RENAME_EXCL) == 0) return {};
+    return {errno, std::generic_category()};
+#elif defined(__linux__)
+    if (::syscall(SYS_renameat2, AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), RENAME_NOREPLACE) == 0) return {};
+    return {errno, std::generic_category()};
+#else
+    return std::make_error_code(std::errc::function_not_supported);
+#endif
+}
+
+std::uint64_t read_epoch_text(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot read " + path.string());
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -391,6 +474,13 @@ std::optional<std::uint64_t> load_epoch(const std::filesystem::path& path) {
         epoch = epoch * 10 + digit;
     }
     return epoch;
+}
+
+std::optional<std::uint64_t> load_epoch(const std::filesystem::path& path) {
+    const EntryInspection entry = inspect_directory_entry(path);
+    if (entry.presence == EntryPresence::error) throw std::runtime_error("cannot inspect " + entry.detail);
+    if (entry.presence == EntryPresence::absent) return std::nullopt;
+    return read_epoch_text(path);
 }
 
 // MARK: Seq ranges
@@ -434,6 +524,9 @@ std::pair<msg::MapBricks, VoxelLayer> load_reference(const std::filesystem::path
     if (!in) throw std::runtime_error("cannot read " + path.string());
     const msg::Bytes data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     msg::MapBricks message = msg::MapBricks::from_cdr(data);
+    if (message.kind != msg::MapKind::snapshot) {
+        throw std::invalid_argument(path.string() + " is a delta, not a complete reference");
+    }
     VoxelLayer layer = VoxelLayer::from_bricks(message.bricks);
     return {std::move(message), std::move(layer)};
 }
@@ -644,52 +737,194 @@ std::vector<std::filesystem::path> RoomMemory::paths() const {
 
 void RoomMemory::load(const msg::Time& start) {
     if (!config_.state_dir) return;
+    try {
+        recover_saved_room(start);
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception& error) {
+        // A persistence failure that the per-file handlers did not catch. Do not leave main:
+        // Docker would restart onto the same files.
+        append_note(startup_note_, error.what());
+        append_note(startup_note_, "saves suppressed");
+        saves_suppressed_ = true;
+        note_save_failure(error.what());
+        if (state_ != msg::MemoryState::tracking) {
+            for (Channel& channel : channels_) {
+                channel.reference = VoxelLayer{};
+                channel.reference_windows = 0;
+                channel.reference_index.reset();
+            }
+            coverage_.reset();
+            map_epoch_ = 0;
+        }
+    }
+}
+
+void RoomMemory::recover_saved_room(const msg::Time& start) {
     // The room's last epoch, whichever sensors that run had: a subset run moves it on and saves
     // only its own references, so the others' saved epochs may lag behind it.
-    const std::optional<std::uint64_t> room_epoch = load_epoch(epoch_path(*config_.state_dir, config_.room_id));
-    const std::vector<std::filesystem::path> all = paths();
-    std::vector<std::string> missing;
-    std::size_t present = 0;
-    for (std::size_t n = 0; n < all.size(); ++n) {
-        if (std::filesystem::exists(all[n])) {
-            ++present;
-        } else {
-            missing.push_back(channels_[n].sensor.name);
+    const std::string stamp =
+        quarantine_stamp_ok(config_.quarantine_stamp) ? config_.quarantine_stamp : quarantine_stamp_now();
+    const std::filesystem::path epoch_file = epoch_path(*config_.state_dir, config_.room_id);
+    std::optional<std::uint64_t> room_epoch;
+    bool epoch_quarantined = false;
+    bool epoch_unreadable = false;
+    bool suppress = false;
+    std::string note;
+
+    const EntryInspection epoch_entry = inspect_directory_entry(epoch_file);
+    if (epoch_entry.presence == EntryPresence::error) {
+        append_note(note, "cannot inspect " + epoch_entry.detail);
+        epoch_unreadable = true;
+        suppress = true;
+    } else if (epoch_entry.presence == EntryPresence::present) {
+        try {
+            room_epoch = read_epoch_text(epoch_file);
+        } catch (const std::exception& error) {
+            append_note(note, error.what());
+            std::string qerror;
+            if (const auto dest = quarantine_entry(epoch_file, stamp, qerror)) {
+                append_note(note, "moved " + epoch_file.filename().string() + " -> " + dest->filename().string());
+                epoch_quarantined = true;
+            } else {
+                append_note(note, qerror);
+                epoch_unreadable = true;
+                suppress = true;
+            }
         }
     }
-    if (present == 0) {
-        // BUILDING publishes no map or events; TRACKING takes the next epoch.
+    const std::string epoch_words = epoch_unreadable    ? "map_epoch unreadable"
+                                     : epoch_quarantined ? "map_epoch quarantined"
+                                     : room_epoch        ? "map_epoch kept"
+                                                         : "map_epoch absent";
+
+    struct Loaded {
+        std::size_t index = 0;
+        msg::MapBricks message;
+        VoxelLayer layer;
+    };
+    const std::vector<std::filesystem::path> all = paths();
+    std::vector<std::filesystem::path> present;
+    std::vector<Loaded> decoded;
+    std::vector<std::string> missing_names;
+    bool missing = false;
+    bool damaged = false;
+    bool inspect_error = false;
+    for (std::size_t n = 0; n < all.size(); ++n) {
+        const EntryInspection entry = inspect_directory_entry(all[n]);
+        if (entry.presence == EntryPresence::error) {
+            inspect_error = true;
+            append_note(note, "cannot inspect " + entry.detail);
+            continue;
+        }
+        if (entry.presence == EntryPresence::absent) {
+            missing = true;
+            missing_names.push_back(channels_[n].sensor.name);
+            continue;
+        }
+        present.push_back(all[n]);
+        try {
+            auto [message, layer] = load_reference(all[n]);
+            if (message.header.room_id != config_.room_id) {
+                throw std::invalid_argument(all[n].string() + " holds room '" + message.header.room_id + "', not '" +
+                                            config_.room_id + "'");
+            }
+            if (message.voxel_size != static_cast<float>(config_.voxel_size)) {
+                throw std::invalid_argument(all[n].string() + " uses a different voxel_size");
+            }
+            decoded.push_back(Loaded{n, std::move(message), std::move(layer)});
+        } catch (const std::exception& error) {
+            damaged = true;
+            append_note(note, error.what());
+        }
+    }
+    if (!present.empty() && missing) {
+        std::sort(missing_names.begin(), missing_names.end());
+        append_note(note, "saved references are incomplete for room '" + config_.room_id + "': missing " +
+                              sensor_list(missing_names));
+    }
+
+    const auto move_aside = [&](const std::vector<std::filesystem::path>& paths) {
+        bool all_moved = true;
+        for (const std::filesystem::path& path : paths) {
+            std::string qerror;
+            if (const auto dest = quarantine_entry(path, stamp, qerror)) {
+                append_note(note, "moved " + path.filename().string() + " -> " + dest->filename().string());
+            } else {
+                append_note(note, qerror);
+                all_moved = false;
+            }
+        }
+        return all_moved;
+    };
+    const auto install = [&] {
+        for (Loaded& item : decoded) {
+            set_reference(channels_[item.index], std::move(item.layer));
+            channels_[item.index].reference_windows = config_.reference_windows;
+        }
+    };
+
+    // A bad or partial set is not installed. Leaving it in place makes the next start throw again.
+    if (inspect_error || damaged || (!present.empty() && missing)) {
+        if (!move_aside(present)) suppress = true;
+        if (inspect_error) suppress = true;
+        if (suppress) {
+            saves_suppressed_ = true;
+            append_note(note, "saves suppressed");
+        }
+        append_note(note, epoch_words);
+        append_note(note, "fresh reference starting");
         map_epoch_ = room_epoch.value_or(0);
+        startup_note_ = note;
         return;
     }
-    if (!missing.empty()) {
-        std::sort(missing.begin(), missing.end());
-        throw std::invalid_argument("saved references are incomplete for room '" + config_.room_id + "': missing " +
-                                    sensor_list(missing));
+    if (present.empty()) {
+        // No reference for this config. A kept epoch still numbers the room the next build continues.
+        map_epoch_ = room_epoch.value_or(0);
+        if (suppress) {
+            saves_suppressed_ = true;
+            append_note(note, "saves suppressed");
+        }
+        if (!note.empty()) append_note(note, epoch_words);
+        startup_note_ = note;
+        return;
     }
+
     std::uint64_t epoch = room_epoch.value_or(0);
-    for (std::size_t n = 0; n < all.size(); ++n) {
-        auto [message, layer] = load_reference(all[n]);
-        if (message.header.room_id != config_.room_id) {
-            throw std::invalid_argument(all[n].string() + " holds room '" + message.header.room_id + "', not '" +
-                                        config_.room_id + "'");
-        }
-        if (message.voxel_size != static_cast<float>(config_.voxel_size)) {
-            throw std::invalid_argument(all[n].string() + " uses a different voxel_size");
-        }
-        epoch = std::max(epoch, message.header.map_epoch);
-        set_reference(channels_[n], std::move(layer));
-        channels_[n].reference_windows = config_.reference_windows;
+    for (const Loaded& item : decoded) epoch = std::max(epoch, item.message.header.map_epoch);
+    install();
+    if (epoch == msg::kUint64Max) {
+        // Do not wrap. Epoch 0 would be a new cursor only because the publisher generation
+        // changed; the log says the counter is exhausted instead of pretending it moved on.
+        map_epoch_ = msg::kUint64Max;
+        epoch_saturated_ = true;
+        append_note(note, "map_epoch is saturated and was not incremented");
+        note_save_failure("map_epoch is saturated and was not incremented");
+    } else {
+        // seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor
+        // from before it names a message after it. The publisher generation is the fence when
+        // this process cannot take that next epoch.
+        map_epoch_ = epoch + 1;
     }
-    // seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
-    // before it names a message after it. Saved at once, so the next restart moves on again.
-    map_epoch_ = epoch + 1;
-    save(start);
     state_ = msg::MemoryState::tracking;
+    if (suppress || epoch == msg::kUint64Max) {
+        if (suppress) {
+            saves_suppressed_ = true;
+            append_note(note, "saves suppressed");
+            note_save_failure("saves suppressed after a failed quarantine");
+        }
+        append_note(note, epoch_words);
+        startup_note_ = note;
+        return;
+    }
+    if (!note.empty()) append_note(note, epoch_words);
+    startup_note_ = note;
+    try_save(start);
 }
 
 void RoomMemory::save(const msg::Time& stamp) {
     if (!config_.state_dir) return;
+    if (saves_suppressed_) throw std::runtime_error("saves suppressed after a failed quarantine");
     const msg::Header header{config_.room_id, map_epoch_, 0, stamp};
     // The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
     save_epoch(epoch_path(*config_.state_dir, config_.room_id), map_epoch_);
@@ -697,6 +932,71 @@ void RoomMemory::save(const msg::Time& stamp) {
     for (std::size_t n = 0; n < all.size(); ++n) {
         save_reference(all[n], channels_[n].reference, header, static_cast<float>(config_.voxel_size));
     }
+}
+
+void RoomMemory::note_save_failure(const std::string& message) {
+    persistence_failed_ = true;
+    persistence_detail_ = message;
+    if (!unread_save_error_) unread_save_error_ = message;
+}
+
+bool RoomMemory::try_save(const msg::Time& stamp) {
+    if (!config_.state_dir) return true;
+    if (saves_suppressed_) {
+        note_save_failure("saves suppressed after a failed quarantine");
+        return false;
+    }
+    last_save_attempt_ns_ = nanoseconds(stamp);
+    try {
+        save(stamp);
+    } catch (const std::exception& error) {
+        note_save_failure(error.what());
+        save_pending_ = true;
+        return false;
+    }
+    save_pending_ = false;
+    persistence_failed_ = false;
+    persistence_detail_.clear();
+    return true;
+}
+
+void RoomMemory::retry_pending_save(const msg::Time& stamp) {
+    if (!save_pending_ || saves_suppressed_ || !config_.state_dir) return;
+    if (nanoseconds(stamp) - last_save_attempt_ns_ < period_ns(config_.window_s)) return;
+    try_save(stamp);
+}
+
+bool RoomMemory::advance_epoch() {
+    if (map_epoch_ == msg::kUint64Max) {
+        epoch_saturated_ = true;
+        return false;
+    }
+    ++map_epoch_;
+    return true;
+}
+
+std::optional<std::string> RoomMemory::take_save_error() { return std::exchange(unread_save_error_, std::nullopt); }
+
+bool RoomMemory::persistence_ok() const { return !persistence_failed_ && !saves_suppressed_ && !epoch_saturated_; }
+
+std::string RoomMemory::persistence_report() const {
+    std::string startup = startup_note_.empty() ? std::string("ok") : startup_note_;
+    for (char& c : startup) {
+        if (c == '\n' || c == '\r') c = ' ';
+    }
+    std::string detail = persistence_detail_;
+    for (char& c : detail) {
+        if (c == '\n' || c == '\r') c = ' ';
+    }
+    const char* health = saves_suppressed_ ? "suppressed" : persistence_failed_ ? "failed" : "ok";
+    std::ostringstream out;
+    out << "startup: " << startup << '\n'
+        << "persistence: " << health << '\n'
+        << "pending_save: " << (save_pending_ ? '1' : '0') << '\n'
+        << "saves_suppressed: " << (saves_suppressed_ ? '1' : '0') << '\n'
+        << "epoch_saturated: " << (epoch_saturated_ ? '1' : '0') << '\n'
+        << "detail: " << detail << '\n';
+    return out.str();
 }
 
 void RoomMemory::add_points(const std::string& sensor, std::span<const float> xyz) {
@@ -743,6 +1043,7 @@ bool RoomMemory::reference_ready(const Channel& channel) const {
 }
 
 std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
+    retry_pending_save(stamp);
     std::vector<msg::ChangeEvent> events;
     // Every activity region of this window, all sensors.
     struct Moving {
@@ -880,8 +1181,11 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
                 }
             }
         }
-        ++map_epoch_;
-        save(stamp);
+        if (!advance_epoch()) {
+            note_save_failure("map_epoch is saturated and was not incremented");
+        } else {
+            try_save(stamp);
+        }
     }
     return events;
 }
@@ -954,12 +1258,19 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
         }
     }
     if (!changed && !keyframe_due) return std::nullopt;
+    // A delta has to name an epoch after its base. When the counter cannot move, the changed
+    // bricks go out as a snapshot at the same epoch instead of wrapping to 0.
+    bool epoch_advanced = true;
     if (changed) {
-        ++map_epoch_;
-        save(stamp);
+        if (!advance_epoch()) {
+            note_save_failure("map_epoch is saturated and was not incremented");
+            epoch_advanced = false;
+        } else {
+            try_save(stamp);
+        }
     }
     std::vector<msg::Brick> bricks = changed ? channels_[map_channel_].reference.to_bricks() : map_bricks_;
-    if (!keyframe_due) {
+    if (epoch_advanced && !keyframe_due) {
         const MapDelta change = map_delta(map_bricks_, bricks);
         msg::MapBricks delta = map_message(msg::MapKind::delta, stamp);
         delta.base_epoch = map_epoch_sent_;

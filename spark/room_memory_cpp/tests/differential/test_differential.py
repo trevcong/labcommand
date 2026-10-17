@@ -11,6 +11,7 @@ import contextlib
 import io
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -209,6 +210,18 @@ def run_both(tmp_path, script):
     return outputs[1]
 
 
+def run_one(tmp_path, script, side):
+    """One engine, ``cpp`` or ``py``. ``{state}`` is that side's directory, as in ``run_both``."""
+    state = tmp_path / f"state-{side}"
+    text = script.replace("{state}", str(state))
+    if side == "cpp":
+        path = tmp_path / f"script-{side}.txt"
+        path.write_text(text)
+        result = subprocess.run([REPLAY, str(path)], capture_output=True, check=True)
+        return result.stdout.decode(), state
+    return replay.run(text), state
+
+
 def test_engines_share_the_node_defaults(tmp_path):
     """Every MemoryConfig default, field by field (numbers compared as numbers)."""
     sides = []
@@ -304,9 +317,38 @@ config sensors=mid360,jt128 room_id=lab-7
 start 1760400200 0
 """
     run_both(tmp_path, build)
-    out = run_both(tmp_path, reload).splitlines()
-    # Each load takes the next epoch and saves it; a refused load saves nothing.
-    assert out[0] == "init TRACKING 2" and out[2] == "init error" and out[4] == "init TRACKING 3"
+    # The matching reload agrees. A voxel_size mismatch is a damaged room in C++: the reference
+    # is quarantined and the process starts BUILDING at the kept epoch. The Python oracle still
+    # raises, prints init error, and leaves the files in place, so the later lab-7 start reloads
+    # TRACKING there and starts fresh in C++ (the sibling reference is quarantined as incomplete).
+    cpp_text, cpp_state = run_one(tmp_path, reload, "cpp")
+    py_text, py_state = run_one(tmp_path, reload, "py")
+    cpp_lines, py_lines = cpp_text.splitlines(), py_text.splitlines()
+    assert cpp_lines[0] == py_lines[0] == "init TRACKING 2"
+    assert cpp_lines[1] == py_lines[1] and cpp_lines[1].startswith("status ")
+    assert [line for line in cpp_lines if line.startswith("init ")] == [
+        "init TRACKING 2", "init BUILDING 2", "init BUILDING 0", "init BUILDING 2"]
+    assert [line for line in py_lines if line.startswith("init ")] == [
+        "init TRACKING 2", "init error", "init BUILDING 0", "init TRACKING 3"]
+
+    def room_files(state, room):
+        root = state / room
+        if not root.exists():
+            return {}
+        return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    cpp_lab, py_lab = room_files(cpp_state, "lab-7"), room_files(py_state, "lab-7")
+    assert cpp_lab["map_epoch"] == b"2\n" and py_lab["map_epoch"] == b"3\n"
+    assert set(py_lab) == {"map_epoch", "reference-mid360.cdr", "reference-jt128.cdr"}
+    quarantined = {}
+    for name in cpp_lab:
+        if name == "map_epoch":
+            continue
+        match = re.fullmatch(r"reference-(mid360|jt128)\.cdr\.quarantine-(\d{8}T\d{6}Z)(?:\.(\d+))?", name)
+        assert match, name
+        quarantined[match.group(1)] = name
+    assert set(quarantined) == {"mid360", "jt128"} and set(cpp_lab) == {"map_epoch", *quarantined.values()}
+    assert room_files(cpp_state, "other") == room_files(py_state, "other")
 
 
 def test_sync_cursor_across_restarts(tmp_path):

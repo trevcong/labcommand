@@ -619,7 +619,7 @@ When several conditions hold at once, the banner shows the first that applies:
 | F9 | Rig bumped | guard → RIG_MOVED | red banner, overlays suppressed | §4.9 |
 | F10 | One sensor silent | `per_sensor_hz` 0 → DEGRADED | amber banner naming the sensor | Trevor restarts that driver. With the extrinsic, events continue from the other sensor (D17). Before it (P14), a silent non-frame sensor changes nothing, and a silent frame sensor stops new events until it returns |
 | F11 | Spark clock steps back | possible `event_id` seed collision after a restart (§2.3) | an `event_id` reused with another `kind`: protocol violation | the node refuses to start if its clock is earlier than the newest `first_seen` in its event log (PR 2.4) |
-| F12 | Spark disk full | reference save fails | not visible today | proposed: DEGRADED with a reason in the `:8766` block (Q9); the node keeps serving from memory |
+| F12 | Spark disk full | reference save fails; the C++ node keeps the map in memory, retries the save once per window, and latches `/room_memory/persistence`. A full disk while allocating `publisher_generation` still refuses to start (protocol §5.1), before that recovery exists | the persistence topic (`failed` or `suppressed`), not a DEGRADED banner | free the disk; the next window retries. Q9 stays open: DEGRADED is still only a silent sensor or a dropped window. A quarantine rename that did not finish does not retry, so the unmoved original is not overwritten |
 | F13 | Resync storm (flapping link, many Macs) | request counter; bytes per minute | slow recovery | P3, P4 |
 | F14 | `:8766` relay down | POST fails | map stays STALE; "cannot request resync" | keyframes every 60 s (protocol D29); ssh tunnel restart (existing `RigService` path) |
 | F15 | Large accept or re-reference | delta over half a snapshot | none | snapshot instead (P7) |
@@ -805,7 +805,7 @@ None of these is in effect until accepted. Each would change `ROOM-MEMORY-PROTOC
 6. **Should memory mode be on at launch?** LIVE is off at launch by policy. Memory mode costs ~1.8 KB/s, so it could run whenever the app is open, or be opt-in like LIVE.
 7. **How many Macs?** With one, the shared sync topics stay cheap. With several, P4 is necessary rather than prudent.
 8. **Is the full event history needed on the Mac,** beyond the last 100 messages? If so, it needs a paged read on `:8766` (§4.5) and a retention policy for the Spark's event log (brief R10).
-9. **Should a failed reference save (disk full) put the node in DEGRADED?** That changes protocol §4.1's DEGRADED trigger.
+9. **Should a failed reference save (disk full) put the node in DEGRADED?** That changes protocol §4.1's DEGRADED trigger. Still open. The C++ node reports the failure on `/room_memory/persistence` instead (F12), and a failed save does not by itself change `MemoryStatus`.
 10. **Will the JT128↔Mid-360 extrinsic (brief R1) exist by S2? Until then, which sensor is `frame_sensor`?** That sensor alone contributes geometry (P14), so a silent frame sensor stops new events (F10). Changing the frame sensor later starts a new room generation. Adding the other sensor's transform when the extrinsic lands does not: it rebuilds the reference within the same frame (§2.3).
 11. **How large will real snapshots get?** The bucket (P15) delays the next `map_bricks` message by about (snapshot − 180 KB) ÷ 3 KB/s: none at the measured 59 KB, ~2 min at 500 KB, ~10 min at 2 MB. If maps approach the 500 KB target, the bucket's rate needs revisiting against the 5 KB/s mean.
 

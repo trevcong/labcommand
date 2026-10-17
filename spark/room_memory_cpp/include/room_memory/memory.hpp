@@ -13,11 +13,13 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -110,16 +112,38 @@ std::filesystem::path reference_path(const std::string& state_dir, const std::st
 // (protocol 1.4). load_reference reads both layouts.
 void save_reference(const std::filesystem::path& path, const VoxelLayer& layer, const msg::Header& header,
                     float voxel_size);
-// Reads a saved reference. Throws msg::CDRError or std::runtime_error.
+// Reads a saved reference. The file must be a complete snapshot: a delta is not a reference.
+// Throws msg::CDRError, std::invalid_argument, or std::runtime_error.
 std::pair<msg::MapBricks, VoxelLayer> load_reference(const std::filesystem::path& path);
 // <state_dir>/<room_id>/map_epoch: the room's last map_epoch, whichever sensors the node ran,
 // as decimal ASCII and a newline. Same room_id rule as reference_path.
 std::filesystem::path epoch_path(const std::string& state_dir, const std::string& room_id);
 // Writes the epoch file, atomically (write_atomic).
 void save_epoch(const std::filesystem::path& path, std::uint64_t epoch);
-// Reads the epoch file: nullopt if it does not exist. Throws std::invalid_argument if it does not
-// hold one uint64 as digits and a newline.
+// Reads the epoch file: nullopt when the path has no directory entry. A dangling symlink is an
+// entry, so it is not nullopt. Throws std::invalid_argument when the contents are not one uint64
+// and a newline, or std::runtime_error when the entry cannot be inspected or read.
 std::optional<std::uint64_t> load_epoch(const std::filesystem::path& path);
+
+// How many `<name>.quarantine-<stamp>` and `.<n>` names one load will try before it stops and
+// leaves the original in place. The first name has no suffix; the rest are `.2` .. `.<attempts>`.
+inline constexpr int kQuarantineNameAttempts = 32;
+
+// A directory entry, without following symlinks. `exists()` is the wrong check here: it follows
+// a symlink, and a dangling one then looks absent.
+enum class EntryPresence { absent, present, error };
+
+struct EntryInspection {
+    EntryPresence presence = EntryPresence::absent;
+    std::string detail;
+};
+
+EntryInspection inspect_directory_entry(const std::filesystem::path& path);
+
+// Renames `from` to `to` only when `to` has no directory entry. A file, directory, or symlink
+// already at `to` (dangling included) is left untouched and the call fails with `file_exists`.
+// Does not delete. `std::filesystem::rename` would replace a file or a symlink.
+std::error_code rename_noreplace(const std::filesystem::path& from, const std::filesystem::path& to);
 
 // Inclusive seq ranges sorted, with overlapping or touching ones merged.
 std::vector<msg::SeqRange> canonical_ranges(std::vector<msg::SeqRange> ranges);
@@ -240,6 +264,9 @@ struct MemoryConfig {
     std::int64_t reference_windows = 30;
     std::int64_t recent_windows = 3;
     std::optional<std::string> state_dir = std::string("~/room-memory");
+    // Empty: a damaged file is moved aside under a UTC stamp chosen at load. Tests set this so
+    // the quarantine name is fixed. Not a ROS parameter; the node leaves it empty.
+    std::string quarantine_stamp;
     // Reference evidence from per-voxel window counts (VoxelStats::settled).
     std::int64_t occupied_min_hits = 2;
     double occupied_min_ratio = 0.3;
@@ -349,9 +376,13 @@ public:
         std::shared_ptr<const Membership> reference_index;  // over reference.occupied
     };
 
-    // Throws std::invalid_argument on a bad config, a publisher_generation of 0, or inconsistent
-    // saved state. `scope` is the diff scope of tracking windows: regions (the default) or full,
-    // which gives the same events and exists to measure and prove that.
+    // Throws std::invalid_argument on a bad config or a publisher_generation of 0. A damaged room
+    // (truncated, undecodable, wrong room or voxel, a delta saved as the reference, an incomplete
+    // sensor set, a malformed epoch) is quarantined and the constructor returns: BUILDING with
+    // empty references, or TRACKING when the references themselves are usable. A failed save does
+    // not escape. publisher_generation and publisher.lock are not touched. `scope` is the diff
+    // scope of tracking windows: regions (the default) or full, which gives the same events and
+    // exists to measure and prove that.
     RoomMemory(MemoryConfig config, const msg::Time& start, std::uint64_t publisher_generation,
                const RayBackend* backend = nullptr, DiffScope scope = DiffScope::regions);
 
@@ -374,7 +405,8 @@ public:
     // once delta_period_s has passed since the last message, voxels that settled since are
     // added to the references (map_epoch + 1, references saved) and sent as a delta of the
     // changed map bricks; a snapshot instead when keyframe_period_s has passed since the last
-    // one, or when the deltas since it would exceed keyframe_delta_ratio of its size.
+    // one, when the deltas since it would exceed keyframe_delta_ratio of its size, or when
+    // map_epoch is already UINT64_MAX and cannot advance.
     // After learn_windows tracking windows, that settle pass drops every sensor's counts.
     // Later ticks do not settle, and a keyframe of the unchanged map does not bump map_epoch.
     std::optional<msg::Bytes> map_update(const msg::Time& stamp);
@@ -384,8 +416,24 @@ public:
     // as SINCE_NONE.
     SyncAnswer sync(const msg::RequestSync& request, const msg::Time& stamp);
     // Writes every sensor's reference and the room's epoch file with the current map_epoch.
-    // No-op without state_dir.
+    // No-op without state_dir. Throws std::runtime_error (or filesystem_error) on a write
+    // failure, and when saves are suppressed after a quarantine rename that did not finish:
+    // writing then would replace an original this process could not move aside.
     void save(const msg::Time& stamp);
+    // Empty when load found nothing wrong. Otherwise one paragraph: the exception text, each
+    // `moved <old> -> <quarantine>` pair, whether map_epoch was kept, and a fresh start or
+    // suppressed saves when those happened.
+    const std::string& startup_note() const { return startup_note_; }
+    // The oldest save failure this process has not reported yet. A later successful save does
+    // not clear it. Empty when there is nothing unreported.
+    std::optional<std::string> take_save_error();
+    // Current persistence health, including the startup note. A successful retry changes
+    // `persistence:` and leaves `startup:` in place, so a late reader still sees the quarantine.
+    std::string persistence_report() const;
+    // False while a save is failing, saves are suppressed, or map_epoch cannot advance.
+    bool persistence_ok() const;
+    bool saves_suppressed() const { return saves_suppressed_; }
+    bool save_pending() const { return save_pending_; }
 
     const MemoryConfig& config() const { return config_; }
     msg::MemoryState state() const { return state_; }
@@ -404,6 +452,14 @@ private:
     bool reference_ready(const Channel& channel) const;
     std::vector<std::filesystem::path> paths() const;
     void load(const msg::Time& start);
+    void recover_saved_room(const msg::Time& start);
+    void note_save_failure(const std::string& message);
+    // save(), catching failures. False when nothing was written. Does not clear an unread error.
+    bool try_save(const msg::Time& stamp);
+    // One attempt per window_s while a previous try_save left the disk behind memory.
+    void retry_pending_save(const msg::Time& stamp);
+    // False at UINT64_MAX. Does not wrap: epoch 0 would reuse a cursor inside this generation.
+    bool advance_epoch();
     std::uint64_t next_id();
     msg::ChangeEvent event(const Channel& channel, msg::EventState state, const Candidate& candidate,
                            const msg::Time& stamp);
@@ -449,6 +505,16 @@ private:
     std::deque<Logged> event_log_;
     std::map<std::uint64_t, Logged> open_latest_;  // event_id -> latest message, open events only
     std::optional<float> coverage_;
+    std::string startup_note_;
+    std::optional<std::string> unread_save_error_;
+    std::string persistence_detail_;
+    bool persistence_failed_ = false;
+    bool save_pending_ = false;
+    bool saves_suppressed_ = false;
+    bool epoch_saturated_ = false;
+    // nanoseconds of the last try_save that actually called save. Far in the past so the first
+    // retry is not held back by a zero stamp.
+    std::int64_t last_save_attempt_ns_ = std::numeric_limits<std::int64_t>::min();
 };
 
 template <typename NextId>
