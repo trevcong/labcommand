@@ -2,7 +2,7 @@
 
 This file is decision D49 and protocol section 3.13. `~/Developer/lc-tasks/NUMBERING.md` reserves that pair for this checkout. It is the operator procedure for one room visit. It does not add a message, a topic, or a threshold, and it does not amend `docs/ROOM-MEMORY-PROTOCOL.md`.
 
-The scored session is PR #36, branch `g5-acceptance-harness`, commit `1225db5` ("Physical acceptance-test harness and scorer"). The commands, label grammar, and exit codes below were read from that commit (`README.md`, `session.py`, `score.py`). If that PR changes, re-read those files before the visit. This checkout does not contain `spark/room_memory/acceptance/` and does not copy it.
+The scored session is the harness in `spark/room_memory/acceptance/` (PR #36). Main has that harness at the merge `5a51554`. The commands, label grammar, and exit codes below were read from commit `1225db5`, subject "Do not deny acceptance for a lifetime dropped-window count" (`README.md`, `session.py`, `score.py`). If that harness changes, re-read those files before the visit. This procedure does not edit them. This branch does not contain `acceptance/` until it is merged with main; run the harness from a tree that has that directory.
 
 `evaluate.py`, the `acceptance_replay` ctest, and the `bag_stream.py` rig-move flags are still deferred. This visit does not run them.
 
@@ -35,12 +35,15 @@ Script-owned rows are `driver` `room_acceptance_marks`. Harness-owned rows are `
 
 ## 2. Preflight, before anyone moves
 
-Do this in the room. This procedure does not deploy, restart, set a parameter, `docker exec`, or ssh.
+Do this in the room. The marks script does not deploy, restart, set a parameter, ssh, or run `docker exec`. It only reads local files.
+
+`docker inspect` and `docker logs` are read-only. You run them on the machine whose docker already sees the container, and you redirect them to files on this Mac. The script does not run them.
+
+Section 4 is a different process. `acceptance run` starts one subscribe-only `docker exec -i` inside the container. That exec belongs to the harness, not to the marks script. The bump capture in section 3 is the same kind of subscribe-only exec, in its own terminal. It does not restart the node and it does not set a parameter.
 
 - The room-memory container is already up. Leave it up.
-- A display you already have (LabCommand Room, or the node log already on screen) is how you read state. This script does not open a socket.
-- Write down what you actually see. Both launch files default `rig_guard` to false, `auto_relearn` to true, `relearn_after_s` to 60, `imu_quiet_s` to 2, and `check_max_s` to 10. Those are what an un-overridden launch would pass. They are not observations of this process. If you did not see the value, the answer is `unknown`.
-- IMU availability is the same rule. `imu_topic` defaulting to `/livox/imu` does not mean samples are arriving. Answer `yes` only if you saw samples or `imu_ok`. Answer `no` if you saw that they are absent. Otherwise `unknown`.
+- A display you already have (LabCommand Room, or the node log already on screen) is how you read `TRACKING` and `RIG_MOVED`. This script does not open a socket. LabCommand Room does not subscribe to `/room_memory/rig`, and the node log does not print `auto_relearn`, `relearn_after_s`, or `imu_ok`. Those three come from the files in section 3, not from the display.
+- Both launch files default `rig_guard` to false, `auto_relearn` to true, `relearn_after_s` to 60, `imu_quiet_s` to 2, and `check_max_s` to 10. A default counts as an observation only when the inspect file names `room_memory.launch.py` or `room_memory_cpp.launch.py`, that argument is absent, and the command has no params file. Remembering the default does not count. If the command does not name one of those two files, an absent argument stays `unknown`.
 - Three distinct objects, taped, with the real names in your notes:
   - PLACE: not in the frozen reference. The spot is empty in that reference.
   - REMOVE: a different object that is already in the reference.
@@ -120,11 +123,7 @@ The third token is the move source (`reference_setup.move_source`). The physical
 
 Do this before the harness, with the scene matching the reference and nobody in view. One leg, 3-5 cm (PLAN-RIGGUARD E2), then put the leg back (E4). Do not tap only, twist, or carry the rig out on this visit.
 
-```text
-python3 scripts/room_acceptance_marks.py --live --out DIR
-```
-
-`--live` refuses any scenario other than `tripod_bump`. It does not run the protocol and it does not sleep the hour. `--bump-s` shortens the planned watch. The protocol duration in the file stays 30 s.
+Start the capture in the next paragraphs before this script. `--live` refuses any scenario other than `tripod_bump`. It does not run the protocol and it does not sleep the hour. `--bump-s` shortens the planned watch. The protocol duration in the file stays 30 s. The command, with the three local files, is after the capture.
 
 1. Press Enter at the push. That timestamp is the start. It is not rewritten when the watch ends.
 2. Press Enter when the leg is back down. That is the normal path and records `completion` `complete`, including when it is sooner than 30 s. If the deadline passes with no Enter, `restore_mono_ns` and `wall_end_utc` stay empty and `completion` is `restore_unmarked`. The script does not fill those fields with the deadline. The questions still follow. Finishing them exits 0. `restore_unmarked` is not a harness exit code.
@@ -142,9 +141,137 @@ python3 scripts/room_acceptance_marks.py --live --out DIR
 | recovery | `realigned` / `in_place` / `still_moved` / `relearning` / `unknown` |
 | unexpected candidates | `none`, a short description, or `unknown` |
 
-The harness status lines do not carry `map_epoch`. Read it from the display or from the node log line that prints `map_epoch` at startup. `frame_epoch` is on `RigPose` (`/room_memory/rig`), which PR #36 does not subscribe. If that value is not on the display, type `unshown`.
+Type `unknown` for a field you are not copying from the source named below. A value you type is kept, so a remembered launch default typed by hand is recorded as if you had seen it. Type `unknown` and let the file fill the field.
 
-Recovery matches `_track_moved` in `spark/room_memory/room_memory/memory.py`. Agreeing fits inside the align envelope adopt the displaced pose and return the channel to normal (`REALIGNED`, or `IN_PLACE` when the increment is below the move threshold). That is a successful alignment at the displaced pose. It does not by itself change `map_epoch`. Relearning runs only while that recovery is still unresolved and `auto_relearn` is enabled, after `relearn_after_s`. Do not hold the rig out of place to force a relearn. If you did not see `auto_relearn` on the running node, type `unknown`. Do not fill in `true` from the launch file.
+| field | what counts as an observation |
+|---|---|
+| `rig_guard` | A node-log line `rig guard: N ICP estimates` means the guard is on. Both nodes print that line only while the guard is running (`node.py`, `room_memory_node.cpp`). Seeing it on screen and typing `on` counts. Passing the saved log as `--log` counts, including when inspect would have said off. Absence of the line does not mean off. Off counts only from the inspect command (`rig_guard:=false`, or the launch default when inspect shows that file and no override). |
+| `auto_relearn`, `relearn_after_s` | The inspect command. An explicit `name:=value` is source `command`. If inspect names `room_memory.launch.py` or `room_memory_cpp.launch.py` and does not pass that argument or a params file, the launch default counts and is source `launch_default` (`auto_relearn` on, `relearn_after_s` 60). No other source has these values. The startup log does not print them. |
+| IMU | `imu_ok` on `/room_memory/rig` in the topics capture below. `true` is `yes`, `false` is `no`. PR #36's `topics.jsonl` does not subscribe to that topic. On that file `imu_lines` is 0 and `imu_subscribed` is false. That zero is not an observation that the IMU is off. |
+| `map_epoch` before and after | Two or more `map_epoch` values on `/room_memory/status` in the topics capture (or on the rig lines, if status has fewer than two). The first is before, the last is after. One sample does not fill both. The startup log prints `map_epoch` once and is not the after-bump value. Harness status lines do not carry `map_epoch`. |
+| `frame_epoch` before and after | Two or more `frame_epoch` values on `/room_memory/rig`. The capture replaces a typed `unshown`. Without a rig capture, `unshown` is the answer when the display does not show it. PR #36 does not subscribe to `/room_memory/rig`. |
+| `RIG_MOVED` | A status line `state` `rig_moved`, or a rig `outcome` of `moved`, in the topics capture. Two or more status samples, or two or more rig outcomes, with none of those, is `not_seen`. The window log's `state RIG_MOVED` is the same fact if you saw it and type `seen`. |
+| recovery | The last rig `outcome` in the capture: `realigned`, `in_place`, `relearning`, or `moved` (stored as `still_moved`). `checking` and `inconclusive` do not fill it. |
+| unexpected candidates | The events topic in the capture. Zero candidate lines is `none`. A count is the note. The harness log is not this capture. |
+
+These files count. A visit that passes them and types `unknown` can finish `bump_evaluation` `observed`. A visit that does not have them stays `not_evaluated`. That is not a harness exit code and not a failed guard test.
+
+Save the two process files any time the container is up. They do not describe the push. The topics file does, so it has to keep running across the push and be read after you close it.
+
+```text
+docker inspect NAME > inspect.json
+docker logs NAME > node.log
+```
+
+Start the topics capture before you start the marks script, so the file exists. In another terminal, on the machine whose docker already sees the container:
+
+```text
+docker exec -i NAME python3 -u - > bump-topics.jsonl <<'PY'
+import json, sys, time
+import rclpy
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from labcommand_msgs.msg import ChangeEvent, MemoryStatus, RigPose
+
+STATE = {0: "building", 1: "tracking", 2: "rig_moved", 3: "degraded", 4: "paused"}
+OUTCOME = {0: "in_place", 1: "checking", 2: "moved", 3: "realigned", 4: "relearning", 5: "inconclusive"}
+EVENT = {0: "candidate", 1: "confirmed", 2: "accepted", 3: "reverted", 4: "expired"}
+TOPICS = ["/room_memory/status", "/room_memory/events", "/room_memory/rig"]
+
+def latched():
+    return QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+
+def volatile():
+    return QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+class Dropped:
+    def publish(self, *_a, **_k):
+        return None
+
+class Reader(Node):
+    def __init__(self):
+        super().__init__(
+            "room_memory_bump_capture",
+            enable_rosout=False,
+            start_parameter_services=False,
+            enable_logger_service=False,
+            parameter_overrides=[
+                Parameter("use_sim_time", Parameter.Type.BOOL, False),
+                Parameter("start_type_description_service", Parameter.Type.BOOL, False),
+            ],
+        )
+        self.subs = []
+        self.subs.append(self.create_subscription(MemoryStatus, "/room_memory/status", self.on_status, latched()))
+        self.subs.append(self.create_subscription(ChangeEvent, "/room_memory/events", self.on_event, volatile()))
+        self.subs.append(self.create_subscription(RigPose, "/room_memory/rig", self.on_rig, latched()))
+
+    def create_publisher(self, *_a, **_k):
+        return Dropped()
+
+    def create_client(self, *_a, **_k):
+        raise RuntimeError("bump capture does not create clients")
+
+    def create_service(self, *_a, **_k):
+        raise RuntimeError("bump capture does not create services")
+
+    def on_status(self, message):
+        emit({"topic": "/room_memory/status", "message": {
+            "state": STATE.get(int(message.state), str(int(message.state))),
+            "map_epoch": int(message.map_epoch),
+        }})
+
+    def on_event(self, message):
+        emit({"topic": "/room_memory/events", "message": {
+            "state": EVENT.get(int(message.state), str(int(message.state))),
+            "event_id": int(message.event_id),
+        }})
+
+    def on_rig(self, message):
+        emit({"topic": "/room_memory/rig", "message": {
+            "imu_ok": bool(message.imu_ok),
+            "frame_epoch": int(message.frame_epoch),
+            "map_epoch": int(message.map_epoch),
+            "outcome": OUTCOME.get(int(message.outcome), str(int(message.outcome))),
+        }})
+
+def main():
+    rclpy.init()
+    node = Reader()
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not all(sub.get_publisher_count() > 0 for sub in node.subs):
+            rclpy.spin_once(node, timeout_sec=0.2)
+        emit({"op": "ready", "topics": list(TOPICS)})
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+main()
+PY
+```
+
+That process only subscribes. It turns rosout, the parameter services, and the logger service off, and it does not advertise `/parameter_events`. Stop it by Ctrl-C in its own terminal, or `kill` that PID. Do not kill the container. Do not send keystrokes to LabCommand or to any other app. If the guard is off there is no `/room_memory/rig` publisher; the capture still records status and events, and IMU stays `unknown`.
+
+Leave the capture running through the push and the restore. After the leg is back, stop the capture, rewrite `node.log` if you want the log from this visit (`docker logs NAME > node.log`), then press Enter at the script's close prompt. The script reads the files then. It does not read them before the push, and a dry-run read is not a bump observation. `read_after_bump` on the stored summary is true only for that post-close read. `applied_to_bump` is true only for a source that filled an answer.
+
+```text
+python3 scripts/room_acceptance_marks.py --live --inspect inspect.json --log node.log --topics bump-topics.jsonl --out DIR
+```
+
+`--status` is still a local JSON object, read only. Nothing in this repo writes `rig_guard`, `auto_relearn`, `relearn_after_s`, or `imu_ok` into one, so it is not the visit path. A single object also cannot supply both epochs. `--recording` stores the path, the byte size (a directory sums files one level down, not deeper), and whether `metadata.yaml` is present. That summary is not a bump observation.
+
+The script refuses to overwrite `scenario-marks.json` or `scenario-marks.csv`, refuses an input path that is one of those files, and refuses an `--out` directory that is the recording or sits inside it. Use a new directory for a second run. A missing input path exits 2 and writes no marks. The topics file may be empty when the script starts and grow while the capture runs. The post-close read is the one that is stored.
+
+Recovery matches `_track_moved` in `spark/room_memory/room_memory/memory.py`. Agreeing fits inside the align envelope adopt the displaced pose and return the channel to normal (`REALIGNED`, or `IN_PLACE` when the increment is below the move threshold). That is a successful alignment at the displaced pose. It does not by itself change `map_epoch`. Relearning runs only while that recovery is still unresolved and `auto_relearn` is enabled, after `relearn_after_s`. Do not hold the rig out of place to force a relearn.
 
 `bump_evaluation` is `observed` only when the guard was seen `on`, configuration and IMU were answered, both map epochs are integers, both frame epochs are integers or `unshown`, `RIG_MOVED` is `seen` or `not_seen`, recovery is one of the four outcomes, and the candidate note is not empty or `unknown`. Every other case is `not_evaluated`:
 
@@ -157,21 +284,13 @@ Recovery matches `_track_moved` in `spark/room_memory/room_memory/memory.py`. Ag
 | `rehearsal` | dry-run timing sheet |
 | `interrupted` / `eof` / `aborted` | the bump watch or its questions did not finish |
 
-Optional local files are summaries stored next to the answers. They do not become the answers and they do not flip `not_evaluated` to `observed`.
-
-```text
-python3 scripts/room_acceptance_marks.py --live --status PATH --topics PATH --recording PATH --out DIR
-```
-
-Each path is opened read-only. A missing path exits 2 and writes no marks. `--status` must be a JSON object. Copied keys, when present, are `state`, `events_seq`, `map_epoch`, `frame_epoch`, `rig_guard`, `auto_relearn`, `relearn_after_s`, `imu_ok`, `outcome`, and `publisher_generation`. `--topics` stores the path, the line count, and counts of candidate event lines, `rig_moved` status lines, and IMU lines (`imu_ok`, `/livox/imu`, or topic `/room_memory/rig`). PR #36's `topics.jsonl` subscribes only to `/room_memory/status`, `/room_memory/events`, and `/room_memory/activity`. On that file `imu_lines` is 0 and `imu_subscribed` is false. That zero is not an observation that the IMU is off. Answer the IMU prompt from the display. `--recording` stores the path, the byte size (a directory sums files one level down, not deeper), and whether `metadata.yaml` is present.
-
-The script refuses to overwrite `scenario-marks.json` or `scenario-marks.csv`, refuses an input path that is one of those files, and refuses an `--out` directory that is the recording or sits inside it. Use a new directory for a second run.
+Do not point `--topics` at the harness `topics.jsonl`. That log is not the bump, and the script will not treat it as one.
 
 If recovery was `relearning`, do not start the harness on the new epoch until a reference is frozen again and the three objects are checked again. If it realigned, confirm the display is back to `TRACKING` after the leg is home, and check the three objects again. The physical spots moved with the tripod until you put it back.
 
 ## 4. Scored session
 
-Stop the marks script. On the machine whose `docker` already sees the container (no `--ssh`, no default container name):
+Stop the marks script. On the machine whose `docker` already sees the container (no `--ssh`, no default container name). This is the one step that runs `docker exec`: the harness runs `docker exec -i NAME` of a process that only subscribes. The marks script is not part of that, and it never execs.
 
 ```text
 PYTHONPATH=spark/room_memory python3 -m acceptance run --transport ros2 --container NAME --out HARNESS_DIR
@@ -233,7 +352,7 @@ A miss with activity somewhere in the window is `miss_with_activity_observed`. N
 
 ## 7. Stop
 
-Ctrl-C the marks script in its own terminal, or `kill` that PID from another terminal. `kill` sends SIGTERM. Ctrl-C sends SIGINT. Both write the rows already taken and exit 130. The push time stays. The restore time stays if you had already pressed Enter for it. Answers you had already accepted stay, including when the next question is still open. An open watch, with no restore yet, is `completion` `aborted` and `session.end_reason` is `interrupted`. A deadline that passed with no Enter stays `restore_unmarked`, with the restore time empty. If you stop it after the questions are done, while the handoff text is printing or the file is being written, that finished bump row is written as it was and the process still exits 130.
+Ctrl-C the marks script in its own terminal, or `kill` that PID from another terminal. `kill` sends SIGTERM. Ctrl-C sends SIGINT. Both write the rows already taken and exit 130. The push time stays. The restore time stays if you had already pressed Enter for it. Answers you had already accepted stay, including when the next question is still open. An open watch, with no restore yet, is `completion` `aborted` and `session.end_reason` is `interrupted`. A deadline that passed with no Enter stays `restore_unmarked`, with the restore time empty. Stopping while the handoff text is printing exits 130 and keeps that finished bump. A stop while the two files are being written is held until both files are in place, then the process exits 130. The stop is delayed, not dropped, and the exit code does not stay 0. If the stop lands after both files are already written, the process still exits 130. It does not report that the output already exists.
 
 `kill -9` stops the process without writing the file. Do not use it.
 

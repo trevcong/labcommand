@@ -286,11 +286,14 @@ def test_local_reads_do_not_write_back_or_become_observations(tmp_path):
     assert body["status"]["events_seq"] == 9
     assert body["status"]["map_epoch"] == 4
     assert body["status"]["rig_guard"] is False
+    assert body["status"]["read_after_bump"] is False
+    assert body["status"]["applied_to_bump"] is False
     assert "secret" not in body["status"]
     assert "auto_relearn" in body["status"]
     bump = next(row for row in body["scenarios"] if row["id"] == "tripod_bump")
     assert all(value is None for value in bump["observations"].values())
     assert bump["bump_evaluation"] == "not_evaluated"
+    assert "not a bump observation" in body["recording"]["note"]
     assert body["topics"]["lines"] == 4
     assert body["topics"]["candidate_lines"] == 1
     assert body["topics"]["rig_moved_lines"] == 1
@@ -563,6 +566,12 @@ def test_import_allowlist_blocks_remote_execution():
 def test_runbook_matches_harness_head_and_the_stop_path():
     text = RUNBOOK.read_text(encoding="utf-8")
     assert "1225db5" in text
+    assert "Do not deny acceptance for a lifetime dropped-window count" in text
+    assert "Physical acceptance-test harness and scorer" not in text
+    assert "5a51554" in text
+    assert "docker inspect" in text
+    assert "rig guard:" in text
+    assert "output already exists" in text
     assert "172518b" not in text
     assert "session_dropped_windows" in text
     assert "dropped_windows did not change from ready" not in text
@@ -613,6 +622,7 @@ def test_harness_topics_log_does_not_count_as_an_imu_observation(tmp_path):
     assert summary["imu_lines"] == 0
     assert summary["imu_subscribed"] is False
     assert "not an observation" in summary["imu_note"]
+    assert summary["bump_evidence"] is None
 
 
 def test_interrupt_during_questions_keeps_answers_already_taken():
@@ -759,14 +769,302 @@ def test_sigterm_during_questions_keeps_answers_and_the_restore(tmp_path):
     assert (out / "scenario-marks.csv").is_file()
 
 
-def _spawn_live(tmp_path):
+def _rehearsal_payload(module):
+    return module.build_rehearsal(module.resolve_durations(None, None, None, None, None))
+
+
+def test_launch_defaults_match_the_launch_files():
+    module = load()
+    for relative in (
+        "spark/room_memory/launch/room_memory.launch.py",
+        "spark/room_memory_cpp/launch/room_memory_cpp.launch.py",
+    ):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        assert '"rig_guard": ("false", bool)' in text
+        assert '"auto_relearn": ("true", bool)' in text
+        assert '"relearn_after_s": ("60.0", float)' in text
+        assert module.LAUNCH_DEFAULTS[Path(relative).name] == {
+            "rig_guard": "off",
+            "auto_relearn": "on",
+            "relearn_after_s": 60,
+        }
+
+
+def test_inspect_counts_a_named_launch_file_and_not_a_remembered_default():
+    module = load()
+    named = module.parse_inspect(json.dumps([{
+        "Config": {
+            "Cmd": ["ros2", "launch", "room_memory", "room_memory.launch.py", "rig_guard:=true"],
+        }
+    }]))
+    assert named["launch_file"] == "room_memory.launch.py"
+    assert named["rig_guard"] == "on"
+    assert named["sources"]["rig_guard"] == "command"
+    assert named["auto_relearn"] == "on"
+    assert named["sources"]["auto_relearn"] == "launch_default"
+    assert named["relearn_after_s"] == 60
+    assert named["sources"]["relearn_after_s"] == "launch_default"
+    args_only = module.parse_inspect(json.dumps([{
+        "Args": ["ros2", "launch", "room_memory_cpp", "room_memory_cpp.launch.py"],
+    }]))
+    assert args_only["launch_file"] == "room_memory_cpp.launch.py"
+    assert args_only["rig_guard"] == "off"
+    assert args_only["sources"]["rig_guard"] == "launch_default"
+    bare = module.parse_inspect("ros2 run room_memory room_memory_node")
+    assert bare["defaults_apply"] is False
+    assert "auto_relearn" not in bare
+    assert "relearn_after_s" not in bare
+    blocked = module.parse_inspect(
+        "ros2 launch room_memory room_memory.launch.py rig_guard:=true --params-file /tmp/p.yaml"
+    )
+    assert blocked["defaults_apply"] is False
+    assert blocked["rig_guard"] == "on"
+    assert blocked["sources"]["rig_guard"] == "command"
+    assert "auto_relearn" not in blocked
+
+
+def test_named_sources_make_an_untyped_bump_observed():
+    """A visit that types unknown can still be observed from the files it can actually collect."""
+    module = load()
+    row = {"observations": {key: "unknown" for key in module.OBSERVATION_KEYS}}
+    evidence = {
+        "imu": "yes",
+        "map_epoch_before": 4,
+        "map_epoch_after": 4,
+        "frame_epoch_before": 9,
+        "frame_epoch_after": 9,
+        "rig_moved": "seen",
+        "recovery": "realigned",
+        "unexpected_candidates": "none",
+    }
+    summaries = {
+        "inspect": module.parse_inspect("ros2 launch room_memory room_memory.launch.py"),
+        "log": {"rig_guard_line": True},
+        "topics": {"bump_evidence": evidence},
+        "status": {},
+    }
+    sources = module._apply_evidence(row, summaries)
+    assert row["observations"]["rig_guard"] == "on"
+    assert sources["rig_guard"] == "node_log"
+    assert row["observations"]["auto_relearn"] == "on"
+    assert sources["auto_relearn"] == "launch_default"
+    assert row["observations"]["relearn_after_s"] == 60
+    assert sources["imu"] == "topics"
+    assert module.judge_bump(row["observations"]) == ("observed", "observed")
+    # A typed answer is not replaced by the file.
+    row["observations"]["auto_relearn"] = "off"
+    module._apply_evidence(row, summaries)
+    assert row["observations"]["auto_relearn"] == "off"
+
+
+def test_one_status_sample_does_not_fill_both_epochs(tmp_path):
+    module = load()
+    topics = tmp_path / "topics.jsonl"
+    topics.write_text(
+        json.dumps({"topic": "/room_memory/status", "message": {"state": "tracking", "map_epoch": 4}}) + "\n",
+        encoding="utf-8",
+    )
+    summary = module.summarize_topics(topics)
+    assert "map_epoch_before" not in summary["bump_evidence"]
+    assert "map_epoch_after" not in summary["bump_evidence"]
+    topics.write_text(
+        "\n".join([
+            json.dumps({"topic": "/room_memory/status", "message": {"state": "tracking", "map_epoch": 4}}),
+            json.dumps({"topic": "/room_memory/status", "message": {"state": "rig_moved", "map_epoch": 4}}),
+            json.dumps({
+                "topic": "/room_memory/rig",
+                "message": {"imu_ok": False, "frame_epoch": 4, "map_epoch": 4, "outcome": "moved"},
+            }),
+            json.dumps({
+                "topic": "/room_memory/rig",
+                "message": {"imu_ok": False, "frame_epoch": 4, "map_epoch": 4, "outcome": "realigned"},
+            }),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    summary = module.summarize_topics(topics)
+    evidence = summary["bump_evidence"]
+    assert evidence["map_epoch_before"] == 4
+    assert evidence["map_epoch_after"] == 4
+    assert evidence["frame_epoch_before"] == 4
+    assert evidence["imu"] == "no"
+    assert evidence["rig_moved"] == "seen"
+    assert evidence["recovery"] == "realigned"
+
+
+def test_live_csv_leaves_restore_cells_empty_when_unmarked():
+    module = load()
+    clock = module.ManualClock(1_000)
+    answers = iter(["\n", "on", "off", "45", "no", "3", "3", "unshown", "unshown", "not_seen", "in_place", "none"])
+
+    def read_line(deadline):
+        if deadline is None:
+            return next(answers)
+        return None
+
+    result = module.run_bump(clock, read_line, _wall, 30, 30, _discard)
+    text = module._csv_text([result["row"]])
+    assert text.endswith("\n")
+    assert "\r" not in text
+    header, row = text.strip("\n").split("\n")
+    assert header == CSV_HEADER
+    cells = dict(zip(module.CSV_COLUMNS, row.split(",")))
+    assert cells["id"] == "tripod_bump"
+    assert cells["completion"] == "restore_unmarked"
+    assert cells["push_mono_ns"] == "1000"
+    assert cells["restore_mono_ns"] == ""
+    assert cells["wall_end_utc"] == ""
+    assert cells["bump_evaluation"] == "observed"
+    assert cells["actual_duration_s"] == ""
+
+
+def test_stop_during_the_write_is_delayed_and_exits_130(tmp_path):
+    module = load()
+    out = tmp_path / "out"
+    payload = _rehearsal_payload(module)
+    previous = signal.getsignal(signal.SIGINT)
+    real = module.write_outputs
+
+    def write_and_signal(path, body):
+        real(path, body)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    module.write_outputs = write_and_signal
+    try:
+        stopped = module._emit(out, payload)
+    finally:
+        module.write_outputs = real
+        signal.signal(signal.SIGINT, previous)
+    assert stopped is True
+    assert module._outputs_match(out, payload)
+    code = 130 if stopped else 0
+    assert code == 130
+
+
+def test_stop_after_both_files_exist_does_not_report_a_conflict(tmp_path):
+    module = load()
+    out = tmp_path / "out"
+    payload = _rehearsal_payload(module)
+    module.write_outputs(out, payload)
+    real_hold = module._holding_stop_signals
+
+    def finished_then_stop(action):
+        action()
+        raise KeyboardInterrupt
+
+    module._holding_stop_signals = finished_then_stop
+    try:
+        assert module._emit(out, payload) is True
+    finally:
+        module._holding_stop_signals = real_hold
+    assert module._outputs_match(out, payload)
+    # A second write of the same payload is the retry the race used to take.
+    module.write_outputs(out, payload)
+    assert module._outputs_match(out, payload)
+
+
+def test_missing_inspect_writes_nothing(tmp_path):
+    module = load()
+    out = tmp_path / "out"
+    assert module.main(["--out", str(out), "--inspect", str(tmp_path / "missing.json")]) == 2
+    assert not out.exists()
+
+
+def test_interrupt_during_capture_close_does_not_mark_the_files_read():
+    module = load()
+    clock = module.ManualClock(4)
+
+    def read_line(deadline):
+        if deadline is not None:
+            clock.advance(1)
+            return "\n"
+        return "unknown"
+
+    def say(text):
+        if "capture files are closed" in text:
+            raise KeyboardInterrupt
+
+    payload, code = module._conduct_bump(clock, read_line, _wall, 30, say, {
+        "status": None, "topics": None, "recording": None, "inspect": None, "log": None,
+    }, capture=True)
+    assert code == 130
+    assert payload["capture_closed"] is False
+    assert payload["scenarios"][0]["push_mono_ns"] == 4
+    assert payload["scenarios"][0]["completion"] == "complete"
+
+
+def test_live_capture_is_read_after_the_bump_and_can_be_observed(tmp_path):
+    module = load()
+    inspect = tmp_path / "inspect.json"
+    inspect.write_text(json.dumps([{
+        "Config": {
+            "Cmd": ["ros2", "launch", "room_memory", "room_memory.launch.py", "rig_guard:=true"],
+        }
+    }]), encoding="utf-8")
+    log = tmp_path / "node.log"
+    log.write_text("[INFO] rig guard: 3 ICP estimates, 1.2 ms of the window\n", encoding="utf-8")
+    topics = tmp_path / "topics.jsonl"
+    topics.write_text(json.dumps({
+        "op": "ready",
+        "topics": ["/room_memory/status", "/room_memory/events", "/room_memory/rig"],
+    }) + "\n", encoding="utf-8")
+    proc, out, stdout_path, stderr_path = _spawn_live(
+        tmp_path, "--inspect", str(inspect), "--log", str(log), "--topics", str(topics),
+    )
+    try:
+        _wait_live(stdout_path, "push mark", proc)
+        unknowns = "".join("unknown\n" for _ in module.QUESTIONS)
+        proc.stdin.write("\n\n" + unknowns)
+        proc.stdin.flush()
+        _wait_live(stdout_path, "capture files are closed", proc)
+        with topics.open("a", encoding="utf-8") as handle:
+            for row in (
+                {"topic": "/room_memory/status", "message": {"state": "tracking", "map_epoch": 4}},
+                {"topic": "/room_memory/status", "message": {"state": "rig_moved", "map_epoch": 4}},
+                {"topic": "/room_memory/status", "message": {"state": "tracking", "map_epoch": 4}},
+                {"topic": "/room_memory/rig", "message": {
+                    "imu_ok": True, "frame_epoch": 9, "map_epoch": 4, "outcome": "moved",
+                }},
+                {"topic": "/room_memory/rig", "message": {
+                    "imu_ok": True, "frame_epoch": 9, "map_epoch": 4, "outcome": "realigned",
+                }},
+            ):
+                handle.write(json.dumps(row) + "\n")
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        code = proc.wait(timeout=10)
+    finally:
+        _stop_live(proc)
+    assert code == 0, stderr_path.read_text(encoding="utf-8")
+    body = marks(out)
+    bump = body["scenarios"][0]
+    assert bump["bump_evaluation"] == "observed"
+    assert body["session"]["bump_evaluation"] == "observed"
+    assert body["session"]["bump_evaluation_reason"] == "observed"
+    assert bump["observations"]["auto_relearn"] == "on"
+    assert bump["observation_sources"]["auto_relearn"] == "launch_default"
+    assert bump["observations"]["relearn_after_s"] == 60
+    assert bump["observations"]["imu"] == "yes"
+    assert bump["observations"]["map_epoch_before"] == 4
+    assert bump["observations"]["frame_epoch_after"] == 9
+    assert bump["observations"]["recovery"] == "realigned"
+    assert bump["observations"]["unexpected_candidates"] == "none"
+    assert body["topics"]["read_after_bump"] is True
+    assert body["topics"]["applied_to_bump"] is True
+    assert body["topics"]["lines"] == 6
+    assert body["topics"]["lines"] == len(topics.read_text(encoding="utf-8").splitlines())
+    assert body["inspect"]["applied_to_bump"] is True
+    assert body["capture_closed"] is True
+
+
+def _spawn_live(tmp_path, *extra):
     out = tmp_path / "marks"
     stdout_path = tmp_path / "stdout.txt"
     stderr_path = tmp_path / "stderr.txt"
     stdout_f = stdout_path.open("w", encoding="utf-8")
     stderr_f = stderr_path.open("w", encoding="utf-8")
     proc = subprocess.Popen(
-        [sys.executable, str(SCRIPT), "--live", "--bump-s", "30", "--out", str(out)],
+        [sys.executable, str(SCRIPT), "--live", "--bump-s", "30", "--out", str(out), *extra],
         stdin=subprocess.PIPE,
         stdout=stdout_f,
         stderr=stderr_f,
@@ -800,11 +1098,20 @@ def _stop_live(proc):
 
 
 class _ExplodingStdin:
-    def readline(self):
+    """A blocking read has to fail the test. End-of-input would hide it."""
+
+    def read(self, _n=-1):
+        raise AssertionError("dry-run read stdin")
+
+    def readline(self, _n=-1):
         raise AssertionError("dry-run read stdin")
 
     def fileno(self):
         raise AssertionError("dry-run selected stdin")
+
+    @property
+    def buffer(self):
+        raise AssertionError("dry-run read stdin")
 
 
 class _Capture:

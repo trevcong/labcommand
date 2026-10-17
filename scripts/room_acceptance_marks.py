@@ -53,6 +53,17 @@ STATUS_KEYS = (
     "publisher_generation",
 )
 
+# Both launch files declare these. They are an observation of this process only when
+# docker inspect (or the command the operator saved) names that file and does not
+# override the argument or pass a params file. A remembered default is not enough.
+LAUNCH_DEFAULTS = {
+    "room_memory.launch.py": {"rig_guard": "off", "auto_relearn": "on", "relearn_after_s": 60},
+    "room_memory_cpp.launch.py": {"rig_guard": "off", "auto_relearn": "on", "relearn_after_s": 60},
+}
+_LAUNCH_FILES = ("room_memory_cpp.launch.py", "room_memory.launch.py")
+_HARNESS_TOPICS = {"/room_memory/status", "/room_memory/events", "/room_memory/activity"}
+_CONFIG_KEYS = ("rig_guard", "auto_relearn", "relearn_after_s")
+
 CSV_COLUMNS = (
     "id",
     "class",
@@ -110,7 +121,7 @@ The third token is the move source. Any other line blocks the three change scena
 RECOVERY_TEXT = (
     "A successful alignment recovers at the displaced pose and does not by itself change map_epoch. "
     "Relearning runs only while recovery is still unresolved and auto_relearn is enabled. "
-    "Type unknown when you did not see the value. A launch-file default is not an observation."
+    "Type unknown when you did not see the value. A launch default you remember is not an observation."
 )
 
 HANDOFF_TEXT = """\
@@ -119,6 +130,19 @@ Do not pass scenario-marks.json to acceptance score. The clocks are not the same
 PYTHONPATH=spark/room_memory python3 -m acceptance run --transport ros2 --container NAME --out HARNESS_DIR
 PYTHONPATH=spark/room_memory python3 -m acceptance score --log HARNESS_DIR/topics.jsonl --marks HARNESS_DIR/marks.json --out HARNESS_DIR
 """
+
+CLOSE_CAPTURE = (
+    "Press Enter once the local capture files are closed. "
+    "They are read now and count as the bump observation.\n"
+)
+
+OBSERVATION_TEXT = (
+    "Type unknown unless you are copying the named source. A launch default you remember is unknown. "
+    "rig_guard on: a node-log line 'rig guard:' with 'ICP estimates', or the inspect command. "
+    "rig_guard off: the inspect command only. "
+    "auto_relearn and relearn_after_s: the inspect command, or the launch file it names when that argument is absent. "
+    "IMU, both epochs, RIG_MOVED, recovery, and candidates: the topics capture, read after you close it.\n"
+)
 
 ROW_PROMPTS = {
     "preflight": "Preflight. Container already up. Do not deploy, restart, or change parameters.\n" + WORKSHEET,
@@ -352,6 +376,8 @@ def _payload(mode, wall_clock, rows, session, summaries):
         "status": summaries.get("status"),
         "topics": summaries.get("topics"),
         "recording": summaries.get("recording"),
+        "inspect": summaries.get("inspect"),
+        "log": summaries.get("log"),
         "scenarios": rows,
         "session": session,
     }
@@ -520,6 +546,7 @@ def run_bump(clock, read_line, wall, planned_s, protocol_s, write):
             row["actual_duration_s"] = (end - push) / float(NS)
             row["completion"] = "complete"
         row["observations"] = empty_observations()
+        write(OBSERVATION_TEXT)
         _collect_observations(read_line, write, row["observations"])
         evaluation, reason = judge_bump(row["observations"])
         row["bump_evaluation"] = evaluation
@@ -627,6 +654,302 @@ def output_error(out, inputs):
     return None
 
 
+def _norm_state(value):
+    names = {0: "building", 1: "tracking", 2: "rig_moved", 3: "degraded", 4: "paused"}
+    if isinstance(value, str):
+        return value.strip().lower()
+    if isinstance(value, int) and not isinstance(value, bool):
+        return names.get(value)
+    return None
+
+
+def _norm_outcome(value):
+    names = {
+        0: "in_place",
+        1: "checking",
+        2: "moved",
+        3: "realigned",
+        4: "relearning",
+        5: "inconclusive",
+    }
+    if isinstance(value, str):
+        key = value.strip().lower()
+        return key if key in names.values() else None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return names.get(value)
+    return None
+
+
+def _norm_epoch(value):
+    if isinstance(value, bool) or isinstance(value, str):
+        text = value.strip() if isinstance(value, str) else ""
+        if text.isdigit():
+            return int(text)
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, float) and value >= 0 and value.is_integer():
+        return int(value)
+    return None
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "yes", "1"):
+            return True
+        if text in ("false", "no", "0"):
+            return False
+    return None
+
+
+def _message_of(obj):
+    message = obj.get("message")
+    if isinstance(message, dict):
+        return message
+    return {}
+
+
+def _topic_evidence(status_epochs, rig_epochs, frame_epochs, outcomes, last_imu, status_samples, saw_moved, saw_events, candidates):
+    """Fields a bump capture can fill. One sample is not a before and an after."""
+    evidence = {}
+    if len(status_epochs) >= 2:
+        evidence["map_epoch_before"] = status_epochs[0]
+        evidence["map_epoch_after"] = status_epochs[-1]
+    elif len(rig_epochs) >= 2:
+        evidence["map_epoch_before"] = rig_epochs[0]
+        evidence["map_epoch_after"] = rig_epochs[-1]
+    if len(frame_epochs) >= 2:
+        evidence["frame_epoch_before"] = frame_epochs[0]
+        evidence["frame_epoch_after"] = frame_epochs[-1]
+    if last_imu is not None:
+        evidence["imu"] = "yes" if last_imu else "no"
+    if saw_moved or "moved" in outcomes:
+        evidence["rig_moved"] = "seen"
+    elif status_samples >= 2 or len(outcomes) >= 2:
+        evidence["rig_moved"] = "not_seen"
+    if outcomes:
+        recovery = {
+            "realigned": "realigned",
+            "in_place": "in_place",
+            "relearning": "relearning",
+            "moved": "still_moved",
+        }.get(outcomes[-1])
+        if recovery:
+            evidence["recovery"] = recovery
+    if saw_events:
+        if candidates == 0:
+            evidence["unexpected_candidates"] = "none"
+        else:
+            evidence["unexpected_candidates"] = "%d candidate event lines" % candidates
+    return evidence
+
+
+def _command_tokens(obj):
+    tokens = []
+
+    def walk(value, allow_command_keys):
+        if isinstance(value, str):
+            tokens.extend(value.replace("\n", " ").split())
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, True)
+        elif isinstance(value, dict) and allow_command_keys:
+            for key in ("Cmd", "Entrypoint", "Args", "command", "argv"):
+                if key in value:
+                    walk(value[key], True)
+            config = value.get("Config")
+            if isinstance(config, dict):
+                for key in ("Cmd", "Entrypoint"):
+                    if key in config:
+                        walk(config[key], True)
+
+    if isinstance(obj, list):
+        for item in obj:
+            walk(item, True)
+    else:
+        walk(obj, True)
+    return tokens
+
+
+def _launch_file(tokens):
+    for token in tokens:
+        base = token.strip("'\"").rsplit("/", 1)[-1]
+        for name in _LAUNCH_FILES:
+            if base == name:
+                return name
+    return None
+
+
+def _blocks_launch_defaults(tokens):
+    for token in tokens:
+        if token in ("--params-file",) or token.startswith("--params-file=") or token.startswith("params_file:="):
+            return True
+    return False
+
+
+def _ros_switch(value):
+    text = value.strip().strip("'\"").lower()
+    if text in ("true", "on", "yes", "1"):
+        return "on"
+    if text in ("false", "off", "no", "0"):
+        return "off"
+    return None
+
+
+def _explicit_config(tokens):
+    found = {}
+    sources = {}
+    for token in tokens:
+        if ":=" not in token:
+            continue
+        name, value = token.split(":=", 1)
+        name = name.strip("'\"").rsplit("/", 1)[-1]
+        if name not in _CONFIG_KEYS:
+            continue
+        if name == "relearn_after_s":
+            try:
+                number = float(value.strip().strip("'\""))
+            except ValueError:
+                continue
+            if number < 0 or number != number or number in (float("inf"), float("-inf")):
+                continue
+            found[name] = _as_stored(number)
+        else:
+            switch = _ros_switch(value)
+            if switch is None:
+                continue
+            found[name] = switch
+        sources[name] = "command"
+    return found, sources
+
+
+def parse_inspect(text):
+    """Launch configuration from a saved ``docker inspect`` JSON or a command line.
+
+    The script does not run docker. Explicit ``name:=value`` tokens are source
+    ``command``. A named launch file with no params file supplies its defaults
+    for arguments that are absent; those are source ``launch_default``.
+    """
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        obj = {"command": text}
+    tokens = _command_tokens(obj)
+    launch = _launch_file(tokens)
+    values, sources = _explicit_config(tokens)
+    defaults_apply = launch is not None and not _blocks_launch_defaults(tokens)
+    if defaults_apply:
+        for key, value in LAUNCH_DEFAULTS[launch].items():
+            if key not in values:
+                values[key] = value
+                sources[key] = "launch_default"
+    summary = {
+        "launch_file": launch,
+        "defaults_apply": defaults_apply,
+        "sources": sources,
+    }
+    for key in _CONFIG_KEYS:
+        if key in values:
+            summary[key] = values[key]
+    return summary
+
+
+def _guard_line(text):
+    for line in text.splitlines():
+        if "rig guard:" in line and "ICP estimates" in line:
+            return True
+    return False
+
+
+def _fill(obs, sources, key, value, source, replace=()):
+    if value is None:
+        return
+    current = obs.get(key)
+    if current not in (None, "unknown") and current not in replace:
+        return
+    obs[key] = value
+    sources[key] = source
+
+
+def _status_choice(value, kind):
+    if isinstance(value, bool):
+        if kind == "imu":
+            return "yes" if value else "no"
+        return "on" if value else "off"
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if kind == "imu" and text in ("yes", "no"):
+            return text
+        if text in ("on", "off"):
+            return text
+    return None
+
+
+def _apply_evidence(row, summaries):
+    """Fill ``unknown`` answers from the post-bump files. Typed answers stay.
+
+    A node-log ``rig guard:`` line is stronger than an inspect value of off:
+    that line is printed only while the guard is running. Frame epochs from
+    the rig capture replace ``unshown``, because the capture is the source
+    for that field. A harness log has no ``bump_evidence`` and fills nothing.
+    """
+    obs = row.get("observations")
+    if not isinstance(obs, dict):
+        return {}
+    sources = {}
+    inspect = summaries.get("inspect") or {}
+    inspect_sources = inspect.get("sources") if isinstance(inspect.get("sources"), dict) else {}
+    for key in _CONFIG_KEYS:
+        if key in inspect and key in inspect_sources:
+            _fill(obs, sources, key, inspect.get(key), inspect_sources[key])
+    log = summaries.get("log") or {}
+    if log.get("rig_guard_line"):
+        filled_by_inspect = sources.get("rig_guard") in ("command", "launch_default")
+        if obs.get("rig_guard") in (None, "unknown") or (obs.get("rig_guard") == "off" and filled_by_inspect):
+            obs["rig_guard"] = "on"
+            sources["rig_guard"] = "node_log"
+    topics = summaries.get("topics") or {}
+    evidence = topics.get("bump_evidence") if isinstance(topics.get("bump_evidence"), dict) else {}
+    for key, value in evidence.items():
+        replace = ("unshown",) if key in ("frame_epoch_before", "frame_epoch_after") else ()
+        _fill(obs, sources, key, value, "topics", replace)
+    status = summaries.get("status") or {}
+    _fill(obs, sources, "rig_guard", _status_choice(status.get("rig_guard"), "guard"), "status_file")
+    _fill(obs, sources, "auto_relearn", _status_choice(status.get("auto_relearn"), "guard"), "status_file")
+    if _is_number(status.get("relearn_after_s")):
+        _fill(obs, sources, "relearn_after_s", _as_stored(status["relearn_after_s"]), "status_file")
+    _fill(obs, sources, "imu", _status_choice(status.get("imu_ok"), "imu"), "status_file")
+    if sources:
+        row["observation_sources"] = sources
+    return sources
+
+
+def _mark_applied(summaries, sources):
+    used = set(sources.values())
+    topics = summaries.get("topics")
+    if isinstance(topics, dict):
+        topics["applied_to_bump"] = "topics" in used
+    log = summaries.get("log")
+    if isinstance(log, dict):
+        log["applied_to_bump"] = "node_log" in used
+    status = summaries.get("status")
+    if isinstance(status, dict):
+        status["applied_to_bump"] = "status_file" in used
+    inspect = summaries.get("inspect")
+    if isinstance(inspect, dict):
+        inspect["applied_to_bump"] = bool({"command", "launch_default"} & used)
+
+
+def _store_summaries(payload, summaries):
+    for key in ("status", "topics", "recording", "inspect", "log"):
+        payload[key] = summaries.get(key)
+
+
 def summarize_status(path):
     text = Path(path).read_text(encoding="utf-8")
     try:
@@ -648,6 +971,14 @@ def summarize_topics(path):
     rig_moved = 0
     imu = 0
     subscribed = None
+    saw_rig = False
+    saw_events = False
+    status_samples = 0
+    status_epochs = []
+    rig_epochs = []
+    frame_epochs = []
+    outcomes = []
+    last_imu = None
     imu_topics = ("/room_memory/rig", "/livox/imu")
     for line in lines:
         try:
@@ -656,6 +987,8 @@ def summarize_topics(path):
             obj = None
         if isinstance(obj, dict) and obj.get("op") == "ready" and isinstance(obj.get("topics"), list):
             subscribed = list(obj["topics"])
+            if "/room_memory/events" in subscribed:
+                saw_events = True
         topic = obj.get("topic") if isinstance(obj, dict) else None
         # A ready line names topics. It is not an IMU sample.
         if not (isinstance(obj, dict) and obj.get("op") == "ready"):
@@ -663,11 +996,35 @@ def summarize_topics(path):
                 imu += 1
         if not isinstance(obj, dict):
             continue
-        message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
-        if topic == "/room_memory/events" and message.get("state") == "candidate":
-            candidate += 1
-        if topic == "/room_memory/status" and message.get("state") == "rig_moved":
-            rig_moved += 1
+        message = _message_of(obj)
+        state_name = _norm_state(message.get("state"))
+        if topic == "/room_memory/events":
+            saw_events = True
+            if state_name == "candidate":
+                candidate += 1
+        if topic == "/room_memory/status":
+            status_samples += 1
+            if state_name == "rig_moved":
+                rig_moved += 1
+            epoch = _norm_epoch(message.get("map_epoch"))
+            if epoch is None:
+                epoch = _norm_epoch(obj.get("map_epoch"))
+            if epoch is not None:
+                status_epochs.append(epoch)
+        if topic in imu_topics:
+            saw_rig = True
+            flag = _as_bool(message.get("imu_ok"))
+            if flag is not None:
+                last_imu = flag
+            frame = _norm_epoch(message.get("frame_epoch"))
+            if frame is not None:
+                frame_epochs.append(frame)
+            epoch = _norm_epoch(message.get("map_epoch"))
+            if epoch is not None:
+                rig_epochs.append(epoch)
+            outcome = _norm_outcome(message.get("outcome"))
+            if outcome is not None:
+                outcomes.append(outcome)
     imu_subscribed = None
     imu_note = None
     if subscribed is not None:
@@ -677,6 +1034,19 @@ def summarize_topics(path):
                 "This log does not include /room_memory/rig or /livox/imu. "
                 "imu_lines 0 is not an observation that the IMU is off."
             )
+    harness_log = subscribed is not None and set(subscribed) <= _HARNESS_TOPICS and not saw_rig
+    if harness_log:
+        evidence = None
+        harness_note = (
+            "Harness log (status, events, activity only). "
+            "It is not a bump observation. imu_lines 0 is not an observation that the IMU is off."
+        )
+        imu_note = harness_note
+    else:
+        evidence = _topic_evidence(
+            status_epochs, rig_epochs, frame_epochs, outcomes, last_imu,
+            status_samples, rig_moved > 0, saw_events, candidate,
+        )
     return {
         "path": str(path),
         "lines": len(lines),
@@ -685,16 +1055,19 @@ def summarize_topics(path):
         "imu_lines": imu,
         "imu_subscribed": imu_subscribed,
         "imu_note": imu_note,
+        "bump_evidence": evidence,
     }
 
 
 def summarize_recording(path):
     target = Path(path)
+    note = "Byte size and metadata only. This is not a bump observation."
     if target.is_file():
         return {
             "path": str(path),
             "bytes": target.stat().st_size,
             "has_metadata": target.name == "metadata.yaml",
+            "note": note,
         }
     if not target.is_dir():
         raise ValueError("%s is not a recording file or directory" % path)
@@ -706,26 +1079,52 @@ def summarize_recording(path):
         "path": str(path),
         "bytes": total,
         "has_metadata": (target / "metadata.yaml").is_file(),
+        "note": note,
     }
 
 
-def _load_inputs(status, topics, recording):
-    loaded = {"status": None, "topics": None, "recording": None}
+def _tag_read(summary, after_bump):
+    if summary is None:
+        return None
+    summary["read_after_bump"] = bool(after_bump)
+    summary["applied_to_bump"] = False
+    return summary
+
+
+def _load_inputs(status, topics, recording, inspect=None, log=None, after_bump=False):
+    loaded = {"status": None, "topics": None, "recording": None, "inspect": None, "log": None}
     if status:
         path = Path(status)
         if not path.is_file():
             raise ValueError("status file not found: %s" % path)
-        loaded["status"] = summarize_status(path)
+        loaded["status"] = _tag_read(summarize_status(path), after_bump)
     if topics:
         path = Path(topics)
         if not path.is_file():
             raise ValueError("topics file not found: %s" % path)
-        loaded["topics"] = summarize_topics(path)
+        loaded["topics"] = _tag_read(summarize_topics(path), after_bump)
     if recording:
         path = Path(recording)
         if not path.exists():
             raise ValueError("recording not found: %s" % path)
-        loaded["recording"] = summarize_recording(path)
+        loaded["recording"] = _tag_read(summarize_recording(path), after_bump)
+    if inspect:
+        path = Path(inspect)
+        if not path.is_file():
+            raise ValueError("inspect file not found: %s" % path)
+        summary = parse_inspect(path.read_text(encoding="utf-8"))
+        summary["path"] = str(path)
+        loaded["inspect"] = _tag_read(summary, after_bump)
+    if log:
+        path = Path(log)
+        if not path.is_file():
+            raise ValueError("log file not found: %s" % path)
+        text = path.read_text(encoding="utf-8")
+        loaded["log"] = _tag_read({
+            "path": str(path),
+            "lines": len(text.splitlines()),
+            "rig_guard_line": _guard_line(text),
+        }, after_bump)
     return loaded
 
 
@@ -746,12 +1145,30 @@ def _csv_text(rows):
     return "".join(buffer.parts)
 
 
+def _outputs_match(out, payload):
+    destination = Path(out)
+    json_path = destination / JSON_NAME
+    csv_path = destination / CSV_NAME
+    if not json_path.is_file() or not csv_path.is_file():
+        return False
+    try:
+        on_disk = json.loads(json_path.read_text(encoding="utf-8"))
+        csv_text = csv_path.read_text(encoding="utf-8")
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    return on_disk == payload and csv_text == _csv_text(payload["scenarios"])
+
+
 def write_outputs(out, payload):
     destination = Path(out)
     destination.mkdir(parents=True, exist_ok=True)
     json_path = destination / JSON_NAME
     csv_path = destination / CSV_NAME
     if json_path.exists() or csv_path.exists():
+        # A stop that lands after a finished write retries this function.
+        # The files are already this payload. Do not report a false conflict.
+        if _outputs_match(destination, payload):
+            return
         raise FileExistsError("output already exists")
     json_tmp = destination / ".scenario-marks.json.tmp"
     csv_tmp = destination / ".scenario-marks.csv.tmp"
@@ -817,32 +1234,52 @@ def _install_operator_stop():
 
 
 def _holding_stop_signals(action):
-    """Run ``action`` while SIGINT and SIGTERM cannot split the two output files."""
-    previous = []
+    """Run ``action``, then surface a stop that arrived while the files were written.
+
+    The handler records the signal and returns, so the write is not torn in half.
+    After both files are in place the stop is raised. It is delayed, not discarded.
+    """
+    pending = []
 
     def _hold(signum, frame):
-        return None
+        pending.append(signum)
 
+    previous = []
     for name in (signal.SIGINT, signal.SIGTERM):
         try:
             previous.append((name, signal.signal(name, _hold)))
         except (OSError, ValueError):
             pass
     try:
-        return action()
+        result = action()
     finally:
         for name, handler in reversed(previous):
             signal.signal(name, handler)
+    if pending:
+        raise KeyboardInterrupt
+    return result
 
 
-def _conduct_bump(clock, read_line, wall, planned, say, summaries):
-    """Run the bump and the handoff. A stop still returns the row already taken."""
+def _conduct_bump(clock, read_line, wall, planned, say, summaries, capture=False):
+    """Run the bump and the handoff. A stop still returns the row already taken.
+
+    When ``capture`` is set, a finished bump asks for the local files to be closed
+    before the handoff. That Enter is what makes the following read a bump
+    observation. A stop or EOF on that prompt leaves ``capture_closed`` false,
+    and the caller must not keep a pre-bump snapshot of those files.
+    """
     protocol = 30
     result = None
     stopped_after = False
+    closed = False
+    exit_override = None
     try:
         say(WORKSHEET if WORKSHEET.endswith("\n") else WORKSHEET + "\n")
         result = run_bump(clock, read_line, wall, planned, protocol, say)
+        if result["end_reason"] == "complete" and capture:
+            say(CLOSE_CAPTURE)
+            _ask(read_line, None)
+            closed = True
         if result["end_reason"] != "interrupted":
             say(HANDOFF_TEXT if HANDOFF_TEXT.endswith("\n") else HANDOFF_TEXT + "\n")
     except KeyboardInterrupt:
@@ -854,6 +1291,14 @@ def _conduct_bump(clock, read_line, wall, planned, say, summaries):
                 "keyboard interrupt",
                 "interrupted",
             )
+    except _Eof:
+        if result is None:
+            result = _close_bump(_blank_bump(_as_stored(planned), protocol), "eof", "stdin closed", "eof")
+        elif not closed:
+            exit_override = 2
+    except _Abort:
+        if result is None:
+            result = _close_bump(_blank_bump(_as_stored(planned), protocol), "aborted", "operator abort", "aborted")
     session = _session(
         result["end_reason"],
         result["detail"],
@@ -861,14 +1306,24 @@ def _conduct_bump(clock, read_line, wall, planned, say, summaries):
         result["bump_evaluation_reason"],
     )
     payload = _payload("live", "utc", [result["row"]], session, summaries)
+    # A stop while the handoff prints still keeps a close the operator already confirmed.
+    payload["capture_closed"] = bool(closed)
     code = {"complete": 0, "aborted": 0, "eof": 2, "interrupted": 130}[result["end_reason"]]
     if stopped_after:
         code = 130
+    elif exit_override is not None:
+        code = exit_override
     return payload, code
 
 
 def _emit(out, payload):
-    """Write both marks files. A stop during the write is retried once with signals held."""
+    """Write both marks files.
+
+    A stop during the write is held until both files exist, then reported to
+    the caller as a stop (exit 130). If the files are already this payload, the
+    write is not repeated: repeating it would raise ``FileExistsError`` and
+    the process would exit 2 even though both files are fine.
+    """
 
     def _write():
         write_outputs(out, payload)
@@ -876,22 +1331,42 @@ def _emit(out, payload):
     try:
         _holding_stop_signals(_write)
     except KeyboardInterrupt:
-        _holding_stop_signals(_write)
+        if not _outputs_match(out, payload):
+            try:
+                _holding_stop_signals(_write)
+            except KeyboardInterrupt:
+                if not _outputs_match(out, payload):
+                    raise
+            except FileExistsError:
+                if not _outputs_match(out, payload):
+                    raise
         return True
     return False
 
 
 def _run(args):
-    inputs = {"status": args.status, "topics": args.topics, "recording": args.recording}
+    inputs = {
+        "status": args.status,
+        "topics": args.topics,
+        "recording": args.recording,
+        "inspect": args.inspect,
+        "log": args.log,
+    }
     problem = output_error(args.out, inputs)
     if problem:
         sys.stderr.write(problem + "\n")
         return 2
     try:
-        summaries = _load_inputs(args.status, args.topics, args.recording)
+        # Fail before the bump if a path is missing or the status file is not an object.
+        # Live mode discards this snapshot. The stored summary is the read after the
+        # operator closes the captures, so the counts describe the bump and not the room before it.
+        preflight = _load_inputs(
+            args.status, args.topics, args.recording, args.inspect, args.log, after_bump=False,
+        )
     except (OSError, ValueError) as exc:
         sys.stderr.write(str(exc) + "\n")
         return 2
+    capture = any(inputs.values())
     if args.live:
         payload, code = _conduct_bump(
             time,
@@ -899,8 +1374,27 @@ def _run(args):
             wall_utc,
             30 if args.bump_s is None else args.bump_s,
             _say,
-            summaries,
+            {"status": None, "topics": None, "recording": None, "inspect": None, "log": None},
+            capture=capture,
         )
+        if payload.get("capture_closed"):
+            try:
+                summaries = _load_inputs(
+                    args.status, args.topics, args.recording, args.inspect, args.log, after_bump=True,
+                )
+            except (OSError, ValueError) as exc:
+                sys.stderr.write(str(exc) + "\n")
+                payload["read_error"] = str(exc)
+            else:
+                row = payload["scenarios"][0]
+                sources = _apply_evidence(row, summaries)
+                if payload["session"]["end_reason"] == "complete":
+                    evaluation, reason = judge_bump(row["observations"])
+                    row["bump_evaluation"] = evaluation
+                    payload["session"]["bump_evaluation"] = evaluation
+                    payload["session"]["bump_evaluation_reason"] = reason
+                _mark_applied(summaries, sources)
+                _store_summaries(payload, summaries)
     else:
         try:
             selected = _select_specs(args.scenarios)
@@ -909,9 +1403,7 @@ def _run(args):
             return 2
         durations = resolve_durations(args.watch_s, args.sit_s, args.walk_s, args.hour_s, args.bump_s)
         payload = build_rehearsal(durations, selected)
-        payload["status"] = summaries["status"]
-        payload["topics"] = summaries["topics"]
-        payload["recording"] = summaries["recording"]
+        _store_summaries(payload, preflight)
         _say(format_rehearsal(payload))
         code = 0
     try:
@@ -944,6 +1436,12 @@ def main(argv=None):
     parser.add_argument("--status", default=None, help="local status JSON, read only")
     parser.add_argument("--topics", default=None, help="local topics jsonl, read only")
     parser.add_argument("--recording", default=None, help="local recording file or directory, read only")
+    parser.add_argument(
+        "--inspect",
+        default=None,
+        help="local docker inspect JSON or the launch command text, read only",
+    )
+    parser.add_argument("--log", default=None, help="local node log, read only")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
