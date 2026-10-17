@@ -378,11 +378,6 @@ Bytes u64le(std::uint64_t value) {
     return out;
 }
 
-// Derived on rig-guard; the Swift suite decodes neither RigPose nor Imu, so it has no copy (PROVENANCE.md).
-bool in_swift(const std::string& name) {
-    return name != "rig_pose_le.hex" && name != "rig_pose_v2_le.hex" && name != "imu_le.hex";
-}
-
 Bytes inflate_all(const Bytes& data) {
     z_stream stream{};
     inflateInit2(&stream, -15);
@@ -445,12 +440,10 @@ TEST(hand_goldens_match_the_swift_copies) {
     for (const auto& entry : std::filesystem::directory_iterator(kSwiftHand)) {
         if (entry.path().extension() == ".hex") copies.insert(entry.path().filename().string());
     }
-    for (const auto& [name, g] : goldens()) {
-        if (in_swift(name)) expected.insert(name);
-    }
+    for (const auto& [name, g] : goldens()) expected.insert(name);
     CHECK(copies == expected);
     for (const auto& [name, g] : goldens()) {
-        if (in_swift(name) && hexfile(name, kSwiftHand) != hexfile(name)) {
+        if (hexfile(name, kSwiftHand) != hexfile(name)) {
             throw harness::Failure("Swift copy differs: " + name);
         }
     }

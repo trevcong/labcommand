@@ -172,8 +172,6 @@ GOLDENS = {
 }
 # v2 goldens whose cut at the legacy length (+ up to 3 bytes) is a valid legacy message.
 V2_EXTENDS_LEGACY = {name for name in GOLDENS if "_v2_" in name}
-# Derived on rig-guard; the Swift suite decodes neither RigPose nor Imu, so it has no copy (PROVENANCE.md).
-NOT_IN_SWIFT = {"rig_pose_le.hex", "rig_pose_v2_le.hex", "imu_le.hex"}
 
 
 def test_provenance_hashes():
@@ -185,7 +183,7 @@ def test_provenance_hashes():
 
 @pytest.mark.skipif(not SWIFT_HAND.is_dir(), reason=f"Swift hand goldens not found at {SWIFT_HAND}")
 def test_hand_goldens_match_the_swift_copies():
-    shared = sorted(set(GOLDENS) - NOT_IN_SWIFT)
+    shared = sorted(GOLDENS)
     assert sorted(path.name for path in SWIFT_HAND.glob("*.hex")) == shared
     for name in shared:
         assert hexfile(name, SWIFT_HAND) == hexfile(name), name
