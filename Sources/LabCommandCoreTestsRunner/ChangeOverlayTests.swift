@@ -356,7 +356,14 @@ func testChangeOverlayCaptions() {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!
     let date = calendar.date(from: DateComponents(year: 2026, month: 10, day: 14, hour: 15, minute: 4, second: 5))
-    expect(ChangeOverlay.clock(date, missing: "A", timeZone: TimeZone(secondsFromGMT: 0)!) == "15:04:05", "clock is HH:mm:ss")
+    expect(ChangeOverlay.clock(date, missing: "A", timeZone: TimeZone(secondsFromGMT: 0)!) == "2026-10-14 15:04:05", "clock is the date and HH:mm:ss")
+    if let chicago = TimeZone(identifier: "America/Chicago") {
+        let evening = Date(timeIntervalSince1970: 1_760_400_010)
+        expect(ChangeOverlay.clock(evening, missing: "A", timeZone: chicago) == "2025-10-13 19:00:10",
+               "scrubber clock uses the zone's date, not UTC")
+    } else {
+        expect(false, "America/Chicago is available")
+    }
     expect(ChangeOverlay.clock(nil, missing: "A") == "A" && ChangeOverlay.clock(nil, missing: "B") == "B", "missing stamps read A and B")
 
     expect(ChangeOverlay.localSessionLine == "Local snapshots. No rig contact.", "local session line")

@@ -5,13 +5,13 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>Lab</string>
+	<string>LabCommand</string>
 	<key>CFBundleExecutable</key>
 	<string>LabCommand</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.tconf.labcommand</string>
 	<key>CFBundleName</key>
-	<string>Lab</string>
+	<string>LabCommand</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -36,7 +36,7 @@
 		</dict>
 	</dict>
 	<key>NSDesktopFolderUsageDescription</key>
-	<string>Lab reads Desktop/lidar-sessions so the rig deck can show takes on this Mac. It never talks to a lidar from this Mac.</string>
+	<string>LabCommand reads Desktop/lidar-sessions so the rig deck can show takes on this Mac. It never talks to a lidar from this Mac.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>

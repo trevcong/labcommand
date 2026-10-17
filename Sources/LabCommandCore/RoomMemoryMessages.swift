@@ -621,4 +621,198 @@ public enum RoomMemory {
             self.unavailable = unavailable
         }
     }
+
+    /// One value per sensor, in the wire order of the `RigPose` pairs: `[0]` Mid-360, `[1]` JT128.
+    public struct SensorPair<Value: Sendable & Equatable>: Sendable, Equatable {
+        /// Index 0, the Livox Mid-360.
+        public var mid360: Value
+        /// Index 1, the Hesai JT128.
+        public var jt128: Value
+
+        /// Creates a pair.
+        public init(mid360: Value, jt128: Value) {
+            self.mid360 = mid360
+            self.jt128 = jt128
+        }
+    }
+
+    /// `labcommand_msgs/RigPose` on `/room_memory/rig`: the rig-pose guard (protocol §3.9, D40–D44).
+    ///
+    /// The outcome, what started the check, each sensor's result and absolute pose, and the last
+    /// check's metrics. Published on every change of the outcome or the decision and every 10 s.
+    /// NaN on the wire is nil here (a pose: NaN × 7). Both nodes always send the v2 tail.
+    public struct RigPose: Sendable, Equatable {
+        /// `RigPose.OUTCOME_*`: the guard's state. MOVED while any sensor is moved, CHECKING during
+        /// a check, else the last decision. CHECKING and INCONCLUSIVE are not memory states (D44).
+        public enum Outcome: UInt8, Sendable, CaseIterable {
+            /// Every checked sensor is where its reference says.
+            case inPlace = 0
+            /// A check is running; promotion and learning are held.
+            case checking = 1
+            /// A sensor moved and has no stable, fit new pose yet.
+            case moved = 2
+            /// Every moved sensor has a new pose in the same room frame (D40).
+            case realigned = 3
+            /// The guard could not re-align and the room is being relearned (D41).
+            case relearning = 4
+            /// The check could not decide.
+            case inconclusive = 5
+        }
+
+        /// `RigPose.CAUSE_*`: what started the current or last check.
+        public struct Causes: OptionSet, Sendable, Hashable {
+            /// The bitmask as sent on the wire.
+            public let rawValue: UInt8
+
+            /// Creates a set from its wire bitmask.
+            public init(rawValue: UInt8) {
+                self.rawValue = rawValue
+            }
+
+            /// An IMU shock.
+            public static let imuShock = Causes(rawValue: 1 << 0)
+            /// IMU gravity tilted against its baseline.
+            public static let imuTilt = Causes(rawValue: 1 << 1)
+            /// `pose_residual_m` above `pose_trigger_m`.
+            public static let poseOffset = Causes(rawValue: 1 << 2)
+            /// The periodic check.
+            public static let periodic = Causes(rawValue: 1 << 3)
+            /// A start with saved state.
+            public static let startup = Causes(rawValue: 1 << 4)
+            /// A sensor back from silence.
+            public static let sensorResumed = Causes(rawValue: 1 << 5)
+            /// Every bit v1 defines.
+            public static let all: Causes = [.imuShock, .imuTilt, .poseOffset, .periodic, .startup, .sensorResumed]
+        }
+
+        /// `RigPose.CHANNEL_*`: one sensor's result in the decision a message reports.
+        public enum Channel: UInt8, Sendable, CaseIterable {
+            /// Not checked.
+            case none = 0
+            /// Where its reference says.
+            case inPlace = 1
+            /// Moved.
+            case moved = 2
+            /// Its registration was not fit to decide.
+            case rejected = 3
+            /// No data from the sensor.
+            case unavailable = 4
+        }
+
+        /// One sensor's absolute pose: it maps the sensor's current frame into its reference frame,
+        /// `p_ref = R p + t`. Wire order `tx ty tz qx qy qz qw`.
+        public struct Pose: Sendable, Equatable {
+            /// `t`, meters.
+            public var translation: SIMD3<Float>
+            /// `R` as a unit quaternion `(x, y, z, w)`.
+            public var rotation: SIMD4<Float>
+
+            /// Creates a pose.
+            public init(translation: SIMD3<Float>, rotation: SIMD4<Float>) {
+                self.translation = translation
+                self.rotation = rotation
+            }
+        }
+
+        /// The common fields.
+        public var header: Header
+        /// The guard's state.
+        public var outcome: Outcome
+        /// What started the current or last check; empty before the first.
+        public var causes: Causes
+        /// Sensors available (checked) in the decision this message reports.
+        public var sensors: Sensors
+        /// Each sensor's result in that decision; `.none` or `.unavailable` outside `sensors`.
+        public var channel: SensorPair<Channel>
+        /// `map_epoch` at which the current room frame began; changes only on a relearn (D41).
+        public var frameEpoch: UInt64
+        /// REALIGNED decisions since the frame began (`n_realigned`).
+        public var realignedCount: UInt32
+        /// The Mid-360's pose. Nil when the sensor is not configured.
+        public var mid360Pose: Pose?
+        /// The JT128's pose. Nil when the sensor is not configured.
+        public var jt128Pose: Pose?
+        /// Size of the increment of the last applied estimate, meters. Nil: none.
+        public var deltaM: SensorPair<Float?>
+        /// Its angle, degrees `0...180`. Nil: none.
+        public var deltaDeg: SensorPair<Float?>
+        /// The last check's ICP inlier fraction, `0...1`. Nil: not run, or no registration cloud yet.
+        public var inlierFrac: SensorPair<Float?>
+        /// The last check's inlier RMS, meters. Nil as `inlierFrac`.
+        public var rmsM: SensorPair<Float?>
+        /// λ_min of the point-to-plane information matrix over Σw. Nil as `inlierFrac`.
+        public var observe: SensorPair<Float?>
+        /// IMU gravity against the baseline of the last accepted decision, degrees `0...180`.
+        /// Nil: no IMU or no baseline.
+        public var tiltDeg: Float?
+        /// IMU samples within the last second.
+        public var imuOK: Bool
+        /// First trigger of the current or last move. Nil: none (`{0, 0}` on the wire).
+        public var movedAt: Time?
+        /// The publishing process's generation (protocol §1.4); nil for the legacy layout.
+        public var publisherGeneration: UInt64?
+
+        /// Creates a rig-pose report.
+        public init(
+            header: Header,
+            outcome: Outcome,
+            causes: Causes,
+            sensors: Sensors,
+            channel: SensorPair<Channel>,
+            frameEpoch: UInt64,
+            realignedCount: UInt32,
+            mid360Pose: Pose?,
+            jt128Pose: Pose?,
+            deltaM: SensorPair<Float?>,
+            deltaDeg: SensorPair<Float?>,
+            inlierFrac: SensorPair<Float?>,
+            rmsM: SensorPair<Float?>,
+            observe: SensorPair<Float?>,
+            tiltDeg: Float?,
+            imuOK: Bool,
+            movedAt: Time?,
+            publisherGeneration: UInt64? = nil
+        ) {
+            self.header = header
+            self.outcome = outcome
+            self.causes = causes
+            self.sensors = sensors
+            self.channel = channel
+            self.frameEpoch = frameEpoch
+            self.realignedCount = realignedCount
+            self.mid360Pose = mid360Pose
+            self.jt128Pose = jt128Pose
+            self.deltaM = deltaM
+            self.deltaDeg = deltaDeg
+            self.inlierFrac = inlierFrac
+            self.rmsM = rmsM
+            self.observe = observe
+            self.tiltDeg = tiltDeg
+            self.imuOK = imuOK
+            self.movedAt = movedAt
+            self.publisherGeneration = publisherGeneration
+        }
+    }
+
+    /// The fields of one `sensor_msgs/Imu` (ROS 2 Jazzy) the rig guard reads: the header stamp,
+    /// angular velocity (rad/s) and linear acceleration (the driver's unit: g or m/s²), binary64.
+    /// Orientation and the covariances are read past, not kept.
+    public struct ImuSample: Sendable, Equatable {
+        /// `header.stamp`.
+        public var stamp: Time
+        /// `header.frame_id`.
+        public var frameId: String
+        /// Rad/s.
+        public var angularVelocity: SIMD3<Double>
+        /// g or m/s², as the driver sends it.
+        public var linearAcceleration: SIMD3<Double>
+
+        /// Creates a sample.
+        public init(stamp: Time, frameId: String, angularVelocity: SIMD3<Double>, linearAcceleration: SIMD3<Double>) {
+            self.stamp = stamp
+            self.frameId = frameId
+            self.angularVelocity = angularVelocity
+            self.linearAcceleration = linearAcceleration
+        }
+    }
 }

@@ -1,5 +1,6 @@
 // MemoryConfig from key=value words, shared by room_memory_replay and room_memory_bag. Keys are
-// the field names; sensors=a,b; max_range=none and state_dir=none clear the optional.
+// the field names; sensors=a,b; max_range=none and state_dir=none clear the optional; booleans are
+// true or false.
 #pragma once
 
 #include <cstdint>
@@ -24,6 +25,12 @@ inline double real(const std::string& value) {
     const double out = std::stod(value, &used);
     if (used != value.size()) throw std::invalid_argument("not a number: " + value);
     return out;
+}
+
+inline bool boolean(const std::string& value) {
+    if (value == "true") return true;
+    if (value == "false") return false;
+    throw std::invalid_argument("not true or false: " + value);
 }
 
 inline void configure(MemoryConfig& config, const std::string& key, const std::string& value) {
@@ -85,6 +92,56 @@ inline void configure(MemoryConfig& config, const std::string& key, const std::s
         config.keyframe_period_s = real(value);
     } else if (key == "keyframe_delta_ratio") {
         config.keyframe_delta_ratio = real(value);
+    } else if (key == "rig_guard") {
+        config.rig_guard = boolean(value);
+    } else if (key == "auto_relearn") {
+        config.auto_relearn = boolean(value);
+    } else if (key == "imu_topic") {
+        config.imu_topic = value;
+    } else if (key == "imu_shock_frac") {
+        config.imu_shock_frac = real(value);
+    } else if (key == "imu_gyro_dps") {
+        config.imu_gyro_dps = real(value);
+    } else if (key == "imu_quiet_s") {
+        config.imu_quiet_s = real(value);
+    } else if (key == "tilt_trigger_deg") {
+        config.tilt_trigger_deg = real(value);
+    } else if (key == "pose_trigger_m") {
+        config.pose_trigger_m = real(value);
+    } else if (key == "guard_check_period_s") {
+        config.guard_check_period_s = real(value);
+    } else if (key == "check_max_s") {
+        config.check_max_s = real(value);
+    } else if (key == "move_min_m") {
+        config.move_min_m = real(value);
+    } else if (key == "move_min_deg") {
+        config.move_min_deg = real(value);
+    } else if (key == "align_max_m") {
+        config.align_max_m = real(value);
+    } else if (key == "align_max_deg") {
+        config.align_max_deg = real(value);
+    } else if (key == "align_inlier_ratio") {
+        config.align_inlier_ratio = real(value);
+    } else if (key == "align_max_rms_m") {
+        config.align_max_rms_m = real(value);
+    } else if (key == "observe_min_eig") {
+        config.observe_min_eig = real(value);
+    } else if (key == "gross_inlier_ratio") {
+        config.gross_inlier_ratio = real(value);
+    } else if (key == "relearn_after_s") {
+        config.relearn_after_s = real(value);
+    } else if (key == "reg_voxel_m") {
+        config.reg_voxel_m = real(value);
+    } else if (key == "src_voxel_m") {
+        config.src_voxel_m = real(value);
+    } else if (key == "icp_max_range_m") {
+        config.icp_max_range_m = real(value);
+    } else if (key == "align_stable_windows") {
+        config.align_stable_windows = integer(value);
+    } else if (key == "reg_max_points") {
+        config.reg_max_points = integer(value);
+    } else if (key == "src_max_points") {
+        config.src_max_points = integer(value);
     } else {
         throw std::runtime_error("unknown config key " + key);
     }

@@ -199,7 +199,7 @@ but only while `isStatusFresh`. Otherwise "STALE · age".
 ## Screen (`LiveRoomScreen.make`)
 
 `LiveRoomScreen` is pure: `make(mirror:connection:requestPathExists:started:now:kinds:selection:timeZone:)`.
-`timeZone` defaults to `.current`. Event clocks are `HH:mm:ss` in that zone; `{sec: 0, nanosec: 0}` stays `time —`.
+`timeZone` defaults to `.current`. Event clocks are `yyyy-MM-dd HH:mm:ss` in that zone; `{sec: 0, nanosec: 0}` stays `time —`.
 Besides the pip, banner, status line, canvas, markers, caption and event rows it carries:
 - `historyLine`: "all events through event n are here", "no events this run", "history incomplete: n
   missing (k lost on the Spark)" (+ " · can't ask the Spark for them" when nothing can fetch the pending

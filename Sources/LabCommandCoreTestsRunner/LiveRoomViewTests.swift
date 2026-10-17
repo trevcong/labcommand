@@ -629,18 +629,21 @@ func testLiveRoomLocalClocks() {
         let got = lines(stamp, zone)
         for (name, line) in [("open", got.open), ("history", got.history), ("earlier", got.earlier)] {
             expect(line.contains(clock), "\(label) \(name) row is \(clock), got \(line)")
-            if clock != "00:00:10" {
+            if !clock.contains("00:00:10") {
                 expect(!line.contains("00:00:10"), "\(label) \(name) row is not the UTC clock, got \(line)")
             }
         }
     }
 
-    expectClock(october, chicago, "19:00:10", "Chicago October")
-    expectClock(july, chicago, "19:00:10", "Chicago July")
-    expectClock(january, chicago, "18:00:10", "Chicago January")
-    expectClock(october, kolkata, "05:30:10", "UTC+5:30")
-    expectClock(october, utc, "00:00:10", "UTC")
-    expectClock(october, minusFive, "19:00:10", "fixed -5h")
+    expectClock(october, chicago, "2025-10-13 19:00:10", "Chicago October")
+    expectClock(july, chicago, "2025-07-14 19:00:10", "Chicago July")
+    expectClock(january, chicago, "2025-01-14 18:00:10", "Chicago January")
+    expectClock(october, kolkata, "2025-10-14 05:30:10", "UTC+5:30")
+    expectClock(october, utc, "2025-10-14 00:00:10", "UTC")
+    expectClock(october, minusFive, "2025-10-13 19:00:10", "fixed -5h")
+
+    let dated = "disappeared · no longer detected · 128 cells · 2025-10-13 19:00:10"
+    expect(eventColumnLines(dated, width: 252) <= 2, "a dated clock still fits line 1, lines \(eventColumnLines(dated, width: 252))")
 
     var zero = viewOpened()
     viewFeed(&zero, .events, viewEvent(id: 4, seq: 0, state: .candidate, stamp: RoomMemory.Time(sec: 0, nanosec: 0)), at: 10)
@@ -694,7 +697,7 @@ func testEventColumnUncertaintyFits() {
 
 func runLiveRoomViewTests() {
     testLiveRoomLocalClocks()
-    print("  LiveRoom view: event clocks are local HH:mm:ss; zero stamp stays time —"); passed()
+    print("  LiveRoom view: event clocks are local yyyy-MM-dd HH:mm:ss; zero stamp stays time —"); passed()
     testLiveRoomStatusLine()
     print("  LiveRoom view: status line reads status.eventsSeq, coverage, stale age, cell"); passed()
     testLiveRoomEventRowsAndHistory()

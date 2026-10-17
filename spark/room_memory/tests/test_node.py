@@ -18,10 +18,10 @@ from rclpy.serialization import deserialize_message, serialize_message  # noqa: 
 from room_memory.generation import GenerationError, generation_path  # noqa: E402
 from room_memory.memory import SENSORS  # noqa: E402
 from room_memory.messages import (  # noqa: E402
-    Activity, Header, MemoryState, MemoryStatus, RequestSync, SyncEnd, SyncTopic,
+    Activity, Header, MemoryState, MemoryStatus, RequestSync, RigOutcome, RigPose, SyncEnd, SyncTopic,
 )
 from room_memory.node import (  # noqa: E402
-    ACTIVITY_TOPIC, EVENTS_TOPIC, REQUEST_SERVICE, STATUS_TOPIC, SYNC_END_TOPIC, RoomMemoryNode,
+    ACTIVITY_TOPIC, EVENTS_TOPIC, REQUEST_SERVICE, RIG_TOPIC, STATUS_TOPIC, SYNC_END_TOPIC, RoomMemoryNode,
 )
 from test_messages import T10, TOKEN_A, appeared_event  # noqa: E402
 
@@ -206,3 +206,31 @@ def test_service_refuses_another_room(node, monkeypatch):
     request = RequestSync(Header("elsewhere", (1 << 64) - 1, 0, T10), None, SyncTopic.EVENTS, 0, TOKEN_A)
     assert not node._serve_request(_service_request(request), RequestSyncSrv.Response()).accepted
     assert order == []
+
+
+def test_the_rig_guard_subscribes_to_the_imu_and_publishes_rig_pose(tmp_path):
+    rclpy.init()
+    node = RoomMemoryNode(parameter_overrides=[
+        Parameter("state_dir", value=str(tmp_path)), Parameter("sensors", value=["mid360"]), Parameter("rig_guard", value=True),
+    ])
+    try:
+        assert node.config.rig_guard and node.config.imu_topic == "/livox/imu"
+        [rig] = [publisher for publisher in node.publishers if publisher.topic_name == RIG_TOPIC]
+        assert rig.qos_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL
+        assert "/livox/imu" in {subscription.topic_name for subscription in node.subscriptions}
+        sent = []
+        node.rig.publish = sent.append
+        node._close_window()
+        node._close_window()  # nothing changed: not due again within 10 s
+        [message] = [RigPose.from_cdr(data) for data in sent]
+        assert message.outcome == RigOutcome.IN_PLACE and message.header.room_id == "lab"
+        assert message.publisher_generation == node.generation.generation
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_without_the_guard_there_is_no_rig_topic(node):
+    assert node.rig is None
+    assert RIG_TOPIC not in {publisher.topic_name for publisher in node.publishers}
+    assert "/livox/imu" not in {subscription.topic_name for subscription in node.subscriptions}
