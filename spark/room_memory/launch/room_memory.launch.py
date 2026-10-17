@@ -43,6 +43,8 @@ ARGUMENTS = {
     "keyframe_period_s": ("60.0", float),
     "keyframe_delta_ratio": ("0.5", float),
     "suppress_clear_windows": ("30", int),
+    # The operator service changes durable state: off unless asked (D46).
+    "operator_actions": ("false", bool),
 }
 
 

@@ -15,6 +15,7 @@ import re
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 CPP_LAUNCH = ROOT / "spark/room_memory_cpp/launch/room_memory_cpp.launch.py"
 REQUEST_SERVICE = "/room_memory/sync/request"
+OPERATOR_SERVICE = "/room_memory/operator/action"
 
 
 def _module_constants(path):
@@ -48,7 +49,7 @@ def test_bridge_offers_the_request_service():
     parameters = _bridge_parameters()
     assert constants["REQUEST_SERVICE"] == REQUEST_SERVICE
     assert constants["BRIDGE_CAPABILITIES"] == ["connectionGraph", "services"]
-    assert parameters["service_whitelist"] == "BRIDGE_SERVICE_WHITELIST"
+    assert parameters["service_whitelist"] == "ParameterValue(service_whitelist, value_type=List[str])"
     assert parameters["capabilities"] == "ParameterValue(capabilities, value_type=List[str])"
 
 
@@ -89,3 +90,48 @@ def test_service_request_is_exactly_one_request_sync():
     assert fields[:separator] == ["RequestSync request"]
     assert fields[separator + 1:] == ["bool accepted"]
     assert '"srv/RequestSync.srv"' in (ROOT / "ros/labcommand_msgs/CMakeLists.txt").read_text()
+
+
+def test_the_operator_service_is_opt_in():
+    # D46: it changes durable state through a port without authentication. The node offers it and the
+    # bridge whitelists it only with operator_actions:=true; the default is off in both launch files.
+    constants = _module_constants(CPP_LAUNCH)
+    assert constants["OPERATOR_SERVICE"] == OPERATOR_SERVICE
+    for launch in (CPP_LAUNCH, ROOT / "spark/room_memory/launch/room_memory.launch.py"):
+        assert '"operator_actions": ("false", bool),' in launch.read_text(), launch
+    pattern = constants["OPERATOR_SERVICE_PATTERN"]
+    assert re.fullmatch(pattern, OPERATOR_SERVICE)
+    for other in (REQUEST_SERVICE, "/room_memory/operator", "/room_memory/operator/action_x", "/x/room_memory/operator/action"):
+        assert not re.search(pattern, other), other
+    source = CPP_LAUNCH.read_text()
+    assert 'repr(BRIDGE_SERVICE_WHITELIST + [OPERATOR_SERVICE_PATTERN]), " if \'", LaunchConfiguration("operator_actions")' in source
+    assert '"\'.lower() == \'true\' else ", repr(BRIDGE_SERVICE_WHITELIST)' in source
+    cpp_node = (ROOT / "spark/room_memory_cpp/node/room_memory_node.cpp").read_text()
+    assert 'declare_parameter<bool>("operator_actions", false)' in cpp_node
+    assert "if (operator_actions) {" in cpp_node
+    python_node = (ROOT / "spark/room_memory/room_memory/node.py").read_text()
+    assert 'self.declare_parameter("operator_actions", False)' in python_node
+
+
+def test_every_side_names_the_same_operator_service():
+    python_node = _module_constants(ROOT / "spark/room_memory/room_memory/node.py")
+    assert python_node["OPERATOR_SERVICE"] == OPERATOR_SERVICE
+    assert python_node["OPERATOR_TOPIC"] == "/room_memory/operator"
+    cpp_node = (ROOT / "spark/room_memory_cpp/node/room_memory_node.cpp").read_text()
+    assert f'constexpr const char* kOperatorService = "{OPERATOR_SERVICE}";' in cpp_node
+    assert 'constexpr const char* kOperatorTopic = "/room_memory/operator";' in cpp_node
+
+
+def test_operator_service_is_one_action_and_one_outcome():
+    lines = [line.split("#")[0].strip() for line in (ROOT / "ros/labcommand_msgs/srv/OperatorAction.srv").read_text().splitlines()]
+    fields = [line for line in lines if line]
+    separator = fields.index("---")
+    assert fields[:separator] == ["OperatorAction action"]
+    assert fields[-1] == "uint8 outcome"
+    # The outcome constants match the codec's enum, value for value.
+    from room_memory.messages import OperatorOutcome
+    constants = dict(line.split()[1].split("=") for line in fields[separator + 1:-1])
+    assert {name.removeprefix("OUTCOME_"): int(value) for name, value in constants.items()} == {
+        outcome.name: int(outcome) for outcome in OperatorOutcome}
+    assert '"srv/OperatorAction.srv"' in (ROOT / "ros/labcommand_msgs/CMakeLists.txt").read_text()
+

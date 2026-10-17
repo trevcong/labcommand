@@ -21,7 +21,7 @@ from room_memory.messages import (  # noqa: E402
     Activity, Header, MemoryState, MemoryStatus, RequestSync, SyncEnd, SyncTopic,
 )
 from room_memory.node import (  # noqa: E402
-    ACTIVITY_TOPIC, EVENTS_TOPIC, REQUEST_SERVICE, STATUS_TOPIC, SYNC_END_TOPIC, RoomMemoryNode,
+    ACTIVITY_TOPIC, EVENTS_TOPIC, OPERATOR_SERVICE, REQUEST_SERVICE, STATUS_TOPIC, SYNC_END_TOPIC, RoomMemoryNode,
 )
 from test_messages import T10, TOKEN_A, appeared_event  # noqa: E402
 
@@ -206,3 +206,20 @@ def test_service_refuses_another_room(node, monkeypatch):
     request = RequestSync(Header("elsewhere", (1 << 64) - 1, 0, T10), None, SyncTopic.EVENTS, 0, TOKEN_A)
     assert not node._serve_request(_service_request(request), RequestSyncSrv.Response()).accepted
     assert order == []
+
+
+def test_the_operator_service_is_off_by_default(node):
+    services = dict(node.get_service_names_and_types_by_node("room_memory", "/"))
+    assert OPERATOR_SERVICE not in services
+
+
+def test_operator_actions_answer_with_an_outcome(node, monkeypatch):
+    from room_memory.messages import EventState, OperatorAction, OperatorActionKind, OperatorOutcome
+    published = []
+    monkeypatch.setattr(node.events, "publish", lambda data: published.append(data))
+    assert node._act(b"\x00\x01\x00\x00") == OperatorOutcome.INVALID
+    action = OperatorAction(Header("lab", 0, 0, T10), OperatorActionKind.CONFIRM, 5, EventState.CANDIDATE,
+                            node.generation.generation, "", "trevor", "00000000-0000-4000-8000-000000000001")
+    assert node._act(action.to_cdr()) == OperatorOutcome.NOT_TRACKING
+    assert published == []
+
