@@ -86,6 +86,9 @@ final class AppState: ObservableObject {
     /// Live room socket. Nil in fixture mode: the view reads `fixture` instead.
     /// A snapshot launch isolates the network, so it leaves this nil too.
     let roomLaunch: LiveRoomLaunch
+    /// Resolved once, from the environment and then saved defaults. Settings reads this.
+    /// It does not resolve again on appear.
+    private let roomEndpoint: RoomMemoryEndpointStore
     let room: LiveRoomClient?
     @Published private(set) var fixture: LiveRoomFixture? {
         didSet { recomputeStatusDots() }
@@ -114,6 +117,8 @@ final class AppState: ObservableObject {
         self.launch = launch
         let roomLaunch = LiveRoomLaunch.parse(environment)
         self.roomLaunch = roomLaunch
+        let endpointStore = RoomMemoryEndpointStore(environment: environment, defaults: .standard)
+        self.roomEndpoint = endpointStore
         self.service = service ?? ConnectivityService()
         self.rigIO = rigIO ?? MockMode.createRigService(isolates: launch.isolates)
         // The room gate launch and every fixture leave the lidar client dark.
@@ -122,7 +127,7 @@ final class AppState: ObservableObject {
         )
         switch roomLaunch {
         case .live:
-            self.room = launch.isolates ? nil : LiveRoomClient()
+            self.room = launch.isolates ? nil : LiveRoomClient(url: endpointStore.current)
             self.fixture = nil
         case .fixture(let mode):
             self.room = nil
@@ -147,6 +152,14 @@ final class AppState: ObservableObject {
         }
         recomputeStatusDots()
         watchRoomDots()
+    }
+
+    /// The endpoint this process is using. Settings copies it into the field on appear.
+    var roomEndpointURL: URL { roomEndpoint.current }
+
+    /// Saves a valid endpoint and retargets the live socket. An invalid string changes neither.
+    func commitRoomEndpoint(_ raw: String) -> String? {
+        roomEndpoint.commit(raw, retargeting: room)
     }
 
     var roomMirror: RoomMemoryMirror {

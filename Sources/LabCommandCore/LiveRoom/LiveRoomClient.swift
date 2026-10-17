@@ -56,8 +56,6 @@ public enum LiveRoomConnection: Sendable, Equatable {
 /// a `RoomMemoryMirror`. Bind SwiftUI to `connection` and `mirror` (see `LiveRoom/API.md`).
 @MainActor
 public final class LiveRoomClient: ObservableObject {
-    /// The room-memory bridge on the Spark's tailnet IP (Phase 3 P12).
-    public nonisolated static let defaultURL = URL(string: "ws://100.118.187.99:8767")!
     /// No `serverInfo` by then: give up on the attempt.
     public static let handshakeTimeout: TimeInterval = 5
     /// No message for this long (status is 1 Hz): the link is dead; reconnect.
@@ -94,9 +92,11 @@ public final class LiveRoomClient: ObservableObject {
         return requestSyncSink != nil ? .relay : .unavailable
     }
 
-    public let url: URL
+    public private(set) var url: URL
     /// False keeps the client read-only: it never advertises a channel or sends a request.
     public let publishRequests: Bool
+    /// The room passed to `init`. The mirror may adopt a different id from the wire.
+    private let boundRoomId: String?
     private let session: URLSession
     private var runTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
@@ -123,8 +123,9 @@ public final class LiveRoomClient: ObservableObject {
         var failure: String?
     }
 
-    public init(url: URL = LiveRoomClient.defaultURL, roomId: String? = nil, publishRequests: Bool = true) {
+    public init(url: URL, roomId: String? = nil, publishRequests: Bool = true) {
         self.url = url
+        self.boundRoomId = roomId
         self.publishRequests = publishRequests
         mirror = RoomMemoryMirror(roomId: roomId)
         let config = URLSessionConfiguration.ephemeral
@@ -147,14 +148,55 @@ public final class LiveRoomClient: ObservableObject {
         runTask = Task { [weak self] in await self?.run(generation: generation) }
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                self?.tick()
+                // `try?` used to swallow cancellation and tick the next generation once.
+                do {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                } catch {
+                    return
+                }
+                guard let self, !Task.isCancelled, generation == self.runGeneration else { return }
+                self.tick()
             }
         }
     }
 
+    /// Points this client at `newURL`. The same canonical URL keeps the socket and the mirror.
+    /// While running, `connection` is `.connecting` to the new URL before this returns. `start()`
+    /// only schedules the attempt, so the publish cannot wait for `run()`.
+    public func retarget(_ newURL: URL) {
+        let next = Self.canonical(newURL)
+        guard next.absoluteString != url.absoluteString else { return }
+        guard runTask != nil else {
+            url = next
+            mirror = RoomMemoryMirror(roomId: boundRoomId)
+            return
+        }
+        runGeneration += 1
+        runTask?.cancel()
+        tickTask?.cancel()
+        runTask = nil
+        tickTask = nil
+        if let current = link {
+            current.socket.cancel(with: .goingAway, reason: nil)
+            link = nil
+        }
+        url = next
+        mirror = RoomMemoryMirror(roomId: boundRoomId)
+        connection = .connecting(url: next, attempt: 1)
+        start()
+    }
+
+    private static func canonical(_ url: URL) -> URL {
+        if case .success(let parsed) = RoomMemoryEndpoint.parse(url.absoluteString) {
+            return parsed
+        }
+        return url
+    }
+
     /// Closes the socket. The mirror stays, greyed: nothing proves it current any more.
     public func stop() {
+        // A run or tick still unwinding must not publish over `.off`.
+        runGeneration += 1
         runTask?.cancel()
         tickTask?.cancel()
         runTask = nil
@@ -184,7 +226,12 @@ public final class LiveRoomClient: ObservableObject {
             let delay = max(Self.reconnectFloor, FoxgloveProtocol.reconnectDelay(afterFailures: failures))
             note(opened ? "connection lost: \(reason); retrying in \(Int(delay)) s" : "\(url) unreachable: \(reason); retrying in \(Int(delay)) s")
             connection = .waiting(retryIn: delay, reason: reason)
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            } catch {
+                return
+            }
+            if Task.isCancelled || generation != runGeneration { return }
         }
     }
 
