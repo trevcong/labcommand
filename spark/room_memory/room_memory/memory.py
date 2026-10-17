@@ -1010,7 +1010,8 @@ class RoomMemory:
         # The rig files on disk lag the guard: a write or the relearn's archive failed (disk full,
         # permissions). The guard runs on from memory and close_window retries every window; until
         # the archive goes through, the old frame's files stay as they are. rig_save_failed counts
-        # the failed attempts and rig_save_error is the last one's message.
+        # the failed attempts, a held epoch write (_record_epoch) included, and rig_save_error is
+        # the last one's message.
         # Measurement only, in no output: the guard's ICP estimates in the last close_window and their
         # wall time in ms (source cloud, seed with its yaw sweep, alignment).
         self.window_estimates = 0
@@ -1018,7 +1019,6 @@ class RoomMemory:
         self.rig_save_pending = False
         self.rig_save_failed = 0
         self.rig_save_error = None
-        self._epoch_due = False  # map_epoch not yet in the epoch file (_save_rig)
         self._references_due = None  # a save's references header, not yet written (_save_rig)
         self._archive_due = None  # the relearned frame's prev/ name, not yet archived
         self._gravity = None  # the newest window's gravity
@@ -1091,10 +1091,10 @@ class RoomMemory:
             self._load_rig(room, rig_state)
         # seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
         # before it names a message after it. Saved at once, so the next restart moves on again.
+        if not self._record_epoch(epoch + 1):  # nothing carries the new epoch yet: a start that cannot record it stops
+            raise RuntimeError(self.rig_save_error)
         self.map_epoch = epoch + 1
         self.save(start)
-        if self._epoch_due:  # nothing carries the new epoch yet: a start that cannot record it stops here
-            raise RuntimeError(self.rig_save_error)
         self.state = MemoryState.TRACKING
         if self.config.rig_guard:
             # The rig may have moved while the node was off.
@@ -1131,13 +1131,13 @@ class RoomMemory:
     def save(self, stamp):
         """Writes every sensor's reference and the room's epoch file with the current ``map_epoch``,
         and with the rig guard its registration clouds and ``rig_state`` (``_save_rig``: one ordered
-        commit, the references inside it). No-op without ``state_dir``."""
+        commit, the references inside it; the epoch file is already written, by ``_record_epoch``).
+        No-op without ``state_dir``."""
         if self.config.state_dir is None:
             return
         header = Header(self.config.room_id, self.map_epoch, 0, stamp)
         if self.config.rig_guard:
             # A frame commits whole: until every sensor built, the last committed one stays on disk.
-            self._epoch_due = True
             if not self._building():
                 self._references_due = header
             self._save_rig()
@@ -1147,22 +1147,36 @@ class RoomMemory:
         for name, path in self._paths().items():
             save_reference(path, self.channels[name].reference, header, self.config.voxel_size)
 
+    def _record_epoch(self, epoch):
+        """With the rig guard, writes ``epoch`` to the room's epoch file before anything carries it,
+        so the file never falls behind an epoch in use, whatever else of a save fails. False when the
+        write fails (disk full, permissions; counted like a failed save): the caller holds what would
+        take the epoch (the build's end, a settle) and the next window tries again. Without the guard
+        or ``state_dir`` it writes nothing and returns True: ``save`` writes the epoch file first and
+        a failure raises, as before the guard."""
+        if not self.config.rig_guard or self.config.state_dir is None:
+            return True
+        try:
+            save_epoch(epoch_path(self.config.state_dir, self.config.room_id), epoch)
+            return True
+        except Exception as error:  # as _save_rig: the C++ engine catches std::exception
+            self.rig_save_failed += 1
+            self.rig_save_error = str(error)
+            return False
+
     def _save_rig(self):
-        """One ordered commit: the epoch file (first: it never lags behind an epoch in use), the
-        relearned frame's archive, the registration clouds not yet written, the references a save left
-        due, then ``rig_state`` (last: it names the clouds). A new frame's clouds go before its
-        references and carry its ``frame_epoch``, so a commit cut short leaves either the old frame
-        whole or clouds the old ``rig_state``'s CRCs refuse: never one frame's references with
-        another's poses. A failure (disk full, permissions) never leaves ``close_window``: the guard
-        keeps its state in memory, the files on disk stay the last set written, and ``close_window``
-        retries until a save goes through."""
+        """One ordered commit: the relearned frame's archive, the registration clouds not yet written,
+        the references a save left due, then ``rig_state`` (last: it names the clouds). A new frame's
+        clouds go before its references and carry its ``frame_epoch``, so a commit cut short leaves
+        either the old frame whole or clouds the old ``rig_state``'s CRCs refuse: never one frame's
+        references with another's poses. A failure (disk full, permissions) never leaves
+        ``close_window``: the guard keeps its state in memory, the files on disk stay the last set
+        written, and ``close_window`` retries until a save goes through. (The epoch file is not part
+        of it: ``_record_epoch`` writes each epoch before it is used.)"""
         if self.config.state_dir is None:
             return
         try:
             room = _room_dir(self.config.state_dir, self.config.room_id)
-            if self._epoch_due:
-                save_epoch(epoch_path(self.config.state_dir, self.config.room_id), self.map_epoch)
-                self._epoch_due = False
             if self._archive_due is not None:
                 files = ["map_epoch", "rig_state"] + [path.name for path in self._paths().values()]
                 files += [rig_files.registration_name(name) for name in self.channels]
@@ -1326,7 +1340,9 @@ class RoomMemory:
             self._activity = (len(activity), sum(region.voxel_count for _, region in activity),
                               functools.reduce(operator.or_, (b for b, _ in activity)), bit, largest)
             self._last_activity_ns = _nanoseconds(stamp)
-        if self.state == MemoryState.BUILDING and self._built(now):
+        # With the guard, the build ends only once the epoch file holds the epoch it takes (else BUILDING
+        # holds, and the next window tries again).
+        if self.state == MemoryState.BUILDING and self._built(now) and self._record_epoch(self.map_epoch + 1):
             self.state = MemoryState.TRACKING
             # From here on only the voxels the reference has not settled keep their counts.
             # learn_windows 0 drops those leftovers: this run teaches the reference nothing.
@@ -1893,18 +1909,20 @@ class RoomMemory:
             return None
         changed = False
         if self._settle_pending:
-            for channel in self.channels.values():
-                if channel.builder is not None:
-                    continue  # still building: its counts are its reference's
-                fresh = channel.stats.settled(self.config.settle_rule())
-                if not len(fresh.known):
-                    continue
+            # Still building: its counts are its reference's.
+            settled = [(channel, channel.stats.settled(self.config.settle_rule()))
+                       for channel in self.channels.values() if channel.builder is None]
+            settled = [(channel, fresh) for channel, fresh in settled if len(fresh.known)]
+            # With the guard, voxels merge only once the epoch file holds the epoch they take: else the
+            # counts, the references and map_epoch stay as they are, and the next window tries again.
+            held = bool(settled) and not self._record_epoch(self.map_epoch + 1)
+            for channel, fresh in [] if held else settled:
                 channel.stats.erase(fresh.known)
                 self._set_reference(channel, channel.reference.merge(fresh))
                 changed = True
             # The budget is spent: merge whatever just settled, then drop the rest, including
             # counts that never reached the rule. A tick that is not due returned above.
-            if self._tracking_windows >= self.config.learn_windows:
+            if not held and self._tracking_windows >= self.config.learn_windows:
                 for channel in self.channels.values():
                     if channel.builder is None:
                         channel.stats = VoxelStats()

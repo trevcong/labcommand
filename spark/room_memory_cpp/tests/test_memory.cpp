@@ -2235,24 +2235,25 @@ TEST(a_failed_relearn_archive_holds_the_old_frame_until_it_goes_through) {
     CHECK(saved_rig_state(run.room).frame_epoch > run.old_frame);
 }
 
-TEST(a_failed_epoch_write_never_leaves_close_window_and_retries) {
-    // The rebuild's new epoch goes into the epoch file inside the guarded commit, first: when that
-    // write fails (here a directory where its temp file goes, as a full disk would) the rebuild still
-    // completes, nothing of the new frame reaches disk, and the next window retries. A start that
-    // cannot record its epoch stops: nothing carries that epoch yet.
+TEST(a_failed_epoch_write_holds_the_rebuild_until_it_goes_through) {
+    // The rebuild's new epoch goes into the epoch file before anything carries it: when that write
+    // fails (here a directory where its temp file goes, as a full disk would) the build's end is held,
+    // so every window stays BUILDING under an epoch the file holds, nothing of the new frame reaches
+    // disk, and the next window retries. A start that cannot record its epoch stops: nothing carries
+    // that epoch yet.
     Relearned run({});
     RoomMemory& memory = *run.memory;
     CHECK(!memory.rig_save_pending());  // the archive went through
     const std::filesystem::path epoch_file = run.room / "map_epoch";
-    const std::optional<std::uint64_t> old_epoch = load_epoch(epoch_file);
     std::filesystem::create_directory(run.room / "map_epoch.tmp");
-    run.rebuild();
-    CHECK(memory.rig_save_pending() && memory.rig_save_error().find("map_epoch.tmp") != std::string::npos);
-    const std::int64_t failed = memory.rig_save_failed();
-    CHECK(failed >= 1 && old_epoch && memory.map_epoch() > *old_epoch && load_epoch(epoch_file) == old_epoch);
+    for (int n = 0; n < 3 * kGuardReferenceWindows; ++n) {
+        run.step();
+        CHECK(memory.state() == MemoryState::building && !memory.map_update(msg::Time{1000, 0}));
+        CHECK(load_epoch(epoch_file) && memory.map_epoch() <= *load_epoch(epoch_file));
+    }
+    CHECK(memory.rig_save_failed() >= 2 * kGuardReferenceWindows);
+    CHECK(memory.rig_save_error().find("map_epoch.tmp") != std::string::npos);
     CHECK(run.files() == run.old_files);
-    run.step();
-    CHECK(memory.rig_save_pending() && memory.rig_save_failed() > failed);
     std::string refused;
     try {
         RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
@@ -2262,10 +2263,56 @@ TEST(a_failed_epoch_write_never_leaves_close_window_and_retries) {
     CHECK(refused.find("map_epoch.tmp") != std::string::npos);
     std::filesystem::remove(run.room / "map_epoch.tmp");
     run.step();
-    CHECK(!memory.rig_save_pending() && load_epoch(epoch_file) == std::optional<std::uint64_t>{memory.map_epoch()});
+    CHECK(memory.state() == MemoryState::tracking && !memory.rig_save_pending());
+    CHECK(load_epoch(epoch_file) == std::optional<std::uint64_t>{memory.map_epoch()});
     CHECK(saved_rig_state(run.room).frame_epoch > run.old_frame);
     RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
     CHECK_EQ(restarted.map_epoch(), memory.map_epoch() + 1);
+}
+
+TEST(a_failed_epoch_write_holds_a_settle_until_it_goes_through) {
+    // While tracking, voxels that settle take the next map_epoch. When the epoch file cannot record it
+    // the settle is held: the counts, the reference and map_epoch stay, no delta goes out, and the next
+    // window retries; once the write goes through the delta carries the epoch the file holds.
+    TempDir dir;
+    const std::filesystem::path room = dir.path / "lab";
+    MemoryConfig config = guarded_config(dir.path.string());
+    config.learn_windows = 30;
+    config.delta_period_s = 2.0;
+    config.keyframe_period_s = 1000.0;
+    config.keyframe_delta_ratio = 100.0;
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+    // The reference sees only what is within 4 m; the far walls are new coverage once tracking.
+    const auto window = [&](std::int64_t second, double max_range_m) {
+        const Cloud cloud = rooms::scan({}, rooms::kRoom, rooms::kFurniture, 0.01, static_cast<std::uint64_t>(second),
+                                        max_range_m);
+        return feed(memory, &cloud, second);
+    };
+    std::int64_t second = 1;
+    std::optional<msg::MapBricks> opening;
+    while (!opening) {
+        opening = window(second++, 4.0);
+        CHECK(second < 3 * kGuardReferenceWindows);
+    }
+    CHECK(opening->kind == msg::MapKind::snapshot && opening->header.map_epoch == memory.map_epoch());
+    const std::uint64_t epoch = memory.map_epoch();
+    const std::vector<msg::Brick> bricks = memory.channel("mid360").reference.to_bricks();
+    std::filesystem::create_directory(room / "map_epoch.tmp");
+    for (const std::int64_t last = second + 7; second < last; ++second) {
+        CHECK(!window(second, 30.0));
+        CHECK(memory.map_epoch() == epoch && load_epoch(room / "map_epoch") == std::optional<std::uint64_t>{epoch});
+        CHECK(memory.channel("mid360").reference.to_bricks() == bricks);
+    }
+    CHECK(!memory.channel("mid360").stats.keys.empty());
+    CHECK(memory.rig_save_error().find("map_epoch.tmp") != std::string::npos);
+    const std::int64_t failed = memory.rig_save_failed();
+    CHECK(failed >= 2);
+    std::filesystem::remove(room / "map_epoch.tmp");
+    const std::optional<msg::MapBricks> delta = window(second, 30.0);
+    CHECK(delta && delta->kind == msg::MapKind::delta && delta->header.map_epoch == epoch + 1);
+    CHECK(load_epoch(room / "map_epoch") == std::optional<std::uint64_t>{epoch + 1});
+    CHECK(memory.rig_save_failed() == failed && !memory.rig_save_pending());
+    CHECK(memory.channel("mid360").reference.to_bricks().size() > bricks.size());
 }
 
 TEST(a_new_frame_cut_short_never_loads_with_the_old_frames_poses) {

@@ -15,8 +15,8 @@ from room_memory.core import Config, decode_pointcloud2, occupancy_map
 from room_memory import state as rig_files
 from room_memory.memory import MemoryConfig, RoomMemory, load_epoch, load_reference, pose_shift
 from room_memory.messages import (CAUSE_IMU_SHOCK, CAUSE_IMU_TILT, CAUSE_PERIODIC, CAUSE_POSE_OFFSET, CAUSE_STARTUP,
-                                  SENSOR_JT128, SENSOR_MID360, EventKind, EventState, ImuSample, MemoryState,
-                                  RigChannel, RigOutcome, Time)
+                                  SENSOR_JT128, SENSOR_MID360, EventKind, EventState, ImuSample, MapBricks, MapKind,
+                                  MemoryState, RigChannel, RigOutcome, Time)
 
 import rooms
 from test_memory import GENERATION
@@ -757,30 +757,67 @@ def test_a_failed_relearn_archive_holds_the_old_frame_until_it_goes_through(tmp_
     assert rig_files.parse_rig_state((room / "rig_state").read_bytes(), "rig_state").frame_epoch == memory._frame_epoch
 
 
-def test_a_failed_epoch_write_never_leaves_close_window_and_retries(tmp_path):
-    """The rebuild's new epoch goes into the epoch file inside the guarded commit, first: when that
-    write fails (here a directory where its temp file goes, as a full disk would) the rebuild still
-    completes, nothing of the new frame reaches disk, and the next window retries. A start that
-    cannot record its epoch stops: nothing carries that epoch yet."""
+def test_a_failed_epoch_write_holds_the_rebuild_until_it_goes_through(tmp_path):
+    """The rebuild's new epoch goes into the epoch file before anything carries it: when that write
+    fails (here a directory where its temp file goes, as a full disk would) the build's end is held,
+    so every window stays BUILDING under an epoch the file holds, nothing of the new frame reaches
+    disk, and the next window retries. A start that cannot record its epoch stops: nothing carries
+    that epoch yet."""
     memory, step, old_frame, old_files = relearned(tmp_path, [])
     room = tmp_path / "lab"
     assert not memory.rig_save_pending  # the archive went through
-    old_epoch = load_epoch(room / "map_epoch")
     (room / "map_epoch.tmp").mkdir()
-    rebuild(memory, step)
-    assert memory.rig_save_pending and "map_epoch.tmp" in memory.rig_save_error
-    failed = memory.rig_save_failed
-    assert failed >= 1 and memory.map_epoch > old_epoch == load_epoch(room / "map_epoch")
+    for _ in range(3 * REFERENCE_WINDOWS):
+        step()
+        assert memory.state == MemoryState.BUILDING and memory.map_update(Time(1000, 0)) is None
+        assert memory.map_epoch <= load_epoch(room / "map_epoch")
+    assert memory.rig_save_failed >= 2 * REFERENCE_WINDOWS and "map_epoch.tmp" in memory.rig_save_error
     assert {name: (room / name).read_bytes() for name in old_files} == old_files
-    step()
-    assert memory.rig_save_pending and memory.rig_save_failed > failed
     with pytest.raises(RuntimeError, match="map_epoch.tmp"):
         guarded(tmp_path)
     (room / "map_epoch.tmp").rmdir()
     step()
-    assert not memory.rig_save_pending and load_epoch(room / "map_epoch") == memory.map_epoch
+    assert memory.state == MemoryState.TRACKING and not memory.rig_save_pending
+    assert load_epoch(room / "map_epoch") == memory.map_epoch
     assert rig_files.parse_rig_state((room / "rig_state").read_bytes(), "rig_state").frame_epoch == memory._frame_epoch
     assert guarded(tmp_path).map_epoch == memory.map_epoch + 1
+
+
+def test_a_failed_epoch_write_holds_a_settle_until_it_goes_through(tmp_path):
+    """While tracking, voxels that settle take the next map_epoch. When the epoch file cannot record it
+    the settle is held: the counts, the reference and map_epoch stay, no delta goes out, and the next
+    window retries; once the write goes through the delta carries the epoch the file holds."""
+    memory = guarded(tmp_path, learn_windows=30, delta_period_s=2.0, keyframe_period_s=1000.0,
+                     keyframe_delta_ratio=100.0)
+    room = tmp_path / "lab"
+
+    def window(second, max_range_m):
+        memory.add_points("mid360", rooms.scan(seed=second, max_range_m=max_range_m))
+        memory.close_window(Time(second, 0))
+        data = memory.map_update(Time(second, 0))
+        return None if data is None else MapBricks.from_cdr(data)
+
+    # The reference sees only what is within 4 m; the far walls are new coverage once tracking.
+    second, opening = 1, None
+    while opening is None:
+        opening = window(second, 4.0)
+        second += 1
+        assert second < 3 * REFERENCE_WINDOWS
+    assert opening.kind == MapKind.SNAPSHOT and opening.header.map_epoch == memory.map_epoch
+    epoch, bricks = memory.map_epoch, memory.channels["mid360"].reference.to_bricks()
+    (room / "map_epoch.tmp").mkdir()
+    for second in range(second, second + 7):
+        assert window(second, 30.0) is None
+        assert memory.map_epoch == epoch == load_epoch(room / "map_epoch")
+        assert memory.channels["mid360"].reference.to_bricks() == bricks
+    assert len(memory.channels["mid360"].stats.keys) and "map_epoch.tmp" in memory.rig_save_error
+    failed = memory.rig_save_failed
+    assert failed >= 2
+    (room / "map_epoch.tmp").rmdir()
+    delta = window(second + 1, 30.0)
+    assert delta.kind == MapKind.DELTA and delta.header.map_epoch == epoch + 1 == load_epoch(room / "map_epoch")
+    assert memory.rig_save_failed == failed and not memory.rig_save_pending
+    assert len(memory.channels["mid360"].reference.to_bricks()) > len(bricks)
 
 
 def test_a_moved_sensor_gone_silent_keeps_the_move(moved_window):

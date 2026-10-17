@@ -757,10 +757,10 @@ void RoomMemory::load(const msg::Time& start) {
     if (config_.rig_guard) load_rig(room, rig_state);
     // seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
     // before it names a message after it. Saved at once, so the next restart moves on again.
+    // Nothing carries the new epoch yet: a start that cannot record it stops here.
+    if (!record_epoch(epoch + 1)) throw std::runtime_error(rig_save_error_);
     map_epoch_ = epoch + 1;
     save(start);
-    // Nothing carries the new epoch yet: a start that cannot record it stops here.
-    if (epoch_due_) throw std::runtime_error(rig_save_error_);
     state_ = msg::MemoryState::tracking;
     // The rig may have moved while the node was off.
     if (config_.rig_guard) start_check(nanoseconds(start), msg::kCauseStartup);
@@ -771,7 +771,6 @@ void RoomMemory::save(const msg::Time& stamp) {
     const msg::Header header{config_.room_id, map_epoch_, 0, stamp};
     if (config_.rig_guard) {
         // A frame commits whole: until every sensor built, the last committed one stays on disk.
-        epoch_due_ = true;
         if (!building()) references_due_ = header;
         save_rig();
         return;
@@ -1008,7 +1007,9 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         activity_ = std::move(summary);
         last_activity_ns_ = nanoseconds(stamp);
     }
-    if (state_ == msg::MemoryState::building && built(now)) {
+    // With the guard, the build ends only once the epoch file holds the epoch it takes (else BUILDING
+    // holds, and the next window tries again).
+    if (state_ == msg::MemoryState::building && built(now) && record_epoch(map_epoch_ + 1)) {
         state_ = msg::MemoryState::tracking;
         // From here on only the voxels the reference has not settled keep their counts.
         // learn_windows 0 drops those leftovers: this run teaches the reference nothing.
@@ -1094,17 +1095,25 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
     if (!keyframe_due && ns - last_map_ns_ < period_ns(config_.delta_period_s)) return std::nullopt;
     bool changed = false;
     if (settle_pending_) {
+        std::vector<std::pair<Channel*, VoxelLayer>> settled;
         for (Channel& channel : channels_) {
             if (channel.builder) continue;  // still building: its counts are its reference's
             VoxelLayer fresh = channel.stats.settled(config_.settle_rule());
-            if (fresh.known.empty()) continue;
-            channel.stats.erase(fresh.known);
-            set_reference(channel, channel.reference.merge(fresh));
-            changed = true;
+            if (!fresh.known.empty()) settled.emplace_back(&channel, std::move(fresh));
+        }
+        // With the guard, voxels merge only once the epoch file holds the epoch they take: else the
+        // counts, the references and map_epoch stay as they are, and the next window tries again.
+        const bool held = !settled.empty() && !record_epoch(map_epoch_ + 1);
+        if (!held) {
+            for (auto& [channel, fresh] : settled) {
+                channel->stats.erase(fresh.known);
+                set_reference(*channel, channel->reference.merge(fresh));
+                changed = true;
+            }
         }
         // The budget is spent: merge whatever just settled, then drop the rest, including
         // counts that never reached the rule. A tick that is not due returned above.
-        if (tracking_windows_ >= config_.learn_windows) {
+        if (!held && tracking_windows_ >= config_.learn_windows) {
             for (Channel& channel : channels_) {
                 if (!channel.builder) channel.stats = VoxelStats{};
             }
@@ -1832,21 +1841,30 @@ void RoomMemory::load_rig(const std::filesystem::path& room, const std::filesyst
     g_base_ = state.g_base;
 }
 
+bool RoomMemory::record_epoch(std::uint64_t epoch) {
+    if (!config_.rig_guard || !config_.state_dir) return true;
+    try {
+        save_epoch(epoch_path(*config_.state_dir, config_.room_id), epoch);
+        return true;
+    } catch (const std::exception& error) {
+        ++rig_save_failed_;
+        rig_save_error_ = error.what();
+        return false;
+    }
+}
+
 void RoomMemory::save_rig() {
-    // One ordered commit: the epoch file (first: it never lags behind an epoch in use), the relearned
-    // frame's archive, the registration clouds not yet written, the references a save left due, then
-    // rig_state (last: it names the clouds). A new frame's clouds go before its references and carry
-    // its frame_epoch, so a commit cut short leaves either the old frame whole or clouds the old
-    // rig_state's CRCs refuse: never one frame's references with another's poses. A failure (disk
-    // full, permissions) never leaves close_window: the guard keeps its state in memory, the files on
-    // disk stay the last set written, and close_window retries until a save goes through.
+    // One ordered commit: the relearned frame's archive, the registration clouds not yet written,
+    // the references a save left due, then rig_state (last: it names the clouds). A new frame's
+    // clouds go before its references and carry its frame_epoch, so a commit cut short leaves either
+    // the old frame whole or clouds the old rig_state's CRCs refuse: never one frame's references
+    // with another's poses. A failure (disk full, permissions) never leaves close_window: the guard
+    // keeps its state in memory, the files on disk stay the last set written, and close_window
+    // retries until a save goes through. (The epoch file is not part of it: record_epoch writes each
+    // epoch before it is used.)
     if (!config_.state_dir) return;
     try {
         const std::filesystem::path room = room_dir(*config_.state_dir, config_.room_id);
-        if (epoch_due_) {
-            save_epoch(epoch_path(*config_.state_dir, config_.room_id), map_epoch_);
-            epoch_due_ = false;
-        }
         if (archive_due_) {
             std::vector<std::string> files{"map_epoch", "rig_state"};
             for (const std::filesystem::path& path : paths()) files.push_back(path.filename().string());

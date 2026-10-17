@@ -468,7 +468,8 @@ public:
     SyncAnswer sync(const msg::RequestSync& request, const msg::Time& stamp);
     // Writes every sensor's reference and the room's epoch file with the current map_epoch, and
     // with the rig guard its registration clouds and rig_state (save_rig: one ordered commit, the
-    // references inside it). No-op without state_dir.
+    // references inside it; the epoch file is already written, by record_epoch). No-op without
+    // state_dir.
     void save(const msg::Time& stamp);
     // Feeds one CDR sensor_msgs/Imu received at `received` to the rig guard. False when the guard is
     // off or the frame does not decode (counted in imu_failed, never thrown).
@@ -487,7 +488,8 @@ public:
     // The rig files on disk lag the guard: a write or the relearn's archive failed (disk full,
     // permissions). The guard runs on from memory and close_window retries every window; until
     // the archive goes through, the old frame's files stay as they are. rig_save_failed counts the
-    // failed attempts and rig_save_error is the last one's message.
+    // failed attempts, a held epoch write (record_epoch) included, and rig_save_error is the last
+    // one's message.
     bool rig_save_pending() const { return rig_save_pending_; }
     std::int64_t rig_save_failed() const { return rig_save_failed_; }
     const std::string& rig_save_error() const { return rig_save_error_; }
@@ -527,6 +529,13 @@ private:
         std::int64_t decisions = 0;
     };
     void load_rig(const std::filesystem::path& room, const std::filesystem::path& path);
+    // With the rig guard, writes `epoch` to the room's epoch file before anything carries it, so the
+    // file never falls behind an epoch in use, whatever else of a save fails. False when the write
+    // fails (disk full, permissions; counted like a failed save): the caller holds what would take
+    // the epoch (the build's end, a settle) and the next window tries again. Without the guard or
+    // state_dir it writes nothing and returns true: save writes the epoch file first and a failure
+    // throws, as before the guard.
+    bool record_epoch(std::uint64_t epoch);
     void save_rig();
     void set_pose(Channel& channel, const rig::Pose& pose);
     bool imu_ok(std::int64_t now) const;
@@ -595,7 +604,6 @@ private:
     bool rig_save_pending_ = false;
     std::int64_t rig_save_failed_ = 0;
     std::string rig_save_error_;
-    bool epoch_due_ = false;                     // map_epoch_ not yet in the epoch file (save_rig)
     std::optional<msg::Header> references_due_;  // a save's references, not yet written (save_rig)
     std::optional<std::string> archive_due_;     // the relearned frame's prev/ name, not yet archived
     std::optional<rig::Vec3d> gravity_;  // the newest window's gravity
