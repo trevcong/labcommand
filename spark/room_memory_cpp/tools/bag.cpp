@@ -36,7 +36,7 @@ namespace msg = room_memory::msg;
 
 constexpr std::int64_t kSecond = 1'000'000'000;
 // A replay with no state_dir is not a node start and uses a fixed generation. With state_dir it
-// allocates, the way the node does (D45): a second process must not continue the previous
+// allocates, the way the node does (D47): a second process must not continue the previous
 // generation's seqs.
 constexpr std::uint64_t kGeneration = 1;
 

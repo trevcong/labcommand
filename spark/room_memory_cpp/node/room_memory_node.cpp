@@ -229,7 +229,7 @@ private:
             return false;
         }
         // The whole answer is published in this callback. A retained events replay stays one
-        // manifest (D36); D45 bounds it by the durable log's cap.
+        // manifest (D36); D47 bounds it by the durable log's cap.
         const auto& publisher = request.topic == msg::SyncTopic::map_bricks ? sync_map_ : sync_events_;
         for (const msg::Bytes& bytes : reply.messages) publisher->publish(serialized(bytes));
         sync_end_->publish(serialized(reply.end->to_cdr()));

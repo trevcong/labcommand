@@ -1,6 +1,6 @@
 #pragma once
 
-// Durable ChangeEvent log (protocol D45). Append-only segments under
+// Durable ChangeEvent log (protocol D47). Append-only segments under
 // <state_dir>/<room_id>/events, fsynced before close_window returns. The in-memory
 // deque stays a cache of the tail. RequestSync for the live generation reads past
 // that cache; TOPIC_EVENT_ARCHIVE reads one generation's original bytes after a restart.

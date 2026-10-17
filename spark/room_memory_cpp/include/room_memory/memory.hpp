@@ -283,7 +283,7 @@ struct MemoryConfig {
     double delta_period_s = 5.0;
     double keyframe_period_s = 60.0;
     double keyframe_delta_ratio = 0.5;
-    // Durable event log under state_dir (D45). Ignored without state_dir, and not a replay config key.
+    // Durable event log under state_dir (D47). Ignored without state_dir, and not a replay config key.
     // event_log_io outlives this RoomMemory; null uses the real filesystem.
     std::uint64_t event_log_bytes = std::uint64_t{32} << 20;
     std::uint64_t event_segment_bytes = std::uint64_t{4} << 20;

@@ -190,7 +190,7 @@ def floats(tmp_path, name, cloud):
 
 
 def shared_state(state):
-    """Reference files both engines write. The durable event log (D45) is C++ only."""
+    """Reference files both engines write. The durable event log (D47) is C++ only."""
     if not state.exists():
         return {}
     files = {}

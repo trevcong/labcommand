@@ -5,7 +5,7 @@
 
 uint8 TOPIC_MAP_BRICKS=0          # /room_memory/map_bricks
 uint8 TOPIC_EVENTS=1              # /room_memory/events
-uint8 TOPIC_EVENT_ARCHIVE=2       # one generation's durable events; not the live stream (D45)
+uint8 TOPIC_EVENT_ARCHIVE=2       # one generation's durable events; not the live stream (D47)
 
 uint64 SINCE_NONE=18446744073709551615   # since_epoch and since_seq when the Mac holds nothing for the topic
 uint64 GENERATION_UNKNOWN=0      # expected_generation when the Mac's since belongs to no known generation

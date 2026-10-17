@@ -810,7 +810,7 @@ func testLiveRoomActivityAndEpoch() {
     expect(bad.activity.rejected == 1 && bad.mapState == .current, "a truncated activity is rejected; the map stays current")
 }
 
-/// Archive retrieval (D45): a retired generation's answer is stored and is not a live install.
+/// Archive retrieval (D47): a retired generation's answer is stored and is not a live install.
 func testLiveRoomArchiveRetrieval() {
     var early = Mirror(tokenSeed: 8)
     _ = early.connectionOpened(at: 0, canRequest: true)

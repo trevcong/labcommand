@@ -123,7 +123,7 @@ public struct LiveRoomActivity: Sendable, Equatable {
     }
 }
 
-/// Durable replay of one generation, kept out of the active reducer (D45).
+/// Durable replay of one generation, kept out of the active reducer (D47).
 private struct ArchivedEventLog: Sendable, Equatable {
     var events: [UInt64: RoomMemory.ChangeEvent] = [:]
     /// Highest seq filed for each event id. An older message cannot reopen a closed event.
@@ -400,7 +400,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         }
     }
 
-    /// Events filed from an archive answer for `generation`, in `seq` order (D45). Empty when none were.
+    /// Events filed from an archive answer for `generation`, in `seq` order (D47). Empty when none were.
     public func archivedHistory(_ generation: UInt64) -> [RoomMemory.ChangeEvent] {
         let events = archiveLogs[generation]?.events ?? [:]
         return events.keys.sorted().compactMap { events[$0] }

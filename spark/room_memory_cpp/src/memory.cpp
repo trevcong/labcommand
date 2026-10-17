@@ -1004,7 +1004,7 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
 RoomMemory::SyncAnswer RoomMemory::sync(const msg::RequestSync& request, const msg::Time& stamp) {
     SyncAnswer answer;
     if (request.header.room_id != config_.room_id) return answer;
-    // Archive names one generation and is not a live SINCE_NONE of this process (D45).
+    // Archive names one generation and is not a live SINCE_NONE of this process (D47).
     if (request.topic == msg::SyncTopic::event_archive) {
         const std::uint64_t generation = request.expected_generation.value_or(msg::kGenerationUnknown);
         if (!durable_events_ || generation == msg::kGenerationUnknown) return answer;

@@ -1,4 +1,4 @@
-// Durable event log (D45): crash recovery, prefix retention, and RequestSync past the 100-deep cache.
+// Durable event log (D47): crash recovery, prefix retention, and RequestSync past the 100-deep cache.
 #include <unistd.h>
 #include <zlib.h>
 
