@@ -99,6 +99,11 @@ def test_the_operator_service_is_opt_in():
     assert constants["OPERATOR_SERVICE"] == OPERATOR_SERVICE
     for launch in (CPP_LAUNCH, ROOT / "spark/room_memory/launch/room_memory.launch.py"):
         assert '"operator_actions": ("false", bool),' in launch.read_text(), launch
+        # A node flag, not a MemoryConfig field: it lives in NODE_ARGUMENTS, never in ARGUMENTS.
+        tables = {node.targets[0].id: [ast.literal_eval(key) for key in node.value.keys]
+                  for node in ast.parse(launch.read_text()).body
+                  if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Dict)}
+        assert tables["NODE_ARGUMENTS"] == ["operator_actions"] and "operator_actions" not in tables["ARGUMENTS"], launch
     pattern = constants["OPERATOR_SERVICE_PATTERN"]
     assert re.fullmatch(pattern, OPERATOR_SERVICE)
     for other in (REQUEST_SERVICE, "/room_memory/operator", "/room_memory/operator/action_x", "/x/room_memory/operator/action"):

@@ -60,6 +60,10 @@ ARGUMENTS = {
     "keyframe_period_s": ("60.0", float),
     "keyframe_delta_ratio": ("0.5", float),
     "suppress_clear_windows": ("30", int),
+}
+
+# Node parameters that are not MemoryConfig fields (ARGUMENTS mirrors MemoryConfig exactly).
+NODE_ARGUMENTS = {
     # The operator service changes durable state through an unauthenticated port: off unless asked (D46).
     "operator_actions": ("false", bool),
 }
@@ -86,7 +90,7 @@ BRIDGE_ARGUMENTS = {
 def generate_launch_description():
     parameters = {
         name: ParameterValue(LaunchConfiguration(name), value_type=kind) if kind else LaunchConfiguration(name)
-        for name, (_, kind) in ARGUMENTS.items()
+        for name, (_, kind) in {**ARGUMENTS, **NODE_ARGUMENTS}.items()
     }
     service_whitelist = PythonExpression([
         repr(BRIDGE_SERVICE_WHITELIST + [OPERATOR_SERVICE_PATTERN]), " if '", LaunchConfiguration("operator_actions"),
@@ -109,7 +113,7 @@ def generate_launch_description():
         }],
     )
     return LaunchDescription(
-        [DeclareLaunchArgument(name, default_value=default) for name, (default, _) in ARGUMENTS.items()]
+        [DeclareLaunchArgument(name, default_value=default) for name, (default, _) in {**ARGUMENTS, **NODE_ARGUMENTS}.items()]
         + [DeclareLaunchArgument(name, default_value=default) for name, default in BRIDGE_ARGUMENTS.items()]
         + [Node(package="room_memory_cpp", executable="room_memory_node", name="room_memory", output="screen",
                 parameters=[parameters]),
