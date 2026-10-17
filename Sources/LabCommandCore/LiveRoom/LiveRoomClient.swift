@@ -5,17 +5,42 @@ import Foundation
 public struct LiveRoomServer: Sendable, Equatable {
     public var name: String
     public var capabilities: [String]
-    /// The bridge accepts client channels and this client may publish, so `RequestSync` goes over this socket.
+    /// The bridge accepts client channels and this client may publish, so `RequestSync` can go out
+    /// on a client channel.
     public var canPublish: Bool
     /// `/room_memory/*` topics advertised and subscribed. Empty: the bridge is up but room
     /// memory is not running ("Room memory not running on Spark", never an empty room).
     public var memoryTopics: [String]
+    /// The bridge's id for the node's `RequestSync` service (D39), while it is advertised and this
+    /// client may send requests. Nil until `advertiseServices` names it, and again after a withdrawal.
+    public var requestServiceId: UInt32?
 
-    public init(name: String, capabilities: [String], canPublish: Bool, memoryTopics: [String]) {
+    public init(name: String, capabilities: [String], canPublish: Bool, memoryTopics: [String],
+                requestServiceId: UInt32? = nil) {
         self.name = name
         self.capabilities = capabilities
         self.canPublish = canPublish
         self.memoryTopics = memoryTopics
+        self.requestServiceId = requestServiceId
+    }
+}
+
+/// How `RequestSync` leaves this Mac (protocol D39). The bridge's service is preferred: it is the
+/// path the bridge can restrict to the one name.
+public enum LiveRoomRequestPath: Sendable, Equatable {
+    /// The node's `/room_memory/sync/request` service, called over the bridge socket.
+    case bridgeService(id: UInt32)
+    /// A client channel on `/room_memory/request_sync` (the bridge offers `clientPublish`).
+    case bridgeChannel
+    /// `requestSyncSink`.
+    case relay
+    case unavailable
+
+    /// The path a connection to `server` has, given whether a sink is set.
+    public static func of(_ server: LiveRoomServer?, hasSink: Bool) -> LiveRoomRequestPath {
+        if let id = server?.requestServiceId { return .bridgeService(id: id) }
+        if server?.canPublish == true { return .bridgeChannel }
+        return hasSink ? .relay : .unavailable
     }
 }
 
@@ -43,6 +68,10 @@ public final class LiveRoomClient: ObservableObject {
     public static let requestChannelId: UInt32 = 1
     public static let requestTopic = "/room_memory/request_sync"
     public static let requestSchemaName = "labcommand_msgs/msg/RequestSync"
+    /// The node's service for `RequestSync`, the one the bridge exposes (D39). Its request is one
+    /// `RequestSync`, so the call carries the message's CDR unchanged.
+    public static let requestService = "/room_memory/sync/request"
+    public static let requestServiceType = "labcommand_msgs/srv/RequestSync"
     /// URLSession's default cap is 1 MiB; a snapshot may reach 16 MiB raw (D22).
     static let maxMessageBytes = 64 << 20
     static let logCapacity = 200
@@ -53,8 +82,17 @@ public final class LiveRoomClient: ObservableObject {
     @Published public private(set) var log: [String] = []
 
     /// Another path for `RequestSync` (the `:8766` relay, Phase 3 P11). Return true when sent.
-    /// Used when the bridge does not offer `clientPublish`. Set it before `start()`.
+    /// Used when the bridge offers neither the request service nor `clientPublish`. Set it before `start()`.
     public var requestSyncSink: ((RoomMemory.RequestSync) -> Bool)?
+
+    /// How a `RequestSync` would leave now. `.unavailable` is "no request path" on screen.
+    public var requestPath: LiveRoomRequestPath {
+        guard publishRequests else { return .unavailable }
+        if case .connected(let server) = connection {
+            return .of(server, hasSink: requestSyncSink != nil)
+        }
+        return requestSyncSink != nil ? .relay : .unavailable
+    }
 
     public let url: URL
     /// False keeps the client read-only: it never advertises a channel or sends a request.
@@ -77,6 +115,11 @@ public final class LiveRoomClient: ObservableObject {
         var channels: [UInt32: UInt32] = [:]
         var nextSubscriptionId: UInt32 = 1
         var mirrorOpened = false
+        /// The bridge offers `services` and this client may send requests.
+        var mayCallServices = false
+        var nextCallId: UInt32 = 1
+        /// Service calls awaiting a response or failure: call id → what was asked.
+        var pendingCalls: [UInt32: String] = [:]
         var failure: String?
     }
 
@@ -224,6 +267,7 @@ public final class LiveRoomClient: ObservableObject {
             let canPublish = publishRequests && capabilities.contains(FoxgloveProtocol.clientPublishCapability)
             let server = LiveRoomServer(name: name, capabilities: capabilities, canPublish: canPublish, memoryTopics: [])
             link?.server = server
+            link?.mayCallServices = publishRequests && capabilities.contains(FoxgloveProtocol.servicesCapability)
             connection = .connected(server)
             note("connected \(url) (capabilities: \(capabilities.joined(separator: ", ")))")
             if canPublish {
@@ -232,11 +276,15 @@ public final class LiveRoomClient: ObservableObject {
                     topic: Self.requestTopic,
                     schemaName: Self.requestSchemaName
                 )))
-            } else if publishRequests {
+            } else if publishRequests, link?.mayCallServices != true {
                 note(requestSyncSink == nil
-                    ? "bridge has no clientPublish and no relay is set: RequestSync cannot be sent; relying on live snapshots"
-                    : "bridge has no clientPublish: RequestSync goes through the relay")
+                    ? "bridge has no services and no clientPublish, and no relay is set: RequestSync cannot be sent; relying on live snapshots"
+                    : "bridge has no services and no clientPublish: RequestSync goes through the relay")
             }
+            return
+        }
+        if let service = FoxgloveProtocol.parseServiceMessage(text) {
+            handle(service: service)
             return
         }
         switch FoxgloveProtocol.parseServerMessage(text) {
@@ -287,8 +335,7 @@ public final class LiveRoomClient: ObservableObject {
         publishTopics()
         if link?.mirrorOpened == false {
             link?.mirrorOpened = true
-            let canRequest = publishRequests && ((link?.server?.canPublish ?? false) || requestSyncSink != nil)
-            perform(mirror.connectionOpened(at: Self.now, canRequest: canRequest))
+            perform(mirror.connectionOpened(at: Self.now, canRequest: requestPath != .unavailable))
         }
     }
 
@@ -299,7 +346,49 @@ public final class LiveRoomClient: ObservableObject {
         connection = .connected(server)
     }
 
+    /// The request service coming and going (node restarts withdraw it), and call failures.
+    private func handle(service message: FoxgloveProtocol.ServiceMessage) {
+        guard var current = link, var server = current.server else { return }
+        switch message {
+        case .advertise(let services):
+            guard current.mayCallServices,
+                  let service = services.first(where: { $0.name == Self.requestService }) else { return }
+            guard service.type == Self.requestServiceType else {
+                note("\(service.name) advertised as \(service.type); not used")
+                return
+            }
+            server.requestServiceId = service.id
+            note("RequestSync goes through the bridge's \(service.name) service")
+        case .unadvertise(let ids):
+            guard let id = server.requestServiceId, ids.contains(id) else { return }
+            server.requestServiceId = nil
+            note("\(Self.requestService) withdrawn")
+        case .failure(_, let callId, let reason):
+            guard let asked = current.pendingCalls.removeValue(forKey: callId) else { return }
+            link = current
+            // The bridge did not reach the node: the request was not carried.
+            mirror.noteRequestUnsent()
+            note("RequestSync \(asked) failed on the bridge: \(reason)")
+            return
+        }
+        current.server = server
+        link = current
+        connection = .connected(server)
+        if current.mirrorOpened {
+            perform(mirror.requestPathChanged(canRequest: requestPath != .unavailable, at: Self.now))
+        }
+    }
+
     private func handle(frame: Data) {
+        if let response = FoxgloveProtocol.parseServiceCallResponse(frame) {
+            let asked = link?.pendingCalls.removeValue(forKey: response.callId) ?? "call \(response.callId)"
+            switch Self.requestAccepted(response) {
+            case true?: note("RequestSync \(asked) accepted by the node")
+            case false?: note("RequestSync \(asked) refused by the node (bad request or another room)")
+            case nil: note("RequestSync \(asked): unreadable response (\(response.payload.count) bytes)")
+            }
+            return
+        }
         guard let data = FoxgloveProtocol.parseMessageData(frame),
               let topic = link?.subscriptions[data.subscriptionId] else {
             return
@@ -318,18 +407,48 @@ public final class LiveRoomClient: ObservableObject {
             switch action {
             case .requestSync(var request):
                 request.header.stamp = RoomMemory.Time(date: Date())
-                let since = request.since.map { "(\($0.epoch), \($0.seq))" } ?? "NONE"
-                if link?.server?.canPublish == true, let payload = try? request.encodedCDR() {
-                    send(.data(FoxgloveProtocol.clientMessageData(channelId: Self.requestChannelId, payload: payload)))
-                    note("RequestSync \(request.topic) since \(since) sent on the bridge")
-                } else if let sink = requestSyncSink, sink(request) {
-                    note("RequestSync \(request.topic) since \(since) sent via relay")
+                let asked = "\(request.topic) since \(request.since.map { "(\($0.epoch), \($0.seq))" } ?? "NONE")"
+                if let path = carry(request, asked: asked) {
+                    note("RequestSync \(asked) \(path)")
                 } else {
                     mirror.noteRequestUnsent()
-                    note("RequestSync \(request.topic) since \(since) not sent: no request path")
+                    note("RequestSync \(asked) not sent: no request path")
                 }
             }
         }
+    }
+
+    /// Sends `request` on the current path. Returns where it went, nil when nothing carried it.
+    private func carry(_ request: RoomMemory.RequestSync, asked: String) -> String? {
+        switch requestPath {
+        case .bridgeService(let serviceId):
+            guard let payload = try? request.encodedCDR(), var current = link else { return nil }
+            let callId = current.nextCallId
+            current.nextCallId &+= 1
+            current.pendingCalls[callId] = asked
+            link = current
+            send(.data(FoxgloveProtocol.serviceCallRequest(serviceId: serviceId, callId: callId, payload: payload)))
+            return "sent to \(Self.requestService)"
+        case .bridgeChannel:
+            guard let payload = try? request.encodedCDR() else { return nil }
+            send(.data(FoxgloveProtocol.clientMessageData(channelId: Self.requestChannelId, payload: payload)))
+            return "sent on the bridge"
+        case .relay:
+            return requestSyncSink?(request) == true ? "sent via relay" : nil
+        case .unavailable:
+            return nil
+        }
+    }
+
+    /// The request service's `bool accepted`: CDR with its encapsulation header, then one byte.
+    /// Nil when the response is not that.
+    public nonisolated static func requestAccepted(_ response: FoxgloveProtocol.ServiceCallResponse) -> Bool? {
+        let bytes = [UInt8](response.payload)
+        guard response.encoding == FoxgloveProtocol.cdrEncoding, bytes.count >= 5, bytes[0] == 0,
+              bytes[1] <= 1, bytes[4] <= 1 else {
+            return nil
+        }
+        return bytes[4] == 1
     }
 
     private func send(_ message: URLSessionWebSocketTask.Message) {

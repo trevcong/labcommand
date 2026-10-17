@@ -83,3 +83,116 @@ extension FoxgloveProtocol {
         return frame
     }
 }
+
+// MARK: Services (protocol D39)
+
+extension FoxgloveProtocol {
+    /// Lets clients call the services the server advertises (`RequestSync`, D39).
+    public static let servicesCapability = "services"
+    /// Binary opcode 0x02, client → server: uint32 LE service id, uint32 LE call id, uint32 LE
+    /// encoding length, the encoding, then the request payload.
+    public static let serviceCallRequestOpcode: UInt8 = 0x02
+    /// Binary opcode 0x03, server → client: the same layout, with the response payload.
+    public static let serviceCallResponseOpcode: UInt8 = 0x03
+
+    /// One advertised service. `type` is the ROS service type (`labcommand_msgs/srv/RequestSync`).
+    public struct Service: Sendable, Equatable {
+        public var id: UInt32
+        public var name: String
+        public var type: String
+
+        public init(id: UInt32, name: String, type: String) {
+            self.id = id
+            self.name = name
+            self.type = type
+        }
+    }
+
+    /// The service ops of the text frames.
+    public enum ServiceMessage: Sendable, Equatable {
+        case advertise([Service])
+        case unadvertise([UInt32])
+        /// The server could not carry a call (unknown service, node not up, bad encoding, …).
+        case failure(serviceId: UInt32, callId: UInt32, message: String)
+    }
+
+    /// `advertiseServices`, `unadvertiseServices` or `serviceCallFailure`; nil for any other text.
+    /// Services missing an id, name or type are dropped rather than failing the whole batch.
+    public static func parseServiceMessage(_ text: String) -> ServiceMessage? {
+        guard let object = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any],
+              let op = object["op"] as? String else {
+            return nil
+        }
+        switch op {
+        case "advertiseServices":
+            let raw = object["services"] as? [[String: Any]] ?? []
+            return .advertise(raw.compactMap { entry in
+                guard let id = uint32(entry["id"]), let name = entry["name"] as? String,
+                      let type = entry["type"] as? String else {
+                    return nil
+                }
+                return Service(id: id, name: name, type: type)
+            })
+        case "unadvertiseServices":
+            return .unadvertise((object["serviceIds"] as? [Any] ?? []).compactMap(uint32))
+        case "serviceCallFailure":
+            guard let serviceId = uint32(object["serviceId"]), let callId = uint32(object["callId"]) else { return nil }
+            return .failure(serviceId: serviceId, callId: callId, message: object["message"] as? String ?? "")
+        default:
+            return nil
+        }
+    }
+
+    private static func uint32(_ value: Any?) -> UInt32? {
+        guard let number = value as? NSNumber else { return nil }
+        return UInt32(exactly: number.doubleValue)
+    }
+
+    /// A service call: opcode `0x02`, then the ids, the encoding and the payload (CDR with its
+    /// encapsulation header, as for a message).
+    public static func serviceCallRequest(serviceId: UInt32, callId: UInt32, encoding: String = cdrEncoding,
+                                          payload: Data) -> Data {
+        let encodingBytes = Data(encoding.utf8)
+        var frame = Data(capacity: 13 + encodingBytes.count + payload.count)
+        frame.append(serviceCallRequestOpcode)
+        for value in [serviceId, callId, UInt32(encodingBytes.count)] {
+            withUnsafeBytes(of: value.littleEndian) { frame.append(contentsOf: $0) }
+        }
+        frame.append(encodingBytes)
+        frame.append(payload)
+        return frame
+    }
+
+    public struct ServiceCallResponse: Sendable, Equatable {
+        public var serviceId: UInt32
+        public var callId: UInt32
+        public var encoding: String
+        /// A slice of the frame it was parsed from.
+        public var payload: Data
+
+        public init(serviceId: UInt32, callId: UInt32, encoding: String, payload: Data) {
+            self.serviceId = serviceId
+            self.callId = callId
+            self.encoding = encoding
+            self.payload = payload
+        }
+    }
+
+    /// Parse a binary frame. Nil for any opcode other than a service call response, or a frame
+    /// too short for its header and encoding.
+    public static func parseServiceCallResponse(_ frame: Data) -> ServiceCallResponse? {
+        guard frame.count >= 13, frame.first == serviceCallResponseOpcode else { return nil }
+        let (serviceId, callId, encodingLength) = frame.withUnsafeBytes { bytes in
+            (
+                UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: 1, as: UInt32.self)),
+                UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: 5, as: UInt32.self)),
+                Int(UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: 9, as: UInt32.self)))
+            )
+        }
+        guard frame.count - 13 >= encodingLength else { return nil }
+        let start = frame.startIndex + 13
+        guard let encoding = String(data: frame[start..<(start + encodingLength)], encoding: .utf8) else { return nil }
+        return ServiceCallResponse(serviceId: serviceId, callId: callId, encoding: encoding,
+                                   payload: frame[(start + encodingLength)...])
+    }
+}

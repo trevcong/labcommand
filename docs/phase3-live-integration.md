@@ -30,7 +30,7 @@ No Spark, rig or app was touched to write this.
   - The Mac opens one memory WebSocket to a second foxglove_bridge instance, which runs inside the room-memory container (P12).
   - That bridge serves only `/room_memory/*` and accepts no client publishing.
   - The existing `:8765` bridge, LIVE and SNAPSHOT are not touched.
-- **Resync requests and operator actions go over the ssh-authenticated `:8766` API, not the bridge (P11).**
+- **Resync requests and operator actions go over the ssh-authenticated `:8766` API, not the bridge (P11).** *Superseded for `RequestSync` by protocol D39 (issue #21):* it goes over the :8767 bridge as a call of the node's `/room_memory/sync/request` service, the only service the bridge exposes (`service_whitelist` is enforced, unlike `client_topic_whitelist`), and the bridge still accepts no client publishing. Operator actions still need P11.
   - The bridge documents `client_topic_whitelist`, but at the deployed version and on `main` the parameter is parsed and never applied ([F2]).
   - With client publishing on, any peer that reaches the port could publish any known type on any topic, including a forged `/livox/lidar` cloud into the memory node.
 - **The budget is easy in steady state and hard on reconnects.**

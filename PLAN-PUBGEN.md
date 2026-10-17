@@ -343,7 +343,7 @@ The deployed bridge has no `clientPublish` (`Tests/Fixtures/room/live/README.md`
 - the map becomes current from the next keyframe;
 - the UI says "history incomplete · no request path" instead of retrying.
 
-This plan does not change the transport.
+This plan does not change the transport. *Later, issue #21 (protocol D39):* the :8767 bridge offers `services`, whitelisted to the node's `/room_memory/sync/request`, and the client calls it with the `RequestSync` bytes, so a D39 image has a request path and this section applies only to older ones.
 
 ### 4.8 UI (`Sources/LabCommandCore/LiveRoomView.swift`)
 

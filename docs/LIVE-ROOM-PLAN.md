@@ -77,7 +77,7 @@ The client is already committed on `live-room-client` as `05eaf98`, `574feb2`, a
 
 `swift run LabCommandCoreTestsRunner` stays offline: `live-room-probe` is a separate argv and is not part of this gate.
 
-`LiveRoomClient.defaultURL` is `ws://100.118.187.99:8767`, subprotocol `foxglove.sdk.v1`. The bridge probed on 2026-10-15 advertises `connectionGraph` only. It has no `clientPublish`. The Spark still publishes snapshots on the live map topic, so the map arrives with no request path.
+`LiveRoomClient.defaultURL` is `ws://100.118.187.99:8767`, subprotocol `foxglove.sdk.v1`. The bridge probed on 2026-10-15 advertises `connectionGraph` only. It has no `clientPublish`. The Spark still publishes snapshots on the live map topic, so the map arrives with no request path. Since issue #21 the room-memory image's bridge also offers `services`, whitelisted to the node's `/room_memory/sync/request`, and the client sends `RequestSync` as that call (protocol D39).
 
 ## Who starts the socket
 
@@ -355,7 +355,7 @@ When the count is non-zero the text is `cannot request resync · <n> unsent`. Ot
 
 The standalone line does not replace the winning banner. It does not outrank connection loss, an empty topic list, or a stale status. The column stays on screen while the line is present, including when Events and History are both empty. Rule 1 suppresses the standalone line.
 
-The view does not set `requestSyncSink`, does not open `:8766`, and does not speak Foxglove. The relay (Phase 3 P11, the owner of the existing `RigService` tunnel) sets the sink before `start()`. Until that owner lands, the sink stays nil and this line is how the operator sees it.
+The view does not set `requestSyncSink`, does not open `:8766`, and does not speak Foxglove. Its "request path exists" is `LiveRoomClient.requestPath`: the bridge's request service (D39), client publishing, or the relay's sink. Against a bridge without D39, and with no sink, this line is how the operator sees it.
 
 ## Fixture source
 
@@ -487,7 +487,7 @@ No new golden hex files. The default test run opens no socket and no SSH.
 9. An accepted event whose `mapEpoch` the mirror has not reached draws an uncounted outline until a current map catches up. The client is not modified for that.
 10. Unknown voxels are a wireframe of any brick that still has an unknown cell. Free cells are undrawn. Occupied cells are grey points. Centers use `(index + 0.5) × voxelSize`.
 11. `mapRevision` and `voxelSize` gate voxel uploads. The camera auto-fits only until the user orbits or zooms, and the fit includes drawn boxes and arrow points.
-12. This bridge has no `clientPublish`. The view reports `cannot request resync` and does not grow a request path. The relay owner sets `requestSyncSink`. When the banner is not the map-stale line, that report is a standalone line in the event column. Missing events report ` · no request path` on the history line.
+12. A bridge without the request service (D39) or `clientPublish`, and no `requestSyncSink`, means no request path. The view then reports `cannot request resync`; the client, not the view, owns the path (`LiveRoomClient.requestPath`). When the banner is not the map-stale line, that report is a standalone line in the event column. Missing events report ` · no request path` on the history line.
 13. The change-overlay branch contributes colors, box topology, fill alphas, and the arrow. It is not merged.
 14. Selected candidates stay dashed and unfilled. The caption counts drawn markers. Event rows wrap on two lines inside 280pt.
 15. `65122d2` is on this branch, and its decode-and-test gate has passed, before any `LiveRoom` client file is added. Marker colors are counted inside the sidecar's canvas rect. Row readability is read off the PNG.

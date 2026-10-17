@@ -140,10 +140,10 @@ final class AppState: ObservableObject {
         return fixture?.connection ?? .off
     }
 
-    /// The bridge can publish, or a relay sink is installed. This job leaves the sink nil.
+    /// The bridge offers the request service or client publishing, or a relay sink is installed (D39).
     var requestPathExists: Bool {
-        if case .connected(let server) = room?.connection, server.canPublish { return true }
-        return room?.requestSyncSink != nil
+        guard let room else { return false }
+        return room.requestPath != .unavailable
     }
 
     func selectFixture(_ mode: LiveRoomFixture.Mode) {

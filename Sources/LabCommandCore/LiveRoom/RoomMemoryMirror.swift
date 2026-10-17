@@ -229,7 +229,7 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     public private(set) var roomId: String?
     public private(set) var connection = Connection.offline
     public private(set) var wire = Wire.undetermined
-    /// Some request path exists on this connection.
+    /// Some request path exists on this connection. Set on open, changed by `requestPathChanged`.
     public private(set) var canRequest = false
     /// The highest generation ever installed. Survives archiving and legacy mode.
     public private(set) var highestGeneration: UInt64?
@@ -403,6 +403,16 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         resetRetrievals()
         refreshFreshness()
         return flushRequests()
+    }
+
+    /// A request path appeared or went away on the open connection: the bridge advertised or
+    /// withdrew the request service (D39). Requests follow the flag from now on; one already
+    /// outstanding runs to its timeout as usual.
+    public mutating func requestPathChanged(canRequest: Bool, at now: TimeInterval) -> [Action] {
+        clock = now
+        guard canRequest != self.canRequest else { return [] }
+        self.canRequest = canRequest
+        return settleAndFlush()
     }
 
     /// The socket closed. Nothing proves the map current until a status of the generation arrives
