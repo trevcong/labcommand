@@ -686,6 +686,17 @@ TEST(request_sync_rules) {
     CHECK_THROWS(Invalid, RequestSync::from_cdr(data));
 }
 
+// The node's RequestSync service re-serializes the request with rmw, which leaves alignment
+// padding uninitialized (D39): pad bytes are never checked, so the value is unchanged.
+TEST(request_sync_ignores_padding_bytes) {
+    const RequestSync request = request_map_v2();
+    Bytes data = request.to_cdr();
+    // "lab" (8 bytes), five uint64 and the stamp end at 48; topic at 48, then 7 pad bytes.
+    CHECK_EQ(data[4 + 48], std::uint8_t{0});
+    std::memset(data.data() + 4 + 49, 0xA5, 7);
+    CHECK(RequestSync::from_cdr(data) == request);
+}
+
 TEST(float_fields_hold_binary32) {
     MemoryStatus status = memory_status();
     status.coverage_known_frac = f32(0.1);

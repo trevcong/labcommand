@@ -463,6 +463,16 @@ def test_request_sync_v2_round_trip():
     assert hexfile("request_sync_map_v2_be.hex")[4 + 64:] == TOKEN_C  # uint8[16] is never reversed
 
 
+def test_request_sync_ignores_padding_bytes():
+    # The node's RequestSync service re-serializes the request with rmw, which leaves alignment
+    # padding uninitialized (D39): pad bytes are never checked, so the value is unchanged.
+    request = request_map_v2()
+    data = bytearray(request.to_cdr())
+    assert data[4 + 48:4 + 56] == bytes([request.topic]) + bytes(7)  # topic, then 7 pad bytes
+    data[4 + 49:4 + 56] = b"\xa5" * 7
+    assert m.RequestSync.from_cdr(bytes(data)) == request
+
+
 @pytest.mark.parametrize("change", [
     lambda s: replace(s, publisher_generation=0),
     lambda s: replace(s, token=TOKEN_A[:8]),
