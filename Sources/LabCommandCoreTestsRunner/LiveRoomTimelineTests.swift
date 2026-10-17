@@ -631,6 +631,29 @@ func testRoomTimelineInFixtureMode() {
         expect(timeline.unverified == (mode == .legacy), "fixture \(mode.rawValue): only legacy is unverified")
         tlCheckIdsMatchTheColumn(timeline, screen, fixture.mirror, "fixture \(mode.rawValue)")
     }
+
+    // The sidecar lines the Room view appends: what it drew under the map, for a launched app to check.
+    guard let map = try? LiveRoomFixture.load(mode: .map, root: tlRepoRoot(), now: 100) else { return }
+    let recorder = LiveRoomTimelineRecorder.once(map.mirror)
+    let plain = LiveRoomTimeline.make(mirror: map.mirror, recorder: recorder, window: LiveRoomTimeline.windows[0], timeZone: tlZone, now: 100)
+    let lines = LiveRoomTimeline.sidecarLines(timeline: plain, halo: .none, buttons: [])
+    expect(lines.first == "timeline appeared,disappeared,moved,activity · \(plain.items.count) items" && lines.count == plain.items.count + 1,
+           "sidecar: lanes and one line per item, no actions without a selection: \(lines)")
+    guard let open = plain.items.first(where: \.open) else {
+        expect(false, "sidecar: the map fixture has an open event")
+        return
+    }
+    let picked = LiveRoomTimeline.make(mirror: map.mirror, recorder: recorder, window: LiveRoomTimeline.windows[0], selection: open.id,
+                                       timeZone: tlZone, now: 100)
+    let (entry, earlier) = LiveRoomOperator.entry(for: open.id, mirror: map.mirror)!
+    let buttons = LiveRoomOperator.buttons(for: entry, earlier: earlier, mirror: map.mirror, operatorPath: false, pending: nil)
+    let halo = LiveRoomTimeline.halo(selection: open.id, mirror: map.mirror)
+    let selected = LiveRoomTimeline.sidecarLines(timeline: picked, halo: halo, buttons: buttons)
+    expect(selected.contains { $0.hasPrefix("  \(open.id) ") && $0.hasSuffix(" open selected") },
+           "sidecar: the selected item is marked: \(selected)")
+    expect(selected.last == "actions " + buttons.map { "\($0.kind.rawValue) off (this Spark can't take actions)" }.joined(separator: ", ")
+           && !buttons.isEmpty, "sidecar: fixture mode shows the buttons, disabled with the reason: \(selected)")
+    expect(selected.contains { $0.hasPrefix("halo ") }, "sidecar: the halo's state is a line: \(selected)")
 }
 
 func runLiveRoomTimelineTests() {

@@ -371,7 +371,14 @@ private struct LiveRoomBody: View {
 
     private func sidecarText(_ screen: LiveRoomScreen) -> String {
         let rect = canvas.map { ($0.x, $0.y, $0.w, $0.h) }
+        let selected = LiveRoomOperator.entry(for: selection, mirror: mirror)
+        let buttons = LiveRoomOperator.buttons(for: selected?.entry, earlier: selected?.earlier ?? false, mirror: mirror,
+                                               operatorPath: operatorPath && act != nil,
+                                               pending: selected.flatMap { desk.latest(for: $0.entry.event.eventId) })
+        let below = LiveRoomTimeline.sidecarLines(timeline: timeline(now: ProcessInfo.processInfo.systemUptime),
+                                                  halo: LiveRoomTimeline.halo(selection: selection, mirror: mirror), buttons: buttons)
         return LiveRoomSidecar.render(screen: screen, connection: connection, url: url, canvas: rect)
+            + below.map { $0 + "\n" }.joined()
     }
 
     private func writeSidecar(_ screen: LiveRoomScreen) {

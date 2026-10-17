@@ -302,7 +302,7 @@ public struct LiveRoomOperator: Sendable, Equatable {
         case .notTracking: return "the Spark isn't tracking right now"
         case .unsupported: return "this Spark doesn't support it"
         case .storageFailed: return "the Spark could not save it; nothing changed"
-        case .targetChanged: return "the change no longer looks like what you saw; look again"
+        case .targetChanged: return "the Spark doesn't see the change as you saw it just now (gone, hidden or reshaped); look again"
         case .rigUnsettled: return "the rig may have moved; accept is held back"
         }
     }

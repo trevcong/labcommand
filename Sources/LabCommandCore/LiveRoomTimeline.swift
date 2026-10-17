@@ -595,6 +595,28 @@ public struct LiveRoomTimeline: Sendable, Equatable {
         }
     }
 
+    /// What the Room view draws under its map, as sidecar lines after `LiveRoomSidecar.render`:
+    /// the timeline's lanes and items, the selection's halo, and the action bar's buttons. Nothing
+    /// here moves with "now" alone, so the file is rewritten only when what is drawn changes.
+    public static func sidecarLines(timeline: LiveRoomTimeline, halo: Halo, buttons: [LiveRoomOperator.Button]) -> [String] {
+        var lines = ["timeline \(timeline.lanes.map(\.rawValue).joined(separator: ",")) · \(timeline.items.count) items"
+                     + (timeline.unverified ? " · unverified" : "")]
+        for item in timeline.items {
+            lines.append("  \(item.id) \(item.lane.rawValue) \(item.state)" + (item.open ? " open" : "")
+                         + (item.earlierRun ? " earlier run" : "") + (item.selected ? " selected" : ""))
+        }
+        switch halo {
+        case .none: break
+        case .marker: lines.append("halo on map")
+        case .unavailable(let reason): lines.append("halo none · \(reason)")
+        }
+        if timeline.selection != nil {
+            let words = buttons.map { "\($0.kind.rawValue) " + ($0.enabled ? "on" : "off (\($0.reason ?? ""))") }
+            lines.append("actions " + (words.isEmpty ? "none" : words.joined(separator: ", ")))
+        }
+        return lines
+    }
+
     /// The map's markers with the selection's halo drawn last, on top. The screen's own markers
     /// (and so the sidecar) are unchanged.
     public static func markers(_ markers: [LiveRoomMarker], with halo: Halo) -> [LiveRoomMarker] {
