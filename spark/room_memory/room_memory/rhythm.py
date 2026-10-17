@@ -53,6 +53,8 @@ _RECORD = struct.Struct("<IqQHHHHIIBBH")
 _REGION = struct.Struct("<hhhHH")
 # Same little-endian row as ``_REGION``. The minute seal writes this in one block.
 _REGION_DTYPE = np.dtype([("ix", "<i2"), ("iy", "<i2"), ("iz", "<i2"), ("hits", "<u2"), ("mean", "<u2")])
+# ``<IqQHHHHIIB`` ends on ``pose_ok``. The flags byte is the next one.
+_FLAGS_OFFSET = struct.calcsize("<IqQHHHHIIB")
 _NAME = re.compile(r"^rhythm-(mid360|jt128)-(\d{8})(?:-(\d+))?\.rhy$")
 _QUARANTINE = re.compile(r"^rhythm-(mid360|jt128)-(\d{8})(?:-(\d+))?\.rhy\.(superseded|bad)-(\d+)$")
 _ROOM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -293,31 +295,26 @@ def encode_marker(minute, map_epoch):
     return encode_record(minute, map_epoch, 0, 0, 0, 0, 0, 0, FLAG_DISCONTINUITY | FLAG_LOST, ())
 
 
-def parse_record(data):
-    """One record, or ``None`` when the length or CRC does not match."""
-    if len(data) < 4 + 40:
+def _record_fields(data):
+    """Header fields of one valid record, or ``None``. Region rows are checked, not decoded.
+
+    The writer appends from this. A full table is 4096 regions; building a Python tuple
+    for each one holds the interpreter while the next window callback still needs it.
+    """
+    if len(data) < 4 + ENVELOPE_BYTES:
         return None
     body = struct.unpack_from("<I", data, 0)[0]
-    if body < 40 or 4 + body != len(data) or (body - 40) % REGION_BYTES:
+    if body < ENVELOPE_BYTES or 4 + body != len(data) or (body - ENVELOPE_BYTES) % REGION_BYTES:
         return None
     if _crc(data[4:-4]) != struct.unpack_from("<I", data, len(data) - 4)[0]:
         return None
     fields = _RECORD.unpack_from(data, 0)
     # ``<IqQHHHHIIBBH`` is 12 fields. ``n_regions`` is the last one.
     count = fields[11]
-    if fields[6] != 0 or 40 + count * REGION_BYTES != body:
+    if fields[6] != 0 or ENVELOPE_BYTES + count * REGION_BYTES != body:
         return None
-    regions = []
-    offset = ENVELOPE_BYTES
-    previous = None
-    for _ in range(count):
-        region = _REGION.unpack_from(data, offset)
-        current = region[:3]
-        if region[3] == 0 or (previous is not None and current <= previous):
-            return None
-        previous = current
-        regions.append(region)
-        offset += REGION_BYTES
+    if count and not _regions_well_formed(data, count):
+        return None
     return {
         "minute": fields[1],
         "map_epoch": fields[2],
@@ -329,8 +326,51 @@ def parse_record(data):
         "regions_dropped": fields[8],
         "pose_ok": fields[9],
         "flags": fields[10],
-        "regions": tuple(regions),
+        "n_regions": count,
     }
+
+
+def _strictly_increasing(ix, iy, iz, n):
+    """True when the first ``n`` coordinates are strictly signed ``(ix, iy, iz)`` order."""
+    if n <= 1:
+        return True
+    ix, iy, iz = ix[:n], iy[:n], iz[:n]
+    same_ix = ix[1:] == ix[:-1]
+    same_iy = iy[1:] == iy[:-1]
+    return not bool(np.any(
+        (ix[1:] < ix[:-1]) | (same_ix & (iy[1:] < iy[:-1])) | (same_ix & same_iy & (iz[1:] <= iz[:-1]))
+    ))
+
+
+def _regions_well_formed(data, count):
+    """True when every row has a hit and the signed coordinates strictly increase."""
+    rows = np.frombuffer(data, dtype=_REGION_DTYPE, count=count, offset=ENVELOPE_BYTES)
+    if np.any(rows["hits"] == 0):
+        return False
+    return _strictly_increasing(rows["ix"], rows["iy"], rows["iz"], count)
+
+
+def _replace_flags(data, flags):
+    """Copy ``data`` with the flags byte replaced and the CRC recomputed. Regions stay put."""
+    buf = bytearray(data)
+    buf[_FLAGS_OFFSET] = int(flags) & 0xFF
+    struct.pack_into("<I", buf, len(buf) - 4, _crc(buf[4:-4]))
+    return bytes(buf)
+
+
+def parse_record(data):
+    """One record, or ``None`` when the length, the region rows, or the CRC do not match."""
+    fields = _record_fields(data)
+    if fields is None:
+        return None
+    count = fields.pop("n_regions")
+    regions = []
+    offset = ENVELOPE_BYTES
+    for _ in range(count):
+        regions.append(_REGION.unpack_from(data, offset))
+        offset += REGION_BYTES
+    fields["regions"] = tuple(regions)
+    return fields
 
 
 def scan_records(data):
@@ -390,6 +430,7 @@ class _Table:
         self._ciy = np.empty(slots, dtype=np.int16)
         self._ciz = np.empty(slots, dtype=np.int16)
         self._cslot = np.empty(slots, dtype=np.int32)
+        self._cache_sorted = False
 
     def clear(self):
         """Drop occupancy and counts. A complete layout cache stays.
@@ -397,10 +438,12 @@ class _Table:
         A minute seal calls this. The next window of the same room writes those slots
         back and does not probe. The cache is dropped when it is not the whole table:
         restoring a subset would leave a key past an empty slot, and the next probe
-        would miss it.
+        would miss it. A second clear of an already empty table leaves that cache,
+        so the layout survives a repeated seal.
         """
-        if self._cached != self.count:
+        if self.count and self._cached != self.count:
             self._cached = 0
+            self._cache_sorted = False
         self.used.fill(0)
         self.hits.fill(0)
         self.sums.fill(0)
@@ -459,6 +502,7 @@ class _Table:
             self._remember(ix, iy, iz, total)
         else:
             self._cached = 0
+            self._cache_sorted = False
         return 0
 
     def _prefix_matches(self, ix, iy, iz, cached):
@@ -488,11 +532,15 @@ class _Table:
     def _remember(self, ix, iy, iz, n):
         if n <= 0 or n > self.slots:
             self._cached = 0
+            self._cache_sorted = False
             return
         self._cix[:n] = ix[:n]
         self._ciy[:n] = iy[:n]
         self._ciz[:n] = iz[:n]
         self._cached = n
+        # Insertion order is the file order only when the caller already sorted.
+        # ``_cells`` does. An unsorted insert keeps the scan in ``pack_regions``.
+        self._cache_sorted = _strictly_increasing(self._cix, self._ciy, self._ciz, n)
 
     def _slot(self, ix, iy, iz, start):
         for step in range(self.slots):
@@ -546,7 +594,18 @@ class _Table:
         )
 
     def pack_regions(self, with_points):
-        """Sorted region payload, little endian. Empty when nothing was hit."""
+        """Sorted region payload, little endian. Empty when nothing was hit.
+
+        The slot cache is the insertion order. When that order is already strictly
+        increasing and it lists every occupied slot, the minute seal copies it.
+        Sorting the full table here is most of the seal, and it runs on the callback.
+        """
+        if with_points <= 0:
+            return b""
+        if self._cache_sorted and self._cached == self.count and self.count:
+            packed = self._pack_cached(with_points)
+            if packed is not None:
+                return packed
         rows = self._occupied(with_points)
         if rows is None:
             return b""
@@ -555,6 +614,24 @@ class _Table:
         packed["ix"] = ix
         packed["iy"] = iy
         packed["iz"] = iz
+        packed["hits"] = hits
+        packed["mean"] = means
+        return packed.tobytes()
+
+    def _pack_cached(self, with_points):
+        """Pack the cached prefix. ``None`` when a stored slot has no hit."""
+        n = self.count
+        slots = self._cslot[:n]
+        hits = self.hits[slots]
+        if np.any(hits == 0):
+            return None
+        sums = self.sums[slots]
+        means = (sums + np.uint64(with_points // 2)) // np.uint64(with_points)
+        np.minimum(means, np.uint64(U16_MAX), out=means)
+        packed = np.empty(n, dtype=_REGION_DTYPE)
+        packed["ix"] = self._cix[:n]
+        packed["iy"] = self._ciy[:n]
+        packed["iz"] = self._ciz[:n]
         packed["hits"] = hits
         packed["mean"] = means
         return packed.tobytes()
@@ -1068,12 +1145,20 @@ class RhythmWriter:
                 with self._lock:
                     self._busy = False
 
+    def _read_record(self, data):
+        """Fields for an append. Region tuples are built only when a publish needs them."""
+        if self.config.rhythm_publish and self.publish is not None:
+            return parse_record(data)
+        return _record_fields(data)
+
     def _append(self, sensor_name, data, prune):
-        record = parse_record(data)
+        record = self._read_record(data)
         if record is None:
             self.io_errors += 1
             return
         if self.directory is None:
+            if "regions" not in record:
+                record = parse_record(data)
             self._publish(sensor_name, record, data)
             return
         segment = self._open.get(sensor_name)
@@ -1083,13 +1168,12 @@ class RhythmWriter:
         if last is not None and record["minute"] == last:
             self._force_disc[sensor_name] = True
         if self._force_disc.get(sensor_name) and not (record["flags"] & FLAG_DISCONTINUITY):
-            record["flags"] |= FLAG_DISCONTINUITY
-            data = encode_record(
-                record["minute"], record["map_epoch"], record["closed"], record["with_points"],
-                record["unavailable"], record["clipped"], record["regions_dropped"], record["pose_ok"],
-                record["flags"], record["regions"],
-            )
-            record = parse_record(data)
+            # Patch the flag in place. Re-encoding walks every region back into a tuple.
+            data = _replace_flags(data, record["flags"] | FLAG_DISCONTINUITY)
+            record = self._read_record(data)
+            if record is None:
+                self.io_errors += 1
+                return
         if not self._ready(sensor_name, record, len(data), prune):
             return
         segment = self._open[sensor_name]

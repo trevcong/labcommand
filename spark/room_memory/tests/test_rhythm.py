@@ -37,6 +37,8 @@ from room_memory.rhythm import (
     Rhythm,
     RhythmAccumulator,
     _Table,
+    _record_fields,
+    _replace_flags,
     encode_header,
     encode_record,
     header_identity,
@@ -619,6 +621,13 @@ def test_an_overflowing_window_reuses_slots_and_does_not_probe():
     assert encode_record(10, 1, 1, 1, 0, 0, 2, 0, FLAG_OVERFLOW, packed_regions=packed) == encode_record(
         10, 1, 1, 1, 0, 0, 2, 0, FLAG_OVERFLOW, table.regions(1),
     )
+
+    def refuse_scan(*_args, **_kwargs):
+        raise AssertionError("sorted cache scanned the slots")
+
+    table._occupied = refuse_scan
+    assert table.pack_regions(1) == packed
+    del table._occupied
     signed = _Table(4)
     signed.insert_window(
         np.array([0, -2, 1], dtype=np.int16),
@@ -652,8 +661,12 @@ def test_an_overflowing_window_reuses_slots_and_does_not_probe():
     assert int(table.hits[_slot_of(table, 0, 0, 0)]) == before + 1
 
     # The seal clears occupancy. The same window reoccupies the cached slots.
+    # A second clear must not drop the layout: count is already 0, and treating
+    # that as "cache is not the whole table" would probe the next minute.
     table.clear()
     assert table.count == 0 and table._cached == 4 and int(table.used.sum()) == 0
+    table.clear()
+    assert table.count == 0 and table._cached == 4 and table._cache_sorted and int(table.used.sum()) == 0
     assert table.insert_window(*overflow) == 2
     assert table.count == 4 and int(table.hits[_slot_of(table, 3, 0, 0)]) == 1
     assert int(table.sums[_slot_of(table, 3, 0, 0)]) == 1
@@ -674,8 +687,36 @@ def test_an_overflowing_window_reuses_slots_and_does_not_probe():
     other.insert_window(*stored)
     other.insert_window(*_cells([10, 11]))
     assert other.count == 6 and other._cached == 2
+    assert encode_record(1, 1, 1, 1, 0, 0, 0, 0, 0, packed_regions=other.pack_regions(1)) == encode_record(
+        1, 1, 1, 1, 0, 0, 0, 0, 0, other.regions(1),
+    )
     other.clear()
     assert other._cached == 0 and other.count == 0 and int(other.used.sum()) == 0
+
+
+def test_record_fields_reject_a_bad_region_without_building_tuples():
+    """The writer checks rows in the byte buffer. A decreasing pair or a zero hit is not a record."""
+    good = encode_record(1, 1, 1, 1, 0, 0, 0, 0, 0, ((0, 0, 0, 1, 1), (1, 0, 0, 1, 1)))
+    fields = _record_fields(good)
+    assert fields["minute"] == 1 and fields["n_regions"] == 2 and "regions" not in fields
+    assert parse_record(good)["regions"] == ((0, 0, 0, 1, 1), (1, 0, 0, 1, 1))
+    flagged = _replace_flags(good, FLAG_DISCONTINUITY)
+    parsed = parse_record(flagged)
+    assert parsed["flags"] == FLAG_DISCONTINUITY
+    assert parsed["regions"] == ((0, 0, 0, 1, 1), (1, 0, 0, 1, 1))
+
+    def recrc(buf):
+        struct.pack_into("<I", buf, len(buf) - 4, zlib.crc32(buf[4:-4]) & 0xFFFFFFFF)
+
+    decreasing = bytearray(good)
+    decreasing[40:50], decreasing[50:60] = decreasing[50:60], decreasing[40:50]
+    recrc(decreasing)
+    assert _record_fields(bytes(decreasing)) is None and parse_record(bytes(decreasing)) is None
+    zero_hit = bytearray(good)
+    zero_hit[46] = 0
+    zero_hit[47] = 0
+    recrc(zero_hit)
+    assert _record_fields(bytes(zero_hit)) is None and parse_record(bytes(zero_hit)) is None
 
 
 def test_a_sealed_overflow_minute_keeps_counts_and_the_next_minute_starts_over():

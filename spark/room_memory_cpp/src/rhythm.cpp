@@ -237,7 +237,9 @@ struct Table {
         // A minute seal. Keep a cache that lists the whole table so the next identical
         // window writes those slots back. A partial cache is not a valid empty-table
         // layout: a key stored past a neighbor would sit behind an empty slot.
-        if (cached != count) cached = 0;
+        // count == 0 means this table was already cleared; dropping the cache then
+        // would make the next minute probe the full table again.
+        if (count != 0 && cached != count) cached = 0;
         std::fill(used.begin(), used.end(), 0);
         std::fill(hits.begin(), hits.end(), 0);
         std::fill(sums.begin(), sums.end(), 0);
