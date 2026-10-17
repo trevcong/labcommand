@@ -142,15 +142,22 @@ def parse_rig_state(data, what):
     return state
 
 
-def write_atomic(path, data):
+def write_atomic(path, data, make_parents=True):
+    """Temp file, fsync, rename, then fsync the directory, so the rename survives a crash."""
     path = pathlib.Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if make_parents:
+        path.parent.mkdir(parents=True, exist_ok=True)
     scratch = path.with_suffix(path.suffix + ".tmp")
     with open(scratch, "wb") as handle:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(scratch, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def archive(room, name, files, remove=()):

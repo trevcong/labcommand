@@ -19,6 +19,7 @@ from room_memory.messages import (CAUSE_IMU_SHOCK, CAUSE_IMU_TILT, CAUSE_PERIODI
                                   RigChannel, RigOutcome, Time)
 
 import rooms
+from test_memory import GENERATION
 
 SYNTHETIC = pathlib.Path(__file__).resolve().parents[3] / "Tests" / "Fixtures" / "room" / "synthetic"
 VOXEL = 0.05
@@ -247,7 +248,7 @@ CUBE = ((2.0, -0.4, -1.2), (2.4, 0.0, -0.8))
 def guarded(state_dir=None, **changes):
     config = MemoryConfig(sensors=("mid360",), state_dir=None if state_dir is None else str(state_dir),
                           reference_windows=REFERENCE_WINDOWS, rig_guard=True)
-    return RoomMemory(replace(config, **changes), Time(0, 0))
+    return RoomMemory(replace(config, **changes), Time(0, 0), GENERATION)
 
 
 @dataclass

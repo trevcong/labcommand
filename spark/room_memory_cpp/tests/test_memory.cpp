@@ -1703,7 +1703,7 @@ TEST(a_hold_defers_promotion_to_the_first_window_without_it) {
 }
 
 TEST(a_pushed_rig_realigns_without_false_events_and_finds_a_cube) {
-    RoomMemory memory(guarded_config(), msg::Time{0, 0});
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
     const rig::Pose truth = rooms::rig(0.10, 0.0, 0.0, 2.0);
     std::vector<Window> trace = drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 2), 1);
     append(trace, drive(memory, repeat(truth, 20), static_cast<std::int64_t>(trace.size()) + 1));
@@ -1735,7 +1735,7 @@ TEST(a_pushed_rig_realigns_without_false_events_and_finds_a_cube) {
 TEST(without_the_guard_the_push_floods_candidates) {
     MemoryConfig config = guarded_config();
     config.rig_guard = false;
-    RoomMemory memory(config, msg::Time{0, 0});
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
     drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 2), 1);
     const std::vector<Window> trace = drive(memory, repeat(rooms::rig(0.10, 0.0, 0.0, 2.0), 45), kGuardReferenceWindows + 3);
     CHECK(!candidates(trace).empty());
@@ -1743,7 +1743,7 @@ TEST(without_the_guard_the_push_floods_candidates) {
 }
 
 TEST(a_yaw_alone_realigns_before_the_candidate_gate) {
-    RoomMemory memory(guarded_config(), msg::Time{0, 0});
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
     const rig::Pose truth = rooms::rig(0.0, 0.0, 0.0, 3.0);
     drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 2), 1);
     const std::vector<Window> trace = drive(memory, repeat(truth, 45), kGuardReferenceWindows + 3);
@@ -1758,7 +1758,7 @@ TEST(a_static_rig_checks_periodically_and_stays_in_place) {
     // the periodic timer (a_pushed_rig_realigns_without_false_events_and_finds_a_cube covers it).
     MemoryConfig config = guarded_config();
     config.pose_trigger_m = 1.0;
-    RoomMemory memory(config, msg::Time{0, 0});
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
     const std::vector<Window> trace = drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 70), 1);
     CHECK(all_events(trace).empty());
     for (const Window& window : trace) CHECK(window.state == MemoryState::building || window.state == MemoryState::tracking);
@@ -1797,7 +1797,7 @@ ImuSource imu_stream(std::optional<double> shock_at = std::nullopt, double yaw_d
 }
 
 TEST(an_imu_shock_with_a_move_realigns_from_the_gyro_prior) {
-    RoomMemory memory(guarded_config(), msg::Time{0, 0});
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
     const rig::Pose truth = rooms::rig(0.05, 0.0, 0.0, 2.0);
     std::vector<rig::Pose> poses = repeat(rig::Pose{}, kGuardReferenceWindows + 3);
     const std::vector<rig::Pose> after = repeat(truth, 20);
@@ -1815,7 +1815,7 @@ TEST(an_imu_shock_with_a_move_realigns_from_the_gyro_prior) {
 }
 
 TEST(an_imu_shock_alone_checks_and_stays_in_place) {
-    RoomMemory memory(guarded_config(), msg::Time{0, 0});
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
     const std::vector<Window> trace = drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 15), 1, rooms::kFurniture,
                                             imu_stream(static_cast<double>(kGuardReferenceWindows) + 2.5));
     CHECK((last(outcomes(trace), 2) == std::vector<O>{O::checking, O::in_place}));
@@ -1830,7 +1830,7 @@ RigState saved_rig_state(const std::filesystem::path& room) {
 TEST(the_gravity_baseline_is_set_while_building) {
     // The IMU streams through BUILDING, so the new frame starts with a gravity baseline.
     TempDir dir;
-    RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0});
+    RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
     drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows), 1, rooms::kFurniture, imu_stream());
     CHECK(memory.state() == MemoryState::tracking);
     const RigState state = saved_rig_state(dir.path / "lab");
@@ -1840,7 +1840,7 @@ TEST(the_gravity_baseline_is_set_while_building) {
 TEST(an_imu_tilt_is_move_evidence_where_icp_cannot_register) {
     // Codex's repro: a planar reference with the IMU streaming throughout, then a 3 degree roll with
     // a gyro shock. ICP rejects the floor, so the tilt alone must give RIG_MOVED, not INCONCLUSIVE.
-    RoomMemory memory(guarded_config(), msg::Time{0, 0});
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
     std::vector<rig::Pose> poses = repeat(rig::Pose{}, kGuardReferenceWindows + 3);
     const std::vector<rig::Pose> after = repeat(rooms::rig(0.0, 0.0, 0.0, 0.0, 3.0), 20);
     poses.insert(poses.end(), after.begin(), after.end());
@@ -1860,7 +1860,7 @@ TEST(an_imu_that_comes_up_after_the_build_starts_the_gravity_baseline) {
     // The IMU is silent through BUILDING, so the frame starts without a baseline: quiet gravity in
     // place starts it (and saves it), and a tilt on a floor ICP cannot register still gives RIG_MOVED.
     TempDir dir;
-    RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0});
+    RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
     const ImuSource stream = imu_stream(static_cast<double>(kGuardReferenceWindows) + 6.5, 0.0, 50, 3.0);
     const ImuSource late = [&](std::int64_t second) {
         return second > kGuardReferenceWindows ? stream(second) : std::vector<msg::ImuSample>{};
@@ -1885,7 +1885,7 @@ TEST(an_imu_that_comes_up_after_the_build_starts_the_gravity_baseline) {
 }
 
 TEST(a_shock_while_building_does_not_start_a_check) {
-    RoomMemory memory(guarded_config(), msg::Time{0, 0});
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
     const std::vector<Window> trace = drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 5), 1, rooms::kFurniture,
                                             imu_stream(static_cast<double>(kGuardReferenceWindows) / 2));
     CHECK(std::none_of(trace.begin(), trace.end(), [](const Window& w) { return w.rig && (w.rig->causes & msg::kCauseImuShock); }));
@@ -1900,7 +1900,7 @@ TEST(a_sensor_lost_after_a_move_does_not_block_the_relearn) {
     const std::filesystem::path room = dir.path / "lab";
     MemoryConfig config = guarded_config(dir.path.string());
     config.sensors = {"mid360", "jt128"};
-    RoomMemory memory(config, msg::Time{0, 0});
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
     const rig::Pose far = rooms::rig(0.5, 0.0, 0.0, 20.0, 3.0);
     ImuSource imu = imu_stream();
     std::vector<rooms::Box> with_cube = rooms::kFurniture;
@@ -1960,7 +1960,7 @@ TEST(a_sensor_lost_after_a_move_does_not_block_the_relearn) {
         std::filesystem::copy(room, copy.path / "lab", std::filesystem::copy_options::recursive);
         MemoryConfig again = config;
         again.state_dir = copy.path.string();
-        RoomMemory restarted(again, msg::Time{0, 0});
+        RoomMemory restarted(again, msg::Time{0, 0}, kGeneration);
         CHECK(restarted.state() == MemoryState::tracking && restarted.rig_outcome() == O::checking);
         CHECK(restarted.channel("jt128").cloud);
     }
@@ -1990,7 +1990,7 @@ TEST(a_sensor_lost_after_a_move_does_not_block_the_relearn) {
     const RigState state = saved_rig_state(room);
     CHECK(state.frame_epoch > old_frame);
     const std::size_t cloud = jt128.cloud->size();
-    RoomMemory restarted(config, msg::Time{0, 0});
+    RoomMemory restarted(config, msg::Time{0, 0}, kGeneration);
     CHECK(restarted.state() == MemoryState::tracking);
     CHECK_EQ(restarted.channel("jt128").cloud->size(), cloud);
 }
@@ -2001,7 +2001,7 @@ TEST(a_sensor_still_building_when_the_rig_moves_starts_its_build_over) {
     // it joins with a reference of one pose and reports nothing on the unchanged room.
     MemoryConfig config = guarded_config();
     config.sensors = {"mid360", "jt128"};
-    RoomMemory memory(config, msg::Time{0, 0});
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
     const rig::Pose truth = rooms::rig(0.10, 0.0, 0.0, 2.0);
     const Channel& jt128 = memory.channel("jt128");
     std::vector<Window> trace;
@@ -2051,7 +2051,7 @@ TEST(the_rig_state_round_trips_and_a_restart_checks_the_pose) {
     rig::Pose pose;
     std::size_t cloud = 0;
     {
-        RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0});
+        RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
         drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 2), 1);
         drive(memory, repeat(truth, 10), kGuardReferenceWindows + 3);
         pose = memory.channel("mid360").pose;
@@ -2060,7 +2060,7 @@ TEST(the_rig_state_round_trips_and_a_restart_checks_the_pose) {
     CHECK(!pose.is_identity());
     CHECK(std::filesystem::exists(dir.path / "lab" / "rig_state"));
     CHECK(std::filesystem::exists(dir.path / "lab" / "registration-mid360.bin"));
-    RoomMemory restarted(guarded_config(dir.path.string()), msg::Time{0, 0});
+    RoomMemory restarted(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
     CHECK(restarted.channel("mid360").pose == pose);
     CHECK_EQ(restarted.channel("mid360").cloud->size(), cloud);
     CHECK(restarted.rig_outcome() == O::checking);
@@ -2072,7 +2072,7 @@ TEST(the_rig_state_round_trips_and_a_restart_checks_the_pose) {
 TEST(a_rig_state_that_does_not_match_its_files_is_refused) {
     TempDir dir;
     {
-        RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0});
+        RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
         drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows), 1);
     }
     const std::filesystem::path cloud = dir.path / "lab" / "registration-mid360.bin";
@@ -2081,7 +2081,7 @@ TEST(a_rig_state_that_does_not_match_its_files_is_refused) {
     std::ofstream(cloud, std::ios::binary).write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
     const auto refused = [&](const MemoryConfig& config, const std::string& reason) {
         try {
-            RoomMemory memory(config, msg::Time{0, 0});
+            RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
         } catch (const std::invalid_argument& error) {
             if (std::string(error.what()).find(reason) == std::string::npos) throw harness::Failure(error.what());
             return;
@@ -2101,10 +2101,10 @@ TEST(legacy_state_is_archived_and_rebuilt) {
     {
         MemoryConfig off = guarded_config(dir.path.string());
         off.rig_guard = false;
-        RoomMemory memory(off, msg::Time{0, 0});
+        RoomMemory memory(off, msg::Time{0, 0}, kGeneration);
         drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows), 1);
     }
-    RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0});
+    RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
     CHECK(memory.state() == MemoryState::building && memory.rig_outcome() == O::relearning);
     std::vector<std::filesystem::path> archives;
     for (const auto& entry : std::filesystem::directory_iterator(dir.path / "lab" / "prev")) archives.push_back(entry.path());
@@ -2127,9 +2127,9 @@ TEST(guard_config_rejections) {
              [](MemoryConfig& c) { c.imu_quiet_s = NAN; }}) {
         MemoryConfig config = guarded_config();
         edit(config);
-        CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart));
+        CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart, kGeneration));
         config.rig_guard = false;
-        RoomMemory unchecked(config, kStart);  // only checked with the guard on
+        RoomMemory unchecked(config, kStart, kGeneration);  // only checked with the guard on
     }
 }
 

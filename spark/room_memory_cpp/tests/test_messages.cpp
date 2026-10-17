@@ -299,6 +299,8 @@ std::optional<std::uint64_t> generation_of(const T& value) {
         return value.expected_generation;
     } else if constexpr (std::is_same_v<T, SyncEnd>) {
         return value.publisher_generation;
+    } else if constexpr (std::is_same_v<T, RigPose>) {
+        return std::nullopt;
     } else {
         return value.publisher_generation;
     }
@@ -357,7 +359,7 @@ const std::map<std::string, Golden>& goldens() {
         {"activity_v2_le.hex", golden<Activity>(activity_v2, true)},
         {"rig_pose_le.hex", golden<RigPose>(rig_pose, true)},
         {"imu_le.hex", Golden{[](const Bytes& data) { return decode_imu(data) == imu(); }, [] { return imu().to_cdr(); },
-                              [](const Bytes& data) { (void)decode_imu(data); }, true}},
+                              [](const Bytes& data) { (void)decode_imu(data); }, [](const Bytes& data) { (void)decode_imu(data); return false; }, true}},
     };
     return table;
 }
