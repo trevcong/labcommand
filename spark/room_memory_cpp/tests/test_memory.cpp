@@ -12,6 +12,7 @@
 #include <random>
 
 #include "harness.hpp"
+#include "room_memory/generation.hpp"
 #include "room_memory/memory.hpp"
 #include "room_memory/pointcloud2.hpp"
 #include "room_memory/rejectlog.hpp"
@@ -155,6 +156,169 @@ std::optional<msg::MapBricks> feed(RoomMemory& memory, const Cloud* cloud, std::
     const auto bytes = memory.map_update(stamp(second));
     if (!bytes) return std::nullopt;
     return msg::MapBricks::from_cdr(*bytes);
+}
+
+constexpr const char* kQuarantineStamp = "20261017T150000Z";
+
+MemoryConfig room_config(const std::filesystem::path& dir, std::vector<std::string> sensors = {"mid360"}) {
+    MemoryConfig config = mid360_config(dir.string());
+    config.sensors = std::move(sensors);
+    config.quarantine_stamp = kQuarantineStamp;
+    return config;
+}
+
+VoxelLayer single_cell() { return layer({{0, 0, 0}}, {{0, 0, 0}}); }
+
+void plant_reference(const std::filesystem::path& dir, const std::string& sensor, std::uint64_t epoch, float voxel,
+                     const VoxelLayer& cells = single_cell()) {
+    save_reference(reference_path(dir.string(), "lab", sensor), cells, msg::Header{"lab", epoch, 0, kStart}, voxel);
+}
+
+std::filesystem::path room_of(const std::filesystem::path& dir) { return dir / "lab"; }
+
+struct Sentinel {
+    std::filesystem::path path;
+    std::string bytes;
+};
+
+std::vector<Sentinel> plant_sentinels(const std::filesystem::path& room) {
+    std::filesystem::create_directories(room);
+    std::vector<Sentinel> out;
+    const std::pair<const char*, const char*> files[] = {
+        {kGenerationFile, "424242\n"},
+        {kGenerationLockFile, "sentinel-lock"},
+        {"reference-extra.cdr", "unconfigured-reference"},
+    };
+    for (const auto& [name, bytes] : files) {
+        const auto path = room / name;
+        std::ofstream(path, std::ios::binary) << bytes;
+        out.push_back(Sentinel{path, bytes});
+    }
+    return out;
+}
+
+void expect_unchanged(const std::vector<Sentinel>& sentinels) {
+    for (const Sentinel& sentinel : sentinels) CHECK(harness::read_text(sentinel.path) == sentinel.bytes);
+}
+
+std::vector<std::filesystem::path> named_like(const std::filesystem::path& dir, const std::string& prefix) {
+    std::vector<std::filesystem::path> out;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().filename().string().rfind(prefix, 0) == 0) out.push_back(entry.path());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+bool stamp_suffix(const std::string& rest) {
+    if (rest.size() < 16 || rest[8] != 'T' || rest[15] != 'Z') return false;
+    for (int n = 0; n < 16; ++n) {
+        if (n == 8 || n == 15) continue;
+        if (rest[n] < '0' || rest[n] > '9') return false;
+    }
+    if (rest.size() == 16) return true;
+    if (rest[16] != '.' || rest.size() == 17) return false;
+    for (std::size_t n = 17; n < rest.size(); ++n) {
+        if (rest[n] < '0' || rest[n] > '9') return false;
+    }
+    return true;
+}
+
+void expect_absent(const std::filesystem::path& path) {
+    CHECK(inspect_directory_entry(path).presence == EntryPresence::absent);
+}
+
+// The original directory entry is gone (not merely a dangling symlink). Exactly one
+// `<filename>.quarantine-<stamp>` holds `bytes`.
+void expect_quarantine(const std::filesystem::path& room, const std::string& filename, const std::string& bytes,
+                       const std::string& note) {
+    expect_absent(room / filename);
+    const auto found = named_like(room, filename + ".quarantine-");
+    CHECK_EQ(found.size(), std::size_t{1});
+    const std::string name = found[0].filename().string();
+    CHECK(stamp_suffix(name.substr((filename + ".quarantine-").size())));
+    CHECK(harness::read_text(found[0]) == bytes);
+    CHECK(note.find(name) != std::string::npos);
+}
+
+void overwrite(const std::filesystem::path& path, const std::string& bytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) throw harness::Failure("cannot write " + path.string());
+    out << bytes;
+}
+
+struct Listed {
+    std::string name;
+    bool symlink = false;
+    std::string payload;
+};
+
+std::vector<Listed> list_entries(const std::filesystem::path& dir) {
+    std::vector<Listed> out;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        Listed item;
+        item.name = entry.path().filename().string();
+        if (entry.is_symlink()) {
+            item.symlink = true;
+            item.payload = std::filesystem::read_symlink(entry.path()).string();
+        } else if (entry.is_regular_file()) {
+            item.payload = harness::read_text(entry.path());
+        } else {
+            item.payload = "directory";
+        }
+        out.push_back(std::move(item));
+    }
+    std::sort(out.begin(), out.end(), [](const Listed& a, const Listed& b) { return a.name < b.name; });
+    return out;
+}
+
+void expect_same_entries(const std::vector<Listed>& before, const std::filesystem::path& dir) {
+    const auto after = list_entries(dir);
+    CHECK_EQ(after.size(), before.size());
+    for (std::size_t n = 0; n < before.size(); ++n) {
+        CHECK(after[n].name == before[n].name);
+        CHECK(after[n].symlink == before[n].symlink);
+        CHECK(after[n].payload == before[n].payload);
+    }
+}
+
+MemoryConfig fast_room(const std::filesystem::path& dir, std::vector<std::string> sensors = {"mid360"}) {
+    MemoryConfig config = room_config(dir, std::move(sensors));
+    config.reference_windows = 1;
+    config.occupied_min_hits = 1;
+    config.learn_windows = 30;
+    config.learn_max_offset_m = 100.0;
+    config.delta_period_s = 1.0;
+    config.keyframe_period_s = 100.0;
+    config.keyframe_delta_ratio = 100.0;
+    return config;
+}
+
+void block_temp(const std::filesystem::path& target) {
+    std::filesystem::create_directories(target.parent_path());
+    std::filesystem::create_directory(target.string() + ".tmp");
+}
+
+std::size_t brick_dim_index(const msg::Bytes& data) {
+    std::size_t at = 4;
+    const auto align = [&](std::size_t size) {
+        while ((at - 4) % size) ++at;
+    };
+    const auto skip = [&](std::size_t size) {
+        align(size);
+        at += size;
+    };
+    skip(4);
+    const std::uint32_t chars = static_cast<std::uint32_t>(data.at(4) | (data.at(5) << 8) | (data.at(6) << 16) | (data.at(7) << 24));
+    at += chars;
+    skip(8);
+    skip(8);
+    skip(4);
+    skip(4);
+    at += 2;
+    skip(8);
+    skip(4);
+    return at;
 }
 
 }  // namespace
@@ -332,6 +496,8 @@ TEST(reload_restores_epoch_and_bricks) {
     const auto bricks = memory.channel("mid360").reference.to_bricks();
     RoomMemory restarted(mid360_config(dir.path.string()), kStart, kGeneration);
     CHECK(restarted.state() == MemoryState::tracking && memory.map_epoch() == 1 && restarted.map_epoch() == 2);
+    CHECK(restarted.startup_note().empty());
+    CHECK(restarted.persistence_ok());
     CHECK(restarted.channel("mid360").reference.to_bricks() == bricks);
     CHECK_EQ(restarted.status(stamp(9), 1.0).n_bricks, static_cast<std::int64_t>(bricks.size()));
 }
@@ -428,20 +594,13 @@ TEST(a_sensor_subset_build_continues_the_room_epoch) {
     CHECK_EQ(RoomMemory(both, stamp(20), kGeneration).map_epoch(), std::uint64_t{4});
 }
 
-TEST(inconsistent_saved_state_is_refused) {
-    TempDir dir;
-    RoomMemory memory(mid360_config(dir.path.string()), kStart, kGeneration);
-    build_reference(memory, scenes::room_shell());
-    MemoryConfig both;
-    both.state_dir = dir.path.string();
-    CHECK_THROWS(std::invalid_argument, RoomMemory(both, kStart, kGeneration));
-    MemoryConfig coarse = mid360_config(dir.path.string());
-    coarse.voxel_size = 0.1;
-    CHECK_THROWS(std::invalid_argument, RoomMemory(coarse, kStart, kGeneration));
-    for (const std::string data : {"", "3", "-3\n", " 3\n", "18446744073709551616\n"}) {
-        std::ofstream(epoch_path(dir.path.string(), "lab"), std::ios::binary | std::ios::trunc) << data;
-        CHECK_THROWS(std::invalid_argument, RoomMemory(mid360_config(dir.path.string()), kStart, kGeneration));
-    }
+TEST(a_zero_period_status_is_not_degraded_without_frames) {
+    MemoryConfig config;
+    config.state_dir = std::nullopt;
+    RoomMemory memory(config, kStart, kGeneration);
+    CHECK(memory.status(stamp(0), 0.0).state == MemoryState::building);
+    // Any positive period with no frames rounds to 0 Hz and is DEGRADED. The startup sample has to pass 0.
+    CHECK(memory.status(stamp(1), 1e-6).state == MemoryState::degraded);
 }
 
 // Codex P2: row_step 0 falls back to point_step x width = 2^42, and 2^42 x height (2^22)
@@ -1097,7 +1256,10 @@ TEST(messages_carry_the_generation_and_references_stay_legacy) {
     const std::vector<msg::Brick> bricks = saved.bricks;
     saved.publisher_generation = 7;
     write_atomic(path, saved.to_cdr());
-    CHECK(RoomMemory(mid360_config(dir.path.string()), kStart, kGeneration).channel("mid360").reference.to_bricks() == bricks);
+    RoomMemory reloaded(mid360_config(dir.path.string()), kStart, kGeneration);
+    CHECK(reloaded.channel("mid360").reference.to_bricks() == bricks);
+    CHECK(reloaded.startup_note().empty());
+    CHECK(named_like(dir.path / "lab", "reference-mid360.cdr.quarantine-").empty());
     MemoryConfig config;
     config.state_dir = std::nullopt;
     CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart, 0));
@@ -1568,6 +1730,588 @@ TEST(gate_config_rejections) {
         edit(config);
         CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart, kGeneration));
     }
+}
+
+std::string truncate_reference(const std::filesystem::path& path) {
+    const std::string bytes = harness::read_text(path).substr(0, 8);
+    overwrite(path, bytes);
+    return bytes;
+}
+
+void expect_fresh(const RoomMemory& memory, const std::string& sensor = "mid360") {
+    CHECK(memory.state() == MemoryState::building);
+    CHECK(memory.channel(sensor).reference.to_bricks().empty());
+    CHECK(memory.startup_note().find("fresh reference starting") != std::string::npos);
+}
+
+TEST(a_truncated_reference_is_quarantined_and_startup_continues) {
+    TempDir dir;
+    const auto room = room_of(dir.path);
+    std::filesystem::create_directories(room);
+    plant_reference(dir.path, "mid360", 4, 0.05f);
+    save_epoch(epoch_path(dir.path.string(), "lab"), 7);
+    const auto sentinels = plant_sentinels(room);
+    const auto path = reference_path(dir.path.string(), "lab", "mid360");
+    const std::string damaged = truncate_reference(path);
+    const RoomMemory memory(room_config(dir.path), kStart, kGeneration);
+    expect_fresh(memory);
+    CHECK_EQ(memory.map_epoch(), std::uint64_t{7});
+    CHECK_EQ(harness::read_text(epoch_path(dir.path.string(), "lab")), std::string("7\n"));
+    CHECK(memory.startup_note().find("truncated") != std::string::npos);
+    CHECK(memory.startup_note().find("map_epoch kept") != std::string::npos);
+    expect_quarantine(room, "reference-mid360.cdr", damaged, memory.startup_note());
+    expect_unchanged(sentinels);
+    CHECK(memory.persistence_ok());
+    CHECK(memory.persistence_report().find("persistence: ok\n") != std::string::npos);
+}
+
+TEST(garbage_reference_bytes_are_quarantined) {
+    TempDir dir;
+    const auto room = room_of(dir.path);
+    std::filesystem::create_directories(room);
+    const auto path = reference_path(dir.path.string(), "lab", "mid360");
+    overwrite(path, "not a cdr");
+    const auto sentinels = plant_sentinels(room);
+    const RoomMemory memory(room_config(dir.path), kStart, kGeneration);
+    expect_fresh(memory);
+    CHECK(memory.startup_note().find("unsupported encapsulation") != std::string::npos);
+    expect_quarantine(room, "reference-mid360.cdr", "not a cdr", memory.startup_note());
+    expect_unchanged(sentinels);
+}
+
+TEST(a_reference_with_brick_dim_9_is_quarantined) {
+    TempDir dir;
+    const auto room = room_of(dir.path);
+    std::filesystem::create_directories(room);
+    plant_reference(dir.path, "mid360", 4, 0.05f);
+    const auto path = reference_path(dir.path.string(), "lab", "mid360");
+    std::string bytes = harness::read_text(path);
+    msg::Bytes data(bytes.begin(), bytes.end());
+    const std::size_t index = brick_dim_index(data);
+    CHECK_EQ(data.at(index), std::uint8_t{8});
+    bytes[index] = 9;
+    overwrite(path, bytes);
+    const auto sentinels = plant_sentinels(room);
+    const RoomMemory memory(room_config(dir.path), kStart, kGeneration);
+    expect_fresh(memory);
+    CHECK(memory.startup_note().find("brick_dim 9") != std::string::npos);
+    expect_quarantine(room, "reference-mid360.cdr", bytes, memory.startup_note());
+    expect_unchanged(sentinels);
+}
+
+TEST(a_corrupt_zlib_payload_is_quarantined) {
+    TempDir dir;
+    const auto room = room_of(dir.path);
+    std::filesystem::create_directories(room);
+    plant_reference(dir.path, "mid360", 4, 0.05f);
+    const auto path = reference_path(dir.path.string(), "lab", "mid360");
+    std::string bytes = harness::read_text(path);
+    CHECK(bytes.size() > 8);
+    bytes.back() = static_cast<char>(static_cast<unsigned char>(bytes.back()) ^ 0xff);
+    overwrite(path, bytes);
+    const RoomMemory memory(room_config(dir.path), kStart, kGeneration);
+    expect_fresh(memory);
+    CHECK(memory.startup_note().find("ZLIB") != std::string::npos);
+    expect_quarantine(room, "reference-mid360.cdr", bytes, memory.startup_note());
+}
+
+TEST(a_wrong_voxel_or_room_id_is_quarantined) {
+    TempDir dir;
+    plant_reference(dir.path, "mid360", 4, 0.1f);
+    const std::string voxel_bytes = harness::read_text(reference_path(dir.path.string(), "lab", "mid360"));
+    const RoomMemory voxel(room_config(dir.path), kStart, kGeneration);
+    expect_fresh(voxel);
+    CHECK(voxel.startup_note().find("different voxel_size") != std::string::npos);
+    expect_quarantine(room_of(dir.path), "reference-mid360.cdr", voxel_bytes, voxel.startup_note());
+
+    TempDir other;
+    save_reference(reference_path(other.path.string(), "lab", "mid360"), single_cell(),
+                   msg::Header{"other", 4, 0, kStart}, 0.05f);
+    const std::string original = harness::read_text(reference_path(other.path.string(), "lab", "mid360"));
+    const RoomMemory foreign(room_config(other.path), kStart, kGeneration);
+    expect_fresh(foreign);
+    CHECK(foreign.startup_note().find("holds room 'other'") != std::string::npos);
+    expect_quarantine(room_of(other.path), "reference-mid360.cdr", original, foreign.startup_note());
+}
+
+TEST(a_malformed_epoch_is_quarantined_and_the_reference_loads) {
+    const char* bad[] = {"", "3", "-3\n", " 3\n", "18446744073709551616\n"};
+    for (const char* text : bad) {
+        TempDir dir;
+        const auto room = room_of(dir.path);
+        std::filesystem::create_directories(room);
+        plant_reference(dir.path, "mid360", 4, 0.05f);
+        const auto sentinels = plant_sentinels(room);
+        overwrite(epoch_path(dir.path.string(), "lab"), text);
+        const RoomMemory memory(room_config(dir.path), kStart, kGeneration);
+        CHECK(memory.state() == MemoryState::tracking);
+        CHECK(memory.channel("mid360").reference.to_bricks() == single_cell().to_bricks());
+        CHECK_EQ(memory.map_epoch(), std::uint64_t{5});
+        CHECK_EQ(harness::read_text(epoch_path(dir.path.string(), "lab")), std::string("5\n"));
+        CHECK(inspect_directory_entry(reference_path(dir.path.string(), "lab", "mid360")).presence == EntryPresence::present);
+        CHECK(memory.startup_note().find("does not hold one map_epoch") != std::string::npos);
+        CHECK(memory.startup_note().find("map_epoch quarantined") != std::string::npos);
+        CHECK(memory.startup_note().find("fresh reference starting") == std::string::npos);
+        // The trailing save writes a new map_epoch at the original name. The bad bytes live beside it.
+        const auto parked = named_like(room, "map_epoch.quarantine-");
+        CHECK_EQ(parked.size(), std::size_t{1});
+        CHECK_EQ(harness::read_text(parked[0]), std::string(text));
+        CHECK(memory.startup_note().find(parked[0].filename().string()) != std::string::npos);
+        expect_unchanged(sentinels);
+    }
+}
+
+TEST(an_incomplete_sensor_set_is_quarantined_and_the_epoch_is_kept) {
+    TempDir dir;
+    const auto room = room_of(dir.path);
+    std::filesystem::create_directories(room);
+    plant_reference(dir.path, "mid360", 4, 0.05f);
+    save_epoch(epoch_path(dir.path.string(), "lab"), 7);
+    const std::string original = harness::read_text(reference_path(dir.path.string(), "lab", "mid360"));
+    const auto sentinels = plant_sentinels(room);
+    const RoomMemory memory(room_config(dir.path, {"mid360", "jt128"}), kStart, kGeneration);
+    expect_fresh(memory, "mid360");
+    CHECK(memory.channel("jt128").reference.to_bricks().empty());
+    CHECK_EQ(memory.map_epoch(), std::uint64_t{7});
+    CHECK_EQ(harness::read_text(epoch_path(dir.path.string(), "lab")), std::string("7\n"));
+    CHECK(memory.startup_note().find("missing ['jt128']") != std::string::npos);
+    CHECK(memory.startup_note().find("map_epoch kept") != std::string::npos);
+    expect_absent(reference_path(dir.path.string(), "lab", "jt128"));
+    expect_quarantine(room, "reference-mid360.cdr", original, memory.startup_note());
+    expect_unchanged(sentinels);
+}
+
+TEST(a_valid_sensor_and_a_corrupt_sensor_are_both_quarantined) {
+    TempDir dir;
+    const auto room = room_of(dir.path);
+    std::filesystem::create_directories(room);
+    plant_reference(dir.path, "mid360", 4, 0.05f);
+    plant_reference(dir.path, "jt128", 4, 0.05f);
+    save_epoch(epoch_path(dir.path.string(), "lab"), 7);
+    const std::string mid = harness::read_text(reference_path(dir.path.string(), "lab", "mid360"));
+    const std::string jt = truncate_reference(reference_path(dir.path.string(), "lab", "jt128"));
+    const auto sentinels = plant_sentinels(room);
+    const RoomMemory memory(room_config(dir.path, {"mid360", "jt128"}), kStart, kGeneration);
+    expect_fresh(memory, "mid360");
+    CHECK(memory.channel("jt128").reference.to_bricks().empty());
+    CHECK_EQ(memory.map_epoch(), std::uint64_t{7});
+    CHECK(memory.startup_note().find("map_epoch kept") != std::string::npos);
+    expect_quarantine(room, "reference-mid360.cdr", mid, memory.startup_note());
+    // expect_quarantine allows one match; the mid360 quarantine is a different prefix.
+    const auto found = named_like(room, "reference-jt128.cdr.quarantine-");
+    CHECK_EQ(found.size(), std::size_t{1});
+    CHECK(harness::read_text(found[0]) == jt);
+    CHECK(memory.startup_note().find(found[0].filename().string()) != std::string::npos);
+    expect_unchanged(sentinels);
+}
+
+TEST(a_delta_saved_as_a_reference_is_rejected) {
+    TempDir dir;
+    const auto path = reference_path(dir.path.string(), "lab", "mid360");
+    msg::MapBricks delta;
+    delta.header = msg::Header{"lab", 1, 0, kStart};
+    delta.compression = msg::Compression::zlib;
+    delta.kind = msg::MapKind::delta;
+    delta.base_epoch = 0;
+    delta.voxel_size = 0.05f;
+    delta.bricks = single_cell().to_bricks();
+    write_atomic(path, delta.to_cdr());
+    std::string message;
+    try {
+        load_reference(path);
+    } catch (const std::invalid_argument& error) {
+        message = error.what();
+    }
+    CHECK(message.find("is a delta, not a complete reference") != std::string::npos);
+    const std::string original = harness::read_text(path);
+    const RoomMemory memory(room_config(dir.path), kStart, kGeneration);
+    expect_fresh(memory);
+    CHECK(memory.startup_note().find("is a delta, not a complete reference") != std::string::npos);
+    expect_quarantine(room_of(dir.path), "reference-mid360.cdr", original, memory.startup_note());
+    CHECK(memory.channel("mid360").reference.to_bricks().empty());
+}
+
+TEST(rename_noreplace_refuses_a_file_and_a_dangling_symlink) {
+    TempDir dir;
+    const auto src = dir.path / "source";
+    const auto dest = dir.path / "dest";
+    overwrite(src, "source-bytes");
+    overwrite(dest, "kept-bytes");
+    CHECK(rename_noreplace(src, dest) == std::errc::file_exists);
+    CHECK_EQ(harness::read_text(src), std::string("source-bytes"));
+    CHECK_EQ(harness::read_text(dest), std::string("kept-bytes"));
+    std::filesystem::remove(dest);
+    std::filesystem::create_symlink("missing-target", dest);
+    CHECK(rename_noreplace(src, dest) == std::errc::file_exists);
+    CHECK_EQ(harness::read_text(src), std::string("source-bytes"));
+    CHECK(std::filesystem::is_symlink(dest));
+    CHECK(std::filesystem::read_symlink(dest) == "missing-target");
+    CHECK(inspect_directory_entry(dest).presence == EntryPresence::present);
+    std::filesystem::remove(dest);
+    CHECK(!rename_noreplace(src, dest));
+    expect_absent(src);
+    CHECK_EQ(harness::read_text(dest), std::string("source-bytes"));
+
+    expect_absent(dir.path / "missing");
+    CHECK(inspect_directory_entry(dest).presence == EntryPresence::present);
+    const auto dangling = dir.path / "dangling";
+    std::filesystem::create_symlink("nowhere", dangling);
+    CHECK(inspect_directory_entry(dangling).presence == EntryPresence::present);
+    const auto child = dest / "child";
+    const EntryInspection broken = inspect_directory_entry(child);
+    CHECK(broken.presence == EntryPresence::error);
+    CHECK(broken.detail.find(child.string()) != std::string::npos);
+
+    const auto epoch = dir.path / "epoch-link";
+    std::filesystem::create_symlink("nowhere", epoch);
+    CHECK_THROWS(std::runtime_error, load_epoch(epoch));
+}
+
+TEST(an_existing_quarantine_name_including_a_dangling_symlink_is_not_replaced) {
+    TempDir dir;
+    const auto room = room_of(dir.path);
+    std::filesystem::create_directories(room);
+    plant_reference(dir.path, "mid360", 4, 0.05f);
+    const auto path = reference_path(dir.path.string(), "lab", "mid360");
+    const std::string damaged = truncate_reference(path);
+    const auto first = room / (std::string("reference-mid360.cdr.quarantine-") + kQuarantineStamp);
+    std::filesystem::create_symlink("nowhere", first);
+    const RoomMemory memory(room_config(dir.path), kStart, kGeneration);
+    expect_fresh(memory);
+    CHECK(std::filesystem::is_symlink(first));
+    CHECK(std::filesystem::read_symlink(first) == "nowhere");
+    CHECK(inspect_directory_entry(first).presence == EntryPresence::present);
+    const auto second = room / (std::string("reference-mid360.cdr.quarantine-") + kQuarantineStamp + ".2");
+    CHECK_EQ(harness::read_text(second), damaged);
+    expect_absent(path);
+    CHECK(memory.startup_note().find(second.filename().string()) != std::string::npos);
+}
+
+TEST(a_failed_rename_leaves_every_unmoved_original_and_suppresses_saves) {
+    TempDir dir;
+    const auto room = room_of(dir.path);
+    std::filesystem::create_directories(room);
+    plant_reference(dir.path, "mid360", 4, 0.05f);
+    plant_reference(dir.path, "jt128", 4, 0.05f);
+    save_epoch(epoch_path(dir.path.string(), "lab"), 7);
+    const auto mid_path = reference_path(dir.path.string(), "lab", "mid360");
+    const std::string mid = truncate_reference(mid_path);
+    const std::string jt = truncate_reference(reference_path(dir.path.string(), "lab", "jt128"));
+    const auto sentinels = plant_sentinels(room);
+    const std::string base = std::string("reference-mid360.cdr.quarantine-") + kQuarantineStamp;
+    std::vector<Listed> slots;
+    for (int n = 1; n <= kQuarantineNameAttempts; ++n) {
+        const std::string name = n == 1 ? base : base + "." + std::to_string(n);
+        const auto slot = room / name;
+        if (n == 1) {
+            std::filesystem::create_symlink("nowhere", slot);
+        } else {
+            overwrite(slot, "slot-" + std::to_string(n));
+        }
+        Listed item;
+        item.name = name;
+        item.symlink = n == 1;
+        item.payload = n == 1 ? "nowhere" : "slot-" + std::to_string(n);
+        slots.push_back(std::move(item));
+    }
+    MemoryConfig config = room_config(dir.path, {"mid360", "jt128"});
+    config.reference_windows = 1;
+    config.occupied_min_hits = 1;
+    RoomMemory memory(config, kStart, kGeneration);
+    CHECK(memory.saves_suppressed());
+    CHECK(memory.startup_note().find("every quarantine name") != std::string::npos);
+    CHECK(memory.startup_note().find("saves suppressed") != std::string::npos);
+    CHECK_EQ(harness::read_text(mid_path), mid);
+    for (const Listed& slot : slots) {
+        const auto path = room / slot.name;
+        if (slot.symlink) {
+            CHECK(std::filesystem::read_symlink(path) == slot.payload);
+        } else {
+            CHECK_EQ(harness::read_text(path), slot.payload);
+        }
+    }
+    const auto moved = named_like(room, "reference-jt128.cdr.quarantine-");
+    CHECK_EQ(moved.size(), std::size_t{1});
+    CHECK_EQ(harness::read_text(moved[0]), jt);
+    expect_absent(reference_path(dir.path.string(), "lab", "jt128"));
+    expect_unchanged(sentinels);
+    const auto preserved = list_entries(room);
+    std::string thrown;
+    try {
+        memory.save(kStart);
+    } catch (const std::runtime_error& error) {
+        thrown = error.what();
+    }
+    CHECK(thrown.find("saves suppressed") != std::string::npos);
+    expect_same_entries(preserved, room);
+    memory.add_points("mid360", scenes::room_shell());
+    memory.add_points("jt128", scenes::room_shell());
+    CHECK(memory.close_window(stamp(0)).empty());
+    CHECK(memory.state() == MemoryState::tracking);
+    expect_same_entries(preserved, room);
+    CHECK_EQ(harness::read_text(epoch_path(dir.path.string(), "lab")), std::string("7\n"));
+    const RoomMemory again(config, stamp(10), kGeneration);
+    CHECK(again.state() == MemoryState::building);
+    expect_same_entries(preserved, room);
+    expect_unchanged(sentinels);
+}
+
+TEST(a_second_start_ignores_files_already_quarantined) {
+    TempDir dir;
+    const auto room = room_of(dir.path);
+    std::filesystem::create_directories(room);
+    plant_reference(dir.path, "mid360", 4, 0.05f);
+    save_epoch(epoch_path(dir.path.string(), "lab"), 7);
+    const std::string damaged = truncate_reference(reference_path(dir.path.string(), "lab", "mid360"));
+    const RoomMemory first(room_config(dir.path), kStart, kGeneration);
+    expect_fresh(first);
+    const auto quarantine = named_like(room, "reference-mid360.cdr.quarantine-");
+    CHECK_EQ(quarantine.size(), std::size_t{1});
+    const std::string parked = harness::read_text(quarantine[0]);
+    CHECK_EQ(parked, damaged);
+    const RoomMemory second(room_config(dir.path), stamp(10), kGeneration);
+    CHECK(second.state() == MemoryState::building);
+    CHECK(second.startup_note().empty());
+    CHECK_EQ(second.map_epoch(), std::uint64_t{7});
+    expect_absent(reference_path(dir.path.string(), "lab", "mid360"));
+    CHECK_EQ(named_like(room, "reference-mid360.cdr.quarantine-").size(), std::size_t{1});
+    CHECK_EQ(harness::read_text(quarantine[0]), parked);
+    CHECK_EQ(harness::read_text(epoch_path(dir.path.string(), "lab")), std::string("7\n"));
+}
+
+TEST(a_dangling_symlink_reference_is_moved_without_being_replaced) {
+    TempDir dir;
+    const auto room = room_of(dir.path);
+    std::filesystem::create_directories(room);
+    const auto path = reference_path(dir.path.string(), "lab", "mid360");
+    std::filesystem::create_symlink("nowhere", path);
+    const RoomMemory memory(room_config(dir.path), kStart, kGeneration);
+    expect_fresh(memory);
+    CHECK(memory.startup_note().find("cannot read") != std::string::npos);
+    expect_absent(path);
+    const auto found = named_like(room, "reference-mid360.cdr.quarantine-");
+    CHECK_EQ(found.size(), std::size_t{1});
+    CHECK(std::filesystem::is_symlink(found[0]));
+    CHECK(std::filesystem::read_symlink(found[0]) == "nowhere");
+    CHECK(inspect_directory_entry(found[0]).presence == EntryPresence::present);
+}
+
+TEST(an_uninspectable_room_directory_suppresses_saves_and_is_not_replaced) {
+    TempDir dir;
+    const auto room = room_of(dir.path);
+    overwrite(room, "not-a-directory");
+    RoomMemory memory(room_config(dir.path), kStart, kGeneration);
+    CHECK(memory.state() == MemoryState::building);
+    CHECK(memory.saves_suppressed());
+    CHECK(memory.startup_note().find("cannot inspect") != std::string::npos);
+    CHECK(memory.startup_note().find("saves suppressed") != std::string::npos);
+    CHECK_EQ(harness::read_text(room), std::string("not-a-directory"));
+    std::string thrown;
+    try {
+        memory.save(kStart);
+    } catch (const std::runtime_error& error) {
+        thrown = error.what();
+    }
+    CHECK(thrown.find("saves suppressed") != std::string::npos);
+    CHECK_EQ(harness::read_text(room), std::string("not-a-directory"));
+    CHECK(memory.persistence_report().find("persistence: suppressed\n") != std::string::npos);
+}
+
+TEST(a_failed_transition_save_retries_on_a_later_window) {
+    TempDir dir;
+    MemoryConfig config = fast_room(dir.path);
+    config.learn_windows = 0;
+    RoomMemory memory(config, kStart, kGeneration);
+    CHECK(memory.startup_note().empty());
+    const auto epoch = epoch_path(dir.path.string(), "lab");
+    block_temp(epoch);
+    memory.add_points("mid360", scenes::room_shell());
+    CHECK(memory.close_window(stamp(0)).empty());
+    CHECK(memory.state() == MemoryState::tracking);
+    CHECK_EQ(memory.map_epoch(), std::uint64_t{1});
+    expect_absent(epoch);
+    CHECK(memory.save_pending());
+    const auto error = memory.take_save_error();
+    CHECK(error && error->find("cannot write") != std::string::npos && error->find("map_epoch.tmp") != std::string::npos);
+    CHECK(memory.persistence_report().find("persistence: failed\n") != std::string::npos);
+    CHECK(memory.persistence_report().find("pending_save: 1\n") != std::string::npos);
+    std::filesystem::remove(epoch.string() + ".tmp");
+    memory.close_window(stamp(0));
+    expect_absent(epoch);
+    memory.close_window(stamp(1));
+    CHECK_EQ(harness::read_text(epoch), std::string("1\n"));
+    CHECK(memory.persistence_ok());
+    CHECK(!memory.save_pending());
+    CHECK(memory.persistence_report().find("persistence: ok\n") != std::string::npos);
+    CHECK(memory.persistence_report().find("pending_save: 0\n") != std::string::npos);
+}
+
+TEST(a_successful_retry_keeps_an_unread_save_error) {
+    TempDir dir;
+    MemoryConfig config = fast_room(dir.path);
+    config.learn_windows = 0;
+    RoomMemory memory(config, kStart, kGeneration);
+    const auto epoch = epoch_path(dir.path.string(), "lab");
+    block_temp(epoch);
+    memory.add_points("mid360", scenes::room_shell());
+    memory.close_window(stamp(0));
+    const std::string failed = memory.persistence_report();
+    CHECK(failed.find("persistence: failed\n") != std::string::npos);
+    std::filesystem::remove(epoch.string() + ".tmp");
+    memory.close_window(stamp(1));
+    CHECK(memory.persistence_ok());
+    CHECK(memory.persistence_report().find("persistence: ok\n") != std::string::npos);
+    CHECK(memory.persistence_report().find("pending_save: 0\n") != std::string::npos);
+    CHECK(memory.persistence_report().find("detail: \n") != std::string::npos);
+    const auto error = memory.take_save_error();
+    CHECK(error && error->find("cannot write") != std::string::npos && error->find("map_epoch.tmp") != std::string::npos);
+    CHECK(!memory.take_save_error());
+}
+
+TEST(a_direct_save_still_throws_when_the_temp_path_is_a_directory) {
+    TempDir dir;
+    std::filesystem::create_directories(room_of(dir.path));
+    const auto epoch = epoch_path(dir.path.string(), "lab");
+    block_temp(epoch);
+    RoomMemory memory(room_config(dir.path), kStart, kGeneration);
+    std::string thrown;
+    try {
+        memory.save(kStart);
+    } catch (const std::runtime_error& error) {
+        thrown = error.what();
+    }
+    CHECK(thrown.find("cannot write") != std::string::npos);
+    CHECK(thrown.find("map_epoch.tmp") != std::string::npos);
+    expect_absent(epoch);
+    CHECK(std::filesystem::is_directory(epoch.string() + ".tmp"));
+}
+
+TEST(map_update_returns_the_message_when_the_reference_write_fails_after_the_epoch) {
+    TempDir dir;
+    const Cloud room = scenes::room_shell();
+    const Cloud partial = partial_shell(room);
+    MemoryConfig config = fast_room(dir.path);
+    RoomMemory memory(config, kStart, kGeneration);
+    memory.add_points("mid360", partial);
+    memory.close_window(stamp(0));
+    const msg::Bytes opening = *memory.map_update(stamp(0));
+    CHECK(msg::MapBricks::from_cdr(opening).kind == msg::MapKind::snapshot);
+    const std::uint64_t epoch = memory.map_epoch();
+    const auto reference = reference_path(dir.path.string(), "lab", "mid360");
+    const auto epoch_file = epoch_path(dir.path.string(), "lab");
+    const std::string reference_bytes = harness::read_text(reference);
+    CHECK_EQ(harness::read_text(epoch_file), std::to_string(epoch) + "\n");
+    memory.add_points("mid360", room);
+    memory.close_window(stamp(1));
+    block_temp(reference);
+    const auto bytes = memory.map_update(stamp(1));
+    CHECK(bytes);
+    const msg::MapBricks sent = msg::MapBricks::from_cdr(*bytes);
+    CHECK_EQ(sent.header.map_epoch, epoch + 1);
+    CHECK_EQ(memory.map_epoch(), epoch + 1);
+    CHECK_EQ(harness::read_text(epoch_file), std::to_string(epoch + 1) + "\n");
+    CHECK_EQ(harness::read_text(reference), reference_bytes);
+    const auto error = memory.take_save_error();
+    CHECK(error && error->find("cannot write") != std::string::npos && error->find(".tmp") != std::string::npos);
+    CHECK(memory.persistence_report().find("persistence: failed\n") != std::string::npos);
+    CHECK(memory.persistence_report().find("pending_save: 1\n") != std::string::npos);
+    std::filesystem::remove(reference.string() + ".tmp");
+    memory.close_window(stamp(1));
+    CHECK_EQ(harness::read_text(reference), reference_bytes);
+    memory.close_window(stamp(2));
+    CHECK(harness::read_text(reference) != reference_bytes);
+    CHECK(memory.persistence_ok());
+    CHECK(memory.persistence_report().find("pending_save: 0\n") != std::string::npos);
+}
+
+TEST(map_update_returns_the_message_when_the_epoch_write_fails) {
+    TempDir dir;
+    const Cloud room = scenes::room_shell();
+    const Cloud partial = partial_shell(room);
+    RoomMemory memory(fast_room(dir.path), kStart, kGeneration);
+    memory.add_points("mid360", partial);
+    memory.close_window(stamp(0));
+    CHECK(memory.map_update(stamp(0)));
+    const std::uint64_t epoch = memory.map_epoch();
+    const auto reference = reference_path(dir.path.string(), "lab", "mid360");
+    const auto epoch_file = epoch_path(dir.path.string(), "lab");
+    const std::string reference_bytes = harness::read_text(reference);
+    const std::string epoch_bytes = harness::read_text(epoch_file);
+    memory.add_points("mid360", room);
+    memory.close_window(stamp(1));
+    block_temp(epoch_file);
+    const auto bytes = memory.map_update(stamp(1));
+    CHECK(bytes);
+    CHECK_EQ(msg::MapBricks::from_cdr(*bytes).header.map_epoch, epoch + 1);
+    CHECK_EQ(memory.map_epoch(), epoch + 1);
+    CHECK_EQ(harness::read_text(epoch_file), epoch_bytes);
+    CHECK_EQ(harness::read_text(reference), reference_bytes);
+    const auto error = memory.take_save_error();
+    CHECK(error && error->find("cannot write") != std::string::npos && error->find("map_epoch.tmp") != std::string::npos);
+}
+
+TEST(a_saturated_epoch_does_not_wrap_when_tracking_starts) {
+    TempDir dir;
+    const auto epoch = epoch_path(dir.path.string(), "lab");
+    save_epoch(epoch, msg::kUint64Max);
+    MemoryConfig config = fast_room(dir.path);
+    config.learn_windows = 0;
+    RoomMemory memory(config, kStart, kGeneration);
+    CHECK(memory.state() == MemoryState::building);
+    CHECK(memory.startup_note().empty());
+    CHECK_EQ(memory.map_epoch(), msg::kUint64Max);
+    CHECK(memory.persistence_ok());
+    memory.add_points("mid360", scenes::room_shell());
+    memory.close_window(stamp(0));
+    CHECK(memory.state() == MemoryState::tracking);
+    CHECK_EQ(memory.map_epoch(), msg::kUint64Max);
+    CHECK_EQ(harness::read_text(epoch), std::to_string(msg::kUint64Max) + "\n");
+    const auto error = memory.take_save_error();
+    CHECK(error && error->find("saturated") != std::string::npos);
+    CHECK(!memory.persistence_ok());
+    CHECK(memory.persistence_report().find("epoch_saturated: 1\n") != std::string::npos);
+    CHECK(!memory.save_pending());
+}
+
+TEST(a_saturated_reference_stays_loaded_and_later_updates_do_not_wrap) {
+    TempDir dir;
+    const Cloud room = scenes::room_shell();
+    const Cloud partial = partial_shell(room);
+    {
+        RoomMemory seed(fast_room(dir.path), kStart, kGeneration);
+        seed.add_points("mid360", partial);
+        seed.close_window(stamp(0));
+    }
+    const auto reference = reference_path(dir.path.string(), "lab", "mid360");
+    const auto loaded = load_reference(reference);
+    save_reference(reference, loaded.second, msg::Header{"lab", msg::kUint64Max, 0, kStart}, 0.05f);
+    const auto epoch = epoch_path(dir.path.string(), "lab");
+    save_epoch(epoch, 3);
+    const std::string reference_bytes = harness::read_text(reference);
+    const auto sentinels = plant_sentinels(room_of(dir.path));
+    RoomMemory memory(fast_room(dir.path), kStart, kGeneration);
+    CHECK(memory.state() == MemoryState::tracking);
+    CHECK_EQ(memory.map_epoch(), msg::kUint64Max);
+    CHECK(memory.startup_note().find("saturated") != std::string::npos);
+    CHECK(memory.startup_note().find("fresh reference starting") == std::string::npos);
+    CHECK(named_like(room_of(dir.path), "reference-mid360.cdr.quarantine-").empty());
+    CHECK(named_like(room_of(dir.path), "map_epoch.quarantine-").empty());
+    CHECK_EQ(harness::read_text(reference), reference_bytes);
+    CHECK_EQ(harness::read_text(epoch), std::string("3\n"));
+    expect_unchanged(sentinels);
+    const auto opening = memory.map_update(stamp(0));
+    CHECK(opening);
+    CHECK_EQ(msg::MapBricks::from_cdr(*opening).header.map_epoch, msg::kUint64Max);
+    memory.add_points("mid360", room);
+    memory.close_window(stamp(1));
+    const auto next = memory.map_update(stamp(1));
+    CHECK(next);
+    CHECK_EQ(msg::MapBricks::from_cdr(*next).header.map_epoch, msg::kUint64Max);
+    CHECK_EQ(memory.map_epoch(), msg::kUint64Max);
+    CHECK_EQ(harness::read_text(epoch), std::string("3\n"));
+    CHECK_EQ(harness::read_text(reference), reference_bytes);
+    CHECK(memory.persistence_report().find("epoch_saturated: 1\n") != std::string::npos);
+    CHECK(!memory.persistence_ok());
 }
 
 TEST_MAIN
