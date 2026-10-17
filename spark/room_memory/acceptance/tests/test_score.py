@@ -632,14 +632,14 @@ def test_an_unchanged_historical_dropped_count_keeps_coverage():
     assert steady["session_dropped_windows"] == 0
     assert steady["lost_window_scenarios"] == []
 
-    # The same steady 7, with no sample at or before ready, is not history.
-    # The first status is after ready, so the session measures that 7 from 0.
-    # Scenarios that start later still use it as their baseline.
+    # The same steady 7, with ready recorded before the latched status.
+    # That first status is the session baseline, so the 7 is history.
+    # Scenarios that start later still use it as their own baseline.
     bare = _score(messages, mark)
-    assert bare["g5_acceptance"] == "denied"
-    assert bare["exit_code"] == 2
-    assert bare["session_dropped_windows"] == 7
-    assert bare["session_window_reasons"] == ["dropped_windows"]
+    assert bare["g5_acceptance"] == "full_candidate"
+    assert bare["exit_code"] == 0
+    assert bare["session_dropped_windows"] == 0
+    assert bare["session_window_reasons"] == []
     assert bare["dropped_windows"] == 0
     assert bare["lost_window_scenarios"] == []
     assert bare["credited_idle_exposure_s"] == 3660
@@ -679,25 +679,79 @@ def test_a_drop_in_the_gap_between_scenarios_is_not_full_acceptance():
     assert "session_dropped_windows: 1" in report["markdown"]
 
 
-def test_a_drop_before_the_first_status_is_not_full_acceptance():
-    # ready at t=7, first status at t=8, first watch at t=10. The counter steps
-    # at t=7.5, before any status. That first status is not the session baseline.
-    # baseline_idle starts after it, so the scenario keeps its exposure.
-    report = _score(*_perfect(dropped_at=lambda t: 0 if t < 7.5 else 2))
-    assert report["g5_acceptance"] != "full_candidate"
-    assert report["g5_acceptance"] == "denied"
-    assert report["exit_code"] == 2
-    assert report["candidate_result"] == "inconclusive"
-    assert report["protocol_complete"] is True
-    assert report["session_dropped_windows"] == 2
-    assert report["session_window_reasons"] == ["dropped_windows"]
+def test_a_steady_nonzero_counter_with_ready_before_the_first_status_is_not_a_deny():
+    # ros2_subscribe writes ready, then the latched status arrives. A node that
+    # has already dropped 5 windows, and drops nothing more, is not a session
+    # drop. The first status of that generation is the baseline. baseline_idle
+    # starts after it and keeps its exposure.
+    report = _score(*_perfect(dropped_at=lambda t: 5))
+    assert report["g5_acceptance"] == "full_candidate"
+    assert report["exit_code"] == 0
+    assert report["session_dropped_windows"] == 0
+    assert report["session_window_reasons"] == []
     assert report["dropped_windows"] == 0
     assert report["lost_window_scenarios"] == []
     assert report["credited_idle_exposure_s"] == 3660
+    assert report["protocol_complete"] is True
     assert _row(report, "baseline_idle")["coverage"] == "verifiable"
     assert _row(report, "baseline_idle")["dropped_windows"] == 0
     assert "dropped_windows" not in _row(report, "baseline_idle")["coverage_reasons"]
-    assert "session_dropped_windows: 2" in report["markdown"]
+
+
+def test_a_restart_during_the_session_does_not_count_the_old_counter_as_new_drops():
+    # ready is before every status. The old run is already at 3 when its first
+    # status arrives. The new run starts at 0. Neither value is a session drop.
+    # The restart sits in the gap before hour_idle, so every interval stays
+    # verifiable.
+    clean = _score(*_perfect(
+        generation_at=lambda t: 4 if t < 775 else 5,
+        dropped_at=lambda t: 3 if t < 775 else 0,
+    ))
+    assert clean["g5_acceptance"] == "full_candidate"
+    assert clean["exit_code"] == 0
+    assert clean["session_dropped_windows"] == 0
+    assert clean["session_window_reasons"] == []
+    assert clean["dropped_windows"] == 0
+    assert clean["lost_window_scenarios"] == []
+    assert clean["credited_idle_exposure_s"] == 3660
+
+    # A real drop in the old run, after its first status and in the gap before
+    # restore_reference, still denies. Neither neighboring interval sees the step.
+    old_drop = _score(*_perfect(
+        generation_at=lambda t: 4 if t < 775 else 5,
+        dropped_at=lambda t: (3 if t < 705 else 4) if t < 775 else 0,
+    ))
+    assert old_drop["session_dropped_windows"] == 1
+    assert old_drop["session_window_reasons"] == ["dropped_windows"]
+    assert old_drop["dropped_windows"] == 0
+    assert old_drop["lost_window_scenarios"] == []
+    assert old_drop["credited_idle_exposure_s"] == 3660
+    assert old_drop["g5_acceptance"] == "denied"
+    assert old_drop["exit_code"] == 2
+    assert "session_dropped_windows: 1" in old_drop["markdown"]
+
+    # A real drop already stored on the new run's first status still denies.
+    # Counting that generation from 0 is what sees it. Its interval baseline is
+    # the last sample before hour_idle, which already includes the drop.
+    new_drop = _score(*_perfect(
+        generation_at=lambda t: 4 if t < 775 else 5,
+        dropped_at=lambda t: 3 if t < 775 else 2,
+    ))
+    assert new_drop["session_dropped_windows"] == 2
+    assert new_drop["session_window_reasons"] == ["dropped_windows"]
+    assert new_drop["dropped_windows"] == 0
+    assert new_drop["lost_window_scenarios"] == []
+    assert new_drop["g5_acceptance"] == "denied"
+    assert new_drop["exit_code"] == 2
+
+    # An increase after the new run's first status denies too.
+    new_step = _score(*_perfect(
+        generation_at=lambda t: 4 if t < 775 else 5,
+        dropped_at=lambda t: 3 if t < 775 else (0 if t < 800 else 1),
+    ))
+    assert new_step["session_dropped_windows"] == 1
+    assert new_step["g5_acceptance"] == "denied"
+    assert new_step["exit_code"] == 2
 
 
 def test_a_drop_during_setup_is_not_full_acceptance():

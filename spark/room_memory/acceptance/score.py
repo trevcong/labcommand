@@ -189,14 +189,17 @@ def _coverage(scenario, messages, fresh, meta, expected):
 def _session_dropped_windows(messages, meta, reasons):
     """Change in ``dropped_windows`` from ready through ``session_end``.
 
-    Per publisher generation. A drop during setup, in the gap before the first
-    status, or between scenarios sits in neither interval, so the per-interval
-    total stays zero and that interval keeps its exposure. Full acceptance still
-    requires this session change to be zero. The baseline is the last status at
-    or before ready. When none was sampled then, the first status after ready
-    is not the baseline: the counter is measured from 0, so a value already
-    stored on that sample counts. A later generation starts at 0. The span
-    stops at ``session_end`` and does not take a sample from after it.
+    Per publisher generation. A drop during setup or between scenarios sits in
+    neither interval, so the per-interval total stays zero and that interval
+    keeps its exposure. Full acceptance still requires this session change to
+    be zero. The subscriber writes ready before the latched status arrives, so
+    a generation already running often has no sample at or before ready. Its
+    baseline is then its first status at or after ready: a lifetime count
+    already stored there is not a drop during the session. The last status at
+    or before ready is the baseline when one exists. The counter is measured
+    from 0 only for a generation that first appears after an earlier generation
+    was already seen in the span, which is a restart during the session. The
+    span stops at ``session_end`` and does not take a sample from after it.
     """
     ready = meta.get("ready") if isinstance(meta.get("ready"), dict) else None
     ready_ns = None if ready is None else ready.get("receipt_mono_ns")
@@ -204,21 +207,30 @@ def _session_dropped_windows(messages, meta, reasons):
     if _bad_stamp(ready_ns) or _bad_stamp(end_ns) or end_ns < ready_ns:
         reasons.append("dropped_windows_unknown")
         return 0
-    return _dropped_windows(messages, ready_ns, end_ns, reasons, close_after=False)
+    return _dropped_windows(messages, ready_ns, end_ns, reasons, close_after=False, session_span=True)
 
 
 def _bad_stamp(value):
     return not isinstance(value, int) or isinstance(value, bool)
 
 
-def _dropped_windows(messages, t0, t1, reasons, close_after=True):
+def _dropped_windows(messages, t0, t1, reasons, close_after=True, session_span=False):
     """Windows the node dropped from ``t0`` to ``t1``, per publisher generation.
 
     ``dropped_windows`` counts since node start, so only an increase is new. The
-    baseline is the last status sample at or before ``t0``. If the interval has
-    no such sample, the first sample inside it is not the baseline: the counter
-    is measured from 0, so a drop already stored on that sample is counted.
-    A later generation always starts at 0, so a restart's reset is not a decrease.
+    baseline is the last status sample at or before ``t0``. For an interval, if
+    there is no such sample, the first sample inside it is not the baseline: the
+    counter is measured from 0, so a drop already stored on that sample is counted.
+    A later generation starts at 0, so a restart's reset is not a decrease.
+
+    ``session_span`` is the ready-to-``session_end`` read. The subscriber writes
+    ready before the latched status arrives. A generation with no sample at or
+    before ready then uses its first status at or after ready as the baseline,
+    unless it first appears after an earlier generation was already seen in the
+    span. That later generation is a restart during the session and is measured
+    from 0, so drops before its first status still count. A sample at or before
+    ready is still that generation's baseline when one exists.
+
     This does not depend on a coverage chain. Positive Hz does not cover it:
     both publishers count rejected frames toward Hz.
     """
@@ -236,6 +248,7 @@ def _dropped_windows(messages, t0, t1, reasons, close_after=True):
     total = 0
     unknown = False
     regressed = False
+    seen_earlier = False
     for generation in generations:
         own = [sample for sample in samples if sample.get("publisher_generation") == generation]
         before = [sample for sample in own if sample["receipt_mono_ns"] <= t0]
@@ -246,8 +259,15 @@ def _dropped_windows(messages, t0, t1, reasons, close_after=True):
             hi = t1
         lo = before[-1]["receipt_mono_ns"] if before else t0
         run = [sample for sample in own if lo <= sample["receipt_mono_ns"] <= hi]
-        # No sample at or before t0: do not adopt the first in-span sample.
-        previous = None if before else 0
+        # Interval: no sample at or before t0 means measure from 0.
+        # Session: the first generation's first in-span status is the baseline
+        # (ready is recorded before the latch). A generation that shows up
+        # after another was already seen in the span is a restart and starts at 0.
+        if before or (session_span and not seen_earlier):
+            previous = None
+        else:
+            previous = 0
+        seen_earlier = True
         for sample in run:
             value = sample["message"].get("dropped_windows")
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -864,8 +884,8 @@ def _decide(protocol, rows, misses, non_idle, rate_pass, activity_as_change, spl
         return "fail", 1, "denied"
     # Lost windows deny full acceptance even when every protocol scenario is
     # verifiable: a drop inside restore_reference, or any nonzero change from
-    # ready to session_end (before the first status, during setup, or in a gap
-    # between scenarios).
+    # the session baseline through session_end (during setup, in a gap between
+    # scenarios, or on a generation that restarted during the session).
     session_lost = any(reason in LOST_WINDOW_REASONS for reason in session_reasons)
     if unverified or lost or session_lost or rate_pass is not True:
         return "inconclusive", 2, "denied"

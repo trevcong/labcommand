@@ -145,16 +145,20 @@ or a gap already makes the interval unverifiable.
 
 The same counter is also read across the whole session, from subscription ready
 through `session_end`, per publisher generation. A nonzero change denies full
-acceptance. That includes a drop between ready and the first status, a drop
-during setup before the first watch, and a drop in a gap between scenarios.
-The session baseline is a status sample at or before ready. The first status
-after ready is not that baseline: the counter is measured from 0, so a value
-already stored on it counts. Scenarios that start after that status still use
-it as their own baseline, so they keep their exposure. A steady count is
-history only when a sample at or before ready already shows it. A later
-generation starts at 0, so a restart's reset does not count. The session total
-is `session_dropped_windows`. `session_end` is in the log so an offline score
-sees the same interruption.
+acceptance. The subscriber writes ready before the latched status arrives, so
+a generation that is already running usually has no sample at or before ready.
+Its baseline is that generation's first status at or after ready, or the last
+status at or before ready when one exists. A steady nonzero count on the first
+status is the lifetime counter, not a drop during the session. The counter is
+measured from 0 only for a generation that first appears after an earlier
+generation was already seen in the session: the node restarted during the
+session, and the new process starts at 0, so a drop already stored on its
+first status counts. A later increase still denies, including a drop during
+setup before the first watch and a drop in a gap between scenarios. Scenarios
+that start after the baseline still use their own interval baseline, so they
+keep their exposure when that baseline already includes the count. A restart's
+reset to 0 is not a decrease. The session total is `session_dropped_windows`.
+`session_end` is in the log so an offline score sees the same interruption.
 
 The recorder stays up after the last watch until a fresh status sample and a
 fresh activity sample have both arrived at or after that watch, and until the
@@ -171,7 +175,7 @@ so this wait is usually the last watch only.
 scenario complete and verifiable, three true detections, both person scenarios
 showed activity and no candidate, idle candidate alarms per verifiable
 hour are at most `--max-false-alarms-per-hour` (default 1), and
-`dropped_windows` did not change from ready through `session_end`. Exit 1 is a
+`session_dropped_windows` is zero. Exit 1 is a
 complete session that fails that candidate bar. Exit 2 is inconclusive or
 diagnostic, including a shortened sit or hour and a session that lost windows
 outside a scenario. Exit 3 means `score` raised. The traceback is on stderr.
