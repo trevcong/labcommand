@@ -90,6 +90,13 @@ public struct LiveRoomTimelineRecorder: Sendable, Equatable {
 
     public init() {}
 
+    /// A recorder that saw only `mirror` as it is now: the fixture's, which has no history of samples.
+    public static func once(_ mirror: RoomMemoryMirror) -> LiveRoomTimelineRecorder {
+        var recorder = LiveRoomTimelineRecorder()
+        recorder.observe(mirror)
+        return recorder
+    }
+
     /// Unix seconds of a wire stamp.
     public static func seconds(_ time: RoomMemory.Time) -> Double {
         Double(time.sec) + Double(time.nanosec) / 1e9

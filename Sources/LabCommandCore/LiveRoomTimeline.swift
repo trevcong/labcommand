@@ -587,6 +587,19 @@ public struct LiveRoomTimeline: Sendable, Equatable {
         case none
         case marker(LiveRoomMarker)
         case unavailable(String)
+
+        /// Why the map shows no highlight for the selection: the action bar's location note.
+        public var note: String? {
+            if case .unavailable(let reason) = self { return reason }
+            return nil
+        }
+    }
+
+    /// The map's markers with the selection's halo drawn last, on top. The screen's own markers
+    /// (and so the sidecar) are unchanged.
+    public static func markers(_ markers: [LiveRoomMarker], with halo: Halo) -> [LiveRoomMarker] {
+        guard case .marker(let marker) = halo else { return markers }
+        return markers + [marker]
     }
 
     /// Margin the halo adds on each side of the event's box, in meters.

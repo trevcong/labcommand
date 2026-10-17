@@ -85,7 +85,12 @@ public final class LiveRoomClient: ObservableObject {
     static let logCapacity = 200
 
     @Published public private(set) var connection: LiveRoomConnection = .off
-    @Published public private(set) var mirror: RoomMemoryMirror
+    /// Every change, from a message, a tick or the connection, also feeds `timelineRecorder`.
+    @Published public private(set) var mirror: RoomMemoryMirror {
+        didSet { timelineRecorder.observe(mirror) }
+    }
+    /// What this client saw of the Spark over time, for the Room tab's timeline.
+    @Published public private(set) var timelineRecorder = LiveRoomTimelineRecorder()
     /// Diagnostics, newest last.
     @Published public private(set) var log: [String] = []
     /// The operator's actions and their outcomes (D46).

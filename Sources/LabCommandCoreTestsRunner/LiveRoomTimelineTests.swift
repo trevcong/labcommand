@@ -521,10 +521,116 @@ func testTimelineHalo() {
     let server = LiveRoomConnection.connected(LiveRoomServer(name: "timeline-test", capabilities: [], canPublish: false,
                                                             memoryTopics: ["/room_memory/map_bricks", "/room_memory/status"]))
     let screen = LiveRoomScreen.make(mirror: mirror, connection: server, requestPathExists: false, started: true, now: 102, selection: "1")
-    let withHalo = screen.markers + [halo]
+    let withHalo = LiveRoomTimeline.markers(screen.markers, with: .marker(halo))
+    expect(withHalo.last == halo && Array(withHalo.dropLast()) == screen.markers, "the halo is drawn last, over the screen's markers")
     expect(withHalo.filter(\.countsAsChange).count == screen.markers.filter(\.countsAsChange).count
            && withHalo.filter(\.countsAsCandidate).count == screen.markers.filter(\.countsAsCandidate).count,
            "adding the halo changes no caption count (\(screen.caption))")
+    expect(LiveRoomTimeline.markers(screen.markers, with: ownFrame) == screen.markers
+           && LiveRoomTimeline.markers(screen.markers, with: .none) == screen.markers, "no halo: the screen's markers")
+    expect(ownFrame.note == "this sensor's events are in its own frame · location unavailable on this map"
+           && LiveRoomTimeline.Halo.marker(halo).note == nil && LiveRoomTimeline.Halo.none.note == nil,
+           "the action bar's location note is the unavailable reason")
+}
+
+// MARK: The Room tab's wiring (review round 2)
+//
+// The SwiftUI view cannot run here, so these drive what it binds to: the client's recorder and
+// desk over a live socket, and the fixture's one-shot recorder. Ids go timeline → column → action.
+
+private func tlRepoRoot() -> URL {
+    URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+}
+
+@MainActor
+private func tlSpin(_ seconds: TimeInterval, until done: () -> Bool) {
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline, !done() { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+}
+
+/// Every item the timeline draws is a row of the event column, resolves to its event, and `hit`
+/// at its middle selects it.
+private func tlCheckIdsMatchTheColumn(_ timeline: LiveRoomTimeline, _ screen: LiveRoomScreen, _ mirror: RoomMemoryMirror,
+                                      _ what: String) {
+    let rows = Set((screen.openRows + screen.earlierRows + screen.historyRows).map(\.id))
+    for item in timeline.items {
+        expect(rows.contains(item.id), "\(what): timeline item \(item.id) is a column row (\(rows.sorted()))")
+        expect(LiveRoomOperator.entry(for: item.id, mirror: mirror)?.entry.event.eventId == item.eventId,
+               "\(what): item \(item.id) resolves to event \(item.eventId)")
+        let mid = timeline.x(for: (Swift.max(item.start, timeline.start) + Swift.min(item.end, timeline.end)) / 2, width: 1000)
+        expect(timeline.hit(x: mid, lane: item.lane, width: 1000) != nil, "\(what): a click on item \(item.id) selects an item")
+    }
+}
+
+@MainActor
+func testRoomTimelineAndActionsOverTheBridge() {
+    var publisher = LRPublisher(seed: 21, generation: 1_760_400_000_021, legacy: false)
+    _ = publisher.map()
+    for _ in 0..<5 { _ = publisher.event() }
+    let bridge = LRFakeBridge(capabilities: ["connectionGraph", "services"], serviceType: LiveRoomClient.requestServiceType,
+                              publisher: publisher)
+    bridge.operatorOutcome = .applied
+    bridge.start()
+    let client = LiveRoomClient(url: bridge.url)
+    client.start()
+    defer { client.stop(); bridge.stop() }
+    // The fake stamps each topic by its own seq: wait until the status clock passes the newest event.
+    tlSpin(8) { client.operatorPath && client.mirror.eventHistory.coverage == .completeThrough(4)
+        && (client.mirror.status?.stamp.sec ?? 0) > client.mirror.events.map(\.event.header.stamp.sec).max() ?? .max }
+    expect(client.mirror.eventHistory.coverage == .completeThrough(4), "bridge: the five events arrive")
+
+    // The client feeds the recorder from every message; nothing else does.
+    let recorder = client.timelineRecorder
+    expect(recorder.link.count == 1 && recorder.lastStamp == LiveRoomTimelineRecorder.seconds(client.mirror.status!.stamp),
+           "bridge: the recorder follows the client's status (\(recorder.link))")
+    expect(recorder.sensors.count == 1, "bridge: TRACKING with a Mid-360 rate is a healthy-sensors interval")
+    let before = recorder.link[0].end
+    tlSpin(2) { client.timelineRecorder.link.last?.end ?? 0 > before }
+    expect(client.timelineRecorder.link[0].end > before, "bridge: later statuses extend the link interval")
+
+    let now = ProcessInfo.processInfo.systemUptime
+    let timeline = LiveRoomTimeline.make(mirror: client.mirror, recorder: client.timelineRecorder, window: LiveRoomTimeline.windows[2],
+                                         timeZone: tlZone, now: now)
+    let screen = LiveRoomScreen.make(mirror: client.mirror, connection: client.connection, requestPathExists: true, started: true, now: now)
+    expect(!timeline.items.isEmpty && timeline.now != nil && !timeline.nowIsEstimate, "bridge: the timeline draws the events, now is live")
+    tlCheckIdsMatchTheColumn(timeline, screen, client.mirror, "bridge")
+
+    // Selected on the timeline, acted on from the action bar's buttons, sent to the node.
+    guard let item = timeline.items.first(where: \.open),
+          let (entry, earlier) = LiveRoomOperator.entry(for: item.id, mirror: client.mirror) else {
+        expect(false, "bridge: seed 21 leaves an open event on the timeline: \(timeline.items.map { ($0.id, $0.state) })")
+        return
+    }
+    let buttons = LiveRoomOperator.buttons(for: entry, earlier: earlier, mirror: client.mirror, operatorPath: client.operatorPath,
+                                           pending: client.operatorDesk.latest(for: entry.event.eventId))
+    guard let button = buttons.first(where: \.enabled) else {
+        expect(false, "bridge: the open \(entry.event.state) event has an enabled action: \(buttons)")
+        return
+    }
+    expect(client.act(button.kind, on: entry), "bridge: \(button.kind.title) goes out")
+    tlSpin(5) { bridge.operatorCalls.count == 1 }
+    expect(bridge.operatorCalls.first?.eventId == entry.event.eventId
+           && bridge.operatorCalls.first?.expectedState == entry.event.state,
+           "bridge: the node gets the action for the selected event in its shown state")
+}
+
+func testRoomTimelineInFixtureMode() {
+    for mode in [LiveRoomFixture.Mode.map, .lost, .restart, .legacy] {
+        guard let fixture = try? LiveRoomFixture.load(mode: mode, root: tlRepoRoot(), now: 100) else {
+            expect(false, "fixture \(mode.rawValue) loads")
+            continue
+        }
+        let recorder = LiveRoomTimelineRecorder.once(fixture.mirror)
+        expect(recorder.link.count == 1 && recorder == LiveRoomTimelineRecorder.once(fixture.mirror),
+               "fixture \(mode.rawValue): a one-shot recorder of the status, the same every render")
+        let timeline = LiveRoomTimeline.make(mirror: fixture.mirror, recorder: recorder, window: LiveRoomTimeline.windows[0],
+                                             timeZone: tlZone, now: 100)
+        let screen = LiveRoomScreen.make(mirror: fixture.mirror, connection: fixture.connection, requestPathExists: false,
+                                         started: true, now: 100)
+        expect(!timeline.items.isEmpty, "fixture \(mode.rawValue): the timeline draws the fixture's events")
+        expect(timeline.unverified == (mode == .legacy), "fixture \(mode.rawValue): only legacy is unverified")
+        tlCheckIdsMatchTheColumn(timeline, screen, fixture.mirror, "fixture \(mode.rawValue)")
+    }
 }
 
 func runLiveRoomTimelineTests() {
@@ -548,4 +654,10 @@ func runLiveRoomTimelineTests() {
     print("  LiveRoom timeline: hit returns the event column's row ids"); passed()
     testTimelineHalo()
     print("  LiveRoom timeline: halo gates (earlier, unresolved, not current, rig moved, sensor frame, epoch) and the marker"); passed()
+    testRoomTimelineInFixtureMode()
+    print("  LiveRoom timeline: fixture mode draws the fixture's events from a one-shot recorder; ids match the column"); passed()
+    MainActor.assumeIsolated {
+        testRoomTimelineAndActionsOverTheBridge()
+        print("  LiveRoom timeline: over a socket the client feeds the recorder; timeline ids select, an action reaches the node"); passed()
+    }
 }
