@@ -40,17 +40,17 @@ A nudged tripod must not flag the whole room. The node detects a rig move (Mid-3
 
 ## Measured: ICP time per window
 
-The nodes run `close_window`, and so the guard's ICP, in the window timer on the default single-threaded executor: while a check aligns, status, activity and `RequestSync` callbacks wait. `room_memory_bag rig_guard=true` replays both static recordings (both lidars, otherwise node defaults) and times it per window (`window_estimate_ms`; both nodes also log it on every window that runs ICP). The recordings have no `/livox/imu`, so every estimate seeds with the ±10° yaw sweep, the costliest path. Release build on the Mac (Apple M5 Max, 18 cores), 2026-10-16; not yet measured on the Spark.
+The nodes run `close_window`, and so the guard's ICP, in the window timer on the default single-threaded executor: while a check aligns, status, activity and `RequestSync` callbacks wait. `room_memory_bag rig_guard=true` replays both static recordings (both lidars, otherwise node defaults) and times it per window (`window_estimate_ms`; both nodes also log it on every window that runs ICP). The recordings have no `/livox/imu`, so every estimate seeds with the ±10° yaw sweep, the costliest path. Release build on the Mac (Apple M5 Max, 18 cores), 2026-10-16, with `RegistrationCloud` building its normals and correspondence grids when the cloud is built or loaded. Not measured on the Spark: that is a later, read-only step.
 
 | OpenMP threads | ICP per window (2 estimates), median / p95 / max | whole window, median / p95 / max |
 |---|---|---|
-| 1 | 120 / 145 / 687 ms | 139 / 166 / 702 ms |
-| 18 (default) | 42 / 46 / 105 ms | 48 / 52 / 111 ms |
+| 1 | 121 / 143 / 145 ms | 140 / 161 / 166 ms |
+| 18 (default) | 42 / 46 / 46 ms | 48 / 52 / 52 ms |
 
-- Each recording: 24 of ~300 windows run ICP (8 periodic checks of 3 windows each), 48 estimates; `static5m-b` is within 3 ms of `static5m`. Windows without ICP: 20 ms median on one thread, 6 ms on 18.
+- Each recording: 24 of ~300 windows run ICP (8 periodic checks of 3 windows each), 48 estimates; `static5m-b` is within 2 ms of `static5m`. Windows without ICP: 20 ms median on one thread, 6 ms on 18. The outputs are identical to the lazy build's, timings aside.
 - Steady state is ~60 ms per estimate on one thread and ~21 ms on 18.
-- Per check (3 windows × 2 sensors), against Design 3's budget of 150 ms per check: on 18 threads 125 ms median, inside it, but 187–191 ms for the first check; on one thread 361–368 ms median and 913–914 ms for the first check, 2.4–6× over. Each window stays inside `window_s`, so the budget holds only with the default threads; whether it holds on the Spark is still to measure.
-- The first check after a build costs 5× more (687 ms on one thread, 105 ms on 18), and a restart's startup check would too (not measured): `RegistrationCloud` computes its normals and correspondence grids lazily, on first use. On one thread that holds the executor for 0.7 s once, inside `window_s`. Follow-up: compute them when the cloud is built or loaded.
+- Per check (3 windows × 2 sensors), against Design 3's budget of 150 ms per check: on 18 threads 126 ms median and 123–124 ms for the first check, inside it. **On one thread the guard is over budget:** 362–364 ms median per check, 332–336 ms for the first, 2.2–2.6× the budget. Each window stays inside `window_s`, so the budget holds only with the default threads; whether it holds on the Spark is still to measure.
+- The normals and grids now cost the window that ends the build (both sensors' clouds): 662–667 ms on one thread, 131 ms on 18 (64–78 ms before, when the first check paid for them instead: 914–938 ms for that check on one thread, 193 ms on 18). It is once per build and inside `window_s`, but on one thread it still holds the executor for 0.7 s. A restart pays it in the constructor, before the node's timers run (not measured).
 - Not measured: windows while RIG_MOVED (one estimate per moved sensor per window); the recordings hold no move.
 
 ## Tests

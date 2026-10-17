@@ -17,8 +17,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <map>
-#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -175,8 +173,8 @@ private:
     std::vector<float> points_;  // parallel to keys_, 3 floats each
 };
 
-// A sensor's ICP target: real points (binary32, 3 per point) and, computed once, their normals and
-// the correspondence grids.
+// A sensor's ICP target: real points (binary32, 3 per point), their normals and the correspondence
+// grids, all computed when the cloud is built or loaded, so no check pays for them.
 class RegistrationCloud {
 public:
     RegistrationCloud(std::vector<float> points, double voxel_m);
@@ -188,14 +186,14 @@ public:
     const TargetGrid& grid(double radius) const;
     // 3 per point; NaN where a point has fewer than kNormalMinPoints sampled neighbours within
     // kNormalRadiusM (itself included) or its neighbourhood is not planar.
-    const std::vector<double>& normals() const;
+    const std::vector<double>& normals() const { return normals_; }
 
 private:
     std::vector<float> points_;
     std::vector<double> points64_;
     double voxel_m_;
-    mutable std::map<double, std::unique_ptr<TargetGrid>> grids_;
-    mutable std::optional<std::vector<double>> normals_;
+    std::vector<TargetGrid> grids_;  // one per kGridLevels entry
+    std::vector<double> normals_;
 };
 
 // MARK: Alignment

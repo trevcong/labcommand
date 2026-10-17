@@ -559,28 +559,11 @@ RegistrationCloud RegistrationBuilder::finish(const Keys& reference_occupied, do
     return RegistrationCloud(std::move(points), voxel_m_);
 }
 
-RegistrationCloud::RegistrationCloud(std::vector<float> points, double voxel_m)
-    : points_(std::move(points)), points64_(points_.begin(), points_.end()), voxel_m_(voxel_m) {
-    points_.resize(points_.size() / 3 * 3);
-    points64_.resize(points_.size());
-}
+namespace {
 
-const TargetGrid& RegistrationCloud::grid(double radius) const {
-    double cell = kGridLevels.back();
-    for (const double level : kGridLevels) {
-        if (level >= radius) {
-            cell = level;
-            break;
-        }
-    }
-    std::unique_ptr<TargetGrid>& slot = grids_[cell];
-    if (!slot) slot = std::make_unique<TargetGrid>(points64_, cell, kGridCap);
-    return *slot;
-}
-
-const std::vector<double>& RegistrationCloud::normals() const {
-    if (normals_) return *normals_;
-    const std::vector<double>& points = points64_;
+// 3 per point; NaN where a point has fewer than kNormalMinPoints sampled neighbours within
+// kNormalRadiusM (itself included) or its neighbourhood is not planar.
+std::vector<double> cloud_normals(const std::vector<double>& points) {
     const std::size_t count = points.size() / 3;
     std::vector<double> normals(points.size(), std::numeric_limits<double>::quiet_NaN());
     if (count) {
@@ -634,8 +617,25 @@ const std::vector<double>& RegistrationCloud::normals() const {
             }
         }
     }
-    normals_ = std::move(normals);
-    return *normals_;
+    return normals;
+}
+
+}  // namespace
+
+RegistrationCloud::RegistrationCloud(std::vector<float> points, double voxel_m)
+    : points_(std::move(points)), points64_(points_.begin(), points_.end()), voxel_m_(voxel_m) {
+    points_.resize(points_.size() / 3 * 3);
+    points64_.resize(points_.size());
+    grids_.reserve(kGridLevels.size());
+    for (const double level : kGridLevels) grids_.emplace_back(points64_, level, kGridCap);
+    normals_ = cloud_normals(points64_);
+}
+
+const TargetGrid& RegistrationCloud::grid(double radius) const {
+    for (std::size_t n = 0; n < kGridLevels.size(); ++n) {
+        if (kGridLevels[n] >= radius) return grids_[n];
+    }
+    return grids_.back();
 }
 
 // MARK: Alignment

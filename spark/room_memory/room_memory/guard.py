@@ -413,33 +413,24 @@ class RegistrationBuilder:
 
 
 class RegistrationCloud:
-    """A sensor's ICP target: real points (binary32, cell-key order) and, computed once, their
-    normals and the correspondence grids."""
+    """A sensor's ICP target: real points (binary32, cell-key order), their normals and the
+    correspondence grids, all computed when the cloud is built or loaded, so no check pays for them.
+    ``normals`` is ``(n, 3)`` unit normals, NaN where a point has fewer than NORMAL_MIN_POINTS sampled
+    neighbours within NORMAL_RADIUS_M (itself included) or its neighbourhood is not planar."""
 
     def __init__(self, points, voxel_m):
         self.points = np.ascontiguousarray(points, dtype=np.float32).reshape(-1, 3)
         self.voxel_m = voxel_m
         self.points64 = self.points.astype(np.float64)
-        self._grids = {}
-        self._normals = None
+        self._grids = {cell: TargetGrid(self.points64, cell, GRID_CAP) for cell in GRID_LEVELS}
+        self.normals = _normals(self.points64, NORMAL_RADIUS_M)
 
     def __len__(self):
         return len(self.points)
 
     def grid(self, radius):
         """The finest grid whose cell is at least ``radius``."""
-        cell = next((level for level in GRID_LEVELS if level >= radius), GRID_LEVELS[-1])
-        if cell not in self._grids:
-            self._grids[cell] = TargetGrid(self.points64, cell, GRID_CAP)
-        return self._grids[cell]
-
-    @property
-    def normals(self):
-        """``(n, 3)`` unit normals, NaN where a point has fewer than NORMAL_MIN_POINTS sampled neighbours
-        within NORMAL_RADIUS_M (itself included) or its neighbourhood is not planar."""
-        if self._normals is None:
-            self._normals = _normals(self.points64, NORMAL_RADIUS_M)
-        return self._normals
+        return self._grids[next((level for level in GRID_LEVELS if level >= radius), GRID_LEVELS[-1])]
 
 
 def _normals(points, radius):
