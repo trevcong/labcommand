@@ -222,8 +222,27 @@ def test_float32_ratio_period_and_file_cap_are_rejected_without_clamping():
         validate_rhythm(MemoryConfig(state_dir=None, rhythm_dims=1))
     with pytest.raises(ValueError, match="rhythm_enable"):
         validate_rhythm(MemoryConfig(state_dir=None, rhythm_enable=1))
-    with pytest.raises(ValueError):
-        RoomMemory(MemoryConfig(state_dir=None, rhythm_cell_m=0.03), START, GENERATION)
+    with pytest.raises(ValueError, match="1...64"):
+        RoomMemory(MemoryConfig(state_dir=None, rhythm_enable=True, rhythm_cell_m=0.03), START, GENERATION)
+
+
+def test_disabled_rhythm_accepts_a_detection_grid_the_logger_cannot_use():
+    """A logger that is off must not refuse a voxel or window its grid cannot divide.
+
+    ``0.5 / 0.2`` and ``60 / 0.7`` are not integers. Those configs started the node before
+    the logger existed. Turning the logger on rejects them again. A period outside 1...65535
+    still fails while the logger is off.
+    """
+    for changes in ({"voxel_size": 0.2}, {"window_s": 0.7}):
+        memory = RoomMemory(MemoryConfig(state_dir=None, rhythm_enable=False, **changes), START, GENERATION)
+        assert memory._rhythm is None
+        assert memory.close_window(Time(60, 0)) == []
+    with pytest.raises(ValueError, match="1...64"):
+        RoomMemory(MemoryConfig(state_dir=None, rhythm_enable=True, voxel_size=0.2), START, GENERATION)
+    with pytest.raises(ValueError, match="1...3600"):
+        RoomMemory(MemoryConfig(state_dir=None, rhythm_enable=True, window_s=0.7), START, GENERATION)
+    with pytest.raises(ValueError, match="rhythm_period_s"):
+        validate_rhythm(MemoryConfig(state_dir=None, rhythm_enable=False, rhythm_period_s=0))
 
 
 def test_node_declares_rhythm_dir_and_the_cpp_logger_is_built():

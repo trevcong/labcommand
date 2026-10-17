@@ -99,15 +99,27 @@ def windows_per_period(period_s, window_s):
 
 
 def validate_rhythm(config):
-    """Reject a bad rhythm parameter. No clamping. Safe to call before any subscription."""
+    """Reject a bad rhythm parameter. No clamping. Safe to call before any subscription.
+
+    ``rhythm_cell_m / voxel_size`` and ``rhythm_period_s / window_s`` are checked only when
+    ``rhythm_enable`` is true. A disabled logger does not refuse a detection grid. The rhythm
+    period and cell still have to be in range on their own.
+    """
     if not isinstance(config.rhythm_enable, bool):
         raise ValueError("rhythm_enable must be a bool")
     if not isinstance(config.rhythm_publish, bool):
         raise ValueError("rhythm_publish must be a bool")
     if config.rhythm_dims not in (2, 3):
         raise ValueError("rhythm_dims must be 2 or 3")
-    voxels_per_cell(config.rhythm_cell_m, config.voxel_size)
-    windows_per_period(config.rhythm_period_s, config.window_s)
+    if config.rhythm_enable:
+        voxels_per_cell(config.rhythm_cell_m, config.voxel_size)
+        windows_per_period(config.rhythm_period_s, config.window_s)
+    else:
+        if not _is_int(config.rhythm_period_s) or not 1 <= config.rhythm_period_s <= 65535:
+            raise ValueError("rhythm_period_s must be an integer in 1...65535")
+        cell = np.float32(config.rhythm_cell_m)
+        if not np.isfinite(cell) or not (cell > np.float32(0)):
+            raise ValueError("rhythm_cell_m must be finite and > 0")
     if not isinstance(config.rhythm_dir, str):
         raise ValueError("rhythm_dir must be a string")
     if not _is_int(config.rhythm_keep_days) or config.rhythm_keep_days < 0:

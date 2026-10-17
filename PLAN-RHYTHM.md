@@ -52,14 +52,14 @@ Before spin, scan the open append file only (≤32 MiB) and truncate to the last
 
 ## Config
 
-`MemoryConfig` ROS parameters, copied into launch `ARGUMENTS`. A bad value fails before subscribe. No clamp.
+`MemoryConfig` ROS parameters, copied into launch `ARGUMENTS`. A bad value fails before subscribe. No clamp. The `rhythm_cell_m / voxel_size` and `rhythm_period_s / window_s` rules apply only when `rhythm_enable` is true. With it false, a detection `voxel_size` or `window_s` the grid cannot divide still starts.
 
 | parameter | default | rule |
 |---|---|---|
 | `rhythm_enable` | false | off: no logger |
-| `rhythm_cell_m` | 0.5 | float32 ÷ `voxel_size` ∈ 1…64 |
+| `rhythm_cell_m` | 0.5 | when enabled: float32 ÷ `voxel_size` ∈ 1…64 |
 | `rhythm_dims` | 2 | 2 or 3 |
-| `rhythm_period_s` | 60 | 1…65535; ÷ `window_s` ∈ 1…3600 |
+| `rhythm_period_s` | 60 | 1…65535; when enabled, ÷ `window_s` ∈ 1…3600 |
 | `rhythm_publish` | false | publish the topic |
 | `rhythm_dir` | `""` | empty uses `state_dir` |
 | `rhythm_keep_days` | 90 | 0: no age cap |

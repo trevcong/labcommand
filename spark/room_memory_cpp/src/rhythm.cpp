@@ -453,8 +453,21 @@ int windows_per_period(std::int64_t period_s, double window_s) {
 
 void validate_rhythm(const RhythmSettings& settings) {
     if (settings.dims != 2 && settings.dims != 3) throw std::invalid_argument("rhythm_dims must be 2 or 3");
-    voxels_per_cell(settings.cell_m, settings.voxel_size);
-    windows_per_period(settings.period_s, settings.window_s);
+    // The cell and the period have to divide the detection grid only while the logger is on.
+    // A disabled logger must not refuse a voxel_size or window_s that already started the node.
+    // The period and the cell still have to be in range on their own.
+    if (settings.enable) {
+        voxels_per_cell(settings.cell_m, settings.voxel_size);
+        windows_per_period(settings.period_s, settings.window_s);
+    } else {
+        if (settings.period_s < 1 || settings.period_s > 65535) {
+            throw std::invalid_argument("rhythm_period_s must be an integer in 1...65535");
+        }
+        const float cell = static_cast<float>(settings.cell_m);
+        if (!std::isfinite(cell) || !(cell > 0)) {
+            throw std::invalid_argument("rhythm_cell_m must be finite and > 0");
+        }
+    }
     if (settings.keep_days < 0) throw std::invalid_argument("rhythm_keep_days must be an integer >= 0 (0: no age cap)");
     if (settings.max_bytes < 0) throw std::invalid_argument("rhythm_max_bytes must be an integer >= 0 (0: no byte cap)");
     if (settings.max_file_bytes < 0) throw std::invalid_argument("rhythm_max_file_bytes must be an integer >= 0");

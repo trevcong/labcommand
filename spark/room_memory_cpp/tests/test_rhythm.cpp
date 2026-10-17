@@ -410,6 +410,7 @@ TEST(rhythm_minute_golden_round_trips_both_endians) {
 
 TEST(bad_rhythm_config_is_rejected_before_a_bin_exists) {
     RhythmSettings settings;
+    settings.enable = true;
     settings.voxel_size = 0.05;
     settings.window_s = 1.0;
     settings.room_id = "lab";
@@ -426,6 +427,43 @@ TEST(bad_rhythm_config_is_rejected_before_a_bin_exists) {
     settings.max_bytes = 0;
     settings.period_s = 0;
     CHECK_THROWS(std::invalid_argument, validate_rhythm(settings));
+}
+
+// 0.5/0.2 and 60/0.7 are not integers. Those configs started the node before the logger
+// existed. The same values fail again once the logger is on. A period outside 1...65535
+// still fails while the logger is off.
+TEST(disabled_rhythm_accepts_a_detection_grid_the_logger_cannot_use) {
+    MemoryConfig coarse = loose(std::nullopt, false);
+    coarse.voxel_size = 0.2;
+    {
+        RoomMemory memory(coarse, msg::Time{60, 0}, 1);
+        CHECK(memory.close_window(msg::Time{60, 0}).empty());
+        CHECK(!memory.rhythm_sensor("mid360").open);
+    }
+    MemoryConfig uneven = loose(std::nullopt, false);
+    uneven.window_s = 0.7;
+    {
+        RoomMemory memory(uneven, msg::Time{60, 0}, 1);
+        CHECK(memory.close_window(msg::Time{60, 0}).empty());
+        CHECK(!memory.rhythm_sensor("jt128").open);
+    }
+
+    MemoryConfig on = loose(std::nullopt, true);
+    on.voxel_size = 0.2;
+    CHECK_THROWS(std::invalid_argument, RoomMemory(on, msg::Time{60, 0}, 1));
+    on.voxel_size = 0.05;
+    on.window_s = 0.7;
+    CHECK_THROWS(std::invalid_argument, RoomMemory(on, msg::Time{60, 0}, 1));
+
+    RhythmSettings settings;
+    settings.enable = false;
+    settings.voxel_size = 0.2;
+    settings.window_s = 0.7;
+    settings.cell_m = 0.03;
+    settings.state_dir = std::nullopt;
+    room_memory::validate_rhythm(settings);
+    settings.period_s = 0;
+    CHECK_THROWS(std::invalid_argument, room_memory::validate_rhythm(settings));
 }
 
 TEST(rhythm_on_matches_rhythm_off_and_a_throw_drops_only_that_bin) {
