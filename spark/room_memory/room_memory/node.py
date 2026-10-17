@@ -166,17 +166,18 @@ class RoomMemoryNode(Node):
         return response
 
     def _report_rig_save(self):
-        """One warning when the rig files start lagging the guard (or a relearn archive fails), one
-        line when a retry catches up; not one per window while the disk stays full."""
-        failed, pending = self.memory.rig_save_failed, self.memory.rig_save_pending
-        if failed > self._rig_save_failed and not self._rig_save_lagging:
-            retry = "; the guard runs on and retries every window" if pending else ""
-            self.get_logger().warning(f"rig state not saved: {self.memory.rig_save_error}{retry}")
-        elif self._rig_save_lagging and not pending:
-            self.get_logger().info(f"rig state saved after {failed - self._rig_save_failed_at} failed attempts")
-        if pending and not self._rig_save_lagging:
+        """One warning when the rig files start lagging the guard (or a relearn archive fails, or the
+        epoch file cannot take a new epoch), one line when a retry catches up; not one per window while
+        the disk stays full. A held epoch write is not a pending save, so both count."""
+        failed = self.memory.rig_save_failed
+        lagging = self.memory.rig_save_pending or self.memory.epoch_held
+        if lagging and not self._rig_save_lagging:
+            self.get_logger().warning(f"rig state not saved: {self.memory.rig_save_error}; "
+                                      "the guard runs on and retries every window")
             self._rig_save_failed_at = self._rig_save_failed
-        self._rig_save_failed, self._rig_save_lagging = failed, pending
+        elif self._rig_save_lagging and not lagging:
+            self.get_logger().info(f"rig state saved after {failed - self._rig_save_failed_at} failed attempts")
+        self._rig_save_failed, self._rig_save_lagging = failed, lagging
 
     def _answer(self, data):
         """Publishes the answer and its ``SyncEnd``; False when the request was dropped."""

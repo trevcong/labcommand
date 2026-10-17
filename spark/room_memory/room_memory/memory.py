@@ -1011,7 +1011,8 @@ class RoomMemory:
         # permissions). The guard runs on from memory and close_window retries every window; until
         # the archive goes through, the old frame's files stay as they are. rig_save_failed counts
         # the failed attempts, a held epoch write (_record_epoch) included, and rig_save_error is
-        # the last one's message.
+        # the last one's message. epoch_held: the last epoch write failed, so the build's end or a
+        # settle waits for it (no save is pending for that).
         # Measurement only, in no output: the guard's ICP estimates in the last close_window and their
         # wall time in ms (source cloud, seed with its yaw sweep, alignment).
         self.window_estimates = 0
@@ -1019,6 +1020,7 @@ class RoomMemory:
         self.rig_save_pending = False
         self.rig_save_failed = 0
         self.rig_save_error = None
+        self.epoch_held = False
         self._references_due = None  # a save's references header, not yet written (_save_rig)
         self._archive_due = None  # the relearned frame's prev/ name, not yet archived
         self._gravity = None  # the newest window's gravity
@@ -1158,11 +1160,13 @@ class RoomMemory:
             return True
         try:
             save_epoch(epoch_path(self.config.state_dir, self.config.room_id), epoch)
-            return True
         except Exception as error:  # as _save_rig: the C++ engine catches std::exception
             self.rig_save_failed += 1
             self.rig_save_error = str(error)
+            self.epoch_held = True
             return False
+        self.epoch_held = False
+        return True
 
     def _save_rig(self):
         """One ordered commit: the relearned frame's archive, the registration clouds not yet written,

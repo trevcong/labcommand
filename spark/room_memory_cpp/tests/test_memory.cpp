@@ -2251,6 +2251,7 @@ TEST(a_failed_epoch_write_holds_the_rebuild_until_it_goes_through) {
         CHECK(memory.state() == MemoryState::building && !memory.map_update(msg::Time{1000, 0}));
         CHECK(load_epoch(epoch_file) && memory.map_epoch() <= *load_epoch(epoch_file));
     }
+    CHECK(memory.epoch_held() && !memory.rig_save_pending());  // no save is pending: the node reports it from epoch_held
     CHECK(memory.rig_save_failed() >= 2 * kGuardReferenceWindows);
     CHECK(memory.rig_save_error().find("map_epoch.tmp") != std::string::npos);
     CHECK(run.files() == run.old_files);
@@ -2263,7 +2264,7 @@ TEST(a_failed_epoch_write_holds_the_rebuild_until_it_goes_through) {
     CHECK(refused.find("map_epoch.tmp") != std::string::npos);
     std::filesystem::remove(run.room / "map_epoch.tmp");
     run.step();
-    CHECK(memory.state() == MemoryState::tracking && !memory.rig_save_pending());
+    CHECK(memory.state() == MemoryState::tracking && !memory.rig_save_pending() && !memory.epoch_held());
     CHECK(load_epoch(epoch_file) == std::optional<std::uint64_t>{memory.map_epoch()});
     CHECK(saved_rig_state(run.room).frame_epoch > run.old_frame);
     RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
@@ -2305,13 +2306,14 @@ TEST(a_failed_epoch_write_holds_a_settle_until_it_goes_through) {
     }
     CHECK(!memory.channel("mid360").stats.keys.empty());
     CHECK(memory.rig_save_error().find("map_epoch.tmp") != std::string::npos);
+    CHECK(memory.epoch_held() && !memory.rig_save_pending());  // no save is pending: the node reports it from epoch_held
     const std::int64_t failed = memory.rig_save_failed();
     CHECK(failed >= 2);
     std::filesystem::remove(room / "map_epoch.tmp");
     const std::optional<msg::MapBricks> delta = window(second, 30.0);
     CHECK(delta && delta->kind == msg::MapKind::delta && delta->header.map_epoch == epoch + 1);
     CHECK(load_epoch(room / "map_epoch") == std::optional<std::uint64_t>{epoch + 1});
-    CHECK(memory.rig_save_failed() == failed && !memory.rig_save_pending());
+    CHECK(memory.rig_save_failed() == failed && !memory.rig_save_pending() && !memory.epoch_held());
     CHECK(memory.channel("mid360").reference.to_bricks().size() > bricks.size());
 }
 

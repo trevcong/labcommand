@@ -1845,12 +1845,14 @@ bool RoomMemory::record_epoch(std::uint64_t epoch) {
     if (!config_.rig_guard || !config_.state_dir) return true;
     try {
         save_epoch(epoch_path(*config_.state_dir, config_.room_id), epoch);
-        return true;
     } catch (const std::exception& error) {
         ++rig_save_failed_;
         rig_save_error_ = error.what();
+        epoch_held_ = true;
         return false;
     }
+    epoch_held_ = false;
+    return true;
 }
 
 void RoomMemory::save_rig() {

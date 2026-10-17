@@ -771,13 +771,14 @@ def test_a_failed_epoch_write_holds_the_rebuild_until_it_goes_through(tmp_path):
         step()
         assert memory.state == MemoryState.BUILDING and memory.map_update(Time(1000, 0)) is None
         assert memory.map_epoch <= load_epoch(room / "map_epoch")
+    assert memory.epoch_held and not memory.rig_save_pending  # no save is pending: the node reports it from epoch_held
     assert memory.rig_save_failed >= 2 * REFERENCE_WINDOWS and "map_epoch.tmp" in memory.rig_save_error
     assert {name: (room / name).read_bytes() for name in old_files} == old_files
     with pytest.raises(RuntimeError, match="map_epoch.tmp"):
         guarded(tmp_path)
     (room / "map_epoch.tmp").rmdir()
     step()
-    assert memory.state == MemoryState.TRACKING and not memory.rig_save_pending
+    assert memory.state == MemoryState.TRACKING and not memory.rig_save_pending and not memory.epoch_held
     assert load_epoch(room / "map_epoch") == memory.map_epoch
     assert rig_files.parse_rig_state((room / "rig_state").read_bytes(), "rig_state").frame_epoch == memory._frame_epoch
     assert guarded(tmp_path).map_epoch == memory.map_epoch + 1
@@ -811,12 +812,13 @@ def test_a_failed_epoch_write_holds_a_settle_until_it_goes_through(tmp_path):
         assert memory.map_epoch == epoch == load_epoch(room / "map_epoch")
         assert memory.channels["mid360"].reference.to_bricks() == bricks
     assert len(memory.channels["mid360"].stats.keys) and "map_epoch.tmp" in memory.rig_save_error
+    assert memory.epoch_held and not memory.rig_save_pending  # no save is pending: the node reports it from epoch_held
     failed = memory.rig_save_failed
     assert failed >= 2
     (room / "map_epoch.tmp").rmdir()
     delta = window(second + 1, 30.0)
     assert delta.kind == MapKind.DELTA and delta.header.map_epoch == epoch + 1 == load_epoch(room / "map_epoch")
-    assert memory.rig_save_failed == failed and not memory.rig_save_pending
+    assert memory.rig_save_failed == failed and not memory.rig_save_pending and not memory.epoch_held
     assert len(memory.channels["mid360"].reference.to_bricks()) > len(bricks)
 
 

@@ -489,10 +489,12 @@ public:
     // permissions). The guard runs on from memory and close_window retries every window; until
     // the archive goes through, the old frame's files stay as they are. rig_save_failed counts the
     // failed attempts, a held epoch write (record_epoch) included, and rig_save_error is the last
-    // one's message.
+    // one's message. epoch_held: the last epoch write failed, so the build's end or a settle waits
+    // for it (no save is pending for that).
     bool rig_save_pending() const { return rig_save_pending_; }
     std::int64_t rig_save_failed() const { return rig_save_failed_; }
     const std::string& rig_save_error() const { return rig_save_error_; }
+    bool epoch_held() const { return epoch_held_; }
 
     const MemoryConfig& config() const { return config_; }
     msg::MemoryState state() const { return state_; }
@@ -604,6 +606,7 @@ private:
     bool rig_save_pending_ = false;
     std::int64_t rig_save_failed_ = 0;
     std::string rig_save_error_;
+    bool epoch_held_ = false;
     std::optional<msg::Header> references_due_;  // a save's references, not yet written (save_rig)
     std::optional<std::string> archive_due_;     // the relearned frame's prev/ name, not yet archived
     std::optional<rig::Vec3d> gravity_;  // the newest window's gravity
