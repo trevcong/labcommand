@@ -11,21 +11,31 @@ This module does not put itself on sys.path. Python has to be able to import
 
 import argparse
 import json
+import select
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
+from acceptance.log import TopicLog
 from acceptance.log import load_jsonl
 from acceptance.log import write_jsonl
 from acceptance.report import write_report
 from acceptance.scenarios import resolve_durations
+from acceptance.score import MAX_GAP_NS
+from acceptance.score import interval_tail_ready
 from acceptance.score import score
+from acceptance.session import empty_marks
 from acceptance.session import run_session
 from acceptance.transport import ros2_exec_command
 from acceptance.transport import script_text
 from acceptance.transport import stamp_record
+
+# The scorer accepts a sample at most one coverage gap after the watch. The extra
+# second is for the event line that follows the status advertising events_seq.
+TAIL_GRACE_NS = 1_000_000_000
+_WATCHED = ("complete", "shortened")
 
 
 def main(argv=None):
@@ -63,93 +73,232 @@ def _score(args):
     return report["exit_code"]
 
 
-def _run(args):
+def _run(args, popen=None, clock=None):
+    popen = subprocess.Popen if popen is None else popen
+    clock = time if clock is None else clock
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     records = []
     lock = threading.Lock()
+    state = {"marks": None, "end_reason": None, "detail": "", "error": None, "exit_code": 2}
     command = ros2_exec_command(args.container)
-    proc = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    proc.stdin.write(script_text())
-    proc.stdin.close()
+    proc = None
+    writer = None
+    thread = None
+    try:
+        writer = TopicLog(out / "topics.jsonl")
+        proc = popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        proc.stdin.write(script_text())
+        proc.stdin.close()
 
-    def reader():
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as exc:
-                obj = {"op": "error", "error": str(exc), "topic": "", "mono_ns": 0}
-            stamped = stamp_record(obj, time.monotonic_ns())
-            with lock:
-                records.append(stamped)
+        def reader():
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    obj = {"op": "error", "error": str(exc), "topic": "", "mono_ns": 0}
+                stamped = stamp_record(obj, clock.monotonic_ns())
+                with lock:
+                    records.append(stamped)
+                # Checkpoint before the session returns. A later Ctrl-C still has the lines.
+                writer.append(stamped)
 
-    thread = threading.Thread(target=reader, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+
+        def read_line(deadline_ns):
+            if deadline_ns is None:
+                return sys.stdin.readline()
+            timeout = max(0.0, (deadline_ns - clock.monotonic_ns()) / 1e9)
+            ready, _, _ = select.select([sys.stdin], [], [], timeout)
+            if not ready:
+                return None
+            return sys.stdin.readline()
+
+        def write(text):
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+        def on_progress(marks):
+            state["marks"] = marks
+            _write_marks(out, marks)
+
+        ids = [item for item in args.scenarios.split(",") if item] or None
+        try:
+            _wait_ready(records, lock, proc, clock)
+            marks = run_session(
+                clock=clock,
+                read_line=read_line,
+                write=write,
+                scenario_ids=ids,
+                durations=resolve_durations(args),
+                on_progress=on_progress,
+            )
+            state["marks"] = marks
+            state["end_reason"] = (marks.get("session") or {}).get("end_reason", "complete")
+            state["detail"] = (marks.get("session") or {}).get("detail") or ""
+            _hold_for_tail(records, lock, marks, clock, write)
+        except KeyboardInterrupt:
+            state["end_reason"] = "interrupted"
+            state["detail"] = state["detail"] or "keyboard interrupt"
+            state["marks"] = _coerce_marks(state["marks"], "interrupted", state["detail"])
+        except ValueError as exc:
+            state["end_reason"] = "error"
+            state["detail"] = str(exc)
+            state["marks"] = _coerce_marks(state["marks"], "error", state["detail"])
+        except Exception as exc:
+            state["error"] = exc
+            state["end_reason"] = "error"
+            state["detail"] = str(exc)
+            state["marks"] = _coerce_marks(state["marks"], "error", state["detail"])
+    finally:
+        if proc is not None:
+            _stop(proc)
+        if thread is not None:
+            thread.join(timeout=2)
+        _finalize(out, records, lock, proc, state, clock, args, writer)
+    if state["error"] is not None:
+        raise state["error"]
+    if state["end_reason"] == "error" and state["detail"]:
+        sys.stderr.write(state["detail"] + "\n")
+    return state["exit_code"]
+
+
+def _wait_ready(records, lock, proc, clock):
+    deadline = clock.monotonic() + 15
+    while clock.monotonic() < deadline:
         with lock:
             if any(item.get("op") == "ready" for item in records):
-                break
+                return
         if proc.poll() is not None:
-            break
-        time.sleep(0.05)
+            return
+        clock.sleep(0.05)
 
-    def read_line(deadline_ns):
-        if deadline_ns is None:
-            return sys.stdin.readline()
-        import select
-        timeout = max(0.0, (deadline_ns - time.monotonic_ns()) / 1e9)
-        ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        if not ready:
-            return None
-        return sys.stdin.readline()
 
-    def write(text):
-        sys.stdout.write(text)
-        sys.stdout.flush()
+def _last_watched(marks):
+    """The watched interval whose end is latest. Skipped and blocked rows have no tail."""
+    if not marks:
+        return None
+    rows = []
+    for row in marks.get("scenarios") or []:
+        if row.get("completion") not in _WATCHED:
+            continue
+        if row.get("t0_mono_ns") is None or row.get("t1_mono_ns") is None:
+            continue
+        rows.append(row)
+    if not rows:
+        return None
+    return max(rows, key=lambda row: (row["t1_mono_ns"], row["t0_mono_ns"]))
 
-    ids = [item for item in args.scenarios.split(",") if item] or None
-    try:
-        marks = run_session(
-            clock=time,
-            read_line=read_line,
-            write=write,
-            scenario_ids=ids,
-            durations=resolve_durations(args),
-        )
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2)
-    thread.join(timeout=2)
-    stderr = proc.stderr.read() if proc.stderr else ""
+
+def wait_for_closing(records, lock, marks, now_ns, sleep):
+    """Keep reading until the last watch can be scored, or the bound passes.
+
+    ``now_ns`` and the receipt stamps are the same monotonic clock. A sample read
+    more than one coverage gap after the watch cannot close it.
+    """
+    scenario = _last_watched(marks)
+    if scenario is None:
+        return
+    t0 = scenario["t0_mono_ns"]
+    t1 = scenario["t1_mono_ns"]
+    deadline = t1 + MAX_GAP_NS + TAIL_GRACE_NS
+    while True:
+        with lock:
+            snapshot = list(records)
+        if interval_tail_ready(snapshot, t0, t1):
+            return
+        now = now_ns()
+        if now >= deadline:
+            return
+        remaining = (deadline - now) / 1e9
+        sleep(0.05 if remaining > 0.05 else remaining)
+
+
+def _hold_for_tail(records, lock, marks, clock, write):
+    scenario = _last_watched(marks)
+    if scenario is None:
+        return
+    with lock:
+        ready = interval_tail_ready(list(records), scenario["t0_mono_ns"], scenario["t1_mono_ns"])
+    if not ready:
+        limit_s = (MAX_GAP_NS + TAIL_GRACE_NS) / 1e9
+        write("Holding the recorder for the closing status, activity, and event tail (at most %g s).\n" % limit_s)
+    wait_for_closing(records, lock, marks, clock.monotonic_ns, clock.sleep)
+
+
+def _stop(proc):
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+
+
+def _coerce_marks(marks, reason, detail):
+    if not marks:
+        return empty_marks(reason, detail)
+    updated = dict(marks)
+    session = dict(updated.get("session") or {})
+    session["end_reason"] = reason
+    session["detail"] = detail or session.get("detail") or ""
+    updated["session"] = session
+    return updated
+
+
+def _write_marks(out, marks):
+    path = out / "marks.json"
+    temporary = path.with_name("marks.json.tmp")
+    temporary.write_text(json.dumps(marks, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _finalize(out, records, lock, proc, state, clock, args, writer):
+    if writer is not None:
+        writer.close()
+    marks = state["marks"]
+    reason = state["end_reason"]
+    detail = state["detail"] or ""
+    if marks is None:
+        marks = empty_marks(reason or "error", detail)
+        reason = marks["session"]["end_reason"]
+        detail = marks["session"]["detail"]
+    else:
+        if reason is None:
+            reason = (marks.get("session") or {}).get("end_reason") or "complete"
+        if not detail:
+            detail = (marks.get("session") or {}).get("detail") or ""
+        marks = _coerce_marks(marks, reason, detail)
+    if proc is not None and proc.returncode not in (0, None, -15) and reason == "complete":
+        reason = "transport_died"
+        detail = detail or "subscriber exited"
+        marks = _coerce_marks(marks, reason, detail)
+    with lock:
+        rows = list(records)
+    rows.append(stamp_record(
+        {"op": "session_end", "reason": reason, "detail": detail, "mono_ns": clock.monotonic_ns()},
+        clock.monotonic_ns(),
+    ))
+    write_jsonl(out / "topics.jsonl", rows)
+    _write_marks(out, marks)
+    stderr = proc.stderr.read() if proc is not None and proc.stderr else ""
     if stderr:
         (out / "transport.stderr.log").write_text(stderr, encoding="utf-8")
-    end_reason = marks.get("session", {}).get("end_reason", "complete")
-    if proc.returncode not in (0, None, -15) and end_reason == "complete":
-        end_reason = "transport_died"
-    records.append(stamp_record(
-        {"op": "session_end", "reason": end_reason, "detail": "", "mono_ns": time.monotonic_ns()},
-        time.monotonic_ns(),
-    ))
-    write_jsonl(out / "topics.jsonl", records)
-    (out / "marks.json").write_text(json.dumps(marks, indent=2) + "\n", encoding="utf-8")
-    report = score(records, marks, max_false_alarms_per_hour=args.max_false_alarms_per_hour)
+    report = score(rows, marks, max_false_alarms_per_hour=args.max_false_alarms_per_hour)
     write_report(report, out)
-    return report["exit_code"]
+    state["exit_code"] = report["exit_code"]
+    state["marks"] = marks
 
 
 if __name__ == "__main__":

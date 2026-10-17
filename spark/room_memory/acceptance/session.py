@@ -52,15 +52,21 @@ def parse_label(text):
     return targets, associations
 
 
-def run_session(clock, read_line, write, scenario_ids=None, durations=None, candidates_fn=None):
+def run_session(clock, read_line, write, scenario_ids=None, durations=None, candidates_fn=None, on_progress=None):
     """Run the script. ``read_line(deadline_ns)`` returns a line or None on timeout.
 
     Enter during a watch records ``shortened``. A planned watch below the protocol
     duration is also ``shortened``. ``abort`` skips the scenarios that have not started.
+    A bad target label is asked again. Ctrl-C returns the scenarios already finished,
+    with the one in progress marked ``aborted`` and ``session.end_reason`` ``interrupted``.
+    ``on_progress(marks)`` runs after the setup and after each scenario so a caller can
+    store the capture before the function returns.
     """
     selected = None if scenario_ids is None else set(scenario_ids)
     durations = dict(durations or {})
     rows = []
+    setup = _unverified()
+    current = None
 
     def say(text):
         write(text if text.endswith("\n") else text + "\n")
@@ -74,44 +80,60 @@ def run_session(clock, read_line, write, scenario_ids=None, durations=None, cand
             raise _Abort()
         return line
 
-    say(REFERENCE_PROMPT)
-    try:
-        verdict = ask()
-    except _Abort:
-        return _marks(_unverified(), rows, "aborted")
-    confirmed = (verdict or "").strip().lower() == "verified"
-    setup = _unverified()
-    if confirmed:
-        say("Type this line if it is true, or anything else if it is not: " + TOKEN_LINE)
-        try:
-            tokens = ask()
-        except _Abort:
-            return _marks(setup, rows, "aborted")
-        if (tokens or "").split() == TOKEN_LINE.split():
-            setup = _verified()
-        else:
-            confirmed = False
-            say("That setup is incompatible. Change scenarios are blocked. The node is left as it is.")
-    else:
-        say("Reference setup is not confirmed. Change scenarios are blocked. The node is left as it is.")
+    def publish(reason, detail=""):
+        snapshot = _marks(setup, rows, reason, detail)
+        if on_progress is not None:
+            on_progress(snapshot)
+        return snapshot
 
-    aborted = False
-    for spec in PROTOCOL:
-        if selected is not None and spec["id"] not in selected:
-            continue
-        planned = _planned(spec, durations)
-        if aborted:
-            rows.append(_shell(spec, "skipped", clock.monotonic_ns(), planned))
-            continue
-        if spec["class"] == "change" and not _compatible(setup):
-            rows.append(_shell(spec, "blocked", clock.monotonic_ns(), planned))
-            continue
+    try:
+        say(REFERENCE_PROMPT)
         try:
-            rows.append(_conduct(spec, planned, clock, ask, say, candidates_fn))
+            verdict = ask()
         except _Abort:
-            rows.append(_shell(spec, "aborted", clock.monotonic_ns(), planned))
-            aborted = True
-    return _marks(setup, rows, "aborted" if aborted else "complete")
+            return publish("aborted")
+        confirmed = (verdict or "").strip().lower() == "verified"
+        if confirmed:
+            say("Type this line if it is true, or anything else if it is not: " + TOKEN_LINE)
+            try:
+                tokens = ask()
+            except _Abort:
+                return publish("aborted")
+            if (tokens or "").split() == TOKEN_LINE.split():
+                setup = _verified()
+            else:
+                confirmed = False
+                say("That setup is incompatible. Change scenarios are blocked. The node is left as it is.")
+        else:
+            say("Reference setup is not confirmed. Change scenarios are blocked. The node is left as it is.")
+        publish("running")
+
+        aborted = False
+        for spec in PROTOCOL:
+            if selected is not None and spec["id"] not in selected:
+                continue
+            planned = _planned(spec, durations)
+            if aborted:
+                rows.append(_shell(spec, "skipped", clock.monotonic_ns(), planned))
+                publish("aborted")
+                continue
+            if spec["class"] == "change" and not _compatible(setup):
+                rows.append(_shell(spec, "blocked", clock.monotonic_ns(), planned))
+                publish("running")
+                continue
+            current = spec
+            try:
+                rows.append(_conduct(spec, planned, clock, ask, say, candidates_fn))
+            except _Abort:
+                rows.append(_shell(spec, "aborted", clock.monotonic_ns(), planned))
+                aborted = True
+            current = None
+            publish("aborted" if aborted else "running")
+        return publish("aborted" if aborted else "complete")
+    except KeyboardInterrupt:
+        if current is not None:
+            rows.append(_shell(current, "aborted", clock.monotonic_ns(), _planned(current, durations)))
+        return publish("interrupted", "keyboard interrupt")
 
 
 def _planned(spec, durations):
@@ -125,6 +147,8 @@ def _planned(spec, durations):
 def _conduct(spec, planned, clock, ask, say, candidates_fn):
     say(spec["prompt"])
     kind = spec["class"]
+    targets = []
+    associations = []
     if kind == "change":
         say("Press Enter when the physical change is complete. This is not the clear mark.")
         ask()
@@ -144,15 +168,17 @@ def _conduct(spec, planned, clock, ask, say, candidates_fn):
         clear = None
         start = clock.monotonic_ns()
     else:
-        if kind == "activity":
-            say("Type skip, or a region line for the person, and press Enter to start the watch.")
-        else:
-            say("Press Enter to start the watch.")
-        line = ask()
         change_done = None
         clear = None
+        if kind == "activity":
+            say("Type skip, or a region line for the person, and press Enter to start the watch.")
+            targets, associations = _read_label(ask, say)
+        else:
+            say("Press Enter to start the watch.")
+            ask()
+            targets = []
+            associations = []
         start = clock.monotonic_ns()
-        label_text = line
     say(
         "Watching for %g s. Protocol for this step is %g s. "
         "Enter ends the watch early and withholds full G5 acceptance."
@@ -166,8 +192,6 @@ def _conduct(spec, planned, clock, ask, say, candidates_fn):
         completion = "shortened"
     else:
         completion = "complete"
-    targets = []
-    associations = []
     if kind == "change":
         if candidates_fn is not None:
             for item in candidates_fn(change_done, end):
@@ -176,9 +200,7 @@ def _conduct(spec, planned, clock, ask, say, candidates_fn):
                     % (item.get("event_id"), item.get("sensors"), item.get("kind"), item.get("centroid"), item.get("aabb"))
                 )
         say("Label the target: region SENSOR x0 y0 z0 x1 y1 z1 [from x y z] | event GEN ID | skip")
-        targets, associations = parse_label(ask())
-    elif kind == "activity":
-        targets, associations = parse_label(label_text)
+        targets, associations = _read_label(ask, say)
     return {
         "id": spec["id"],
         "class": spec["class"],
@@ -195,6 +217,15 @@ def _conduct(spec, planned, clock, ask, say, candidates_fn):
         "targets": targets,
         "associations": associations,
     }
+
+
+def _read_label(ask, say):
+    """Ask until the line parses. Enter and ``skip`` are empty labels, not errors."""
+    while True:
+        try:
+            return parse_label(ask())
+        except ValueError as exc:
+            say("%s. Enter region, event, or skip." % exc)
 
 
 def _shell(spec, completion, now, planned):
@@ -246,12 +277,16 @@ def _compatible(setup):
     return bool(setup.get("operator_confirmed") and setup.get("verified") and not setup.get("placement_is_removal"))
 
 
-def _marks(setup, rows, end_reason):
+def empty_marks(reason, detail=""):
+    return _marks(_unverified(), [], reason, detail)
+
+
+def _marks(setup, rows, end_reason, detail=""):
     return {
         "schema": MARKS,
         "clock": "receipt_mono",
         "expected_sensors": [1, 2],
         "reference_setup": setup,
         "scenarios": rows,
-        "session": {"end_reason": end_reason, "detail": ""},
+        "session": {"end_reason": end_reason, "detail": detail},
     }

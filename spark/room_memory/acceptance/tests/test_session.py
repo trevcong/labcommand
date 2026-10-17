@@ -35,13 +35,15 @@ class Script:
                 return None
             self.clock.now = at
             return text
+        if kind[0] == "interrupt":
+            raise KeyboardInterrupt()
         raise AssertionError(kind)
 
 
 def _run(steps, **kwargs):
     clock = Clock()
     script = Script(clock, steps)
-    out = []
+    out = kwargs.pop("transcript", [])
     marks = run_session(clock=clock, read_line=script.read_line, write=out.append, **kwargs)
     assert script.steps == []
     assert any("reference" in line.lower() for line in out)
@@ -151,3 +153,55 @@ def test_parse_label_move_source():
 def test_bad_label_is_rejected():
     with pytest.raises(ValueError):
         parse_label("region only-three-numbers")
+
+
+def test_bad_change_label_is_reasked_and_the_good_one_is_kept():
+    out = []
+    marks = _run([
+        ("line", 1, "verified"),
+        ("line", 2, "new_object reference_object other_reference_object"),
+        ("line", 10, ""),
+        ("line", 25, ""),
+        ("timeout",),
+        ("line", 146, "region nope"),
+        ("line", 147, "region 1 0 0 0 1 1 1"),
+    ], scenario_ids=["box_placed"], transcript=out)
+    row = next(item for item in marks["scenarios"] if item["id"] == "box_placed")
+    assert row["completion"] == "complete"
+    assert row["targets"][0]["sensor"] == 1
+    assert any("region needs a sensor" in line for line in out)
+    assert marks["session"]["end_reason"] == "complete"
+
+
+def test_bad_activity_label_is_reasked_before_the_watch():
+    out = []
+    marks = _run([
+        ("line", 1, "verified"),
+        ("line", 2, "new_object reference_object other_reference_object"),
+        ("line", 5, "nope"),
+        ("line", 6, "region 1 0 2 0 0.6 2.6 1.8"),
+        ("timeout",),
+    ], scenario_ids=["person_sit"], transcript=out)
+    row = next(item for item in marks["scenarios"] if item["id"] == "person_sit")
+    assert row["completion"] == "complete"
+    assert row["actual_duration_s"] == 120
+    assert row["targets"][0]["aabb"] == [[0.0, 2.0, 0.0], [0.6, 2.6, 1.8]]
+    assert any("region, event, or skip" in line for line in out)
+
+
+def test_interrupt_keeps_the_finished_scenario():
+    seen = []
+    marks = _run([
+        ("line", 1, "verified"),
+        ("line", 2, "new_object reference_object other_reference_object"),
+        ("line", 3, ""),
+        ("timeout",),
+        ("interrupt",),
+    ], scenario_ids=["baseline_idle", "box_placed"], on_progress=seen.append)
+    idle = next(item for item in marks["scenarios"] if item["id"] == "baseline_idle")
+    placed = next(item for item in marks["scenarios"] if item["id"] == "box_placed")
+    assert idle["completion"] == "complete"
+    assert placed["completion"] == "aborted"
+    assert marks["session"]["end_reason"] == "interrupted"
+    assert any(item["session"]["end_reason"] == "running" for item in seen)
+    assert seen[-1]["session"]["end_reason"] == "interrupted"

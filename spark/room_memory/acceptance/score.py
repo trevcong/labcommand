@@ -244,6 +244,37 @@ def _event_coverage(messages, start, closing, t0, t1, reasons):
         reasons.append("missing_tail")
 
 
+def interval_tail_ready(messages, t0_mono_ns, t1_mono_ns):
+    """True when this interval already has the samples the scorer needs after ``t1``.
+
+    The closing status and the closing activity are the first fresh samples at or
+    after ``t1`` and within the coverage gap. The event tail is the ``events_seq``
+    that closing status advertises. A later read cannot invent either one.
+    """
+    if t0_mono_ns is None or t1_mono_ns is None:
+        return False
+    fresh = _fresh(messages)
+    status_chain, _, _ = _chain(messages, fresh, STATUS, "status", t0_mono_ns, t1_mono_ns)
+    activity_chain, _, _ = _chain(messages, fresh, ACTIVITY, "activity", t0_mono_ns, t1_mono_ns)
+    if not status_chain or not activity_chain:
+        return False
+    return _advertised_events_present(messages, status_chain[-1])
+
+
+def _advertised_events_present(messages, closing_status):
+    tail = (closing_status.get("message") or {}).get("events_seq")
+    if tail is None:
+        return True
+    generation = closing_status.get("publisher_generation")
+    tail = int(tail)
+    for message in messages:
+        if message.get("topic") != EVENTS or message.get("publisher_generation") != generation:
+            continue
+        if message.get("seq") == tail:
+            return True
+    return False
+
+
 def _first_candidates(messages):
     ignored = 0
     confirmed = 0

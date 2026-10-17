@@ -74,6 +74,11 @@ skip
 Kind plus time without a label is a temporal match, not a true detection.
 Another sensor is corroboration only when it matches that sensor's own target.
 Separate sensor frames are not compared. `skip` withholds full acceptance.
+A line that is not `region`, `event`, or `skip` is asked again. The recording
+stays up. Ctrl-C stops the script and still writes `topics.jsonl`, `marks.json`,
+and the report. The open scenario is `aborted`, the session is `interrupted`,
+and scenarios that had not started are not scored as misses. Those files are
+also written as each scenario finishes, so a killed hour still leaves a capture.
 
 `person_sit` is two minutes. `hour_idle` is one hour. `restore_reference` puts
 the reference scene back. It is not an expected detection. Type `abort` to stop;
@@ -98,6 +103,14 @@ stored on every status line. Gaps, a missing tail, sensor dropout, a decode
 error, and a log that ends before the interval are unverifiable. That time is
 not exposure and is not a zero-false-alarm pass. `session_end` is in the log
 so an offline score sees the same interruption.
+
+The recorder stays up after the last watch until a fresh status sample and a
+fresh activity sample have both arrived at or after that watch, and until the
+event seq on that status is in the log. It stops waiting 3.5 s after the watch:
+the 2.5 s coverage gap, plus 1 s for the event line that follows the status.
+Stopping at the watch would leave a normal 1 Hz stream as `missing_tail` and
+drop the hour. Samples that arrive during a later label are already in the log,
+so this wait is usually the last watch only.
 
 ## Score
 
