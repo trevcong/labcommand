@@ -189,6 +189,21 @@ def floats(tmp_path, name, cloud):
     return path
 
 
+def shared_state(state):
+    """Reference files both engines write. The durable event log (D47) is C++ only."""
+    if not state.exists():
+        return {}
+    files = {}
+    for path in sorted(state.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(state)
+        if "events" in relative.parts:
+            continue
+        files[relative] = path.read_bytes()
+    return files
+
+
 def run_both(tmp_path, script):
     """Runs ``script`` (with {state} for a per-side state dir) through C++ and Python."""
     outputs, states = [], []
@@ -202,8 +217,7 @@ def run_both(tmp_path, script):
             outputs.append(result.stdout.decode())
         else:
             outputs.append(replay.run(text))
-        states.append({p.relative_to(state): p.read_bytes() for p in sorted(state.rglob("*")) if p.is_file()}
-                      if state.exists() else {})
+        states.append(shared_state(state))
     assert outputs[0] == outputs[1]
     assert states[0] == states[1]
     return outputs[1]

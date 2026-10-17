@@ -683,6 +683,8 @@ TEST(request_sync_rules) {
     CHECK_THROWS(Invalid, RequestSync::from_cdr(data));
     data = hexfile("request_sync_map_le.hex");
     data[4 + 48] = 2;
+    CHECK(RequestSync::from_cdr(data).topic == SyncTopic::event_archive);
+    data[4 + 48] = 3;
     CHECK_THROWS(Invalid, RequestSync::from_cdr(data));
 }
 
@@ -782,7 +784,7 @@ TEST(request_sync_v2_round_trip) {
 TEST(sync_end_rejections) {
     const std::vector<std::function<void(SyncEnd&)>> changes = {
         [](SyncEnd& s) { s.publisher_generation = 0; },
-        [](SyncEnd& s) { s.topic = static_cast<SyncTopic>(2); },
+        [](SyncEnd& s) { s.topic = static_cast<SyncTopic>(3); },
         [](SyncEnd& s) { s.bound = kSeqNone; },
         [](SyncEnd& s) { s.bound = 119; },
         [](SyncEnd& s) { s.bound.reset(); },

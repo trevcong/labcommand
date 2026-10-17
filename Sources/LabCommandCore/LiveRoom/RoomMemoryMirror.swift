@@ -123,6 +123,13 @@ public struct LiveRoomActivity: Sendable, Equatable {
     }
 }
 
+/// Durable replay of one generation, kept out of the active reducer (D47).
+private struct ArchivedEventLog: Sendable, Equatable {
+    var events: [UInt64: RoomMemory.ChangeEvent] = [:]
+    /// Highest seq filed for each event id. An older message cannot reopen a closed event.
+    var latestSeq: [UInt64: UInt64] = [:]
+}
+
 /// A retired generation, kept for display only (its map greyed until the new one has a map, its
 /// open events as "earlier run · may be outdated").
 public struct ArchivedGeneration: Sendable, Equatable {
@@ -240,6 +247,11 @@ public struct RoomMemoryMirror: Sendable, Equatable {
 
     var active: GenerationState?
     private var retrieval: [RoomMemory.RequestSync.Topic: Retrieval] = [.mapBricks: Retrieval(), .events: Retrieval()]
+    /// One explicit archive request. Not in `retrieval`, so it is never sent on its own.
+    private var archiveRequest = Retrieval()
+    /// `since` of the outstanding archive request. A timeout resends it unchanged.
+    private var archiveSince: RoomMemory.RequestSync.Position?
+    private var archiveLogs: [UInt64: ArchivedEventLog] = [:]
     private var tokens: TokenRandom
     private var connectionCounter = 0
     private var requestCounter: UInt64 = 0
@@ -388,6 +400,27 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         }
     }
 
+    /// Events filed from an archive answer for `generation`, in `seq` order (D47). Empty when none were.
+    public func archivedHistory(_ generation: UInt64) -> [RoomMemory.ChangeEvent] {
+        let events = archiveLogs[generation]?.events ?? [:]
+        return events.keys.sorted().compactMap { events[$0] }
+    }
+
+    /// Asks for one generation's durable events. Sent only while this connection is observing a v2
+    /// generation and a request path exists, and only when no archive request is already out.
+    /// The answer is filed beside the active generation: it does not install, and it does not
+    /// complete a live retrieval.
+    public mutating func requestArchive(
+        generation: UInt64,
+        since: RoomMemory.RequestSync.Position?,
+        at now: TimeInterval
+    ) -> [Action] {
+        clock = now
+        guard archiveRequestAllowed, !archiveRequest.isOutstanding, archiveRequest.maySend(at: now) else { return [] }
+        archiveSince = since
+        return [.requestSync(sendArchive(generation: generation, since: since, attempt: 1, at: now))]
+    }
+
     // MARK: Connection
 
     /// The socket opened and subscribed. `canRequest` says whether any request path exists.
@@ -524,6 +557,21 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             return settleAndFlush()
         default:
             break
+        }
+
+        // An archive answer is filed beside the active generation. It does not install that
+        // generation, does not count as olderGeneration, and does not touch the live witness.
+        if case .syncEnd(let end) = message, end.topic == .eventArchive {
+            fileArchiveSyncEnd(end)
+            return settleAndFlush()
+        }
+        if case .event(let event) = message,
+           let generation = event.publisherGeneration,
+           archiveRequest.isOutstanding,
+           archiveRequest.generation == generation {
+            let live = active?.generation == generation
+            fileArchiveEvent(event, at: now, countConflict: !live)
+            if !live { return settleAndFlush() }
         }
 
         // Matched before any install resets the retrievals: the manifest applies to its own generation.
@@ -768,8 +816,12 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     /// Publisher facts from any `SyncEnd` of the generation, whoever asked; the manifest too when
     /// it answers this Mac's outstanding request.
     private mutating func receiveSyncEnd(_ end: RoomMemory.SyncEnd, matched: Retrieval?) {
+        // Archive manifests are filed before this. A live witness never absorbs one.
+        if end.topic == .eventArchive { return }
         guard var state = active, state.generation == end.publisherGeneration else { return }
         switch end.topic {
+        case .eventArchive:
+            return
         case .events:
             state.witness = state.witness.merged(end.bound.map(EventsWitness.through) ?? .empty)
             for range in end.unavailable {
@@ -795,6 +847,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         for topic in RoomMemory.RequestSync.Topic.allCases {
             retrieval[topic]?.reset()
         }
+        archiveRequest.reset()
+        archiveSince = nil
     }
 
     /// Completes the retrievals whose manifests are now held.
@@ -823,6 +877,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
                     if state.statusEpochMismatches >= 2 { state.mismatchRetrieved = true }
                     active = state
                 }
+            case .eventArchive:
+                done = false
             }
             if done {
                 current.reset()
@@ -836,12 +892,14 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         switch topic {
         case .mapBricks: return active.mapNeedsRetrieval
         case .events: return !active.overflowed && !active.pending.isEmpty
+        case .eventArchive: return false
         }
     }
 
     private mutating func settleAndFlush() -> [Action] {
         settleRetrievals()
-        return flushRequests()
+        settleArchive()
+        return flushRequests() + flushArchive()
     }
 
     /// Requests go out only while observing a v2 generation, with a request path.
@@ -888,6 +946,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             since = attempt > 1 ? nil : active?.chain.map { .init(epoch: $0.epoch, seq: $0.appliedSeq) }
         case .events:
             since = active?.eventsSince
+        case .eventArchive:
+            since = nil
         }
         let token = RoomMemory.RequestToken(using: &tokens)
         current.phase = .waiting
@@ -912,5 +972,99 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         activity.requestsSent += 1
         activity.lastRequest = request
         return request
+    }
+
+    private var archiveRequestAllowed: Bool {
+        guard wire == .v2, canRequest, roomId != nil else { return false }
+        if case .observing = connection { return true }
+        return false
+    }
+
+    private mutating func sendArchive(
+        generation: UInt64,
+        since: RoomMemory.RequestSync.Position?,
+        attempt: Int,
+        at now: TimeInterval
+    ) -> RoomMemory.RequestSync {
+        let token = RoomMemory.RequestToken(using: &tokens)
+        archiveRequest.phase = .waiting
+        archiveRequest.token = token
+        archiveRequest.generation = generation
+        archiveRequest.sentAt = now
+        archiveRequest.lastSentAt = now
+        archiveRequest.attempt = attempt
+        let request = RoomMemory.RequestSync(
+            header: RoomMemory.Header(
+                roomId: roomId ?? "",
+                mapEpoch: since?.epoch ?? RoomMemory.RequestSync.sinceNone,
+                seq: requestCounter,
+                stamp: RoomMemory.Time(sec: 0, nanosec: 0)
+            ),
+            since: since,
+            topic: .eventArchive,
+            expectedGeneration: generation,
+            token: token
+        )
+        requestCounter += 1
+        activity.requestsSent += 1
+        activity.lastRequest = request
+        return request
+    }
+
+    /// A timeout resends the same `since` with a fresh token. Idle is not a request.
+    private mutating func flushArchive() -> [Action] {
+        guard archiveRequest.isOutstanding, archiveRequest.timedOut(at: clock) else { return [] }
+        guard archiveRequestAllowed, let generation = archiveRequest.generation else {
+            archiveRequest.reset()
+            archiveSince = nil
+            return []
+        }
+        return [.requestSync(sendArchive(generation: generation, since: archiveSince, attempt: archiveRequest.attempt + 1, at: clock))]
+    }
+
+    private mutating func settleArchive() {
+        guard case .receiving(let end) = archiveRequest.phase else { return }
+        let held = archiveLogs[end.publisherGeneration]?.events ?? [:]
+        let complete = end.delivered.allSatisfy { range in
+            range.allSatisfy { held[$0] != nil }
+        }
+        if complete {
+            archiveRequest.reset()
+            archiveSince = nil
+        }
+    }
+
+    private mutating func fileArchiveSyncEnd(_ end: RoomMemory.SyncEnd) {
+        guard archiveRequest.matches(end.token) else { return }
+        archiveRequest.phase = .receiving(end)
+        archiveRequest.generation = end.publisherGeneration
+    }
+
+    private mutating func fileArchiveEvent(_ event: RoomMemory.ChangeEvent, at now: TimeInterval, countConflict: Bool) {
+        guard let generation = event.publisherGeneration else { return }
+        var log = archiveLogs[generation] ?? ArchivedEventLog()
+        if let held = log.events[event.header.seq] {
+            if countConflict, held != event { activity.contractViolations += 1 }
+            archiveLogs[generation] = log
+            return
+        }
+        let previous = log.latestSeq[event.eventId]
+        let newer = previous.map { event.header.seq > $0 } ?? true
+        log.events[event.header.seq] = event
+        if newer { log.latestSeq[event.eventId] = event.header.seq }
+        archiveLogs[generation] = log
+        guard newer, let index = archive.firstIndex(where: { $0.generation == generation }) else { return }
+        var run = archive[index]
+        let entry = LiveRoomEvent(seq: event.header.seq, receivedAt: now, fromSync: true, event: event)
+        if let existing = run.openEvents.firstIndex(where: { $0.event.eventId == event.eventId }) {
+            if entry.isOpen {
+                run.openEvents[existing] = entry
+            } else {
+                run.openEvents.remove(at: existing)
+            }
+        } else if entry.isOpen {
+            run.openEvents.append(entry)
+        }
+        archive[index] = run
     }
 }

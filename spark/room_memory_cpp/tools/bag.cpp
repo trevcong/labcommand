@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "config_keys.hpp"
+#include "room_memory/generation.hpp"
 #include "room_memory/memory.hpp"
 
 namespace {
@@ -34,7 +35,9 @@ using room_memory::RoomMemory;
 namespace msg = room_memory::msg;
 
 constexpr std::int64_t kSecond = 1'000'000'000;
-// A fixed publisher generation: a replay is no node start and allocates none.
+// A replay with no state_dir is not a node start and uses a fixed generation. With state_dir it
+// allocates, the way the node does (D47): a second process must not continue the previous
+// generation's seqs.
 constexpr std::uint64_t kGeneration = 1;
 
 msg::Time time_of(std::int64_t ns) { return msg::Time{ns / kSecond, ns % kSecond}; }
@@ -86,6 +89,7 @@ int main(int argc, char** argv) {
     const char* names[] = {"mid360", "jt128"};
     const std::int64_t window_ns = static_cast<std::int64_t>(config.window_s * 1e9);
     std::unique_ptr<RoomMemory> memory;
+    std::optional<room_memory::Allocation> generation_lock;
     std::int64_t window_end = 0;
     std::int64_t next_status = 0;
     std::int64_t first_ns = 0;
@@ -193,7 +197,15 @@ int main(int argc, char** argv) {
         const auto ns = static_cast<std::int64_t>(t);
         if (!memory) {
             try {
-                memory = std::make_unique<RoomMemory>(config, time_of(ns), kGeneration);
+                std::uint64_t generation = kGeneration;
+                if (config.state_dir) {
+                    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                    generation_lock = room_memory::allocate_generation(config.state_dir, config.room_id, now_ms);
+                    generation = generation_lock->generation();
+                }
+                memory = std::make_unique<RoomMemory>(config, time_of(ns), generation);
             } catch (const std::exception& error) {
                 std::cerr << "room_memory_bag: " << error.what() << "\n";
                 return 2;

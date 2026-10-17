@@ -221,11 +221,15 @@ private:
             return false;
         }
         const RoomMemory::SyncAnswer reply = memory_->sync(request, stamp());
+        const char* topic_name = request.topic == msg::SyncTopic::map_bricks      ? "MAP_BRICKS"
+                                 : request.topic == msg::SyncTopic::event_archive ? "EVENT_ARCHIVE"
+                                                                                  : "EVENTS";
         if (!reply.end) {
-            RCLCPP_WARN(get_logger(), "RequestSync for room '%s' dropped: not this room", request.header.room_id.c_str());
+            RCLCPP_WARN(get_logger(), "RequestSync %s for room '%s' dropped", topic_name, request.header.room_id.c_str());
             return false;
         }
-        // The answer first, then its manifest (which may still arrive first: it has its own topic).
+        // The whole answer is published in this callback. A retained events replay stays one
+        // manifest (D36); D47 bounds it by the durable log's cap.
         const auto& publisher = request.topic == msg::SyncTopic::map_bricks ? sync_map_ : sync_events_;
         for (const msg::Bytes& bytes : reply.messages) publisher->publish(serialized(bytes));
         sync_end_->publish(serialized(reply.end->to_cdr()));
@@ -233,9 +237,8 @@ private:
             request.expected_generation ? std::to_string(*request.expected_generation) : std::string("None");
         const std::string bound = reply.end->bound ? std::to_string(*reply.end->bound) : std::string("None");
         RCLCPP_INFO(get_logger(), "RequestSync %s expected_generation %s: %zu messages, bound %s, delivered %s, unavailable %s",
-                    request.topic == msg::SyncTopic::map_bricks ? "MAP_BRICKS" : "EVENTS", expected.c_str(),
-                    reply.messages.size(), bound.c_str(), range_list(reply.end->delivered).c_str(),
-                    range_list(reply.end->unavailable).c_str());
+                    topic_name, expected.c_str(), reply.messages.size(), bound.c_str(),
+                    range_list(reply.end->delivered).c_str(), range_list(reply.end->unavailable).c_str());
         return true;
     }
 
