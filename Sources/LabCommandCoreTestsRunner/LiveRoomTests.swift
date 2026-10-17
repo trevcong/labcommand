@@ -847,7 +847,18 @@ func runLiveRoomTests() {
 @MainActor
 func runLiveRoomProbe(arguments: [String]) -> Int32 {
     let seconds = arguments.first.flatMap(Double.init) ?? 15
-    let url = arguments.dropFirst().first.flatMap(URL.init(string:)) ?? LiveRoomClient.defaultURL
+    let url: URL
+    if let raw = arguments.dropFirst().first {
+        switch RoomMemoryEndpoint.parse(raw) {
+        case .success(let parsed):
+            url = parsed
+        case .failure(let error):
+            print("FAIL: room endpoint: \(error.message)")
+            return 1
+        }
+    } else {
+        url = RoomMemoryEndpoint.defaultURL
+    }
     let requests = arguments.dropFirst(2).first == "request"
     let client = LiveRoomClient(url: url, publishRequests: requests)
     client.start()
