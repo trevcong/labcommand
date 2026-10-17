@@ -89,3 +89,30 @@ def test_service_request_is_exactly_one_request_sync():
     assert fields[:separator] == ["RequestSync request"]
     assert fields[separator + 1:] == ["bool accepted"]
     assert '"srv/RequestSync.srv"' in (ROOT / "ros/labcommand_msgs/CMakeLists.txt").read_text()
+
+
+def _nodes():
+    """Every Node(...) call in the launch file, as {executable: {keyword: source text}}."""
+    tree = ast.parse(CPP_LAUNCH.read_text())
+    nodes = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Node":
+            keywords = {k.arg: ast.unparse(k.value) for k in node.keywords}
+            nodes[ast.literal_eval(keywords["executable"])] = keywords
+    return nodes
+
+
+def test_either_process_exiting_ends_the_container():
+    # Review round 2: the node logged readiness and then died while the bridge kept ros2 launch, and
+    # so the container, running. Docker never restarted it and the deploy's stability window passed.
+    tree = ast.parse(CPP_LAUNCH.read_text())
+    imports = [n for n in tree.body if isinstance(n, ast.ImportFrom) and n.module == "launch.actions"]
+    assert "Shutdown" in {alias.name for n in imports for alias in n.names}
+    nodes = _nodes()
+    assert set(nodes) == {"room_memory_node", "foxglove_bridge"}
+    for executable, keywords in nodes.items():
+        assert keywords.get("on_exit", "").startswith("Shutdown("), executable
+    # ros2 launch is the container's main process (exec, not a shell's child), so its end is the container's.
+    assert (ROOT / "spark/room_memory_cpp/docker-entrypoint.sh").read_text().splitlines()[-1] == 'exec "$@"'
+    assert 'CMD ["ros2", "launch", "room_memory_cpp", "room_memory_cpp.launch.py"]' in (
+        ROOT / "spark/room_memory_cpp/Dockerfile").read_text()
