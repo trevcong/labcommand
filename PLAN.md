@@ -1,4 +1,4 @@
-# Rig-bump guard and acceptance suite (room_memory), v1
+# Rig-bump guard (room_memory), v1, and its acceptance suite
 
 A nudged tripod must not flag the whole room. The node detects a rig move (Mid-360 IMU + ICP), re-aligns the sensor pose, or relearns if it cannot, and reports RIG_MOVED. Long version: `~/Developer/lc-tasks/plans/rigguard.full.md`.
 
