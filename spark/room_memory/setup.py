@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 setup(
     name="room_memory",
     version="0.1.0",
-    packages=find_packages(exclude=["tests"]),
+    packages=find_packages(exclude=["tests", "tests.*", "acceptance", "acceptance.*"]),
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/room_memory"]),
         ("share/room_memory", ["package.xml"]),
