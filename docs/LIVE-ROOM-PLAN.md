@@ -112,7 +112,7 @@ This job leaves the sink nil.
 
 ## What the screen is
 
-A third destination, **Room** (`Dest.liveRoom`, label `Room`, shortcut `3`). Rig stays `1`, Settings stays `2`. `Dest.navCases` already feeds the View menu. The Rig page, the lidar canvas, and the recording controls stay as they are.
+Room is the first destination (`Dest.liveRoom`, label `Room`, shortcut `1`). Settings stays `2`. Rig is `3`, and it stays the diagnostics tab: the lidar canvas and the recording controls are unchanged. `Dest.navCases` is Room, Settings, Rig. A normal launch opens Room. A snapshot pair stays on Rig unless that launch also asks for Room. `opensRoom` is not the tab; it still skips probes.
 
 Same chrome as the rest of the app (`design-refs/DESIGN-VISION.md`, `LabTheme`):
 
@@ -184,10 +184,10 @@ No match (fresh tracking, map current): no banner.
 
 Event history is not a banner. It is the history line on the event list, specified below. Two notices come from the generation-scoped mirror (PLAN-PUBGEN §4.6, §4.8):
 
-- **Restart.** While `continuity` is `broken`, a second line under the banner: `Spark node restarted · events from the earlier run may be missing` (`LabTheme.warn`). It never heals within the launch, because a retired generation has no final bound on the wire. The earlier run's open events are listed as `earlier run · may be outdated`, never drawn on the map.
+- **Restart.** While `continuity` is `broken`, a second line under the banner: `Spark node restarted · events from the earlier run may be missing` (`LabTheme.warn`). It never heals within the launch, because a retired generation has no final bound on the wire. The earlier run's open events are listed as `earlier run · latest status unknown`, never drawn on the map.
 - **Legacy.** A Spark node without publisher generations renders the map `stale(.unverified)`: banner `unverified · Spark node predates publisher generations` (`LabTheme.warn`), after rig-moved and before the map-stale line. Bricks draw dimmed, markers never draw, and no request is sent.
 
- `{sec: 0, nanosec: 0}` renders `time —`. Other stamps render `HH:mm:ss` UTC.
+ `{sec: 0, nanosec: 0}` renders `time —` in every zone. Other stamps render `HH:mm:ss` in the user's zone (`LiveViewMode.clock`). No date is appended.
 
 Bricks, whenever `!isMapCurrent` and the dictionary is not empty, draw at 35% opacity. That covers a stale status while `mapState` is still `.current`, and a `.stale` map. Markers do not draw in either case. When the map is current, bricks are full opacity even if the state is building or rig-moved; the marker rule is what hides the overlays.
 
@@ -287,17 +287,17 @@ The history line comes from `mirror.eventHistory` (PLAN-PUBGEN §4.2, §4.8; the
 | legacy mode | `history unverified (old Spark node)` |
 | coverage `unknown` | no line |
 | coverage `empty` | `no events this run` |
-| coverage `completeThrough(n)` | `history complete through #n` |
-| coverage `missing(pending, lost)` | `history incomplete: <m> missing`, then ` (<k> lost on the Spark)` when k > 0, then ` · no request path` when no path exists and something is still pending |
+| coverage `completeThrough(n)` | `all events through event n are here` |
+| coverage `missing(pending, lost)` | `history incomplete: <m> missing`, then ` (<k> lost on the Spark)` when k > 0, then ` · can't ask the Spark for them` when no path exists and something is still pending |
 
-Open rows carry `· may be outdated` while `eventHistory.caughtUp` is false. There is no `outdatedEventIds` set on the client. Coverage grows only by receipt, and lost ranges are only those the Spark declared in a `SyncEnd` (D36), so no timer, request flag or quiet period can make the line read complete.
+Open rows carry `· latest status unknown` while `eventHistory.caughtUp` is false. There is no `outdatedEventIds` set on the client. Coverage grows only by receipt, and lost ranges are only those the Spark declared in a `SyncEnd` (D36), so no timer, request flag or quiet period can make the line read complete.
 
 The non-resurrection test drives the public mirror API (`connectionOpened`, `receive`, `tick`) with encoded messages, then reads the marker helper:
 
 1. Snapshot at epoch 43, then a fresh tracking status at that epoch, so `isMapCurrent` is true.
 2. One event, candidate, seq 1 → one dashed unfilled marker. The ring length is 1.
 3. Same `eventId`, confirmed, seq 2 → one filled marker. The ring length is 2. Marker count stays 1.
-4. Same `eventId`, accepted, seq 3, `header.mapEpoch` 44, mirror epoch still 43, status still fresh → one unfilled outline, caption does not count a change, history text contains `accepted · map updating`.
+4. Same `eventId`, accepted, seq 3, `header.mapEpoch` 44, mirror epoch still 43, status still fresh → one unfilled outline, caption does not count a change, history text contains `saved · map updating`.
 5. A later snapshot at epoch 44 → zero markers.
 6. Step 3's mirror, queried again, still has one marker after the ring has both transitions. Query the same mirror; do not feed a lower live seq to simulate this. (A lower seq is never a restart signal: a restart is a higher publisher generation, D37.)
 
@@ -305,21 +305,21 @@ The non-resurrection test drives the public mirror API (`connectionOpened`, `rec
 
 Right column, 280pt, well background, two sections. Slice 2.
 
-Each row is two lines of 11pt mono, wrapping inside the column (about 256pt of text after padding). No horizontal scroller. Line limit 2 on each line.
+Each row is two lines of 11pt mono, wrapping inside the column (about 256pt of text after padding). No horizontal scroller. Line 1 allows 2 lines. Line 2 allows 3, so an earlier-run row can name the box, the false-alarm limit, the sensors, and that the latest status is unknown.
 
 ```
-● appeared · candidate · 8 voxels · 12:00:10
-evidence — · α 0.05 · Mid-360 · no mask
+● appeared · checking · 8 cells · 19:00:10
+box not measured · false-alarm limit 5% · Mid-360 · box only
 ```
 
-- Line 1: kind-colored pip, kind, state, voxel count, `HH:mm:ss` UTC.
-- Line 2, `LabTheme.dim`: evidence, alpha, sensors, then `no mask` or `accepted · map updating` or `may be outdated` when those apply.
+- Line 1: kind-colored pip, kind, state, cell count, `HH:mm:ss` in the user's zone.
+- Line 2, `LabTheme.dim`: how much of the box was seen, the calibrated false-alarm limit, sensors, then `box only` or `saved · map updating` or `latest status unknown` when those apply.
 - Kind words: `appeared`, `disappeared`, `moved`.
-- State words: `candidate`, `confirmed`, `accepted`, `reverted`, `expired`.
-- `evidence` nil → `evidence —`. A real zero is `evidence 0%` (integer percent).
-- `alpha` nil → `uncalibrated`. A real value is `α 0.05` (two decimals). Never `α 0` for nil.
+- State words: `checking`, `confirmed`, `saved`, `change undone`, `no longer detected`. The wire enum stays `.candidate`.
+- Evidence nil → `box not measured`. A real zero is `0% of the box was seen` (integer percent). That fraction is how many of the region's cells have evidence, not a confidence score.
+- Alpha nil → `false-alarm limit not calibrated`. Exact zero is `false-alarm limit 0%`. A positive level under 1% is `false-alarm limit <1%`. Anything else is `false-alarm limit N%`, with a tenth only when the percent is not whole. This is the detector's calibrated limit, not this event's chance of being wrong.
 - Sensors: `Mid-360`, `JT128`, both as `Mid-360, JT128`, empty bitmask → `sensor —`.
-- `mask == nil` → `no mask`. The mask's occupied voxels are not a second mesh. The AABB is the marker.
+- `mask == nil` → `box only`. The mask's occupied cells are not a second mesh. The AABB is the marker.
 
 **Events.** `openEvents`, newest `header.stamp` first, then higher `header.seq`. The section is hidden when empty only if History is also empty and the connection is up; a live empty room shows the caption below rather than a blank column.
 
@@ -327,10 +327,10 @@ evidence — · α 0.05 · Mid-360 · no mask
 
 The caption counts **drawn markers**, after the kind filter and after suppression:
 
-`2 changes · 1 candidate on map`
+`2 changes · 1 checking`
 
 - `changes` = drawn confirmed boxes
-- `candidates` = drawn candidate boxes
+- the second count is drawn boxes still being checked (wire state `.candidate`)
 - the accepted-waiting outline is in neither number
 - suppression or a filter that hides a kind removes it from the count, and the rows stay in the list
 - a current map with nothing open renders `0 changes`
@@ -342,15 +342,15 @@ Three filter chips, mono 11, on by default: Appeared, Disappeared, Moved. Off hi
 
 This bridge cannot carry `RequestSync` (`canPublish` is false). With `requestSyncSink == nil` the mirror never queues a request, so `activity.requestsUnsent` stays 0 even while the map is stale. The counter moves only when the mirror emits a request and the client cannot carry it (`noteRequestUnsent`).
 
-Show `cannot request resync` when the map needs recovery and no path exists. Events say it on the history line itself (` · no request path`, above), so this line is about the map only (PLAN-PUBGEN §4.7).
+Show `can't ask the Spark to resend the map` when the map needs recovery and no path exists. Events say ` · can't ask the Spark for them` on the history line, so this line is about the map only (PLAN-PUBGEN §4.7). The client still calls a missing capability "no request path".
 
 - Recovery is needed when `mapState` is `.stale`, except `stale(.unverified)`: a legacy node is never sent a request, so there is nothing to report.
 - A path exists when `requestPathExists` is true (computed by `AppState`, above).
 - Also show the line when `activity.requestsUnsent > 0`, whether or not the flag is set, because the client already counted a request that did not leave the machine.
 
-When the count is non-zero the text is `cannot request resync · <n> unsent`. Otherwise it is `cannot request resync`. One placement, first match. The text appears once.
+When the count is non-zero the text is `can't ask the Spark to resend the map · <n> not sent`. Otherwise it is `can't ask the Spark to resend the map`. One placement, first match. The text appears once.
 
-1. The visible banner is the map-stale line (`resyncing · as of epoch N`). Append ` · cannot request resync`, and ` · <n> unsent` when the count is non-zero, to that banner.
+1. The visible banner is the map-stale line (`resyncing · as of epoch N`). Append ` · can't ask the Spark to resend the map`, and ` · <n> not sent` when the count is non-zero, to that banner.
 2. Standalone fallback, whenever rule 1 did not fire. The text is its own line in the event column, above the sections, 11pt mono, `LabTheme.warn`. This covers a higher banner winning (connection lost, empty topics, stale status, rig moved, degraded, paused, building), the `Waiting for map` banner (a stale map with no bricks is not the map-stale line), no banner, and `requestsUnsent > 0` with a current map.
 
 The standalone line does not replace the winning banner. It does not outrank connection loss, an empty topic list, or a stale status. The column stays on screen while the line is present, including when Events and History are both empty. Rule 1 suppresses the standalone line.
@@ -386,7 +386,7 @@ The delta golden is not applied. The snapshot is already epoch 43. The mock does
 
 The `Fixture` chip uses `LabTheme.dim` and the help string `Hand goldens. No rig contact.` A segmented control `Map / Status / Stale / Off` sits in the header only in fixture mode.
 
-Map-mode caption from the three drawn markers: `2 changes · 1 candidate on map`.
+Map-mode caption from the three drawn markers: `2 changes · 1 checking`.
 
 ## Screenshots
 
@@ -451,15 +451,15 @@ Not edited after slice 0: `PointCloudRenderer.swift`, `FoxgloveLiveClient.swift`
 
 - Decode `memory_status_le.hex`, assert `eventsSeq == 12`, `receive` it on a mirror, and assert the status line contains `events 12`. A nil `eventsSeq` renders `events —`. A mirror whose `eventHistory.contiguousThrough` is 4 with `status.eventsSeq == 12` renders `events 12`.
 - Coverage `0.75` → `coverage 75.0%`, coverage `0` → `coverage 0.0%`, stale age `4.2` → `STALE · 4s`, cell `0.05` → `cell 5.0 cm`. The state word is absent when `isStatusFresh` is false.
-- `alpha` nil → `uncalibrated`. Evidence nil → `evidence —`.
-- Each `EventHistory` row of the history-line table prints its line: `history complete through #n`, `no events this run`, `history incomplete: <m> missing (<k> lost on the Spark)`, `history unverified (old Spark node)`. `continuity = broken` shows the restart notice. Legacy mode shows the unverified banner and sends no request. The trace and view tests are PLAN-PUBGEN §6.
+- `alpha` nil → `false-alarm limit not calibrated`. Evidence nil → `box not measured`. Alpha `0.004` → `false-alarm limit <1%`, distinct from exact zero.
+- Each `EventHistory` row of the history-line table prints its line: `all events through event n are here`, `no events this run`, `history incomplete: <m> missing (<k> lost on the Spark)`, `history unverified (old Spark node)`. `continuity = broken` shows the restart notice. Legacy mode shows the unverified banner and sends no request. The trace and view tests are PLAN-PUBGEN §6.
 - Voxel samples for the decoded zlib snapshot: exactly the two centers above, one frame, the all-free brick silent.
 - The candidate → confirmed → accepted sequence in "Event adaptation", including one marker while the ring holds two transitions, and the accepted outline until the snapshot epoch catches up.
 - Building, rig-moved, a stale status, and `mapState == .stale` each produce zero boxes. A confirmed event still produces a box when the fresh state is `.degraded` and the map is current. A selected candidate is dashed and has fill alpha 0.
-- Kind filter off removes that kind from the marker set and from the caption. Caption on the map fixture is `2 changes · 1 candidate on map`.
+- Kind filter off removes that kind from the marker set and from the caption. Caption on the map fixture is `2 changes · 1 checking`.
 - `LiveRoomLaunch` maps the env table above. The fixture cases do not construct a client.
-- Banner priority: a stale status wins over a remembered `.rigMoved`. An empty `memoryTopics` wins over `Waiting for map`. `cannot request resync` appears for a stale map with `requestPathExists == false` and a zero unsent count, and the unsent count is included when `noteRequestUnsent` has run.
-- Resync placement, one line each. Map stale, path absent, unsent 0, no higher banner: the warning is on the resync banner, and the standalone line is absent. The same recovery while the winning banner is `connection lost`: the banner stays `connection lost`, and the standalone line is `cannot request resync`. `requestsUnsent == 2` with a current map: the standalone line is `cannot request resync · 2 unsent`. A stale map with no bricks uses the standalone line, because the banner is `Waiting for map`. Missing events with no path put ` · no request path` on the history line, not on the resync line.
+- Banner priority: a stale status wins over a remembered `.rigMoved`. An empty `memoryTopics` wins over `Waiting for map`. `can't ask the Spark to resend the map` appears for a stale map with `requestPathExists == false` and a zero unsent count, and the unsent count is included when `noteRequestUnsent` has run.
+- Resync placement, one line each. Map stale, path absent, unsent 0, no higher banner: the warning is on the resync banner, and the standalone line is absent. The same recovery while the winning banner is `connection lost`: the banner stays `connection lost`, and the standalone line is `can't ask the Spark to resend the map`. `requestsUnsent == 2` with a current map: the standalone line is `can't ask the Spark to resend the map · 2 not sent`. A stale map with no bricks uses the standalone line, because the banner is `Waiting for map`. Missing events with no path put ` · can't ask the Spark for them` on the history line, not on the resync line.
 - Fixture `map` and `status` do not share a `roomId`. Fixture `status` has `status.eventsSeq == 12`. (Fixture `map`'s status values are the code's since v2, above.)
 
 No new golden hex files. The default test run opens no socket and no SSH.
@@ -487,7 +487,7 @@ No new golden hex files. The default test run opens no socket and no SSH.
 9. An accepted event whose `mapEpoch` the mirror has not reached draws an uncounted outline until a current map catches up. The client is not modified for that.
 10. Unknown voxels are a wireframe of any brick that still has an unknown cell. Free cells are undrawn. Occupied cells are grey points. Centers use `(index + 0.5) × voxelSize`.
 11. `mapRevision` and `voxelSize` gate voxel uploads. The camera auto-fits only until the user orbits or zooms, and the fit includes drawn boxes and arrow points.
-12. A bridge without the request service (D39) or `clientPublish`, and no `requestSyncSink`, means no request path. The view then reports `cannot request resync`; the client, not the view, owns the path (`LiveRoomClient.requestPath`). When the banner is not the map-stale line, that report is a standalone line in the event column. Missing events report ` · no request path` on the history line.
+12. A bridge without the request service (D39) or `clientPublish`, and no `requestSyncSink`, means no request path. The view then reports `can't ask the Spark to resend the map`; the client, not the view, owns the path (`LiveRoomClient.requestPath`). When the banner is not the map-stale line, that report is a standalone line in the event column. Missing events report ` · can't ask the Spark for them` on the history line.
 13. The change-overlay branch contributes colors, box topology, fill alphas, and the arrow. It is not merged.
-14. Selected candidates stay dashed and unfilled. The caption counts drawn markers. Event rows wrap on two lines inside 280pt.
+14. A selected box that is still being checked stays dashed and unfilled. The caption counts drawn markers. Event rows wrap inside 280pt; the second line may use three lines.
 15. `65122d2` is on this branch, and its decode-and-test gate has passed, before any `LiveRoom` client file is added. Marker colors are counted inside the sidecar's canvas rect. Row readability is read off the PNG.

@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let appState = AppState()
     private var statusItem: NSStatusItem?
     private var statusWatch: AnyCancellable?
+    private var titleWatch: AnyCancellable?
     private var visibilityObservers: [NSObjectProtocol] = []
     private var keyMonitor: Any?
 
@@ -36,7 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             backing: .buffered,
             defer: false
         )
-        win.title = "Rig command"
+        win.title = appState.dest.windowTitle
         win.contentView = hosting
         win.setContentSize(NSSize(width: 1180, height: 800))
         win.center()
@@ -46,6 +47,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         win.backgroundColor = NSColor(red: 0.043, green: 0.051, blue: 0.063, alpha: 1)
         win.makeKeyAndOrderFront(nil)
         window = win
+        titleWatch = appState.$dest.receive(on: DispatchQueue.main).sink { [weak self] dest in
+            self?.window?.title = dest.windowTitle
+        }
         watchVisibility(of: win)
 
         appState.start()

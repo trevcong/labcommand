@@ -10,7 +10,7 @@ enum Dest: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    static var navCases: [Dest] { [.workspace, .settings, .liveRoom] }
+    static var navCases: [Dest] { [.liveRoom, .settings, .workspace] }
 
     var label: String {
         switch self {
@@ -20,11 +20,13 @@ enum Dest: String, CaseIterable, Identifiable {
         }
     }
 
+    var windowTitle: String { "LabCommand - \(label)" }
+
     var shortcutKey: String {
         switch self {
-        case .workspace: return "1"
+        case .workspace: return "3"
         case .settings: return "2"
-        case .liveRoom: return "3"
+        case .liveRoom: return "1"
         }
     }
 }
@@ -33,7 +35,7 @@ enum Dest: String, CaseIterable, Identifiable {
 final class AppState: ObservableObject {
     @Published private(set) var snapshot: LabStatusSnapshot
     @Published private(set) var isRefreshing = false
-    @Published var dest: Dest = .workspace
+    @Published var dest: Dest = .liveRoom
 
     /// Fast rig poll (API GET over the tunnel). Cheap — not an SSH probe.
     @Published var rigPollSeconds: Double = 5
@@ -138,8 +140,10 @@ final class AppState: ObservableObject {
             pointCloudColorMode = .sensor
             autoRefreshEnabled = false
         }
-        if roomLaunch.opensRoom {
-            dest = .liveRoom
+        // Room is home. A snapshot pair stays on Rig unless this launch also asked
+        // for the room page. Do not open Room by setting `opensRoom`: that skips probes.
+        if launch.isolates && !roomLaunch.opensRoom {
+            dest = .workspace
         }
         recomputeStatusDots()
         watchRoomDots()
