@@ -90,6 +90,89 @@ def records(seconds, hz=10):
     return out
 
 
+def _samples(low, high):
+    """float32 grid matching scenes.cpp samples(): start + i * step while value < high."""
+    step = np.float32(0.02)
+    start = np.float32(low) + np.float32(0.007)
+    values = []
+    i = 0
+    while True:
+        value = np.float32(start + np.float32(i) * step)
+        if value >= np.float32(high):
+            return np.asarray(values, dtype=np.float32)
+        values.append(value)
+        i += 1
+
+
+def _room_and_box():
+    """The C++ room shell and one box, so one window of each emits a change."""
+    x0, x1 = np.float32(-1.5), np.float32(2.5)
+    y0, y1 = np.float32(-1.5), np.float32(2.5)
+    z0, z1 = np.float32(-0.7), np.float32(1.3)
+    xs, ys, zs = _samples(x0, x1), _samples(y0, y1), _samples(z0, z1)
+    phase = np.float32(0.007)
+    floor_z = z0 + phase
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+    floor = np.stack([gx.ravel(), gy.ravel(), np.full(gx.size, floor_z, dtype=np.float32)], axis=1)
+    x_lo, x_hi = x0 + phase, x1 - phase
+    gy, gz = np.meshgrid(ys, zs, indexing="ij")
+    walls_x = np.stack([
+        np.concatenate([np.full(gy.size, x_lo, dtype=np.float32), np.full(gy.size, x_hi, dtype=np.float32)]),
+        np.concatenate([gy.ravel(), gy.ravel()]),
+        np.concatenate([gz.ravel(), gz.ravel()]),
+    ], axis=1)
+    y_lo, y_hi = y0 + phase, y1 - phase
+    gx, gz = np.meshgrid(xs, zs, indexing="ij")
+    walls_y = np.stack([
+        np.concatenate([gx.ravel(), gx.ravel()]),
+        np.concatenate([np.full(gx.size, y_lo, dtype=np.float32), np.full(gx.size, y_hi, dtype=np.float32)]),
+        np.concatenate([gz.ravel(), gz.ravel()]),
+    ], axis=1)
+    room = np.concatenate([floor, walls_x, walls_y], axis=0)
+    cx, cy, cz, half = np.float32(0.3), np.float32(1.2), np.float32(0.3), np.float32(0.2)
+    bxs, bys, bzs = _samples(cx - half, cx + half), _samples(cy - half, cy + half), _samples(cz - half, cz + half)
+    faces = []
+    gy, gz = np.meshgrid(bys, bzs, indexing="ij")
+    for x in (cx - half + phase, cx + half - phase):
+        faces.append(np.stack([np.full(gy.size, x, dtype=np.float32), gy.ravel(), gz.ravel()], axis=1))
+    gx, gz = np.meshgrid(bxs, bzs, indexing="ij")
+    for y in (cy - half + phase, cy + half - phase):
+        faces.append(np.stack([gx.ravel(), np.full(gx.size, y, dtype=np.float32), gz.ravel()], axis=1))
+    gx, gy = np.meshgrid(bxs, bys, indexing="ij")
+    for z in (cz - half + phase, cz + half - phase):
+        faces.append(np.stack([gx.ravel(), gy.ravel(), np.full(gx.size, z, dtype=np.float32)], axis=1))
+    return room, np.concatenate([room, *faces], axis=0)
+
+
+def _frame(points, t_ns):
+    raw = np.ascontiguousarray(points, dtype="<f4").tobytes()
+    return struct.pack("<BBQI", 1, 0, t_ns, len(raw)) + raw
+
+
+@pytest.mark.skipif(not BAG, reason="ROOM_MEMORY_BAG (the room_memory_bag binary) not set")
+def test_a_second_bag_run_allocates_a_new_generation(tmp_path):
+    """Two processes on one state_dir each publish events. Reusing generation 1 appends seq 0
+    after the first run's high water and aborts (static_recording's second replay)."""
+    room, boxed = _room_and_box()
+    t0 = 1000 * 10**9
+    payload = _frame(room, t0) + _frame(boxed, t0 + 10**9) + _frame(boxed, t0 + 2 * 10**9)
+    config = ["sensors=mid360", "max_range=none", "reference_windows=1", "recent_windows=1",
+              "occupied_min_hits=1", "occupied_min_ratio=0", "free_min_seen=1", "candidate_windows=1",
+              "expire_windows=1", "fresh_min_voxels=1", "fresh_min_fraction=0", "activity_radius_m=0",
+              f"state_dir={tmp_path}"]
+
+    def run():
+        result = subprocess.run([BAG, *config], input=payload, capture_output=True, check=True)
+        lines = result.stdout.decode().splitlines()
+        events = [line for line in lines if line.startswith("event ")]
+        assert events, result.stdout.decode()
+        return int((tmp_path / "lab" / "publisher_generation").read_text().strip())
+
+    first = run()
+    second = run()
+    assert second > first
+
+
 @pytest.mark.skipif(not BAG, reason="ROOM_MEMORY_BAG (the room_memory_bag binary) not set")
 def test_statuses_tick_every_second_independently_of_the_window():
     """Codex P2: with window_s=2 both statuses of a window were sent after it closed, the first with

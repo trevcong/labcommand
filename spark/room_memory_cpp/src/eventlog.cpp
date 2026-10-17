@@ -377,8 +377,36 @@ void EventLog::append(std::uint64_t generation, std::uint64_t seq, std::uint64_t
     pending_.push_back(Pending{generation, seq, map_epoch, stamp_ns, std::move(cdr)});
 }
 
+void EventLog::require_next_seq() const {
+    // A known generation's next record is its high water plus one. A new generation may
+    // start at whatever seq this process publishes (a restart starts at 0). Checked
+    // before the write: appending seq 0 after a higher high water must not land on disk.
+    std::map<std::uint64_t, std::uint64_t> next;
+    for (const auto& [generation, seq] : generations_) {
+        if (seq == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::runtime_error("event log does not reach its manifest high water");
+        }
+        next.emplace(generation, seq + 1);
+    }
+    for (const Pending& record : pending_) {
+        const auto known = next.find(record.generation);
+        if (known == next.end()) {
+            if (record.seq == std::numeric_limits<std::uint64_t>::max()) {
+                throw std::runtime_error("event log does not reach its manifest high water");
+            }
+            next.emplace(record.generation, record.seq + 1);
+            continue;
+        }
+        if (record.seq != known->second || known->second == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::runtime_error("event log does not reach its manifest high water");
+        }
+        known->second += 1;
+    }
+}
+
 void EventLog::write_pending() {
     if (pending_.empty() && !write_mark_) return;
+    if (!pending_.empty()) require_next_seq();
     ensure_events();
     if (!write_mark_) roll_if_needed();
     const std::vector<std::uint8_t> encoded = encode_pending(retain_high_, have_retain_);

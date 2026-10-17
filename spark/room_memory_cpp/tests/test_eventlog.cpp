@@ -8,6 +8,7 @@
 
 #include "harness.hpp"
 #include "room_memory/eventlog.hpp"
+#include "room_memory/generation.hpp"
 #include "room_memory/memory.hpp"
 #include "scenes.hpp"
 
@@ -713,6 +714,76 @@ TEST(corrupt_history_refuses_the_room) {
     data[static_cast<std::size_t>(offsets[0]) + 12 + 3] ^= 0x11;
     write_file(segment, data);
     CHECK_THROWS(std::runtime_error, RoomMemory(config, stamp(50), kGeneration + 1));
+}
+
+TEST(a_reused_generation_is_refused_before_it_is_written) {
+    Room room;
+    EventLog log = EventLog::open(room.path, EventLogLimits{});
+    commit_one(log, kGeneration, 4, 10, bytes_of(1));
+    log.append(kGeneration, 0, 7, 11, bytes_of(2));
+    CHECK_THROWS(std::runtime_error, log.commit());
+    EventLog again = EventLog::open(room.path, EventLogLimits{});
+    const EventReplay kept = again.replay_archive(kGeneration, std::nullopt).value();
+    CHECK(kept.messages.size() == 1 && kept.bound == 4);
+    again.append(kGeneration + 1, 0, 7, 12, bytes_of(3));
+    again.commit();
+    CHECK(again.replay_archive(kGeneration, std::nullopt)->bound == 4);
+    CHECK(again.replay_archive(kGeneration + 1, std::nullopt)->messages.size() == 1);
+}
+
+TEST(a_second_process_allocates_instead_of_reusing_the_generation) {
+    TempDir dir;
+    const auto config = config_with(dir.path.string());
+    const std::int64_t now_ms = static_cast<std::int64_t>(kGeneration);
+    std::vector<msg::Bytes> published;
+    std::uint64_t first_generation = 0;
+    {
+        const Allocation held = allocate_generation(config.state_dir, "lab", now_ms);
+        first_generation = held.generation();
+        CHECK_EQ(first_generation, kGeneration);
+        RoomMemory memory(config, kStart, first_generation);
+        const scenes::Cloud room = scenes::room_shell();
+        const std::int64_t second = build_reference(memory, room);
+        const scenes::Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
+        memory.add_points("mid360", scenes::concat({&room, &box}));
+        const auto events = memory.close_window(stamp(second));
+        CHECK(events.size() == 1 && events[0].header.seq == 0);
+        published.push_back(events[0].to_cdr());
+        memory.add_points("mid360", room);
+        const auto expired = memory.close_window(stamp(second + 1));
+        CHECK(expired.size() == 1 && expired[0].header.seq == 1);
+        published.push_back(expired[0].to_cdr());
+    }
+    {
+        RoomMemory reused(config, stamp(50), first_generation);
+        const scenes::Cloud room = scenes::room_shell();
+        const scenes::Cloud box = scenes::box_shell({0.3, 1.2, 0.3});
+        reused.add_points("mid360", scenes::concat({&room, &box}));
+        bool refused = false;
+        try {
+            reused.close_window(stamp(50));
+        } catch (const std::runtime_error& error) {
+            refused = std::string(error.what()).find("manifest high water") != std::string::npos;
+        }
+        CHECK(refused);
+    }
+    const Allocation again = allocate_generation(config.state_dir, "lab", now_ms);
+    CHECK_EQ(again.generation(), first_generation + 1);
+    RoomMemory restarted(config, stamp(60), again.generation());
+    const auto archived =
+        restarted.sync(sync_request(std::nullopt, msg::SyncTopic::event_archive, first_generation), stamp(60));
+    CHECK(archived.messages == published);
+    CHECK(archived.end && archived.end->publisher_generation == first_generation && archived.end->bound == 1);
+    const scenes::Cloud room = scenes::room_shell();
+    const scenes::Cloud other = scenes::box_shell({-0.4, 0.4, 0.3});
+    restarted.add_points("mid360", scenes::concat({&room, &other}));
+    const auto neu = restarted.close_window(stamp(60));
+    CHECK(neu.size() == 1 && neu[0].header.seq == 0 && neu[0].publisher_generation == again.generation());
+    const auto live = restarted.sync(sync_request(std::nullopt, msg::SyncTopic::events, again.generation()), stamp(60));
+    CHECK(live.messages.size() == 1 && live.end->bound == 0 && live.end->publisher_generation == again.generation());
+    const auto still =
+        restarted.sync(sync_request(std::nullopt, msg::SyncTopic::event_archive, first_generation), stamp(60));
+    CHECK(still.messages == published && still.end->bound == 1);
 }
 
 TEST_MAIN

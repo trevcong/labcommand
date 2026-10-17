@@ -99,7 +99,9 @@ public:
                 msg::Bytes cdr);
 
     // Writes, fsyncs, then drops a prefix for age and size. No I/O when nothing is buffered
-    // and nothing was left half-rotated. Throws on I/O failure; a failed write leaves the
+    // and nothing was left half-rotated. A seq that is not the next seq of a generation the
+    // log already knows throws before the write, so a second process cannot append seq 0
+    // onto a generation it does not own. Throws on I/O failure; a failed write leaves the
     // buffer in place. Returns seqs removed from the retained index.
     std::vector<EvictedEvent> commit();
 
@@ -153,6 +155,7 @@ private:
     msg::Bytes read_cdr(const Stored& stored) const;
     std::vector<Stored> retained_of(std::uint64_t generation) const;
     void recover();
+    void require_next_seq() const;
     void require_suffix() const;
     bool expired(std::int64_t retain) const;
     std::uint64_t occupied_bytes() const;
