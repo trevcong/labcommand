@@ -464,29 +464,46 @@ TEST(an_accept_of_the_other_sensor_sends_an_empty_delta) {
     CHECK(memory.accepted_after_map(stamp(8)).size() == 1);
 }
 
-TEST(a_map_save_that_throws_keeps_the_accept_held_until_a_map_carries_it) {
+// The node's window timer (room_memory_node.cpp close_window): the window, then the map message
+// if one is due, then the ACCEPTED it carries. Nothing here may throw: a throw ends the node's spin.
+struct Tick {
+    std::optional<msg::Bytes> map;
+    std::vector<msg::ChangeEvent> accepted;
+};
+
+Tick tick(RoomMemory& memory, const Cloud& cloud, std::int64_t second) {
+    Tick out;
+    window(memory, cloud, second);
+    out.map = memory.map_update(stamp(second));
+    if (out.map) out.accepted = memory.accepted_after_map(stamp(second));
+    return out;
+}
+
+TEST(a_map_save_that_fails_keeps_the_accept_held_and_the_window_timer_retries_it) {
     TempDir dir;
     RoomMemory memory(config(dir.path.string()), kStart, kGeneration);
     const std::uint64_t id = candidate(memory);
     memory.operate(act(OperatorActionKind::confirm, id, EventState::candidate, 1, 1), stamp(5));
     CHECK(memory.operate(act(OperatorActionKind::accept, id, EventState::confirmed, 1, 2), stamp(5)).outcome == Outcome::applied);
-    const std::filesystem::path room_path = dir.path / "lab";
-    std::filesystem::permissions(room_path, std::filesystem::perms::owner_write, std::filesystem::perm_options::remove);
-    bool threw = false;
-    try {
-        memory.map_update(stamp(8));
-    } catch (const std::exception&) {
-        threw = true;
+    // A directory where the epoch file goes: every map save fails, for root as well.
+    const std::filesystem::path epoch_file = epoch_path(dir.path.string(), "lab");
+    std::filesystem::remove(epoch_file);
+    std::filesystem::create_directory(epoch_file);
+    const std::uint64_t epoch = memory.map_epoch();
+    for (const std::int64_t second : {8, 9}) {
+        const Tick failed = tick(memory, with(box()), second);
+        CHECK(!failed.map && failed.accepted.empty() && memory.storage_error());
+        // No epoch is used up by a save that failed, and the accept stays open.
+        CHECK(memory.map_epoch() == epoch && memory.status(stamp(second), 1.0).n_open_events == 1);
     }
-    std::filesystem::permissions(room_path, std::filesystem::perms::owner_write, std::filesystem::perm_options::add);
-    if (getuid() == 0) throw harness::Skip("root ignores directory permissions");
-    CHECK(threw && memory.accepted_after_map(stamp(8)).empty() && memory.status(stamp(8), 1.0).n_open_events == 1);
-    const auto map = memory.map_update(stamp(9));
-    CHECK(map.has_value());
-    const msg::MapBricks message = msg::MapBricks::from_cdr(*map);
-    const auto released = memory.accepted_after_map(stamp(9));
-    CHECK(released.size() == 1 && released[0].header.map_epoch == message.header.map_epoch);
-    CHECK(memory.accepted_after_map(stamp(10)).empty());
+    std::filesystem::remove_all(epoch_file);
+    const Tick healed = tick(memory, with(box()), 10);
+    CHECK(healed.map.has_value() && !memory.storage_error());
+    const msg::MapBricks message = msg::MapBricks::from_cdr(*healed.map);
+    CHECK(message.header.map_epoch == epoch + 1 && load_epoch(epoch_file) == epoch + 1);
+    CHECK(healed.accepted.size() == 1 && healed.accepted[0].event_id == id &&
+          healed.accepted[0].state == EventState::accepted && healed.accepted[0].header.map_epoch == epoch + 1);
+    CHECK(tick(memory, with(box()), 11).accepted.empty() && memory.status(stamp(11), 1.0).n_open_events == 0);
 }
 
 // MARK: Storage faults

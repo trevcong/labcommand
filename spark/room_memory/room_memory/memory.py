@@ -909,6 +909,7 @@ class RoomMemory:
         self._held = []
         self._actions = deque(maxlen=_operator.STORED_ACTIONS)
         self.storage_error = None
+        self._save_pending = False  # a new epoch's save failed: the next due map tick retries it
         self._load(start)
 
     def _paths(self):
@@ -958,6 +959,23 @@ class RoomMemory:
         header = Header(self.config.room_id, self.map_epoch, 0, stamp)
         for name, path in self._paths().items():
             save_reference(path, self.channels[name].reference, header, self.config.voxel_size)
+
+    def _advance_epoch(self, stamp):
+        """Takes the next ``map_epoch`` and saves it. A failed write is a storage error, not an
+        exception (it would end the node's spin): the epoch stays where it was and the save is
+        retried on the next due map tick, which publishes nothing until it succeeds."""
+        self.map_epoch += 1
+        try:
+            self.save(stamp)
+        except (OSError, ValueError) as error:  # a failed write, or a layer the codec cannot carry
+            self.map_epoch -= 1
+            self._save_pending = True
+            self.storage_error = f"map_epoch {self.map_epoch + 1} not saved: {error}"
+            return False
+        if self._save_pending:
+            self.storage_error = None
+        self._save_pending = False
+        return True
 
     def add_points(self, sensor, positions):
         """Queues decoded ``(n, 3)`` positions (meters, sensor frame) for the current window."""
@@ -1084,8 +1102,7 @@ class RoomMemory:
                 self._settle_pending = False
             elif any(len(channel.stats.keys) for channel in self.channels.values()):
                 self._settle_pending = True
-            self.map_epoch += 1
-            self.save(stamp)
+            self._advance_epoch(stamp)
         _operator.persist_suppressions(self)
         return events
 
@@ -1142,11 +1159,14 @@ class RoomMemory:
         bricks; a snapshot instead when ``keyframe_period_s`` has passed since the last one, or
         when the deltas since it would exceed ``keyframe_delta_ratio`` of its size. After
         ``learn_windows`` tracking windows, that settle pass drops every sensor's counts. Later
-        ticks do not settle, and a keyframe of the unchanged map does not bump ``map_epoch``."""
+        ticks do not settle, and a keyframe of the unchanged map does not bump ``map_epoch``. Never
+        raises for storage: a failed save sends nothing and is retried on the next due tick."""
         if self.state == MemoryState.BUILDING:
             return None
         ns = _nanoseconds(stamp)
         if not self._map_started:
+            if self._save_pending and not self._advance_epoch(stamp):
+                return None
             self._map_started = True
             self._map_bricks = self.channels[self.map_sensor].reference.to_bricks()
             return self._publish_map(self._map_message(MapKind.SNAPSHOT, stamp, self._map_bricks))
@@ -1171,11 +1191,13 @@ class RoomMemory:
         # An accept's absorbed reference goes out on the next due tick, retried until a map message carries it.
         if any(held.epoch is None for held in self._held):
             changed = True
+        # So does a reference whose save failed: nothing goes out at an epoch the disk does not hold.
+        if self._save_pending:
+            changed = True
         if not changed and not keyframe_due:
             return None
-        if changed:
-            self.map_epoch += 1
-            self.save(stamp)
+        if changed and not self._advance_epoch(stamp):
+            return None
         bricks = self.channels[self.map_sensor].reference.to_bricks() if changed else self._map_bricks
         if not keyframe_due:
             upserts, removed = map_delta(self._map_bricks, bricks)

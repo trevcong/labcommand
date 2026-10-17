@@ -408,6 +408,7 @@ public:
     // one, or when the deltas since it would exceed keyframe_delta_ratio of its size.
     // After learn_windows tracking windows, that settle pass drops every sensor's counts.
     // Later ticks do not settle, and a keyframe of the unchanged map does not bump map_epoch.
+    // Never throws for storage: a failed save sends nothing and is retried on the next due tick.
     std::optional<msg::Bytes> map_update(const msg::Time& stamp);
     // The answer to one RequestSync (protocol section 5) and its SyncEnd; nothing for another
     // room_id. `since` counts only when expected_generation is this generation; otherwise (a
@@ -427,8 +428,8 @@ public:
     // The ACCEPTED transitions whose map message map_update just published (call after each
     // published map message), with that message's map_epoch.
     std::vector<msg::ChangeEvent> accepted_after_map(const msg::Time& stamp);
-    // The last failed or uncertain durable write of an operator path, cleared by the next good
-    // one; for the node's log.
+    // The last failed or uncertain durable write of an operator path or a map save, cleared by
+    // the next good one; for the node's log.
     const std::optional<std::string>& storage_error() const { return storage_error_; }
     const std::vector<Suppression>& suppressions(const std::string& sensor) const;
     // Writes every sensor's reference and the room's epoch file with the current map_epoch.
@@ -456,6 +457,10 @@ private:
     msg::ChangeEvent event(const Channel& channel, msg::EventState state, const Candidate& candidate,
                            const msg::Time& stamp);
     void set_reference(Channel& channel, VoxelLayer reference);
+    // Takes the next map_epoch and saves it. A failed write is a storage error, not an exception
+    // (it would end the node's spin): the epoch stays where it was and the save is retried on the
+    // next due map tick, which publishes nothing until it succeeds.
+    bool advance_epoch(const msg::Time& stamp);
     msg::MapBricks map_message(msg::MapKind kind, const msg::Time& stamp) const;
     msg::Bytes publish_map(const msg::MapBricks& message);
     void log_event(const msg::ChangeEvent& event);
@@ -522,6 +527,7 @@ private:
     };
     std::deque<StoredAction> actions_;
     std::optional<std::string> storage_error_;
+    bool save_pending_ = false;  // a new epoch's save failed: the next due map tick retries it
 };
 
 // Repeated action ids answered from memory (D46). A restart forgets them; the generation fence

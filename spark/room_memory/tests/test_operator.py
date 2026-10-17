@@ -7,7 +7,16 @@ import pytest
 
 import scenes
 from room_memory import operator as op
-from room_memory.memory import MemoryConfig, RoomMemory, VoxelLayer, load_reference, reference_path, region_keys
+from room_memory.memory import (
+    MemoryConfig,
+    RoomMemory,
+    VoxelLayer,
+    epoch_path,
+    load_epoch,
+    load_reference,
+    reference_path,
+    region_keys,
+)
 from room_memory.messages import (
     EventKind, EventState, Header, MapBricks, MapKind, MemoryState, OperatorAction, OperatorActionKind, OperatorOutcome,
     Time,
@@ -117,6 +126,36 @@ def test_accept_holds_accepted_for_its_map(tmp_path):
     assert [(e.state, e.header.map_epoch) for e in released] == [(EventState.ACCEPTED, 2)]
     assert memory.status(stamp(8), 1.0).n_open_events == 0
     assert window(memory, WITH_BOX, 9) == []
+
+
+def tick(memory, cloud, second):
+    """The node's window timer (node.py ``_close_window``): the window, then the map message if one
+    is due, then the ACCEPTED it carries. Nothing here may raise: an exception ends the node's spin."""
+    window(memory, cloud, second)
+    data = memory.map_update(stamp(second))
+    return data, memory.accepted_after_map(stamp(second)) if data is not None else []
+
+
+def test_a_map_save_that_fails_keeps_the_accept_held_and_the_window_timer_retries_it(tmp_path):
+    memory = RoomMemory(config(tmp_path), START, GENERATION)
+    event_id = candidate(memory)
+    memory.operate(act(OperatorActionKind.CONFIRM, event_id, EventState.CANDIDATE, n=1), stamp(5))
+    assert outcome(memory, act(OperatorActionKind.ACCEPT, event_id, EventState.CONFIRMED, n=2)) == OperatorOutcome.APPLIED
+    # A directory where the epoch file goes: every map save fails, for root as well.
+    epoch_file = epoch_path(str(tmp_path), "lab")
+    epoch_file.unlink()
+    epoch_file.mkdir()
+    epoch = memory.map_epoch
+    for second in (8, 9):
+        assert tick(memory, WITH_BOX, second) == (None, []) and memory.storage_error
+        # No epoch is used up by a save that failed, and the accept stays open.
+        assert memory.map_epoch == epoch and memory.status(stamp(second), 1.0).n_open_events == 1
+    epoch_file.rmdir()
+    data, released = tick(memory, WITH_BOX, 10)
+    assert data is not None and memory.storage_error is None
+    assert MapBricks.from_cdr(data).header.map_epoch == epoch + 1 and load_epoch(epoch_file) == epoch + 1
+    assert [(e.event_id, e.state, e.header.map_epoch) for e in released] == [(event_id, EventState.ACCEPTED, epoch + 1)]
+    assert tick(memory, WITH_BOX, 11)[1] == [] and memory.status(stamp(11), 1.0).n_open_events == 0
 
 
 @pytest.mark.parametrize("stage", ["write", "sync", "rename"])

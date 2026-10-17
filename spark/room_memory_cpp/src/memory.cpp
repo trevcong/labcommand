@@ -704,6 +704,21 @@ void RoomMemory::save(const msg::Time& stamp) {
     }
 }
 
+bool RoomMemory::advance_epoch(const msg::Time& stamp) {
+    ++map_epoch_;
+    try {
+        save(stamp);
+    } catch (const std::exception& error) {  // a failed write, or a layer the codec cannot carry
+        --map_epoch_;
+        save_pending_ = true;
+        storage_error_ = "map_epoch " + std::to_string(map_epoch_ + 1) + " not saved: " + error.what();
+        return false;
+    }
+    if (save_pending_) storage_error_.reset();
+    save_pending_ = false;
+    return true;
+}
+
 void RoomMemory::add_points(const std::string& sensor, std::span<const float> xyz) {
     Channel& channel = find(sensor);
     if (xyz.size() % 3) throw std::invalid_argument("positions must hold 3 floats per point");
@@ -887,8 +902,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
                 }
             }
         }
-        ++map_epoch_;
-        save(stamp);
+        advance_epoch(stamp);
     }
     persist_suppressions();
     return events;
@@ -940,6 +954,7 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
     if (state_ == msg::MemoryState::building) return std::nullopt;
     const std::int64_t ns = nanoseconds(stamp);
     if (!map_started_) {
+        if (save_pending_ && !advance_epoch(stamp)) return std::nullopt;
         map_started_ = true;
         map_bricks_ = channels_[map_channel_].reference.to_bricks();
         msg::MapBricks snapshot = map_message(msg::MapKind::snapshot, stamp);
@@ -966,11 +981,10 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
     }
     // An accept's absorbed reference goes out on the next due tick, retried until a map message carries it.
     if (std::any_of(held_.begin(), held_.end(), [](const HeldAccept& held) { return !held.epoch; })) changed = true;
+    // So does a reference whose save failed: nothing goes out at an epoch the disk does not hold.
+    if (save_pending_) changed = true;
     if (!changed && !keyframe_due) return std::nullopt;
-    if (changed) {
-        ++map_epoch_;
-        save(stamp);
-    }
+    if (changed && !advance_epoch(stamp)) return std::nullopt;
     std::vector<msg::Brick> bricks = changed ? channels_[map_channel_].reference.to_bricks() : map_bricks_;
     if (!keyframe_due) {
         const MapDelta change = map_delta(map_bricks_, bricks);
