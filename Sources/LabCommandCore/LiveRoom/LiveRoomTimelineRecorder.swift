@@ -12,7 +12,9 @@ import Foundation
 /// - `sensors`: a TRACKING status whose measured rates are all above 0 (and at least one is
 ///   measured). DEGRADED, BUILDING, RIG_MOVED and PAUSED do not count.
 /// - `coverage`: an `Activity` received while `sensors` is healthy. Only then does an inactive
-///   `Activity` mean quiet (protocol §3.7, §6).
+///   `Activity` mean quiet (protocol §3.7, §6). An `Activity` that is not the next seq of the last
+///   one in its generation starts a new interval: it covers the interval since the previous
+///   published sample, which never arrived, so what lies between them is not observed.
 public struct LiveRoomTimelineRecorder: Sendable, Equatable {
     /// A sample this far past the end of an interval still extends it: the status staleness rule.
     public static let gapAfter: TimeInterval = RoomMemoryMirror.statusFreshFor
@@ -116,8 +118,9 @@ public struct LiveRoomTimelineRecorder: Sendable, Equatable {
             let header = latest.message.header
             let key = Key(generation: latest.message.publisherGeneration, seq: header.seq, stamp: header.stamp)
             if key != lastActivityKey {
+                let follows = lastActivityKey.map { $0.generation == key.generation && key.seq == $0.seq &+ 1 } ?? false
                 lastActivityKey = key
-                recordActivity(latest)
+                recordActivity(latest, follows: follows)
             }
         }
     }
@@ -146,7 +149,8 @@ public struct LiveRoomTimelineRecorder: Sendable, Equatable {
         prune()
     }
 
-    private mutating func recordActivity(_ latest: LiveRoomLatest<RoomMemory.Activity>) {
+    /// `follows`: the sample is the next seq of the last one recorded, in the same generation.
+    private mutating func recordActivity(_ latest: LiveRoomLatest<RoomMemory.Activity>, follows: Bool) {
         let message = latest.message
         let t = Self.seconds(message.header.stamp)
         let jumped = noteJump(t, previous: lastActivityStamp)
@@ -156,8 +160,9 @@ public struct LiveRoomTimelineRecorder: Sendable, Equatable {
         addLink(t)
         let covered = isCovered(t)
         if covered {
-            // Coverage never bridges a health break: it extends only inside one sensors interval.
-            if jumped || (coverage.last?.end ?? -.infinity) < (sensors.last?.start ?? .infinity) {
+            // Coverage never bridges a health break (it extends only inside one sensors interval)
+            // nor a lost sample, however short the time between the two received.
+            if jumped || !follows || (coverage.last?.end ?? -.infinity) < (sensors.last?.start ?? .infinity) {
                 coverage.append(Interval(start: t, end: t))
             } else {
                 Self.extend(&coverage, with: t)

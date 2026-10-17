@@ -353,6 +353,28 @@ func testTimelineActivityLane() {
     expect(!unhealthy.bands.contains { $0.kind == .notObserved && $0.start >= tlBase }, "messages arrived: link is observed")
 }
 
+/// A lost `Activity` is not quiet, even when the next one arrives well inside the staleness rule:
+/// `active` covers the interval since the previous *published* sample (§3.7), not since the last
+/// one the Mac received. Here the lost one was active.
+func testTimelineActivitySequenceGap() {
+    func run(lost: UInt64?) -> LiveRoomTimeline {
+        var rig = TLRig()
+        for seq in UInt64(0)...3 {
+            rig.feed(.status, tlStatus(seq: seq, at: Double(seq)), at: Double(seq))
+            guard seq != lost else { continue }
+            rig.feed(.activity, tlActivity(seq: seq, at: Double(seq) + 0.5, active: false), at: Double(seq) + 0.5)
+        }
+        return rig.timeline(end: 10, at: 4)
+    }
+    let gap = run(lost: 1)
+    expect(tlActivityState(gap, at: 1) == .unobserved && tlActivityState(gap, at: 2) == .unobserved,
+           "seq 0 then seq 2, 2 s apart: the lost sample's interval is hatched, got \(gap.activity)")
+    expect(tlActivityState(gap, at: 3) == .quiet, "seq 3 follows seq 2: quiet again")
+    let contiguous = run(lost: nil)
+    expect(tlActivityState(contiguous, at: 1) == .quiet && tlActivityState(contiguous, at: 2) == .quiet
+           && tlActivityState(contiguous, at: 3) == .quiet, "every seq received: quiet throughout, got \(contiguous.activity)")
+}
+
 func testTimelineMarkersAndFlags() {
     var rig = TLRig()
     let later = tlGeneration + 1000
@@ -669,6 +691,8 @@ func runLiveRoomTimelineTests() {
     print("  LiveRoom timeline: lost and retrieving bands by neighbour stamps; badges without or inverted"); passed()
     testTimelineActivityLane()
     print("  LiveRoom timeline: activity hatched in gaps and without healthy sensors, never quiet"); passed()
+    testTimelineActivitySequenceGap()
+    print("  LiveRoom timeline: a lost Activity seq is hatched, not quiet, however short the gap"); passed()
     testTimelineMarkersAndFlags()
     print("  LiveRoom timeline: restart and clock-jump markers, earlier run outcome unknown, legacy unverified"); passed()
     testTimelineTicks()
