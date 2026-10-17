@@ -394,11 +394,19 @@ std::filesystem::path archive(const std::filesystem::path& room, const std::stri
     std::snprintf(prefix, sizeof prefix, "%04d-", seq);
     const std::filesystem::path target = prev / (prefix + name);
     if (!std::filesystem::create_directory(target)) throw std::runtime_error(target.string() + " already exists");
-    for (const std::string& file : files) {
-        const std::filesystem::path source = room / file;
-        if (!std::filesystem::exists(source)) continue;
-        std::filesystem::copy_file(source, target / file, std::filesystem::copy_options::overwrite_existing);
-        fsync_file(target / file);
+    try {
+        for (const std::string& file : files) {
+            const std::filesystem::path source = room / file;
+            if (!std::filesystem::exists(source)) continue;
+            std::filesystem::copy_file(source, target / file, std::filesystem::copy_options::overwrite_existing);
+            fsync_file(target / file);
+        }
+    } catch (...) {
+        // A partial copy is no archive: left behind, every retry would add one and pruning would keep
+        // those over complete archives.
+        std::error_code ignored;
+        std::filesystem::remove_all(target, ignored);
+        throw;
     }
     for (const std::string& file : remove) {
         const std::filesystem::path path = room / file;

@@ -388,4 +388,28 @@ TEST(archive_numbers_removes_and_keeps_three) {
     CHECK_THROWS(std::exception, archive(room, "clash", {}));
 }
 
+TEST(a_failed_archive_leaves_no_partial_archive) {
+    // A copy that fails part way (an unreadable file, as a full disk would) removes the archive it
+    // started, so a retry takes the same number and pruning never keeps a partial copy over a whole one.
+    TempDir dir;
+    const std::filesystem::path room = dir.path / "lab";
+    touch(room / "rig_state", "state");
+    touch(room / "registration-mid360.bin", "cloud");
+    const std::vector<std::string> files{"rig_state", "registration-mid360.bin"};
+    std::filesystem::permissions(room / "registration-mid360.bin", std::filesystem::perms::none);
+    bool thrown = false;
+    try {
+        archive(room, "frame-1", files);
+    } catch (const std::exception&) {
+        thrown = true;
+    }
+    std::filesystem::permissions(room / "registration-mid360.bin", std::filesystem::perms::owner_read |
+                                                                       std::filesystem::perms::owner_write);
+    CHECK(thrown);
+    CHECK(std::filesystem::is_empty(room / "prev"));
+    const std::filesystem::path target = archive(room, "frame-1", files);
+    CHECK_EQ(target, room / "prev" / "0001-frame-1");
+    CHECK_EQ(harness::read_text(target / "registration-mid360.bin"), std::string("cloud"));
+}
+
 TEST_MAIN

@@ -171,12 +171,18 @@ def archive(room, name, files, remove=()):
     seq = int(existing[-1].name[:4]) + 1 if existing else 1
     target = prev / f"{seq:04d}-{name}"
     target.mkdir()
-    for file in files:
-        source = room / file
-        if source.exists():
-            shutil.copyfile(source, target / file)
-            with open(target / file, "rb") as handle:
-                os.fsync(handle.fileno())
+    try:
+        for file in files:
+            source = room / file
+            if source.exists():
+                shutil.copyfile(source, target / file)
+                with open(target / file, "rb") as handle:
+                    os.fsync(handle.fileno())
+    except BaseException:
+        # A partial copy is no archive: left behind, every retry would add one and pruning would keep
+        # those over complete archives.
+        shutil.rmtree(target, ignore_errors=True)
+        raise
     for file in remove:
         (room / file).unlink(missing_ok=True)
     for old in (existing + [target])[:-ARCHIVE_KEEP]:

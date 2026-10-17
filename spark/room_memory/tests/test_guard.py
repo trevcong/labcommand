@@ -757,6 +757,26 @@ def test_a_failed_relearn_archive_holds_the_old_frame_until_it_goes_through(tmp_
     assert rig_files.parse_rig_state((room / "rig_state").read_bytes(), "rig_state").frame_epoch == memory._frame_epoch
 
 
+def test_a_failed_archive_leaves_no_partial_archive(tmp_path):
+    """A copy that fails part way (an unreadable file, as a full disk would) removes the archive it
+    started, so a retry takes the same number and pruning never keeps a partial copy over a whole one."""
+    room = tmp_path / "lab"
+    room.mkdir()
+    (room / "rig_state").write_bytes(b"state")
+    cloud = room / "registration-mid360.bin"
+    cloud.write_bytes(b"cloud")
+    files = ["rig_state", "registration-mid360.bin"]
+    cloud.chmod(0)
+    try:
+        with pytest.raises(OSError):
+            rig_files.archive(room, "frame-1", files)
+    finally:
+        cloud.chmod(0o644)
+    assert list((room / "prev").iterdir()) == []
+    target = rig_files.archive(room, "frame-1", files)
+    assert target.name == "0001-frame-1" and (target / "registration-mid360.bin").read_bytes() == b"cloud"
+
+
 def test_a_new_frame_cut_short_never_loads_with_the_old_frames_poses(tmp_path):
     """Codex's repro: the rebuilt frame's commit fails part way. With its registration cloud
     unwritable a restart loads the old frame whole; with rig_state unwritable it refuses the set.
