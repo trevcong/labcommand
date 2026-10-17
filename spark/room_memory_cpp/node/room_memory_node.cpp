@@ -237,7 +237,11 @@ private:
         for (const msg::ChangeEvent& event : events) events_->publish(serialized(event.to_cdr()));
         const std::optional<msg::Bytes> map = memory_->map_update(now_stamp);
         if (map) map_->publish(serialized(*map));
-        if (const std::optional<msg::RigPose> rig = memory_->rig_pose(now_stamp)) rig_->publish(serialized(rig->to_cdr()));
+        if (rig_) {  // created with rig_guard only; rig_pose is empty without it
+            if (const std::optional<msg::RigPose> rig = memory_->rig_pose(now_stamp)) {
+                rig_->publish(serialized(rig->to_cdr()));
+            }
+        }
         const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         RCLCPP_INFO(get_logger(), "window %.1f ms wall, %.1f ms cpu, %zu event messages, map %zu B, state %s", elapsed,
                     cpu_ms() - cpu, events.size(), map ? map->size() : std::size_t{0}, msg::name(memory_->state()));

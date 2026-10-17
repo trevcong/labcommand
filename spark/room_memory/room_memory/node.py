@@ -141,9 +141,10 @@ class RoomMemoryNode(Node):
         message = self.memory.map_update(stamp)
         if message is not None:
             self.map.publish(message)
-        rig = self.memory.rig_pose(stamp)
-        if rig is not None:
-            self.rig.publish(rig.to_cdr())
+        if self.rig is not None:  # created with rig_guard only; rig_pose is None without it
+            rig = self.memory.rig_pose(stamp)
+            if rig is not None:
+                self.rig.publish(rig.to_cdr())
         elapsed_ms = (time.perf_counter() - start) * 1000
         cpu_ms = (time.process_time() - cpu) * 1000
         self.get_logger().info(
