@@ -73,7 +73,7 @@ public struct RigButtonSpec: Sendable, Equatable {
 /// Operator copy + transport specs for the Rig page. Views bind; they do not
 /// invent gates.
 public enum RigDesk {
-    public static let title = "Rig command"
+    public static let title = "Rig"
 
     public static let purpose =
         "This window runs the dual-lidar rig (Livox Mid-360 + Hesai JT128) on the DGX Spark. The Mac never talks to a lidar — it reads the Spark's command-center API over an SSH tunnel, starts and stops the shared driver stack, records dual bags, and shows the takes on this Mac."

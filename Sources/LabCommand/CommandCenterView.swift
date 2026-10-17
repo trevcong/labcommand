@@ -27,7 +27,7 @@ struct CommandCenterView: View {
                 .font(LabTheme.t(13, .semibold))
                 .foregroundStyle(LabTheme.text)
                 .accessibilityLabel("Lab")
-            Text("dual-lidar rig")
+            Text("room memory")
                 .font(LabTheme.t(12))
                 .foregroundStyle(LabTheme.faint)
 
