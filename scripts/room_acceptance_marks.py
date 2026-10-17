@@ -105,6 +105,7 @@ WORKSHEET = """\
 Label worksheet. Resolve it before the scored session. skip does not make a true detection.
 Sensor 1 is the Mid-360 (/livox/lidar, mid360_hz). Sensor 2 is the JT128 (/lidar_points, jt128_hz).
 A region line is in that sensor's frame. Copy message.sensors from the harness topics.jsonl line.
+message.sensors is a bitmask. 3 means both sensors. Do not paste region 3. Split it into region 1 and region 2, or use event GEN ID.
 Do not reuse one sensor's box for the other sensor.
   region SENSOR x0 y0 z0 x1 y1 z1 [from x y z]
   region 1 0 0 0 1 1 1
@@ -121,7 +122,9 @@ The third token is the move source. Any other line blocks the three change scena
 RECOVERY_TEXT = (
     "A successful alignment recovers at the displaced pose and does not by itself change map_epoch. "
     "Relearning runs only while recovery is still unresolved and auto_relearn is enabled. "
-    "Type unknown when you did not see the value. A launch default you remember is not an observation."
+    "Type unknown when you did not see the value. A launch default you remember is not an observation. "
+    "A bump passes only when bump_evaluation is observed, RIG_MOVED is seen, recovery is realigned, "
+    "map_epoch is unchanged, and unexpected candidates are none. observed alone is not a pass."
 )
 
 HANDOFF_TEXT = """\
@@ -973,6 +976,7 @@ def summarize_topics(path):
     subscribed = None
     saw_rig = False
     saw_events = False
+    saw_ready = False
     status_samples = 0
     status_epochs = []
     rig_epochs = []
@@ -985,10 +989,15 @@ def summarize_topics(path):
             obj = json.loads(line)
         except json.JSONDecodeError:
             obj = None
-        if isinstance(obj, dict) and obj.get("op") == "ready" and isinstance(obj.get("topics"), list):
-            subscribed = list(obj["topics"])
-            if "/room_memory/events" in subscribed:
-                saw_events = True
+        if isinstance(obj, dict) and obj.get("op") == "ready":
+            # Any ready line means the capture started. A topics list, when
+            # present, is what it subscribed to. The file may still be empty
+            # at startup, before the capture has printed one.
+            saw_ready = True
+            if isinstance(obj.get("topics"), list):
+                subscribed = list(obj["topics"])
+                if "/room_memory/events" in subscribed:
+                    saw_events = True
         topic = obj.get("topic") if isinstance(obj, dict) else None
         # A ready line names topics. It is not an IMU sample.
         if not (isinstance(obj, dict) and obj.get("op") == "ready"):
@@ -1055,8 +1064,27 @@ def summarize_topics(path):
         "imu_lines": imu,
         "imu_subscribed": imu_subscribed,
         "imu_note": imu_note,
+        "saw_ready": saw_ready,
         "bump_evidence": evidence,
     }
+
+
+def _unstarted_topics(summary):
+    """The post-close topics file has to show that the capture started.
+
+    An empty file is what a capture that never imported ROS leaves behind.
+    Lines with no ``op: ready`` never became a capture either. ``None`` means
+    this input was not a topics file, or the file is usable. The startup read
+    does not call this: the file may still be empty when the script starts.
+    """
+    if not isinstance(summary, dict):
+        return None
+    path = summary.get("path")
+    if summary.get("lines", 0) == 0:
+        return "topics file has no lines: %s" % path
+    if not summary.get("saw_ready"):
+        return "topics file has no op: ready line: %s" % path
+    return None
 
 
 def summarize_recording(path):
@@ -1344,6 +1372,44 @@ def _emit(out, payload):
     return False
 
 
+def _finish_closed_capture(args, payload, code):
+    """Fill the bump from the files the operator just closed.
+
+    Returns the exit code. A topics file with no lines, or no ``op: ready``
+    line, sets ``read_error`` and turns a success into exit 2. Stray samples
+    in that file are not a bump observation. The caller still writes the marks.
+    KeyboardInterrupt is not caught here: the caller writes the rows already
+    taken and exits 130.
+    """
+    try:
+        summaries = _load_inputs(
+            args.status, args.topics, args.recording, args.inspect, args.log, after_bump=True,
+        )
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(str(exc) + "\n")
+        payload["read_error"] = str(exc)
+        return code
+    problem = _unstarted_topics(summaries.get("topics"))
+    if problem:
+        sys.stderr.write(problem + "\n")
+        payload["read_error"] = problem
+        if code == 0:
+            code = 2
+        topics = summaries.get("topics")
+        if isinstance(topics, dict):
+            topics["bump_evidence"] = None
+    row = payload["scenarios"][0]
+    sources = _apply_evidence(row, summaries)
+    if payload["session"]["end_reason"] == "complete":
+        evaluation, reason = judge_bump(row["observations"])
+        row["bump_evaluation"] = evaluation
+        payload["session"]["bump_evaluation"] = evaluation
+        payload["session"]["bump_evaluation_reason"] = reason
+    _mark_applied(summaries, sources)
+    _store_summaries(payload, summaries)
+    return code
+
+
 def _run(args):
     inputs = {
         "status": args.status,
@@ -1377,24 +1443,13 @@ def _run(args):
             {"status": None, "topics": None, "recording": None, "inspect": None, "log": None},
             capture=capture,
         )
+        # This read sits outside _conduct_bump. A stop here used to exit 130
+        # before the marks were written, which dropped the finished bump.
         if payload.get("capture_closed"):
             try:
-                summaries = _load_inputs(
-                    args.status, args.topics, args.recording, args.inspect, args.log, after_bump=True,
-                )
-            except (OSError, ValueError) as exc:
-                sys.stderr.write(str(exc) + "\n")
-                payload["read_error"] = str(exc)
-            else:
-                row = payload["scenarios"][0]
-                sources = _apply_evidence(row, summaries)
-                if payload["session"]["end_reason"] == "complete":
-                    evaluation, reason = judge_bump(row["observations"])
-                    row["bump_evaluation"] = evaluation
-                    payload["session"]["bump_evaluation"] = evaluation
-                    payload["session"]["bump_evaluation_reason"] = reason
-                _mark_applied(summaries, sources)
-                _store_summaries(payload, summaries)
+                code = _finish_closed_capture(args, payload, code)
+            except KeyboardInterrupt:
+                code = 130
     else:
         try:
             selected = _select_specs(args.scenarios)

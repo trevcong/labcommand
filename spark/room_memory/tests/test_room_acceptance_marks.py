@@ -584,6 +584,69 @@ def test_runbook_matches_harness_head_and_the_stop_path():
     assert "not an observation that the IMU is off" in text
 
 
+def _transport_setup():
+    """The harness command string, read as text so this file does not import acceptance."""
+    path = ROOT / "spark" / "room_memory" / "acceptance" / "transport.py"
+    source = path.read_text(encoding="utf-8")
+    found = None
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "_SETUP" and isinstance(node.value, ast.Constant):
+                    found = node.value.value
+    assert found == "source /opt/ros/jazzy/setup.bash && source /ws/install/setup.bash && python3 -u -"
+    assert 'return ["docker", "exec", "-i", container, "bash", "-lc", _SETUP]' in source
+    return found
+
+
+def _capture_source(text):
+    marker = "<<'PY'\n"
+    start = text.index(marker) + len(marker)
+    return text[start:text.index("\nPY\n", start)]
+
+
+def test_runbook_capture_prefix_matches_transport():
+    """The bump capture has to source ROS the way acceptance/transport.py does.
+
+    ``docker exec`` does not run the image entrypoint. A bare ``python3`` never
+    sees ``rclpy`` or ``labcommand_msgs``.
+    """
+    setup = _transport_setup()
+    text = RUNBOOK.read_text(encoding="utf-8")
+    prefix = "docker exec -i NAME bash -lc '%s' > bump-topics.jsonl <<'PY'" % setup
+    assert prefix in text
+    assert "docker exec -i NAME python3 -u -" not in text
+
+
+def test_runbook_capture_stamps_each_line():
+    source = _capture_source(RUNBOOK.read_text(encoding="utf-8"))
+    tree = ast.parse(source)
+    emit = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "emit")
+    attrs = [node.attr for node in ast.walk(emit) if isinstance(node, ast.Attribute)]
+    assert "monotonic_ns" in attrs
+    assert "time_ns" in attrs
+
+
+def test_runbook_states_the_bump_pass_and_the_both_sensor_label():
+    module = load()
+    phrase = (
+        "A bump passes only when bump_evaluation is observed, RIG_MOVED is seen, "
+        "recovery is realigned, map_epoch is unchanged, and unexpected candidates are none."
+    )
+    both = (
+        "message.sensors is a bitmask. 3 means both sensors. Do not paste region 3. "
+        "Split it into region 1 and region 2, or use event GEN ID."
+    )
+    runbook = RUNBOOK.read_text(encoding="utf-8").replace("`", "")
+    assert phrase in runbook
+    assert "observed alone is not a pass" in runbook.lower()
+    assert both in runbook
+    assert phrase in module.RECOVERY_TEXT
+    assert "observed alone is not a pass" in module.RECOVERY_TEXT
+    assert both in module.WORKSHEET
+    assert "A stop during the post-close read writes the rows already taken and exits 130." in runbook
+
+
 def test_empty_scenario_list_is_refused(tmp_path):
     module = load()
     out = tmp_path / "out"
@@ -1055,6 +1118,186 @@ def test_live_capture_is_read_after_the_bump_and_can_be_observed(tmp_path):
     assert body["topics"]["lines"] == len(topics.read_text(encoding="utf-8").splitlines())
     assert body["inspect"]["applied_to_bump"] is True
     assert body["capture_closed"] is True
+
+
+def _finished_live_payload(module):
+    row = module._blank_bump(30, 30)
+    row["push_mono_ns"] = 10
+    row["t0_mono_ns"] = 10
+    row["restore_mono_ns"] = 40
+    row["t1_mono_ns"] = 40
+    row["completion"] = "complete"
+    row["actual_duration_s"] = 30
+    row["wall_start_utc"] = "2026-01-01T00:00:00Z"
+    row["wall_end_utc"] = "2026-01-01T00:00:30Z"
+    row["observations"] = {key: "unknown" for key in module.OBSERVATION_KEYS}
+    row["observations"]["frame_epoch_before"] = "unshown"
+    row["observations"]["frame_epoch_after"] = "unshown"
+    session = module._session("complete", "", "not_evaluated", "guard_unobserved")
+    payload = module._payload(
+        "live",
+        "utc",
+        [row],
+        session,
+        {"status": None, "topics": None, "recording": None, "inspect": None, "log": None},
+    )
+    payload["capture_closed"] = True
+    return payload
+
+
+def _run_closed_live(module, out, topics, payload):
+    real = module._conduct_bump
+    module._conduct_bump = lambda *_args, **_kwargs: (payload, 0)
+    stderr = _Capture()
+    original = sys.stderr
+    sys.stderr = stderr
+    try:
+        code = module.main(["--live", "--topics", str(topics), "--out", str(out)])
+    finally:
+        sys.stderr = original
+        module._conduct_bump = real
+    return code, stderr.text
+
+
+def test_unstarted_topics_names_empty_and_missing_ready(tmp_path):
+    module = load()
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    empty_summary = module.summarize_topics(empty)
+    assert empty_summary["lines"] == 0
+    assert empty_summary["saw_ready"] is False
+    assert "no lines" in module._unstarted_topics(empty_summary)
+    bare = tmp_path / "bare.jsonl"
+    bare.write_text(
+        json.dumps({"topic": "/room_memory/status", "message": {"state": "tracking", "map_epoch": 1}}) + "\n",
+        encoding="utf-8",
+    )
+    bare_summary = module.summarize_topics(bare)
+    assert bare_summary["lines"] == 1
+    assert bare_summary["saw_ready"] is False
+    assert "no op: ready line" in module._unstarted_topics(bare_summary)
+    ready = tmp_path / "ready.jsonl"
+    ready.write_text(json.dumps({"op": "ready"}) + "\n", encoding="utf-8")
+    ready_summary = module.summarize_topics(ready)
+    assert ready_summary["saw_ready"] is True
+    assert module._unstarted_topics(ready_summary) is None
+    assert module._unstarted_topics(None) is None
+
+
+def test_post_close_unstarted_topics_sets_read_error_and_still_writes(tmp_path):
+    module = load()
+    empty_topics = tmp_path / "empty.jsonl"
+    empty_topics.write_text("", encoding="utf-8")
+    dry = tmp_path / "dry"
+    assert module.main(["--out", str(dry), "--topics", str(empty_topics)]) == 0
+    dry_body = marks(dry)
+    assert dry_body["topics"]["lines"] == 0
+    assert dry_body["topics"]["read_after_bump"] is False
+    assert "read_error" not in dry_body
+
+    code, stderr = _run_closed_live(module, tmp_path / "empty-out", empty_topics, _finished_live_payload(module))
+    assert code == 2
+    assert "topics file has no lines" in stderr
+    empty_body = marks(tmp_path / "empty-out")
+    assert "topics file has no lines" in empty_body["read_error"]
+    assert empty_body["scenarios"][0]["push_mono_ns"] == 10
+    assert empty_body["scenarios"][0]["restore_mono_ns"] == 40
+    assert empty_body["topics"]["bump_evidence"] is None
+    assert (tmp_path / "empty-out" / "scenario-marks.csv").is_file()
+
+    bare = tmp_path / "bare.jsonl"
+    bare.write_text(
+        json.dumps({"topic": "/room_memory/status", "message": {"state": "rig_moved", "map_epoch": 4}}) + "\n",
+        encoding="utf-8",
+    )
+    code, stderr = _run_closed_live(module, tmp_path / "bare-out", bare, _finished_live_payload(module))
+    assert code == 2
+    assert "topics file has no op: ready line" in stderr
+    bare_body = marks(tmp_path / "bare-out")
+    assert "no op: ready line" in bare_body["read_error"]
+    assert bare_body["topics"]["bump_evidence"] is None
+    assert bare_body["scenarios"][0]["observations"]["rig_moved"] == "unknown"
+    assert (tmp_path / "bare-out" / "scenario-marks.json").is_file()
+
+    ready = tmp_path / "ready.jsonl"
+    ready.write_text(
+        json.dumps({"op": "ready", "topics": ["/room_memory/status", "/room_memory/events", "/room_memory/rig"]}) + "\n",
+        encoding="utf-8",
+    )
+    code, stderr = _run_closed_live(module, tmp_path / "ready-out", ready, _finished_live_payload(module))
+    assert code == 0, stderr
+    ready_body = marks(tmp_path / "ready-out")
+    assert "read_error" not in ready_body
+    assert ready_body["topics"]["saw_ready"] is True
+    assert ready_body["topics"]["read_after_bump"] is True
+
+
+def test_stop_during_the_post_close_read_writes_the_finished_bump(tmp_path):
+    module = load()
+    out = tmp_path / "out"
+    topics = tmp_path / "bump-topics.jsonl"
+    topics.write_text(
+        json.dumps({"op": "ready", "topics": ["/room_memory/status", "/room_memory/rig"]}) + "\n",
+        encoding="utf-8",
+    )
+    payload = _finished_live_payload(module)
+    real_load = module._load_inputs
+    real_conduct = module._conduct_bump
+
+    def load_inputs(*args, **kwargs):
+        if kwargs.get("after_bump"):
+            raise KeyboardInterrupt
+        return real_load(*args, **kwargs)
+
+    module._load_inputs = load_inputs
+    module._conduct_bump = lambda *_args, **_kwargs: (payload, 0)
+    try:
+        code = module.main(["--live", "--topics", str(topics), "--out", str(out)])
+    finally:
+        module._load_inputs = real_load
+        module._conduct_bump = real_conduct
+    assert code == 130
+    body = marks(out)
+    bump = body["scenarios"][0]
+    assert bump["push_mono_ns"] == 10
+    assert bump["restore_mono_ns"] == 40
+    assert bump["completion"] == "complete"
+    assert bump["observations"]["rig_guard"] == "unknown"
+    assert body["session"]["end_reason"] == "complete"
+    assert "read_error" not in body
+    assert (out / "scenario-marks.csv").is_file()
+    assert (out / "scenario-marks.json").is_file()
+
+
+def test_stop_during_post_close_judge_writes_the_finished_bump(tmp_path):
+    module = load()
+    out = tmp_path / "out"
+    topics = tmp_path / "bump-topics.jsonl"
+    topics.write_text(
+        json.dumps({"op": "ready", "topics": ["/room_memory/status", "/room_memory/rig"]}) + "\n",
+        encoding="utf-8",
+    )
+    payload = _finished_live_payload(module)
+    real_judge = module.judge_bump
+    real_conduct = module._conduct_bump
+
+    def judge(_observations):
+        raise KeyboardInterrupt
+
+    module.judge_bump = judge
+    module._conduct_bump = lambda *_args, **_kwargs: (payload, 0)
+    try:
+        code = module.main(["--live", "--topics", str(topics), "--out", str(out)])
+    finally:
+        module.judge_bump = real_judge
+        module._conduct_bump = real_conduct
+    assert code == 130
+    body = marks(out)
+    bump = body["scenarios"][0]
+    assert bump["push_mono_ns"] == 10
+    assert bump["restore_mono_ns"] == 40
+    assert bump["completion"] == "complete"
+    assert (out / "scenario-marks.csv").is_file()
 
 
 def _spawn_live(tmp_path, *extra):

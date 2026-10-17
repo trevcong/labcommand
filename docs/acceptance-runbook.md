@@ -2,7 +2,7 @@
 
 This file is decision D49 and protocol section 3.13. `~/Developer/lc-tasks/NUMBERING.md` reserves that pair for this checkout. It is the operator procedure for one room visit. It does not add a message, a topic, or a threshold, and it does not amend `docs/ROOM-MEMORY-PROTOCOL.md`.
 
-The scored session is the harness in `spark/room_memory/acceptance/` (PR #36). Main has that harness at the merge `5a51554`. The commands, label grammar, and exit codes below were read from commit `1225db5`, subject "Do not deny acceptance for a lifetime dropped-window count" (`README.md`, `session.py`, `score.py`). If that harness changes, re-read those files before the visit. This procedure does not edit them. This branch does not contain `acceptance/` until it is merged with main; run the harness from a tree that has that directory.
+The scored session is the harness in `spark/room_memory/acceptance/` (PR #36). Main has that harness at the merge `5a51554`. The commands, label grammar, and exit codes below were read from commit `1225db5`, subject "Do not deny acceptance for a lifetime dropped-window count" (`README.md`, `session.py`, `score.py`). If that harness changes, re-read those files before the visit. This procedure does not edit them. This checkout contains that harness. Run it from this tree.
 
 `evaluate.py`, the `acceptance_replay` ctest, and the `bag_stream.py` rig-move flags are still deferred. This visit does not run them.
 
@@ -39,7 +39,7 @@ Do this in the room. The marks script does not deploy, restart, set a parameter,
 
 `docker inspect` and `docker logs` are read-only. You run them on the machine whose docker already sees the container, and you redirect them to files on this Mac. The script does not run them.
 
-Section 4 is a different process. `acceptance run` starts one subscribe-only `docker exec -i` inside the container. That exec belongs to the harness, not to the marks script. The bump capture in section 3 is the same kind of subscribe-only exec, in its own terminal. It does not restart the node and it does not set a parameter.
+Section 4 is a different process. `acceptance run` starts one subscribe-only `docker exec -i` inside the container. That exec belongs to the harness, not to the marks script. The bump capture in section 3 is the same kind of subscribe-only exec, in its own terminal, and it uses the same `bash -lc` setup prefix as `acceptance/transport.py`. It does not restart the node and it does not set a parameter.
 
 - The room-memory container is already up. Leave it up.
 - A display you already have (LabCommand Room, or the node log already on screen) is how you read `TRACKING` and `RIG_MOVED`. This script does not open a socket. LabCommand Room does not subscribe to `/room_memory/rig`, and the node log does not print `auto_relearn`, `relearn_after_s`, or `imu_ok`. Those three come from the files in section 3, not from the display.
@@ -93,6 +93,8 @@ Sensor numbers are the `ChangeEvent.sensors` bit, and the coordinates are in tha
 | 2 | JT128 | `/lidar_points` | `jt128_hz` |
 
 Copy `message.sensors`. Do not translate a Mid-360 box into sensor 2, or the other way around. The two frames are not one frame.
+
+`message.sensors` is a bitmask. 3 means both sensors. Do not paste region 3. Split it into region 1 and region 2, or use event GEN ID. The one-liner prints the integer as-is, so a both-sensor event comes out as `region 3 …`. `parse_label` accepts any integer, including 3. The scorer matches a region only when that number equals `message.sensors`, so `region 1` does not match an event whose sensors value is 3. For that event, paste the `event` line. It does not use the bitmask.
 
 Syntax the harness accepts (`session.py` `parse_label`). Several clauses are separated by semicolons. Anything else is asked again. The recording stays up.
 
@@ -163,10 +165,10 @@ docker inspect NAME > inspect.json
 docker logs NAME > node.log
 ```
 
-Start the topics capture before you start the marks script, so the file exists. In another terminal, on the machine whose docker already sees the container:
+Start the topics capture before you start the marks script, so the file exists. In another terminal, on the machine whose docker already sees the container. `docker exec` does not run the image entrypoint, and the entrypoint is what sources ROS. A bare `python3` raises `ModuleNotFoundError` on `labcommand_msgs` (and on `rclpy`). The traceback stays on the terminal and `bump-topics.jsonl` stays empty. Use the same prefix as the harness (`acceptance/transport.py`): `bash -lc` with `source /opt/ros/jazzy/setup.bash && source /ws/install/setup.bash && python3 -u -`.
 
 ```text
-docker exec -i NAME python3 -u - > bump-topics.jsonl <<'PY'
+docker exec -i NAME bash -lc 'source /opt/ros/jazzy/setup.bash && source /ws/install/setup.bash && python3 -u -' > bump-topics.jsonl <<'PY'
 import json, sys, time
 import rclpy
 from rclpy.node import Node
@@ -186,7 +188,10 @@ def volatile():
     return QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
 
 def emit(payload):
-    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    stamped = dict(payload)
+    stamped["mono_ns"] = time.monotonic_ns()
+    stamped["wall_ns"] = time.time_ns()
+    sys.stdout.write(json.dumps(stamped, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
 class Dropped:
@@ -259,7 +264,7 @@ main()
 PY
 ```
 
-That process only subscribes. It turns rosout, the parameter services, and the logger service off, and it does not advertise `/parameter_events`. Stop it by Ctrl-C in its own terminal, or `kill` that PID. Do not kill the container. Do not send keystrokes to LabCommand or to any other app. If the guard is off there is no `/room_memory/rig` publisher; the capture still records status and events, and IMU stays `unknown`.
+That process only subscribes. It turns rosout, the parameter services, and the logger service off, and it does not advertise `/parameter_events`. Every line carries `mono_ns` (`time.monotonic_ns()`, the container clock) and `wall_ns` (`time.time_ns()`, UTC nanoseconds). Before and after in the marks file are still the first and last sample. Use `mono_ns` deltas inside this file for RIG_MOVED timing and relearn delay. Set `wall_ns` next to the marks file's `wall_start_utc` and `wall_end_utc` (those are whole seconds). `mono_ns` here is not the Mac `push_mono_ns`. Stop the capture by Ctrl-C in its own terminal, or `kill` that PID. Do not kill the container. Do not send keystrokes to LabCommand or to any other app. If the guard is off there is no `/room_memory/rig` publisher; the capture still records status and events, and IMU stays `unknown`.
 
 Leave the capture running through the push and the restore. After the leg is back, stop the capture, rewrite `node.log` if you want the log from this visit (`docker logs NAME > node.log`), then press Enter at the script's close prompt. The script reads the files then. It does not read them before the push, and a dry-run read is not a bump observation. `read_after_bump` on the stored summary is true only for that post-close read. `applied_to_bump` is true only for a source that filled an answer.
 
@@ -269,11 +274,17 @@ python3 scripts/room_acceptance_marks.py --live --inspect inspect.json --log nod
 
 `--status` is still a local JSON object, read only. Nothing in this repo writes `rig_guard`, `auto_relearn`, `relearn_after_s`, or `imu_ok` into one, so it is not the visit path. A single object also cannot supply both epochs. `--recording` stores the path, the byte size (a directory sums files one level down, not deeper), and whether `metadata.yaml` is present. That summary is not a bump observation.
 
-The script refuses to overwrite `scenario-marks.json` or `scenario-marks.csv`, refuses an input path that is one of those files, and refuses an `--out` directory that is the recording or sits inside it. Use a new directory for a second run. A missing input path exits 2 and writes no marks. The topics file may be empty when the script starts and grow while the capture runs. The post-close read is the one that is stored.
+The script refuses to overwrite `scenario-marks.json` or `scenario-marks.csv`, refuses an input path that is one of those files, and refuses an `--out` directory that is the recording or sits inside it. Use a new directory for a second run. A missing input path exits 2 and writes no marks. The topics file may be empty when the script starts and grow while the capture runs. The post-close read is the one that is stored. When `--topics` is set, that read writes `read_error` and exits 2 if the file has no lines or no `op: ready` line. The marks files are still written. Exit 2 here means the capture did not start. It is not a harness exit code, and it is not a passed bump, even when the typed answers would have been `observed`. A file that disappears after startup still sets `read_error`, still writes the marks, and keeps the bump's own exit code.
 
 Recovery matches `_track_moved` in `spark/room_memory/room_memory/memory.py`. Agreeing fits inside the align envelope adopt the displaced pose and return the channel to normal (`REALIGNED`, or `IN_PLACE` when the increment is below the move threshold). That is a successful alignment at the displaced pose. It does not by itself change `map_epoch`. Relearning runs only while that recovery is still unresolved and `auto_relearn` is enabled, after `relearn_after_s`. Do not hold the rig out of place to force a relearn.
 
-`bump_evaluation` is `observed` only when the guard was seen `on`, configuration and IMU were answered, both map epochs are integers, both frame epochs are integers or `unshown`, `RIG_MOVED` is `seen` or `not_seen`, recovery is one of the four outcomes, and the candidate note is not empty or `unknown`. Every other case is `not_evaluated`:
+`bump_evaluation` is `observed` only when the guard was seen `on`, configuration and IMU were answered, both map epochs are integers, both frame epochs are integers or `unshown`, `RIG_MOVED` is `seen` or `not_seen`, recovery is one of the four outcomes, and the candidate note is not empty or `unknown`. Every other case is `not_evaluated`. `observed` means the evidence is complete. It is not a pass.
+
+### Passed bump
+
+A bump passes only when bump_evaluation is observed, RIG_MOVED is seen, recovery is realigned, map_epoch is unchanged, and unexpected candidates are none. `observed` alone is not a pass. Anything else is not a pass. Say the bump separately from `g5_acceptance`, and say which of these failed.
+
+`not_evaluated` cases:
 
 | reason | meaning |
 |---|---|
@@ -290,7 +301,7 @@ If recovery was `relearning`, do not start the harness on the new epoch until a 
 
 ## 4. Scored session
 
-Stop the marks script. On the machine whose `docker` already sees the container (no `--ssh`, no default container name). This is the one step that runs `docker exec`: the harness runs `docker exec -i NAME` of a process that only subscribes. The marks script is not part of that, and it never execs.
+Stop the marks script. On the machine whose `docker` already sees the container (no `--ssh`, no default container name). The harness runs `docker exec -i NAME` of a process that only subscribes, with the same `bash -lc` setup prefix as the bump capture. The marks script is not part of that, and it never execs. The bump capture is a separate exec and it has already been stopped.
 
 ```text
 PYTHONPATH=spark/room_memory python3 -m acceptance run --transport ros2 --container NAME --out HARNESS_DIR
@@ -348,11 +359,11 @@ Open `report.json`. Quote both `g5_acceptance` and `confirmed_product_bar`.
 
 `full_candidate` does not mean Q3 passed. `confirmed_product_bar` is `not_evaluated` when no `CONFIRMED` message was published, and also when `CONFIRMED` messages exist but the static intervals are not a full verifiable baseline plus hour. Today's node emits `CANDIDATE`. `not_evaluated` means the false-CONFIRMED-per-hour bar was not measured. When the field is `pass` or `fail`, each `CONFIRMED` received during a verifiable static interval counted, including one whose candidate was published before the subscription. The candidate score's idle rate is `false_candidate_alarms_per_hour`. The product metric is `false_confirmed_alarms_per_hour`. Do not report one as the other.
 
-A miss with activity somewhere in the window is `miss_with_activity_observed`. No activity on a person scenario is `person_unverified`. It does not prove the detector discriminated. `bump_evaluation` is not in this report. Say it separately, and say `not_evaluated` when that is the value.
+A miss with activity somewhere in the window is `miss_with_activity_observed`. No activity on a person scenario is `person_unverified`. It does not prove the detector discriminated. `bump_evaluation` is not in this report. Say it separately. A bump passes only when bump_evaluation is observed, RIG_MOVED is seen, recovery is realigned, map_epoch is unchanged, and unexpected candidates are none. Say `not_evaluated` when that is the value. `observed` alone is not a pass.
 
 ## 7. Stop
 
-Ctrl-C the marks script in its own terminal, or `kill` that PID from another terminal. `kill` sends SIGTERM. Ctrl-C sends SIGINT. Both write the rows already taken and exit 130. The push time stays. The restore time stays if you had already pressed Enter for it. Answers you had already accepted stay, including when the next question is still open. An open watch, with no restore yet, is `completion` `aborted` and `session.end_reason` is `interrupted`. A deadline that passed with no Enter stays `restore_unmarked`, with the restore time empty. Stopping while the handoff text is printing exits 130 and keeps that finished bump. A stop while the two files are being written is held until both files are in place, then the process exits 130. The stop is delayed, not dropped, and the exit code does not stay 0. If the stop lands after both files are already written, the process still exits 130. It does not report that the output already exists.
+Ctrl-C the marks script in its own terminal, or `kill` that PID from another terminal. `kill` sends SIGTERM. Ctrl-C sends SIGINT. Both write the rows already taken and exit 130. The push time stays. The restore time stays if you had already pressed Enter for it. Answers you had already accepted stay, including when the next question is still open. An open watch, with no restore yet, is `completion` `aborted` and `session.end_reason` is `interrupted`. A deadline that passed with no Enter stays `restore_unmarked`, with the restore time empty. Stopping while the handoff text is printing exits 130 and keeps that finished bump. A stop during the post-close read writes the rows already taken and exits 130. Evidence that read had not finished filling stays as the answers already accepted. A stop while the two files are being written is held until both files are in place, then the process exits 130. The stop is delayed, not dropped, and the exit code does not stay 0. If the stop lands after both files are already written, the process still exits 130. It does not report that the output already exists.
 
 `kill -9` stops the process without writing the file. Do not use it.
 
