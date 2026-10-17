@@ -76,7 +76,7 @@ enum class EventKind : std::uint8_t { appeared = 0, disappeared = 1, moved = 2 }
 enum class EventState : std::uint8_t { candidate = 0, confirmed = 1, accepted = 2, reverted = 3, expired = 4 };
 enum class MemoryState : std::uint8_t { building = 0, tracking = 1, rig_moved = 2, degraded = 3, paused = 4 };
 enum class SyncTopic : std::uint8_t { map_bricks = 0, events = 1 };
-// RigPose (protocol 3.8): the guard's outcome and each sensor's result in the reported decision.
+// RigPose (protocol 3.9): the guard's outcome and each sensor's result in the reported decision.
 enum class RigOutcome : std::uint8_t { in_place = 0, checking = 1, moved = 2, realigned = 3, relearning = 4, inconclusive = 5 };
 enum class RigChannel : std::uint8_t { none = 0, in_place = 1, moved = 2, rejected = 3, unavailable = 4 };
 inline constexpr std::int64_t kCauseImuShock = 1;
@@ -233,7 +233,7 @@ struct Activity {
     static Activity from_cdr(std::span<const std::uint8_t> data);
 };
 
-// The rig-pose guard (protocol 3.8): its outcome, what started the check, each sensor's result and
+// The rig-pose guard (protocol 3.9): its outcome, what started the check, each sensor's result and
 // absolute pose (tx ty tz qx qy qz qw, current sensor frame -> its reference frame), and the last
 // check's metrics. An empty optional is NaN on the wire (a pose: NaN x 7). [0] Mid-360, [1] JT128.
 struct RigPose {

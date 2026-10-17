@@ -1,4 +1,4 @@
-# labcommand_msgs/RigPose: the rig-pose guard (protocol §3.8, D34-D38), on /room_memory/rig.
+# labcommand_msgs/RigPose: the rig-pose guard (protocol §3.9, D39-D43), on /room_memory/rig.
 # Reliable, transient_local, keep-last 1; published on every outcome change and every 10 s.
 # Poses map each sensor's current frame into its reference frame: p_ref = R p + t.
 uint8 OUTCOME_IN_PLACE=0          # last check accepted the current pose
@@ -41,7 +41,7 @@ float32[2] delta_m                # |t| of the increment of the last applied est
 float32[2] delta_deg              # rotation angle of that increment; NaN = none
 float32[2] inlier_frac            # last check, 0..1; NaN = not run or no registration cloud
 float32[2] rms_m                  # last check; NaN = not run
-float32[2] observe                # last check, lambda_min(H)/sum(w) (§3.8); NaN = not run
+float32[2] observe                # last check, lambda_min(H)/sum(w) (§3.9); NaN = not run
 float32 tilt_deg                  # IMU gravity vs the gravity baseline of the last accepted decision; NaN = no IMU
 bool imu_ok                       # IMU samples within the last second
 builtin_interfaces/Time moved_at  # first trigger of the current or last move; {0, 0} = none

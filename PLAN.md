@@ -30,7 +30,7 @@ A nudged tripod must not flag the whole room. The node detects a rig move (Mid-3
 - Precedence RIG_MOVED > DEGRADED > TRACKING; silent channels never block a decision.
 - Check period + 2 windows ≤ 35 s (validated), so a yaw only the periodic check sees resolves before a false 40 s run promotes.
 
-**5. Wire.** `MemoryStatus.state = RIG_MOVED`, plus `labcommand_msgs/RigPose` on `/room_memory/rig` (transient_local, on change + every 10 s): outcome (IN_PLACE, CHECKING, MOVED, REALIGNED, RELEARNING, INCONCLUSIVE), causes, per-sensor pose and Δ, `imu_ok`. A new topic: a new ChangeEvent kind or status field would break deployed Macs (D3, §1.1). Codecs + goldens in both engines; amend protocol §4.1, D17.
+**5. Wire.** `MemoryStatus.state = RIG_MOVED`, plus `labcommand_msgs/RigPose` on `/room_memory/rig` (transient_local, on change + every 10 s): outcome (IN_PLACE, CHECKING, MOVED, REALIGNED, RELEARNING, INCONCLUSIVE), causes, per-sensor pose and Δ, `imu_ok`. A new topic: a new ChangeEvent kind or status field would break deployed Macs (D3, §1.1). Codecs + goldens in both engines; protocol §3.9 and D39–D43 (after pubgen's §3.8 and D34–D38), amending §4.1 and D17.
 
 **6. Persistence.** With `rig_guard=true`, save `registration-<sensor>.bin` and a `rig_state` file (poses, gravity, baselines), atomically; a mismatched set throws on load. Legacy state is archived and rebuilt. `rig_guard=false` writes exactly today's files.
 

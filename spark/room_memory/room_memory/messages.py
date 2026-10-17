@@ -112,7 +112,7 @@ class SyncTopic(IntEnum):
 
 
 class RigOutcome(IntEnum):
-    """``RigPose.outcome``: the rig-pose guard's last decision (protocol §3.8)."""
+    """``RigPose.outcome``: the rig-pose guard's last decision (protocol §3.9)."""
 
     IN_PLACE = 0
     CHECKING = 1
@@ -1145,7 +1145,7 @@ def _f32_optional(values):
 
 @dataclass(frozen=True)
 class RigPose:
-    """The rig-pose guard (protocol §3.8): its outcome, what started the check, each sensor's
+    """The rig-pose guard (protocol §3.9): its outcome, what started the check, each sensor's
     result and absolute pose (``tx ty tz qx qy qz qw``, current sensor frame → its reference
     frame), and the last check's metrics. ``None`` is NaN on the wire (a pose: NaN × 7)."""
 
