@@ -3,6 +3,7 @@ registration cloud, the solver pieces, and ICP on ray-cast rooms."""
 
 import copy
 import math
+import os
 import pathlib
 import shutil
 import warnings
@@ -1105,6 +1106,13 @@ def moved_window():
     return memory, truth, second
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason=(
+        "Docker builds on the Spark run as root, permission-based fault injection cannot fail for root, "
+        "so the test cannot pass there"
+    ),
+)
 def test_a_failed_archive_leaves_no_partial_archive(tmp_path):
     """A copy that fails part way (an unreadable file, as a full disk would) removes the archive it
     started, so a retry takes the same number and pruning never keeps a partial copy over a whole one."""

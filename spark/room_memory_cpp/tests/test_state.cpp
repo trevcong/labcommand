@@ -1,5 +1,6 @@
 // The rig guard's files: the registration cloud and rig_state codecs, their parse errors, atomic
 // writes and archives, and byte identity with the Python engine (room_memory/state.py).
+#include <unistd.h>
 #include <zlib.h>
 
 #include <cmath>
@@ -391,6 +392,12 @@ TEST(archive_numbers_removes_and_keeps_three) {
 TEST(a_failed_archive_leaves_no_partial_archive) {
     // A copy that fails part way (an unreadable file, as a full disk would) removes the archive it
     // started, so a retry takes the same number and pruning never keeps a partial copy over a whole one.
+    // Before the try below: harness::Skip is a std::exception, and that catch would count it as success.
+    if (::geteuid() == 0) {
+        throw harness::Skip(
+            "Docker builds on the Spark run as root, permission-based fault injection cannot fail for root, "
+            "so the test cannot pass there");
+    }
     TempDir dir;
     const std::filesystem::path room = dir.path / "lab";
     touch(room / "rig_state", "state");
