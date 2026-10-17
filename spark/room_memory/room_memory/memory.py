@@ -1007,6 +1007,12 @@ class RoomMemory:
         self._detector = (ImuDetector(config.imu_shock_frac, config.imu_gyro_dps, config.imu_quiet_s)
                           if config.rig_guard else None)
         self.imu_failed = 0
+        # The rig files on disk lag the guard: a write failed (disk full, permissions). The guard runs
+        # on from memory and close_window retries every window; rig_save_failed counts the failed
+        # attempts (a failed relearn archive included) and rig_save_error is the last one's message.
+        self.rig_save_pending = False
+        self.rig_save_failed = 0
+        self.rig_save_error = None
         self._gravity = None  # the newest window's gravity
         self._g_base = None  # gravity at the last accepted decision
         self._gyro = None  # the gyro rotation of the last shock, until the check or move uses it
@@ -1128,21 +1134,29 @@ class RoomMemory:
             self._save_rig()
 
     def _save_rig(self):
-        """The registration clouds not yet written, then ``rig_state`` (last: it names them)."""
+        """The registration clouds not yet written, then ``rig_state`` (last: it names them). A failure
+        (disk full, permissions) never leaves ``close_window``: the guard keeps its state in memory, the
+        files on disk stay the last set written, and ``close_window`` retries until a save goes through."""
         if self.config.state_dir is None or any(c.cloud is None for c in self.channels.values()):
             return
-        room = _room_dir(self.config.state_dir, self.config.room_id)
-        sensors = {}
-        for name, channel in self.channels.items():
-            if channel.registration is None:
-                data = rig_files.registration_bytes(name, self._frame_epoch, channel.cloud.points)
-                file = rig_files.registration_name(name)
-                rig_files.write_atomic(room / file, data)
-                channel.registration = (file, len(data), zlib.crc32(data))
-            sensors[name] = rig_files.SensorState(channel.pose, channel.baseline, channel.registration)
-        state = rig_files.RigState(self.config.room_id, self.config.voxel_size, self._frame_epoch, self._n_realigned,
-                                   self._g_base, sensors)
-        rig_files.write_atomic(room / "rig_state", rig_files.format_rig_state(state))
+        try:
+            room = _room_dir(self.config.state_dir, self.config.room_id)
+            sensors = {}
+            for name, channel in self.channels.items():
+                if channel.registration is None:
+                    data = rig_files.registration_bytes(name, self._frame_epoch, channel.cloud.points)
+                    file = rig_files.registration_name(name)
+                    rig_files.write_atomic(room / file, data)
+                    channel.registration = (file, len(data), zlib.crc32(data))
+                sensors[name] = rig_files.SensorState(channel.pose, channel.baseline, channel.registration)
+            state = rig_files.RigState(self.config.room_id, self.config.voxel_size, self._frame_epoch,
+                                       self._n_realigned, self._g_base, sensors)
+            rig_files.write_atomic(room / "rig_state", rig_files.format_rig_state(state))
+            self.rig_save_pending = False
+        except Exception as error:  # the C++ engine catches std::exception; BaseException still propagates
+            self.rig_save_pending = True
+            self.rig_save_failed += 1
+            self.rig_save_error = str(error)
 
     def add_points(self, sensor, positions):
         """Queues decoded ``(n, 3)`` positions (meters, sensor frame) for the current window."""
@@ -1299,6 +1313,8 @@ class RoomMemory:
         if guard:
             for channel in self.channels.values():
                 channel.window = None
+            if self.rig_save_pending:
+                self._save_rig()
         return events
 
     def _build(self, channel, frames):
@@ -1693,7 +1709,14 @@ class RoomMemory:
             room = _room_dir(self.config.state_dir, self.config.room_id)
             files = ["map_epoch", "rig_state"] + [path.name for path in self._paths().values()]
             files += [rig_files.registration_name(name) for name in self.channels]
-            rig_files.archive(room, f"frame-{self._frame_epoch}", files)
+            # A failed archive (disk full) does not stop the relearn: the old frame's files stay in
+            # place until the new frame commits over them, so they are lost then, not now.
+            try:
+                rig_files.archive(room, f"frame-{self._frame_epoch}", files)
+            except Exception as error:  # as the C++ engine's std::exception
+                self.rig_save_failed += 1
+                self.rig_save_error = str(error)
+        self.rig_save_pending = False  # the old frame's files are moot; the new frame saves when it is built
         for channel in self.channels.values():
             for candidate in sorted(channel.tracker.open, key=lambda c: c.event_id):
                 events.append(self._event(channel, EventState.EXPIRED, candidate, stamp))

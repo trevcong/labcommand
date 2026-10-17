@@ -113,6 +113,9 @@ class RoomMemoryNode(Node):
             if self.config.imu_topic:
                 self.create_subscription(Imu, self.config.imu_topic, self._on_imu, qos_profile_sensor_data, raw=True)
         self._last_status = time.monotonic()
+        self._rig_save_failed = 0  # memory.rig_save_failed at the last window
+        self._rig_save_failed_at = 0  # its value before the current run of failures
+        self._rig_save_lagging = False
         self.create_timer(self.config.window_s, self._close_window)
         self.create_timer(1.0, self._publish_status)
         self.get_logger().info(
@@ -145,6 +148,7 @@ class RoomMemoryNode(Node):
             rig = self.memory.rig_pose(stamp)
             if rig is not None:
                 self.rig.publish(rig.to_cdr())
+            self._report_rig_save()
         elapsed_ms = (time.perf_counter() - start) * 1000
         cpu_ms = (time.process_time() - cpu) * 1000
         self.get_logger().info(
@@ -157,6 +161,19 @@ class RoomMemoryNode(Node):
     def _serve_request(self, request, response):
         response.accepted = self._answer(serialize_message(request.request))
         return response
+
+    def _report_rig_save(self):
+        """One warning when the rig files start lagging the guard (or a relearn archive fails), one
+        line when a retry catches up; not one per window while the disk stays full."""
+        failed, pending = self.memory.rig_save_failed, self.memory.rig_save_pending
+        if failed > self._rig_save_failed and not self._rig_save_lagging:
+            retry = "; the guard runs on and retries every window" if pending else ""
+            self.get_logger().warning(f"rig state not saved: {self.memory.rig_save_error}{retry}")
+        elif self._rig_save_lagging and not pending:
+            self.get_logger().info(f"rig state saved after {failed - self._rig_save_failed_at} failed attempts")
+        if pending and not self._rig_save_lagging:
+            self._rig_save_failed_at = self._rig_save_failed
+        self._rig_save_failed, self._rig_save_lagging = failed, pending
 
     def _answer(self, data):
         """Publishes the answer and its ``SyncEnd``; False when the request was dropped."""

@@ -2071,6 +2071,62 @@ TEST(the_rig_state_round_trips_and_a_restart_checks_the_pose) {
     CHECK_EQ(trace[0].rig->causes, msg::kCauseStartup);
 }
 
+TEST(a_failed_rig_save_never_leaves_close_window_and_retries) {
+    // A rig_state write that fails (a directory where its temp file goes, as a full disk or a
+    // permission error would) is caught: the guard runs on from memory, the failure is counted, every
+    // window retries, and once a save goes through the state loads back.
+    TempDir dir;
+    const std::filesystem::path room = dir.path / "lab";
+    const std::filesystem::path blocker = room / "rig_state.tmp";
+    std::filesystem::create_directories(blocker);
+    RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
+    drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 3), 1);
+    CHECK(memory.state() == MemoryState::tracking && memory.rig_save_pending());
+    CHECK(memory.rig_save_failed() >= 4);  // the build, then a retry per window
+    CHECK(memory.rig_save_error().find("rig_state.tmp") != std::string::npos);
+    CHECK(std::filesystem::exists(room / "registration-mid360.bin") && !std::filesystem::exists(room / "rig_state"));
+    const std::int64_t failed = memory.rig_save_failed();
+    std::filesystem::remove(blocker);
+    drive(memory, repeat(rig::Pose{}, 1), kGuardReferenceWindows + 4);
+    CHECK(!memory.rig_save_pending() && memory.rig_save_failed() == failed);
+    RoomMemory restarted(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
+    CHECK_EQ(restarted.channel("mid360").cloud->size(), memory.channel("mid360").cloud->size());
+    CHECK(restarted.rig_outcome() == O::checking);
+}
+
+TEST(a_failed_relearn_archive_does_not_stop_the_relearn) {
+    // The relearn archives the old frame under prev/; when that fails (here prev is a file) the
+    // failure is counted and the relearn goes on, and the new frame is saved when it is built.
+    TempDir dir;
+    const std::filesystem::path room = dir.path / "lab";
+    MemoryConfig config = guarded_config(dir.path.string());
+    config.relearn_after_s = 5.0;
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+    const rig::Pose far = rooms::rig(0.5, 0.0, 0.0, 20.0, 3.0);
+    ImuSource imu = imu_stream();
+    std::int64_t second = 1;
+    const auto step = [&](const rig::Pose& pose) { drive(memory, repeat(pose, 1), second++, rooms::kFurniture, imu); };
+    // Until an accepted check gives the Mid-360 an inlier baseline.
+    while (!memory.channel("mid360").baseline) {
+        step(rig::Pose{});
+        CHECK(second < kGuardReferenceWindows + 60);
+    }
+    std::ofstream(room / "prev").close();  // a file where the archive directory goes
+    const std::uint64_t old_frame = saved_rig_state(room).frame_epoch;
+    imu = imu_stream(static_cast<double>(second) - 0.5, 0.0, 50, 3.0);  // the roll confirms the move
+    while (memory.rig_outcome() != O::relearning) {
+        step(far);
+        CHECK(second < kGuardReferenceWindows + 100);
+    }
+    CHECK(memory.rig_save_failed() == 1 && !memory.rig_save_pending());
+    CHECK(memory.rig_save_error().find("prev") != std::string::npos);
+    while (memory.state() != MemoryState::tracking) {
+        step(far);
+        CHECK(second < kGuardReferenceWindows + 130);
+    }
+    CHECK(memory.rig_save_failed() == 1 && saved_rig_state(room).frame_epoch > old_frame);
+}
+
 TEST(a_rig_state_that_does_not_match_its_files_is_refused) {
     TempDir dir;
     {

@@ -241,6 +241,7 @@ private:
             if (const std::optional<msg::RigPose> rig = memory_->rig_pose(now_stamp)) {
                 rig_->publish(serialized(rig->to_cdr()));
             }
+            report_rig_save();
         }
         const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         RCLCPP_INFO(get_logger(), "window %.1f ms wall, %.1f ms cpu, %zu event messages, map %zu B, state %s", elapsed,
@@ -248,6 +249,23 @@ private:
         if (elapsed > memory_->config().window_s * 1000) {
             RCLCPP_WARN(get_logger(), "window took %.0f ms, longer than window_s", elapsed);
         }
+    }
+
+    // One warning when the rig files start lagging the guard (or a relearn archive fails), one line
+    // when a retry catches up; not one per window while the disk stays full.
+    void report_rig_save() {
+        const std::int64_t failed = memory_->rig_save_failed();
+        const bool pending = memory_->rig_save_pending();
+        if (failed > rig_save_failed_ && !rig_save_lagging_) {
+            RCLCPP_WARN(get_logger(), "rig state not saved: %s%s", memory_->rig_save_error().c_str(),
+                        pending ? "; the guard runs on and retries every window" : "");
+        } else if (rig_save_lagging_ && !pending) {
+            RCLCPP_INFO(get_logger(), "rig state saved after %lld failed attempts",
+                        static_cast<long long>(failed - rig_save_failed_at_));
+        }
+        if (pending && !rig_save_lagging_) rig_save_failed_at_ = rig_save_failed_;
+        rig_save_failed_ = failed;
+        rig_save_lagging_ = pending;
     }
 
     void publish_status() {
@@ -307,6 +325,9 @@ private:
     rclcpp::TimerBase::SharedPtr window_timer_;
     rclcpp::TimerBase::SharedPtr status_timer_;
     std::chrono::steady_clock::time_point last_status_;
+    std::int64_t rig_save_failed_ = 0;     // RoomMemory::rig_save_failed at the last window
+    std::int64_t rig_save_failed_at_ = 0;  // its value before the current run of failures
+    bool rig_save_lagging_ = false;
 };
 
 }  // namespace

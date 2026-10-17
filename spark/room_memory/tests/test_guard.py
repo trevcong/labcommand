@@ -644,6 +644,61 @@ def test_the_rig_state_round_trips_and_a_restart_checks_the_pose(tmp_path):
     assert trace[0].rig.causes == CAUSE_STARTUP
 
 
+def test_a_failed_rig_save_never_leaves_close_window_and_retries(tmp_path):
+    """A rig_state write that fails (a directory where its temp file goes, as a full disk or a
+    permission error would) is caught: the guard runs on from memory, the failure is counted, every
+    window retries, and once a save goes through the state loads back."""
+    memory = guarded(tmp_path)
+    room = tmp_path / "lab"
+    blocker = room / "rig_state.tmp"
+    blocker.mkdir(parents=True)
+    drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 3), 1)
+    assert memory.state == MemoryState.TRACKING and memory.rig_save_pending
+    # The build's save, then a retry per window.
+    assert memory.rig_save_failed >= 4 and "rig_state.tmp" in memory.rig_save_error
+    assert (room / "registration-mid360.bin").exists() and not (room / "rig_state").exists()
+    failed = memory.rig_save_failed
+    blocker.rmdir()
+    drive(memory, [rooms.Pose()], REFERENCE_WINDOWS + 4)
+    assert not memory.rig_save_pending and memory.rig_save_failed == failed
+    restarted = guarded(tmp_path)
+    assert len(restarted.channels["mid360"].cloud) == len(memory.channels["mid360"].cloud)
+    assert restarted.rig_outcome == RigOutcome.CHECKING
+
+
+def test_a_failed_relearn_archive_does_not_stop_the_relearn(tmp_path):
+    """The relearn archives the old frame under prev/; when that fails (here prev is a file) the
+    failure is counted and the relearn goes on, and the new frame is saved when it is built."""
+    memory = guarded(tmp_path, relearn_after_s=5.0)
+    far = rooms.rig(0.5, yaw_deg=20.0, roll_deg=3.0)
+    imu = imu_stream()
+    second = 1
+
+    def step(pose):
+        nonlocal second
+        trace = drive(memory, [pose], second, imu=imu)
+        second += 1
+        return trace
+
+    # Until an accepted check gives the Mid-360 an inlier baseline.
+    while memory.channels["mid360"].baseline is None:
+        step(rooms.Pose())
+        assert second < REFERENCE_WINDOWS + 60
+    room = tmp_path / "lab"
+    (room / "prev").write_bytes(b"")
+    old_frame = memory._frame_epoch
+    imu = imu_stream(second - 0.5, roll_deg=3.0)  # the roll confirms the move whatever ICP makes of it
+    while memory.rig_outcome != RigOutcome.RELEARNING:
+        step(far)
+        assert second < REFERENCE_WINDOWS + 100
+    assert memory.rig_save_failed == 1 and "prev" in memory.rig_save_error and not memory.rig_save_pending
+    while memory.state != MemoryState.TRACKING:
+        step(far)
+        assert second < REFERENCE_WINDOWS + 130
+    assert memory._frame_epoch > old_frame and memory.rig_save_failed == 1
+    assert rig_files.parse_rig_state((room / "rig_state").read_bytes(), "rig_state").frame_epoch == memory._frame_epoch
+
+
 def test_a_rig_state_that_does_not_match_its_files_is_refused(tmp_path):
     memory = guarded(tmp_path)
     drive(memory, [rooms.Pose()] * REFERENCE_WINDOWS, 1)

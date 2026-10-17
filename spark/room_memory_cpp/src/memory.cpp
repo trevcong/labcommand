@@ -1026,6 +1026,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
     }
     if (guard) {
         for (Channel& channel : channels_) channel.window.clear();
+        if (rig_save_pending_) save_rig();
     }
     return events;
 }
@@ -1679,8 +1680,16 @@ void RoomMemory::relearn(const msg::Time& stamp, std::vector<msg::ChangeEvent>& 
         std::vector<std::string> files{"map_epoch", "rig_state"};
         for (const std::filesystem::path& path : paths()) files.push_back(path.filename().string());
         for (const Channel& channel : channels_) files.push_back(registration_name(channel.sensor.name));
-        archive(room_dir(*config_.state_dir, config_.room_id), "frame-" + std::to_string(frame_epoch_), files);
+        // A failed archive (disk full) does not stop the relearn: the old frame's files stay in place
+        // until the new frame commits over them, so they are lost then, not now.
+        try {
+            archive(room_dir(*config_.state_dir, config_.room_id), "frame-" + std::to_string(frame_epoch_), files);
+        } catch (const std::exception& error) {
+            ++rig_save_failed_;
+            rig_save_error_ = error.what();
+        }
     }
+    rig_save_pending_ = false;  // the old frame's files are moot; the new frame saves when it is built
     for (Channel& channel : channels_) {
         for (const Candidate& candidate : channel.tracker.drop_all()) {
             events.push_back(event(channel, msg::EventState::expired, candidate, stamp));
@@ -1807,22 +1816,33 @@ void RoomMemory::load_rig(const std::filesystem::path& room, const std::filesyst
 }
 
 void RoomMemory::save_rig() {
-    // The registration clouds not yet written, then rig_state (last: it names them).
+    // The registration clouds not yet written, then rig_state (last: it names them). A failure (disk
+    // full, permissions) never leaves close_window: the guard keeps its state in memory, the files
+    // on disk stay the last set written, and close_window retries until a save goes through.
     if (!config_.state_dir) return;
     if (std::any_of(channels_.begin(), channels_.end(), [](const Channel& c) { return !c.cloud; })) return;
-    const std::filesystem::path room = room_dir(*config_.state_dir, config_.room_id);
-    RigState state{config_.room_id, config_.voxel_size, frame_epoch_, n_realigned_, g_base_, {}};
-    for (Channel& channel : channels_) {
-        if (!channel.registration) {
-            const std::vector<std::uint8_t> data = registration_bytes(channel.sensor.name, frame_epoch_, channel.cloud->points());
-            const std::string file = registration_name(channel.sensor.name);
-            write_atomic(room / file, data);
-            channel.registration = RegistrationFile{
-                file, data.size(), static_cast<std::uint32_t>(::crc32(0L, data.data(), static_cast<uInt>(data.size())))};
+    try {
+        const std::filesystem::path room = room_dir(*config_.state_dir, config_.room_id);
+        RigState state{config_.room_id, config_.voxel_size, frame_epoch_, n_realigned_, g_base_, {}};
+        for (Channel& channel : channels_) {
+            if (!channel.registration) {
+                const std::vector<std::uint8_t> data =
+                    registration_bytes(channel.sensor.name, frame_epoch_, channel.cloud->points());
+                const std::string file = registration_name(channel.sensor.name);
+                write_atomic(room / file, data);
+                const auto crc = static_cast<std::uint32_t>(::crc32(0L, data.data(), static_cast<uInt>(data.size())));
+                channel.registration = RegistrationFile{file, data.size(), crc};
+            }
+            state.sensors.emplace_back(channel.sensor.name,
+                                       SensorState{channel.pose, channel.baseline, *channel.registration});
         }
-        state.sensors.emplace_back(channel.sensor.name, SensorState{channel.pose, channel.baseline, *channel.registration});
+        write_atomic(room / "rig_state", format_rig_state(state));
+        rig_save_pending_ = false;
+    } catch (const std::exception& error) {
+        rig_save_pending_ = true;
+        ++rig_save_failed_;
+        rig_save_error_ = error.what();
     }
-    write_atomic(room / "rig_state", format_rig_state(state));
 }
 
 }  // namespace room_memory
