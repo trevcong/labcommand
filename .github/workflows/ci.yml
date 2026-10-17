@@ -60,7 +60,8 @@ jobs:
         id: pytest
         working-directory: spark
         timeout-minutes: 20
-        run: python -m pytest -q -rs --junitxml="$REPORTS/pytest.xml" < /dev/null
+        # --durations names the slowest tests, so the next slow regression is visible in the log.
+        run: python -m pytest -q -rs --durations=15 --junitxml="$REPORTS/pytest.xml" < /dev/null
       - name: Configure non-ROS C++ targets
         id: configure
         run: |

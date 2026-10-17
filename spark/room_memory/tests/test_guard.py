@@ -1,6 +1,7 @@
 """The rig guard's geometry (room_memory/guard.py): pose conventions, the binary32 transform, the
 registration cloud, the solver pieces, and ICP on ray-cast rooms."""
 
+import copy
 import math
 import pathlib
 import shutil
@@ -12,6 +13,7 @@ import pytest
 
 from room_memory import guard as g
 from room_memory.core import Config, decode_pointcloud2, occupancy_map
+from room_memory.core.change_detection import LIMIT
 from room_memory import state as rig_files
 from room_memory.memory import MemoryConfig, RoomMemory, load_epoch, load_reference, pose_shift
 from room_memory.messages import (CAUSE_IMU_SHOCK, CAUSE_IMU_TILT, CAUSE_PERIODIC, CAUSE_POSE_OFFSET, CAUSE_STARTUP,
@@ -145,6 +147,184 @@ def test_grid_finds_the_nearest_point_with_ties_to_the_lower_index():
     assert d2[0] == pytest.approx(0.0025)
 
 
+def reference_nearest(grid, queries, points, radius):
+    """TargetGrid.nearest as #19 wrote it (and guard.cpp runs it): every kept slot of the 27 cells in
+    offset order, a smaller d2 or an equal d2 and a lower index replacing the best."""
+    best = np.full(len(queries), np.inf)
+    best_index = np.full(len(queries), -1, dtype=np.int64)
+    if not len(queries) or not len(grid.keys):
+        return best_index, best
+    base = np.floor(queries / grid.cell).astype(np.int64)
+    for di, dj, dk in g._OFFSETS:
+        keys = g.pack(base[:, 0] + di, base[:, 1] + dj, base[:, 2] + dk)
+        at = np.minimum(np.searchsorted(grid.keys, keys), len(grid.keys) - 1)
+        found = grid.keys[at] == keys
+        starts = np.where(found, grid.start[at], 0)
+        counts = np.where(found, grid.count[at], 0)
+        for slot in range(int(counts.max(initial=0))):
+            rows = np.nonzero(slot < counts)[0]
+            target = grid.indices[starts[rows] + slot]
+            delta = queries[rows] - points[target]
+            d2 = (delta[:, 0] * delta[:, 0] + delta[:, 1] * delta[:, 1]) + delta[:, 2] * delta[:, 2]
+            better = (d2 < best[rows]) | ((d2 == best[rows]) & (target < best_index[rows]))
+            best[rows[better]] = d2[better]
+            best_index[rows[better]] = target[better]
+    outside = best > radius * radius
+    best_index[outside] = -1
+    best[outside] = np.inf
+    return best_index, best
+
+
+@pytest.mark.filterwarnings("ignore:invalid value encountered in cast", "ignore:overflow encountered in multiply")
+def test_grid_nearest_is_bit_identical_to_the_slot_scan():
+    """The vectorized search (one pass over the candidate pairs, neighbour cells pruned by box
+    distance) returns the slot scan's index and binary64 d2 exactly, for points whose cell indices
+    pack: random clouds, lattices full of exact ties, queries on cell faces with radii equal to
+    lattice distances, non-finite queries, d2 that overflows, binary32 targets (cast to binary64),
+    a points array other than the grid's, and a ray-cast room."""
+    rng = np.random.default_rng(7)
+    cases = []
+    for trial in range(160):
+        n, m = int(rng.integers(0, 600)), int(rng.integers(0, 400))
+        cell = float(rng.choice([0.05, 0.16, 0.5]))
+        radius = float(rng.choice([0.0, 0.03, 0.1, 1.0, math.inf]))
+        kind = trial % 5
+        if kind == 0:
+            points, queries = rng.normal(size=(n, 3)), rng.normal(size=(m, 3))
+        elif kind in (1, 2):  # ties: many targets at one lattice distance, queries on or between sites
+            points = rng.integers(-4, 4, size=(n, 3)) * 0.05
+            queries = rng.integers(-4, 4, size=(m, 3)) * 0.05 + (0.025 if kind == 2 else 0.0)
+        elif kind == 3:  # exact binary lattices: queries on cell faces, d2 == radius**2 exactly
+            step = float(rng.choice([0.125, 0.25]))
+            points = rng.integers(-5, 5, size=(n, 3)) * step
+            queries = rng.integers(-5, 5, size=(m, 3)) * step
+            cell = float(rng.choice([0.125, 0.25, 0.5]))
+            radius = float(rng.choice([step, 2 * step, cell]))
+        else:
+            points, queries = rng.integers(-4, 4, size=(n, 3)) * 0.05, rng.normal(size=(m, 3)) * 0.2
+            queries[rng.random(m) < 0.1] = np.nan
+            queries[rng.random(m) < 0.05] = np.inf
+        if trial % 9 == 0:
+            points = points.astype(np.float32)
+        cases.append((points, queries, cell, int(rng.choice([0, 1, 3, 20])), radius, trial % 7 == 0))
+    room = rooms.scan(seed=1).astype(np.float64)
+    moved = rooms.scan(rooms.rig(0.02, yaw_deg=1.0), seed=2).astype(np.float64)
+    cases += [(room, moved, 0.08, g.GRID_CAP, 0.05, False), (room, moved[::4], 0.16, g.GRID_CAP, 0.16, False)]
+    # Neighbours whose d2 overflows to inf: never a match, not even within an infinite radius.
+    # The cell is 1e160, so floor(p / cell) stays inside the 21-bit key range.
+    huge = rng.integers(-3, 3, size=(200, 3)) * 1e160
+    cases.append((huge, huge[:100] + 5e159, 1e160, 3, math.inf, False))
+    for points, queries, cell, cap, radius, foreign in cases:
+        grid = g.TargetGrid(points, cell, cap)
+        coordinates = points.copy() if foreign else points
+        index, d2 = grid.nearest(queries, coordinates, radius)
+        expected_index, expected_d2 = reference_nearest(grid, queries, coordinates, radius)
+        assert index.tobytes() == expected_index.tobytes() and d2.tobytes() == expected_d2.tobytes()
+
+
+def test_grid_casts_float32_queries_and_targets_to_float64():
+    """Binary32 floor(p / cell) can pick a different cell than binary64. The grid casts first, so a
+    float32 cloud matches the float64 grid of the same values, and an already-float64 array keeps
+    its identity (the kept-column path)."""
+    cell = 0.1
+    xs = np.linspace(-2, 2, 40001, dtype=np.float32)
+    narrow = np.floor(xs / cell).astype(np.int64)
+    promoted = np.floor(xs.astype(np.float64) / cell).astype(np.int64)
+    mismatch = np.flatnonzero(narrow != promoted)
+    assert len(mismatch)
+    points32 = np.array([[xs[mismatch[0]], 0.0, 0.0], [0.0, 0.0, 0.0], [0.05, 0.0, 0.0]], np.float32)
+    grid = g.TargetGrid(points32, cell, 20)
+    assert grid._points.dtype == np.float64 and grid._points is not points32
+    wide = g.TargetGrid(points32.astype(np.float64), cell, 20)
+    assert grid.keys.tobytes() == wide.keys.tobytes()
+    queries32 = np.array([[xs[mismatch[0]], 0.01, 0.0], [0.02, 0.0, 0.0]], np.float32)
+    index, d2 = grid.nearest(queries32, points32, 0.5)
+    expected = reference_nearest(grid, queries32.astype(np.float64), grid._points, 0.5)
+    assert index.tobytes() == expected[0].tobytes() and d2.tobytes() == expected[1].tobytes()
+    same_index, same_d2 = wide.nearest(queries32.astype(np.float64), wide._points, 0.5)
+    assert index.tobytes() == same_index.tobytes() and d2.tobytes() == same_d2.tobytes()
+    points64 = points32.astype(np.float64)
+    assert g.TargetGrid(points64, cell, 20)._points is points64
+
+
+def test_grid_rejects_a_point_outside_the_21_bit_cell_range():
+    """floor(p / cell) +/- 1 must pack. The last index that does still matches the slot scan; one
+    step further, on either side, is an error from the grid, from nearest, and from the normals."""
+    cell = 0.5  # a power of two, so (LIMIT - 2) * cell / cell is that index exactly
+    edge = np.array([[(LIMIT - 2) * cell, 0.0, 0.0], [0.0, (-LIMIT + 1) * cell, 0.0]])
+    grid = g.TargetGrid(edge, cell, 20)
+    index, d2 = grid.nearest(edge, grid._points, 1.0)
+    expected = reference_nearest(grid, edge, grid._points, 1.0)
+    assert index.tobytes() == expected[0].tobytes() and d2.tobytes() == expected[1].tobytes()
+    beyond = np.array([[(LIMIT - 1) * cell, 0.0, 0.0]])
+    with pytest.raises(ValueError, match="21-bit"):
+        g.TargetGrid(beyond, cell, 20)
+    with pytest.raises(ValueError, match="21-bit"):
+        grid.nearest(beyond, grid._points, 1.0)
+    with pytest.raises(ValueError, match="21-bit"):
+        grid.nearest(np.array([[-LIMIT * cell, 0.0, 0.0]]), grid._points, 1.0)
+    with pytest.raises(ValueError, match="21-bit"):
+        grid.nearest(np.array([[-1e30, 0.0, 0.0]]), grid._points, 1.0)
+    with pytest.raises(ValueError, match="21-bit"):
+        g.TargetGrid(np.array([[np.nan, 0.0, 0.0]]), cell, 20)
+    outside = np.vstack([np.zeros((4, 3)), [(LIMIT - 1) * g.NORMAL_RADIUS_M, 0.0, 0.0]])
+    with pytest.raises(ValueError, match="21-bit"):
+        g._normals(outside, g.NORMAL_RADIUS_M)
+
+
+def reference_normals(points, radius):
+    """guard._normals as #19 wrote it: the sums run pass by pass, offset-major and slot-minor."""
+    normals = np.full((len(points), 3), np.nan)
+    if not len(points):
+        return normals
+    grid = g.TargetGrid(points, radius, g.GRID_CAP)
+    count, s, ss = np.zeros(len(points)), np.zeros((len(points), 3)), np.zeros((len(points), 6))
+    base = np.floor(points / radius).astype(np.int64)
+    for di, dj, dk in g._OFFSETS:
+        keys = g.pack(base[:, 0] + di, base[:, 1] + dj, base[:, 2] + dk)
+        at = np.minimum(np.searchsorted(grid.keys, keys), len(grid.keys) - 1)
+        found = grid.keys[at] == keys
+        starts = np.where(found, grid.start[at], 0)
+        counts = np.where(found, grid.count[at], 0)
+        for slot in range(int(counts.max(initial=0))):
+            rows = np.nonzero(slot < counts)[0]
+            other = points[grid.indices[starts[rows] + slot]]
+            delta = points[rows] - other
+            d2 = (delta[:, 0] * delta[:, 0] + delta[:, 1] * delta[:, 1]) + delta[:, 2] * delta[:, 2]
+            near = d2 <= radius * radius
+            rows, other = rows[near], other[near]
+            count[rows] += 1.0
+            s[rows] += other
+            x, y, z = other[:, 0], other[:, 1], other[:, 2]
+            ss[rows] += np.stack([x * x, x * y, x * z, y * y, y * z, z * z], axis=1)
+    rows = np.nonzero(count >= g.NORMAL_MIN_POINTS)[0]
+    m, c = s[rows] / count[rows, None], ss[rows] / count[rows, None]
+    cov = np.empty((len(rows), 3, 3))
+    for i, j, slot in ((0, 0, 0), (0, 1, 1), (0, 2, 2), (1, 1, 3), (1, 2, 4), (2, 2, 5)):
+        cov[:, i, j] = cov[:, j, i] = c[:, slot] - m[:, i] * m[:, j]
+    values, vectors = np.linalg.eigh(cov)
+    planar = values[:, 0] <= g.NORMAL_PLANARITY * values[:, 1]
+    normals[rows[planar]] = vectors[planar, :, 0]
+    return normals
+
+
+def test_normals_are_bit_identical_to_the_pass_by_pass_sums():
+    """The normals' sums (pruned cells, all candidates of a chunk at once, then one pass per
+    neighbour rank) add the same terms in the same order as the pass-by-pass scan: the same bytes
+    on a ray-cast room, a corridor, and lattices full of points on cell faces."""
+    rng = np.random.default_rng(11)
+    builder = g.RegistrationBuilder(0.02)
+    builder.add(rooms.scan(seed=3), 15.0)
+    corridor = g.RegistrationBuilder(0.02)
+    corridor.add(rooms.scan(room=rooms.CORRIDOR, boxes=(), seed=4)[::3], 15.0)
+    clouds = [builder.points.astype(np.float64), corridor.points.astype(np.float64),
+              rng.integers(-6, 6, size=(3000, 3)) * 0.05, rng.integers(-4, 4, size=(2000, 3)) * 0.15,
+              rng.normal(size=(2000, 3)) * 0.2, np.zeros((0, 3))]
+    for points in clouds:
+        expected = reference_normals(points, g.NORMAL_RADIUS_M)
+        assert g._normals(points, g.NORMAL_RADIUS_M).tobytes() == expected.tobytes()
+
+
 # MARK: Alignment
 
 
@@ -242,6 +422,11 @@ def test_rig_shifted_golden_is_a_5_cm_move():
 
 
 REFERENCE_WINDOWS = 10
+# Azimuths per scan for the tests of saving, loading and failing writes: what they check does not
+# depend on the scan's density, and half the rays is half the work.
+SPARSE = 360
+# relearn_after_s for the tests that relearn: the wait itself is all a longer one would add.
+RELEARN_AFTER_S = 5
 CUBE = ((2.0, -0.4, -1.2), (2.4, 0.0, -0.8))
 
 
@@ -259,15 +444,17 @@ class Window:
     rig: object  # RigPose or None
 
 
-def drive(memory, poses, first, boxes=rooms.FURNITURE, imu=None, frames=1, room=rooms.ROOM):
-    """One window per pose, at seconds ``first``, ``first + 1``, ..., of ``frames`` scans each;
-    ``imu(second)`` gives the samples received during the second before that window closes."""
+def drive(memory, poses, first, boxes=rooms.FURNITURE, imu=None, frames=1, room=rooms.ROOM, columns=720):
+    """One window per pose, at seconds ``first``, ``first + 1``, ..., of ``frames`` scans each of
+    ``columns`` azimuths; ``imu(second)`` gives the samples received during the second before that
+    window closes."""
     trace = []
     for second, pose in enumerate(poses, first):
         for sample in (imu(second) if imu else ()):
             memory.add_imu(sample.to_cdr(), sample.stamp)
         for frame in range(frames):
-            memory.add_points("mid360", rooms.scan(pose, room=room, boxes=boxes, seed=second * frames + frame))
+            memory.add_points("mid360", rooms.scan(pose, room=room, boxes=boxes, seed=second * frames + frame,
+                                                   columns=columns))
         stamp = Time(second, 0)
         events = memory.close_window(stamp)
         rig = memory.rig_pose(stamp)
@@ -290,11 +477,24 @@ def candidates(trace):
 
 
 @pytest.fixture(scope="module")
-def moved_run():
-    """Astra's repro: the reference, then a 10 cm + 2 degree push, then a cube placed in the room."""
+def built_run():
+    """A guarded engine without a state dir after REFERENCE_WINDOWS + 2 windows of the rig in place
+    (built, then tracking), and their trace: the start several tests share. Read it through built()."""
     memory = guarded()
+    return memory, drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 2), 1)
+
+
+def built(built_run):
+    """A copy of built_run's engine and trace, the same as building them anew."""
+    memory, trace = built_run
+    return copy.deepcopy(memory), list(trace)
+
+
+@pytest.fixture(scope="module")
+def moved_run(built_run):
+    """Astra's repro: the reference, then a 10 cm + 2 degree push, then a cube placed in the room."""
+    memory, trace = built(built_run)
     truth = rooms.rig(0.10, yaw_deg=2.0)
-    trace = drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 2), 1)
     trace += drive(memory, [truth] * 20, len(trace) + 1)
     pose_after_move = memory.channels["mid360"].pose
     # A few frames per window, as a 10 Hz lidar gives: one sparse fan makes the cube's voxels flicker
@@ -333,10 +533,9 @@ def test_without_the_guard_the_push_floods_candidates():
     assert all(window.rig is None for window in trace)
 
 
-def test_a_yaw_alone_realigns_before_the_candidate_gate():
-    memory = guarded()
+def test_a_yaw_alone_realigns_before_the_candidate_gate(built_run):
+    memory, _ = built(built_run)
     truth = rooms.rig(yaw_deg=3.0)
-    drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 2), 1)
     trace = drive(memory, [truth] * 45, REFERENCE_WINDOWS + 3)
     assert not candidates(trace)
     assert RigOutcome.REALIGNED in outcomes(trace)
@@ -344,9 +543,9 @@ def test_a_yaw_alone_realigns_before_the_candidate_gate():
     assert error_m <= 0.005 and error_deg <= 0.05
 
 
-def test_a_static_rig_checks_periodically_and_stays_in_place():
-    memory = guarded()
-    trace = drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 70), 1)
+def test_a_static_rig_checks_periodically_and_stays_in_place(built_run):
+    memory, trace = built(built_run)
+    trace += drive(memory, [rooms.Pose()] * 68, REFERENCE_WINDOWS + 3)  # REFERENCE_WINDOWS + 70 windows in all
     assert not [event for window in trace for event in window.events]
     assert {window.state for window in trace} == {MemoryState.BUILDING, MemoryState.TRACKING}
     assert set(outcomes(trace)) == {RigOutcome.IN_PLACE, RigOutcome.CHECKING}
@@ -404,7 +603,7 @@ def test_an_imu_shock_alone_checks_and_stays_in_place():
 def test_the_gravity_baseline_is_set_while_building(tmp_path):
     """The IMU streams through BUILDING, so the new frame starts with a gravity baseline."""
     memory = guarded(tmp_path)
-    drive(memory, [rooms.Pose()] * REFERENCE_WINDOWS, 1, imu=imu_stream())
+    drive(memory, [rooms.Pose()] * REFERENCE_WINDOWS, 1, imu=imu_stream(), columns=SPARSE)
     assert memory.state == MemoryState.TRACKING
     state = rig_files.parse_rig_state((tmp_path / "lab" / "rig_state").read_bytes(), "rig_state")
     assert state.g_base is not None and math.isclose(state.g_base[2], -1.0)
@@ -451,8 +650,9 @@ def test_a_sensor_lost_after_a_move_does_not_block_the_relearn(tmp_path):
     """Codex's repro: both sensors see a move outside the envelope, then the JT128 drops. The
     Mid-360 relearns on its own at relearn_after_s and tracks again; the JT128 builds its reference
     when it returns, and only then is the new frame committed. The move rolls the rig 3 degrees under a
-    streaming IMU, so the tilt confirms it whatever ICP makes of a pose it cannot reach."""
-    memory = guarded(tmp_path, sensors=("mid360", "jt128"))
+    streaming IMU, so the tilt confirms it whatever ICP makes of a pose it cannot reach. The wait is
+    shortened to RELEARN_AFTER_S; the default 60 s is the test below."""
+    memory = guarded(tmp_path, sensors=("mid360", "jt128"), relearn_after_s=float(RELEARN_AFTER_S))
     far = rooms.rig(0.5, yaw_deg=20.0, roll_deg=3.0)
     imu = imu_stream()
     trace = []
@@ -486,7 +686,7 @@ def test_a_sensor_lost_after_a_move_does_not_block_the_relearn(tmp_path):
     while memory.rig_outcome != RigOutcome.RELEARNING:
         step(second, far, mid)
         second += 1
-        assert second <= moved_at + 62, "the silent JT128 blocked the relearn"
+        assert second <= moved_at + RELEARN_AFTER_S + 2, "the silent JT128 blocked the relearn"
     # The room rebuilds on the Mid-360 alone and tracks again; the JT128 waits unbuilt.
     relearned_at = second
     while memory.state != MemoryState.TRACKING:
@@ -530,6 +730,54 @@ def test_a_sensor_lost_after_a_move_does_not_block_the_relearn(tmp_path):
     restarted = guarded(tmp_path, sensors=("mid360", "jt128"))
     assert restarted.state == MemoryState.TRACKING
     assert len(restarted.channels["jt128"].cloud) == len(jt128.cloud)
+
+
+def test_a_sensor_lost_after_a_move_relearns_at_the_default_60s():
+    """The default relearn_after_s is 60 s. Both sensors are moved out of reach on sparse scans,
+    then the JT128 sends nothing: a silent sensor must not hold the relearn, and a shortened
+    override must not be what makes this pass. The wait itself is a 16-ray fan. The clock does not
+    need a fit (fewer than MIN_SOURCE_POINTS never reaches ICP), and one return keeps the Mid-360
+    from going silent too."""
+    memory = guarded(sensors=("mid360", "jt128"))
+    assert memory.config.relearn_after_s == 60.0
+    far = rooms.rig(0.5, yaw_deg=20.0, roll_deg=3.0)
+    imu = imu_stream()
+    second = 1
+    # Fixed fan: no per-frame azimuth jitter, and small enough that the wait does not run ICP.
+    wait_fan = rooms.fan(rows=2, columns=8)
+
+    def step(stamp, pose, sensors, columns=SPARSE, directions=None):
+        for sample in imu(stamp):
+            memory.add_imu(sample.to_cdr(), sample.stamp)
+        for name in sensors:
+            memory.add_points(name, rooms.scan(pose, seed=stamp, columns=columns, directions=directions))
+        memory.close_window(Time(stamp, 0))
+
+    both, mid = ("mid360", "jt128"), ("mid360",)
+    while any(channel.baseline is None for channel in memory.channels.values()):
+        step(second, rooms.Pose(), both)
+        second += 1
+        assert second < REFERENCE_WINDOWS + 60
+    moving = second
+    imu = imu_stream(moving - 0.5, roll_deg=3.0)
+    while not all(channel.mode == "moved" for channel in memory.channels.values()):
+        step(second, far, both)
+        second += 1
+        assert second < moving + 20
+    moved_at = second
+    step(second, far, mid, directions=wait_fan)
+    second += 1
+    assert memory.channels["jt128"].mode == "stale" and memory.channels["mid360"].mode == "moved"
+    assert memory.rig_outcome != RigOutcome.RELEARNING
+    while memory.rig_outcome != RigOutcome.RELEARNING:
+        # Still moved on the way in. The window that relearns resets every channel to normal.
+        assert memory.channels["jt128"].mode == "stale" and memory.channels["mid360"].mode == "moved"
+        step(second, far, mid, directions=wait_fan)
+        second += 1
+        assert second <= moved_at + 62, "the silent JT128 blocked the relearn"
+    assert second - moved_at >= 60
+    assert memory.state == MemoryState.BUILDING
+    assert memory.channels["mid360"].builder is not None and memory.channels["jt128"].cloud is None
 
 
 def test_a_sensor_silent_through_a_realignment_realigns_when_it_returns():
@@ -613,7 +861,7 @@ def test_close_window_times_the_guard_icp():
     memory = guarded(guard_check_period_s=5.0)
     counts = []
     for second in range(1, REFERENCE_WINDOWS + 13):
-        drive(memory, [rooms.Pose()], second)
+        drive(memory, [rooms.Pose()], second, columns=SPARSE)
         counts.append((memory.window_estimates, memory.window_estimate_ms))
     assert counts[:REFERENCE_WINDOWS - 1] == [(0, 0.0)] * (REFERENCE_WINDOWS - 1)
     checked = [(n, ms) for n, ms in counts if n]
@@ -621,11 +869,11 @@ def test_close_window_times_the_guard_icp():
     assert (0, 0.0) in counts[REFERENCE_WINDOWS:]  # a window between checks
 
 
-def test_too_few_points_to_register_is_never_move_evidence():
+def test_too_few_points_to_register_is_never_move_evidence(built_run):
     """Astra's repro: sparse windows, rejected for fewer than MIN_SOURCE_POINTS, after a baseline and
     with no IMU, end checks INCONCLUSIVE; they never enter RIG_MOVED or relearn."""
-    memory = guarded()
-    drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 10), 1)
+    memory, _ = built(built_run)
+    drive(memory, [rooms.Pose()] * 8, REFERENCE_WINDOWS + 3)  # REFERENCE_WINDOWS + 10 windows in all
     assert memory.channels["mid360"].baseline is not None
     sparse = rooms.fan(rows=2, columns=8)
     trace = []
@@ -683,14 +931,14 @@ def test_a_failed_rig_save_never_leaves_close_window_and_retries(tmp_path):
     room = tmp_path / "lab"
     blocker = room / "rig_state.tmp"
     blocker.mkdir(parents=True)
-    drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 3), 1)
+    drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 3), 1, columns=SPARSE)
     assert memory.state == MemoryState.TRACKING and memory.rig_save_pending
     # The build's save, then a retry per window.
     assert memory.rig_save_failed >= 4 and "rig_state.tmp" in memory.rig_save_error
     assert (room / "registration-mid360.bin").exists() and not (room / "rig_state").exists()
     failed = memory.rig_save_failed
     blocker.rmdir()
-    drive(memory, [rooms.Pose()], REFERENCE_WINDOWS + 4)
+    drive(memory, [rooms.Pose()], REFERENCE_WINDOWS + 4, columns=SPARSE)
     assert not memory.rig_save_pending and memory.rig_save_failed == failed
     restarted = guarded(tmp_path)
     assert len(restarted.channels["mid360"].cloud) == len(memory.channels["mid360"].cloud)
@@ -701,14 +949,14 @@ def relearned(tmp_path, blocked):
     """A guarded engine with an inlier baseline, moved out of reach until it relearns; ``blocked``
     names files placed in the room just before the move. Returns the engine, a step function, the
     old frame and the old frame's files on disk at the relearn (map_epoch aside: it only moves on)."""
-    memory = guarded(tmp_path, relearn_after_s=5.0)
+    memory = guarded(tmp_path, relearn_after_s=float(RELEARN_AFTER_S))
     far = rooms.rig(0.5, yaw_deg=20.0, roll_deg=3.0)
     imu = imu_stream()
     second = 1
 
     def step(pose=far):
         nonlocal second
-        drive(memory, [pose], second, imu=imu)
+        drive(memory, [pose], second, imu=imu, columns=SPARSE)
         second += 1
 
     # Until an accepted check gives the Mid-360 an inlier baseline.
@@ -911,7 +1159,7 @@ def test_a_new_frame_cut_short_never_loads_with_the_old_frames_poses(tmp_path):
 
 def test_a_rig_state_that_does_not_match_its_files_is_refused(tmp_path):
     memory = guarded(tmp_path)
-    drive(memory, [rooms.Pose()] * REFERENCE_WINDOWS, 1)
+    drive(memory, [rooms.Pose()] * REFERENCE_WINDOWS, 1, columns=SPARSE)
     cloud = tmp_path / "lab" / "registration-mid360.bin"
     data = bytearray(cloud.read_bytes())
     data[-5] ^= 1
@@ -926,13 +1174,13 @@ def test_a_rig_state_that_does_not_match_its_files_is_refused(tmp_path):
 
 
 def test_legacy_state_is_archived_and_rebuilt(tmp_path):
-    drive(guarded(tmp_path, rig_guard=False), [rooms.Pose()] * REFERENCE_WINDOWS, 1)
+    drive(guarded(tmp_path, rig_guard=False), [rooms.Pose()] * REFERENCE_WINDOWS, 1, columns=SPARSE)
     memory = guarded(tmp_path)
     assert memory.state == MemoryState.BUILDING and memory.rig_outcome == RigOutcome.RELEARNING
     [archive] = (tmp_path / "lab" / "prev").iterdir()
     assert sorted(path.name for path in archive.iterdir()) == ["map_epoch", "reference-mid360.cdr"]
     assert not (tmp_path / "lab" / "reference-mid360.cdr").exists()
-    drive(memory, [rooms.Pose()] * REFERENCE_WINDOWS, 1)
+    drive(memory, [rooms.Pose()] * REFERENCE_WINDOWS, 1, columns=SPARSE)
     assert memory.state == MemoryState.TRACKING and (tmp_path / "lab" / "rig_state").exists()
     assert memory.map_epoch > 1
 
