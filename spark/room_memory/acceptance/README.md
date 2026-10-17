@@ -145,12 +145,16 @@ or a gap already makes the interval unverifiable.
 
 The same counter is also read across the whole session, from subscription ready
 through `session_end`, per publisher generation. A nonzero change denies full
-acceptance. That includes a drop in a gap between scenarios and a drop during
-setup, before the first watch. Those drops stay out of the neighboring
-scenarios, so the scenarios keep their exposure. A steady historical count, and
-a restart's reset to 0, still do not count. The session total is
-`session_dropped_windows`. `session_end` is in the log so an offline score sees
-the same interruption.
+acceptance. That includes a drop between ready and the first status, a drop
+during setup before the first watch, and a drop in a gap between scenarios.
+The session baseline is a status sample at or before ready. The first status
+after ready is not that baseline: the counter is measured from 0, so a value
+already stored on it counts. Scenarios that start after that status still use
+it as their own baseline, so they keep their exposure. A steady count is
+history only when a sample at or before ready already shows it. A later
+generation starts at 0, so a restart's reset does not count. The session total
+is `session_dropped_windows`. `session_end` is in the log so an offline score
+sees the same interruption.
 
 The recorder stays up after the last watch until a fresh status sample and a
 fresh activity sample have both arrived at or after that watch, and until the

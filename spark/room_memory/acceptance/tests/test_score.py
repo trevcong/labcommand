@@ -32,6 +32,31 @@ def _row(report, scenario_id):
     return next(row for row in report["scenarios"] if row["id"] == scenario_id)
 
 
+def _status_at_ready(messages, dropped_windows):
+    """Copy the earliest status onto the ready stamp.
+
+    That sample is the session counter baseline. A scenario that starts later
+    still chains from the last sample at or before its own t0.
+    """
+    ready = next(item for item in messages if item.get("op") == "ready")
+    template = next(item for item in messages if item.get("topic") == "/room_memory/status")
+    receipt = ready["receipt_mono_ns"]
+    body = dict(template["message"])
+    body["dropped_windows"] = dropped_windows
+    sample = {
+        "schema": template["schema"],
+        "topic": template["topic"],
+        "receipt_mono_ns": receipt,
+        "callback_mono_ns": receipt,
+        "stamp_ns": receipt + template["stamp_ns"] - template["receipt_mono_ns"],
+        "seq": template["seq"],
+        "publisher_generation": template["publisher_generation"],
+        "initial": False,
+        "message": body,
+    }
+    return [*messages, sample]
+
+
 def _dispositions(report, name):
     return [item for item in report["candidates"] if item["disposition"] == name]
 
@@ -585,28 +610,47 @@ def test_a_restart_inside_an_interval_does_not_hide_dropped_windows():
     assert first["g5_acceptance"] == "denied"
 
     # A clean restart inside the interval is unverifiable but loses no windows.
-    clean = _score(*_perfect(
+    # The 7 is already on a status at ready, so it is history, not a session drop.
+    clean_messages, clean_marks = _perfect(
         generation_at=lambda t: 4 if t < 740 else 5,
         dropped_at=lambda t: 7 if t < 740 else 0,
-    ))
+    )
+    clean = _score(_status_at_ready(clean_messages, 7), clean_marks)
     assert _row(clean, "restore_reference")["dropped_windows"] == 0
     assert clean["lost_window_scenarios"] == []
+    assert clean["session_dropped_windows"] == 0
     assert clean["g5_acceptance"] == "full_candidate"
 
 
 def test_an_unchanged_historical_dropped_count_keeps_coverage():
-    steady = _score(*_perfect(dropped_at=lambda t: 7))
+    # The count is already 7 on a status at ready, and it never moves.
+    messages, mark = _perfect(dropped_at=lambda t: 7)
+    steady = _score(_status_at_ready(messages, 7), mark)
     assert steady["g5_acceptance"] == "full_candidate"
     assert steady["credited_idle_exposure_s"] == 3660
     assert steady["dropped_windows"] == 0
     assert steady["session_dropped_windows"] == 0
     assert steady["lost_window_scenarios"] == []
 
+    # The same steady 7, with no sample at or before ready, is not history.
+    # The first status is after ready, so the session measures that 7 from 0.
+    # Scenarios that start later still use it as their baseline.
+    bare = _score(messages, mark)
+    assert bare["g5_acceptance"] == "denied"
+    assert bare["exit_code"] == 2
+    assert bare["session_dropped_windows"] == 7
+    assert bare["session_window_reasons"] == ["dropped_windows"]
+    assert bare["dropped_windows"] == 0
+    assert bare["lost_window_scenarios"] == []
+    assert bare["credited_idle_exposure_s"] == 3660
+    assert bare["protocol_complete"] is True
+
     # A restart between intervals resets the counter in a new generation.
-    restarted = _score(*_perfect(
+    restarted_messages, restarted_marks = _perfect(
         generation_at=lambda t: 4 if t < 775 else 5,
         dropped_at=lambda t: 7 if t < 775 else 0,
-    ))
+    )
+    restarted = _score(_status_at_ready(restarted_messages, 7), restarted_marks)
     assert _row(restarted, "hour_idle")["coverage"] == "verifiable"
     assert restarted["g5_acceptance"] == "full_candidate"
     assert restarted["session_dropped_windows"] == 0
@@ -633,6 +677,27 @@ def test_a_drop_in_the_gap_between_scenarios_is_not_full_acceptance():
     assert _row(report, "restore_reference")["coverage"] == "verifiable"
     assert _row(report, "restore_reference")["dropped_windows"] == 0
     assert "session_dropped_windows: 1" in report["markdown"]
+
+
+def test_a_drop_before_the_first_status_is_not_full_acceptance():
+    # ready at t=7, first status at t=8, first watch at t=10. The counter steps
+    # at t=7.5, before any status. That first status is not the session baseline.
+    # baseline_idle starts after it, so the scenario keeps its exposure.
+    report = _score(*_perfect(dropped_at=lambda t: 0 if t < 7.5 else 2))
+    assert report["g5_acceptance"] != "full_candidate"
+    assert report["g5_acceptance"] == "denied"
+    assert report["exit_code"] == 2
+    assert report["candidate_result"] == "inconclusive"
+    assert report["protocol_complete"] is True
+    assert report["session_dropped_windows"] == 2
+    assert report["session_window_reasons"] == ["dropped_windows"]
+    assert report["dropped_windows"] == 0
+    assert report["lost_window_scenarios"] == []
+    assert report["credited_idle_exposure_s"] == 3660
+    assert _row(report, "baseline_idle")["coverage"] == "verifiable"
+    assert _row(report, "baseline_idle")["dropped_windows"] == 0
+    assert "dropped_windows" not in _row(report, "baseline_idle")["coverage_reasons"]
+    assert "session_dropped_windows: 2" in report["markdown"]
 
 
 def test_a_drop_during_setup_is_not_full_acceptance():
