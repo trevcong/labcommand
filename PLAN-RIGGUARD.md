@@ -65,6 +65,8 @@ The nodes run `close_window`, and so the guard's ICP, in the window timer on the
 
 ## Physical acceptance suite (phase 4, later; not in #19)
 
+Still deferred: `evaluate.py`, ctest `acceptance_replay`, and the `bag_stream.py` flags `--rig-move`, `--imu-synth`, `--drop`, and `--strip-imu`.
+
 **Recorded:** one mcap per scenario in `~/Developer/lc-tasks/recordings/acceptance/<scenario>/` (lidars, IMU, outputs), plus `initial_state/` and `truth.json` (Spark-clock marks, taped box positions). Replayed by `room_memory_bag state_from=initial_state`, judged by `tests/acceptance/evaluate.py` (ctest `acceptance_replay`).
 
 **Live:** back up `~/room-memory/lab`, build a fresh reference with the room empty (D33), deploy the `rig-guard` room-memory image. Per scenario: stop node, archive state, start recorder, start node, wait TRACKING + 60 s, act and mark. Each run is kept as a regression.

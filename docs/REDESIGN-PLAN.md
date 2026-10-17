@@ -196,8 +196,8 @@ Alerts overlay the canvas when action needed:
 | `SessionTrajectory.swift` | **CUT** | Trajectory map is cut |
 | `TelemetryHistory.swift` | **CUT** | No sparklines |
 | `CaptureModels.swift` | **KEEP** | Recording workflow |
-| `CaptureManifest.swift` | **KEEP** | Recording metadata |
-| `CaptureTelemetry.swift` | **SLIM** | Keep TelemetryFormat, cut unused |
+| `CaptureManifest.swift` | **KEEP** | Recording metadata. **Superseded by #40 (D50):** the file was deleted. `CaptureManifest` and `LandedSessionLoader` had no callers. |
+| `CaptureTelemetry.swift` | **SLIM** | Keep TelemetryFormat, cut unused. **Landed in #40 (D50):** the `CaptureTelemetry` struct is gone; `TelemetryFormat` remains in this file. |
 | `CaptureRecipe.swift` | **KEEP** | Constants |
 | `ConnectionStatus.swift` | **KEEP** | Enums |
 | `StatusAggregator.swift` | **CUT** | Was for probe list |

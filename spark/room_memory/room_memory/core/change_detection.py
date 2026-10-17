@@ -18,6 +18,8 @@ _LANE = (1 << 21) - 1
 _LIMIT_F32 = F32(LIMIT)
 _ONE_F32 = F32(1)
 _INF_F32 = F32(np.inf)
+# A cast_rays exit cell no index reaches: an axis that does not step never leaves the box.
+_NO_EXIT = np.iinfo(np.int64).min
 _SIGN = np.uint32(0x80000000)
 
 KIND_RANK = {"moved": 0, "appeared": 1, "disappeared": 2, "unobserved": 3}
@@ -362,14 +364,13 @@ def _offsets(radius):
 
 
 def _surviving(candidates, other, tolerance):
-    if tolerance == 0 or len(candidates) == 0:
+    if tolerance == 0 or len(candidates) == 0 or len(other) == 0:
         return candidates
     i, j, k = unpack(candidates)
     suppressed = np.zeros(len(candidates), dtype=bool)
+    member = _Membership(other)
     for di, dj, dk in _offsets(tolerance):
-        ni, nj, nk = i + di, j + dj, k + dk
-        valid = in_range(ni, nj, nk)
-        suppressed |= valid & contains(other, pack(ni, nj, nk))
+        suppressed |= member.contains((i + di, j + dj, k + dk))
     return candidates[~suppressed]
 
 
@@ -409,6 +410,20 @@ class _Membership:
     def _linear(self, indices):
         (i0, _), (j0, _), (k0, _) = self.box
         return ((indices[0] - i0) * self.shape[1] + (indices[1] - j0)) * self.shape[2] + (indices[2] - k0)
+
+    def contains(self, current):
+        """True where the triple in ``current`` belongs to the set (a triple outside the set's box,
+        one that does not pack among them, never does)."""
+        inside = np.ones(len(current[0]), dtype=bool)
+        for (low, high), position in zip(self.box, current):
+            inside &= (position >= low) & (position <= high)
+        indices = [position[inside] for position in current]
+        found = np.zeros(len(inside), dtype=bool)
+        if self.grid is not None:
+            found[inside] = self.grid[self._linear(indices)]
+        else:
+            found[inside] = contains(self.keys, pack(*indices))
+        return found
 
     def marked(self, current):
         """Packed keys of the triples in ``current`` that belong to the set."""
@@ -480,14 +495,38 @@ def cast_rays(after, config, keep=None):
     if keep is not None:
         member = _Membership(keep)
         box = member.box
+    # Without keep the marks are every cell walked, often millions: when the start-to-ends box (where
+    # every walked cell lies) is small enough they go into a dense grid over it, whose cell order is
+    # key order, instead of being sorted for np.unique.
+    seen = None
+    if keep is None and len(rows):
+        corner = [min(int(start[axis]), int(end.min())) for axis, end in enumerate(ends)]
+        shape = [max(int(start[axis]), int(end.max())) - corner[axis] + 1 for axis, end in enumerate(ends)]
+        if shape[0] * shape[1] * shape[2] <= _Membership.DENSE_CELLS:
+            seen = np.zeros(shape, dtype=bool)
+    if keep is not None:
+        # Past the box of keep on an axis in its step direction (or outside it on an axis that does
+        # not step) a ray is done. Moving one cell at a time, a stepping axis gets past the box on its
+        # exit cell, one beyond the box; a ray that starts past it is dropped before it walks.
+        outside = np.zeros(len(cap), dtype=bool)
+        exits = []
+        for (low, high), position, step in zip(box, current, steps):
+            outside |= ((step >= 0) & (position > high)) | ((step <= 0) & (position < low))
+            exits.append(np.where(step > 0, high + 1, np.where(step < 0, low - 1, _NO_EXIT)))
+        if outside.any():
+            cap, ends, steps, deltas, t_maxes, current, exits = (
+                cap[~outside], [end[~outside] for end in ends], [step[~outside] for step in steps],
+                [delta[~outside] for delta in deltas], [t_max[~outside] for t_max in t_maxes],
+                [position[~outside] for position in current], [edge[~outside] for edge in exits])
     marks = []
     iteration = 0
     while len(cap):
-        at_end = (current[0] == ends[0]) & (current[1] == ends[1]) & (current[2] == ends[2])
-        live = (iteration < cap) & ~at_end
+        # Every axis stays between its start and end index, so it is short of its end exactly where it
+        # differs from it (an axis that does not step starts on its end).
+        short = [position != end for position, end in zip(current, ends)]
+        live = (iteration < cap) & (short[0] | short[1] | short[2])
         if keep is not None:
-            for (low, high), position, step in zip(box, current, steps):
-                live &= ~(((step >= 0) & (position > high)) | ((step <= 0) & (position < low)))
+            live &= (current[0] != exits[0]) & (current[1] != exits[1]) & (current[2] != exits[2])
         if not live.all():
             cap = cap[live]
             ends = [end[live] for end in ends]
@@ -495,18 +534,19 @@ def cast_rays(after, config, keep=None):
             deltas = [delta[live] for delta in deltas]
             t_maxes = [t_max[live] for t_max in t_maxes]
             current = [position[live] for position in current]
+            short = [ahead[live] for ahead in short]
+            if keep is not None:
+                exits = [edge[live] for edge in exits]
             if not len(cap):
                 break
-        if keep is None:
+        if seen is not None:
+            seen[current[0] - corner[0], current[1] - corner[1], current[2] - corner[2]] = True
+        elif keep is None:
             marks.append(pack(*current))
         else:
             marks.append(member.marked(current))
-        short = []
         for axis in range(3):
-            ahead = np.where(steps[axis] > 0, current[axis] < ends[axis], current[axis] > ends[axis])
-            ahead &= steps[axis] != 0
-            t_maxes[axis] = np.where(ahead, t_maxes[axis], _INF_F32)
-            short.append(ahead)
+            t_maxes[axis] = np.where(short[axis], t_maxes[axis], _INF_F32)
         t_next = t_maxes[0]
         t_next = np.where(t_maxes[1] < t_next, t_maxes[1], t_next)
         t_next = np.where(t_maxes[2] < t_next, t_maxes[2], t_next)
@@ -516,9 +556,13 @@ def cast_rays(after, config, keep=None):
             t_maxes[axis] = np.where(moves, t_maxes[axis] + deltas[axis], t_maxes[axis])
         iteration += 1
 
-    if not marks:
+    if seen is not None:
+        i, j, k = np.nonzero(seen)
+        marked = pack(i + corner[0], j + corner[1], k + corner[2])
+    elif not marks:
         return np.zeros(0, dtype=np.int64)
-    marked = np.unique(np.concatenate(marks))
+    else:
+        marked = np.unique(np.concatenate(marks))
     return np.setdiff1d(marked, after.occupied, assume_unique=True)
 
 

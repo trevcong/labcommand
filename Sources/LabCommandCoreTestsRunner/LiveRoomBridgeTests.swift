@@ -23,6 +23,11 @@ final class LRFakeBridge {
     let capabilities: [String]
     var serviceType: String?
     var publisher: LRPublisher
+    /// Accept the socket and send no Foxglove hello until `releaseHandshake()`.
+    var holdHandshake = false
+    /// TCP connections accepted. A handshake test waits for this before retargeting.
+    private(set) var clientCount = 0
+    private var didHello = false
     private(set) var port: UInt16 = 0
     /// Every service call the client made, decoded.
     private(set) var calls: [(callId: UInt32, encoding: String, request: RM.RequestSync?)] = []
@@ -78,6 +83,8 @@ final class LRFakeBridge {
         self.connection?.cancel()
         self.connection = connection
         subscriptions = [:]
+        didHello = false
+        clientCount += 1
         connection.stateUpdateHandler = { [weak self] state in
             guard case .ready = state else { return }
             MainActor.assumeIsolated { self?.opened() }
@@ -87,6 +94,24 @@ final class LRFakeBridge {
     }
 
     private func opened() {
+        guard !holdHandshake else { return }
+        hello()
+    }
+
+    func releaseHandshake() {
+        hello()
+    }
+
+    /// One legacy-or-current snapshot with a single brick, so a test can tell bridges apart.
+    func sendBrick(_ i: Int16) {
+        let generation = publisher.legacy ? nil : publisher.generation
+        let data = LRWire.snapshot(generation, epoch: publisher.mapEpoch, seq: 0, [LRWire.brick(i, occupied: true)])
+        publish(LRMessage(topic: .mapBricks, data: data, meta: LRMeta(generation: generation, kind: .map(seq: 0))))
+    }
+
+    private func hello() {
+        guard !didHello else { return }
+        didHello = true
         send(text: json(["op": "serverInfo", "name": "", "capabilities": capabilities, "supportedEncodings": ["cdr", "json"]]))
         let channels: [[String: Any]] = Self.channelIds.sorted { $0.value < $1.value }.map { topic, id in
             ["id": id, "topic": topic.rawValue, "encoding": "cdr", "schemaName": topic.schemaName,

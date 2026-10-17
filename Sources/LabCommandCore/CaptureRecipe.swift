@@ -103,46 +103,7 @@ public enum CaptureRecipe {
         forbiddenTopics.contains { command.contains($0) }
     }
 
-    /// Remote script invocation: pipe `spark-capture.sh` over SSH stdin.
-    /// Source-tree and Desktop locations for spark-capture.sh (not the serial 2D recorder).
-    public static func scriptSearchRoots(cwd: URL, home: URL) -> [URL] {
-        [
-            cwd.appendingPathComponent("scripts/spark-capture.sh"),
-            cwd.appendingPathComponent("LabCommand/scripts/spark-capture.sh"),
-            cwd.deletingLastPathComponent().appendingPathComponent("scripts/spark-capture.sh"),
-            home.appendingPathComponent("Desktop/hdc-spatial-memory/LabCommand/scripts/spark-capture.sh"),
-        ]
-    }
-
     public static func sshIdentityPath(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> String {
         home.appendingPathComponent(".ssh/\(sshIdentityFileName)").path
-    }
-
-    public static func remoteSSHArguments(
-        host: String = sshHost,
-        connectTimeout: Int = 5,
-        scriptArgs: [String],
-        identityFile: String = CaptureRecipe.sshIdentityPath()
-    ) -> [String] {
-        // One remote string, POSIX-quoted. `ssh host bash -s -- a b` otherwise
-        // word-splits path_script ("fixed loop path…") on the Spark.
-        let remote = (["bash", "-s", "--"] + scriptArgs).map(posixQuote).joined(separator: " ")
-        return [
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=\(connectTimeout)",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "IdentitiesOnly=yes",
-            "-i", identityFile,
-            "-l", sshUser,
-            host,
-            remote,
-        ]
-    }
-
-    public static func posixQuote(_ s: String) -> String {
-        if s.isEmpty { return "''" }
-        let ok = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_./:@+=,."))
-        if s.unicodeScalars.allSatisfy({ ok.contains($0) }) { return s }
-        return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
