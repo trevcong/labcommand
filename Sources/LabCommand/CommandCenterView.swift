@@ -42,16 +42,19 @@ struct CommandCenterView: View {
             if state.isolatesNetwork {
                 localSparkChip
             } else {
+                // The three chips follow the room link. The left column stays on the probe.
                 statusChip(
                     title: "Spark",
-                    ok: state.rig.sparkReachable,
-                    help: state.rig.sparkReachable
-                        ? "Spark reachable — \(state.detail("spark_ssh"))"
-                        : "Spark unreachable — \(state.detail("spark_ssh"))"
+                    ok: state.statusDots.sparkReachable,
+                    help: state.statusDots.sparkHelp ?? (
+                        state.statusDots.sparkReachable
+                            ? "Spark reachable — \(state.detail("spark_ssh"))"
+                            : "Spark unreachable — \(state.detail("spark_ssh"))"
+                    )
                 )
             }
-            sensorChip(state.rig.mid360)
-            sensorChip(state.rig.jt128)
+            sensorChip(state.statusDots.mid360)
+            sensorChip(state.statusDots.jt128)
 
             if state.isRefreshing || state.isActing {
                 ProgressView()
