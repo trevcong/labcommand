@@ -1808,7 +1808,7 @@ class RoomMemory:
         self._n_realigned = 0
         self._outcome = RigOutcome.RELEARNING
         self._rig_dirty = True
-        # The archive now (D40). A failure (disk full) does not stop the relearn: close_window
+        # The archive now (D41). A failure (disk full) does not stop the relearn: close_window
         # retries, and the new frame commits only after the archive.
         self._save_rig()
 

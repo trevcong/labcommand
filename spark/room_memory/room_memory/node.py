@@ -108,7 +108,7 @@ class RoomMemoryNode(Node):
             )
         self.rig = None
         if self.config.rig_guard:
-            # RigPose is full state too (on change and every 10 s): latched like status (protocol D41).
+            # RigPose is full state too (on change and every 10 s): latched like status (protocol D42).
             self.rig = self.create_publisher(RigPoseMsg, RIG_TOPIC, latched())
             if self.config.imu_topic:
                 self.create_subscription(Imu, self.config.imu_topic, self._on_imu, qos_profile_sensor_data, raw=True)

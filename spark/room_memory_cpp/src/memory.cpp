@@ -1750,7 +1750,7 @@ void RoomMemory::relearn(const msg::Time& stamp, std::vector<msg::ChangeEvent>& 
     n_realigned_ = 0;
     outcome_ = msg::RigOutcome::relearning;
     rig_dirty_ = true;
-    // The archive now (D40). A failure (disk full) does not stop the relearn: close_window retries,
+    // The archive now (D41). A failure (disk full) does not stop the relearn: close_window retries,
     // and the new frame commits only after the archive.
     save_rig();
 }

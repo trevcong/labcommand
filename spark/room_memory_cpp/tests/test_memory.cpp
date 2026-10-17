@@ -2211,7 +2211,7 @@ struct Relearned {
 };
 
 TEST(a_failed_relearn_archive_holds_the_old_frame_until_it_goes_through) {
-    // The relearn archives the old frame under prev/ (D40); when that fails (here prev is a file)
+    // The relearn archives the old frame under prev/ (D41); when that fails (here prev is a file)
     // the relearn goes on, but the old frame's files stay as they are: the new frame commits only
     // once the archive, retried every window, goes through.
     Relearned run({"prev"});

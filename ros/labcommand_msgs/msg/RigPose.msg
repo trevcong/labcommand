@@ -1,4 +1,4 @@
-# labcommand_msgs/RigPose: the rig-pose guard (protocol §3.9, D39-D43), on /room_memory/rig.
+# labcommand_msgs/RigPose: the rig-pose guard (protocol §3.9, D40-D44), on /room_memory/rig.
 # Reliable, transient_local, keep-last 1; published on every outcome change and every 10 s.
 # Poses map each sensor's current frame into its reference frame: p_ref = R p + t.
 uint8 OUTCOME_IN_PLACE=0          # last check accepted the current pose
