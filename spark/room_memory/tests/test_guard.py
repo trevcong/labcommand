@@ -13,6 +13,7 @@ import pytest
 
 from room_memory import guard as g
 from room_memory.core import Config, decode_pointcloud2, occupancy_map
+from room_memory.core.change_detection import LIMIT
 from room_memory import state as rig_files
 from room_memory.memory import MemoryConfig, RoomMemory, load_epoch, load_reference, pose_shift
 from room_memory.messages import (CAUSE_IMU_SHOCK, CAUSE_IMU_TILT, CAUSE_PERIODIC, CAUSE_POSE_OFFSET, CAUSE_STARTUP,
@@ -177,10 +178,10 @@ def reference_nearest(grid, queries, points, radius):
 @pytest.mark.filterwarnings("ignore:invalid value encountered in cast", "ignore:overflow encountered in multiply")
 def test_grid_nearest_is_bit_identical_to_the_slot_scan():
     """The vectorized search (one pass over the candidate pairs, neighbour cells pruned by box
-    distance) returns the slot scan's index and binary64 d2 exactly: random clouds, lattices full of
-    exact ties, queries on cell faces with radii equal to lattice distances, non-finite and far-out
-    queries, d2 that overflows, binary32 targets, a points array other than the grid's, and a
-    ray-cast room."""
+    distance) returns the slot scan's index and binary64 d2 exactly, for points whose cell indices
+    pack: random clouds, lattices full of exact ties, queries on cell faces with radii equal to
+    lattice distances, non-finite queries, d2 that overflows, binary32 targets (cast to binary64),
+    a points array other than the grid's, and a ray-cast room."""
     rng = np.random.default_rng(7)
     cases = []
     for trial in range(160):
@@ -203,7 +204,6 @@ def test_grid_nearest_is_bit_identical_to_the_slot_scan():
             points, queries = rng.integers(-4, 4, size=(n, 3)) * 0.05, rng.normal(size=(m, 3)) * 0.2
             queries[rng.random(m) < 0.1] = np.nan
             queries[rng.random(m) < 0.05] = np.inf
-            queries[rng.random(m) < 0.05] = -1e30
         if trial % 9 == 0:
             points = points.astype(np.float32)
         cases.append((points, queries, cell, int(rng.choice([0, 1, 3, 20])), radius, trial % 7 == 0))
@@ -211,6 +211,7 @@ def test_grid_nearest_is_bit_identical_to_the_slot_scan():
     moved = rooms.scan(rooms.rig(0.02, yaw_deg=1.0), seed=2).astype(np.float64)
     cases += [(room, moved, 0.08, g.GRID_CAP, 0.05, False), (room, moved[::4], 0.16, g.GRID_CAP, 0.16, False)]
     # Neighbours whose d2 overflows to inf: never a match, not even within an infinite radius.
+    # The cell is 1e160, so floor(p / cell) stays inside the 21-bit key range.
     huge = rng.integers(-3, 3, size=(200, 3)) * 1e160
     cases.append((huge, huge[:100] + 5e159, 1e160, 3, math.inf, False))
     for points, queries, cell, cap, radius, foreign in cases:
@@ -219,6 +220,56 @@ def test_grid_nearest_is_bit_identical_to_the_slot_scan():
         index, d2 = grid.nearest(queries, coordinates, radius)
         expected_index, expected_d2 = reference_nearest(grid, queries, coordinates, radius)
         assert index.tobytes() == expected_index.tobytes() and d2.tobytes() == expected_d2.tobytes()
+
+
+def test_grid_casts_float32_queries_and_targets_to_float64():
+    """Binary32 floor(p / cell) can pick a different cell than binary64. The grid casts first, so a
+    float32 cloud matches the float64 grid of the same values, and an already-float64 array keeps
+    its identity (the kept-column path)."""
+    cell = 0.1
+    xs = np.linspace(-2, 2, 40001, dtype=np.float32)
+    narrow = np.floor(xs / cell).astype(np.int64)
+    promoted = np.floor(xs.astype(np.float64) / cell).astype(np.int64)
+    mismatch = np.flatnonzero(narrow != promoted)
+    assert len(mismatch)
+    points32 = np.array([[xs[mismatch[0]], 0.0, 0.0], [0.0, 0.0, 0.0], [0.05, 0.0, 0.0]], np.float32)
+    grid = g.TargetGrid(points32, cell, 20)
+    assert grid._points.dtype == np.float64 and grid._points is not points32
+    wide = g.TargetGrid(points32.astype(np.float64), cell, 20)
+    assert grid.keys.tobytes() == wide.keys.tobytes()
+    queries32 = np.array([[xs[mismatch[0]], 0.01, 0.0], [0.02, 0.0, 0.0]], np.float32)
+    index, d2 = grid.nearest(queries32, points32, 0.5)
+    expected = reference_nearest(grid, queries32.astype(np.float64), grid._points, 0.5)
+    assert index.tobytes() == expected[0].tobytes() and d2.tobytes() == expected[1].tobytes()
+    same_index, same_d2 = wide.nearest(queries32.astype(np.float64), wide._points, 0.5)
+    assert index.tobytes() == same_index.tobytes() and d2.tobytes() == same_d2.tobytes()
+    points64 = points32.astype(np.float64)
+    assert g.TargetGrid(points64, cell, 20)._points is points64
+
+
+def test_grid_rejects_a_point_outside_the_21_bit_cell_range():
+    """floor(p / cell) +/- 1 must pack. The last index that does still matches the slot scan; one
+    step further, on either side, is an error from the grid, from nearest, and from the normals."""
+    cell = 0.5  # a power of two, so (LIMIT - 2) * cell / cell is that index exactly
+    edge = np.array([[(LIMIT - 2) * cell, 0.0, 0.0], [0.0, (-LIMIT + 1) * cell, 0.0]])
+    grid = g.TargetGrid(edge, cell, 20)
+    index, d2 = grid.nearest(edge, grid._points, 1.0)
+    expected = reference_nearest(grid, edge, grid._points, 1.0)
+    assert index.tobytes() == expected[0].tobytes() and d2.tobytes() == expected[1].tobytes()
+    beyond = np.array([[(LIMIT - 1) * cell, 0.0, 0.0]])
+    with pytest.raises(ValueError, match="21-bit"):
+        g.TargetGrid(beyond, cell, 20)
+    with pytest.raises(ValueError, match="21-bit"):
+        grid.nearest(beyond, grid._points, 1.0)
+    with pytest.raises(ValueError, match="21-bit"):
+        grid.nearest(np.array([[-LIMIT * cell, 0.0, 0.0]]), grid._points, 1.0)
+    with pytest.raises(ValueError, match="21-bit"):
+        grid.nearest(np.array([[-1e30, 0.0, 0.0]]), grid._points, 1.0)
+    with pytest.raises(ValueError, match="21-bit"):
+        g.TargetGrid(np.array([[np.nan, 0.0, 0.0]]), cell, 20)
+    outside = np.vstack([np.zeros((4, 3)), [(LIMIT - 1) * g.NORMAL_RADIUS_M, 0.0, 0.0]])
+    with pytest.raises(ValueError, match="21-bit"):
+        g._normals(outside, g.NORMAL_RADIUS_M)
 
 
 def reference_normals(points, radius):
@@ -599,7 +650,8 @@ def test_a_sensor_lost_after_a_move_does_not_block_the_relearn(tmp_path):
     """Codex's repro: both sensors see a move outside the envelope, then the JT128 drops. The
     Mid-360 relearns on its own at relearn_after_s and tracks again; the JT128 builds its reference
     when it returns, and only then is the new frame committed. The move rolls the rig 3 degrees under a
-    streaming IMU, so the tilt confirms it whatever ICP makes of a pose it cannot reach."""
+    streaming IMU, so the tilt confirms it whatever ICP makes of a pose it cannot reach. The wait is
+    shortened to RELEARN_AFTER_S; the default 60 s is the test below."""
     memory = guarded(tmp_path, sensors=("mid360", "jt128"), relearn_after_s=float(RELEARN_AFTER_S))
     far = rooms.rig(0.5, yaw_deg=20.0, roll_deg=3.0)
     imu = imu_stream()
@@ -678,6 +730,54 @@ def test_a_sensor_lost_after_a_move_does_not_block_the_relearn(tmp_path):
     restarted = guarded(tmp_path, sensors=("mid360", "jt128"))
     assert restarted.state == MemoryState.TRACKING
     assert len(restarted.channels["jt128"].cloud) == len(jt128.cloud)
+
+
+def test_a_sensor_lost_after_a_move_relearns_at_the_default_60s():
+    """The default relearn_after_s is 60 s. Both sensors are moved out of reach on sparse scans,
+    then the JT128 sends nothing: a silent sensor must not hold the relearn, and a shortened
+    override must not be what makes this pass. The wait itself is a 16-ray fan. The clock does not
+    need a fit (fewer than MIN_SOURCE_POINTS never reaches ICP), and one return keeps the Mid-360
+    from going silent too."""
+    memory = guarded(sensors=("mid360", "jt128"))
+    assert memory.config.relearn_after_s == 60.0
+    far = rooms.rig(0.5, yaw_deg=20.0, roll_deg=3.0)
+    imu = imu_stream()
+    second = 1
+    # Fixed fan: no per-frame azimuth jitter, and small enough that the wait does not run ICP.
+    wait_fan = rooms.fan(rows=2, columns=8)
+
+    def step(stamp, pose, sensors, columns=SPARSE, directions=None):
+        for sample in imu(stamp):
+            memory.add_imu(sample.to_cdr(), sample.stamp)
+        for name in sensors:
+            memory.add_points(name, rooms.scan(pose, seed=stamp, columns=columns, directions=directions))
+        memory.close_window(Time(stamp, 0))
+
+    both, mid = ("mid360", "jt128"), ("mid360",)
+    while any(channel.baseline is None for channel in memory.channels.values()):
+        step(second, rooms.Pose(), both)
+        second += 1
+        assert second < REFERENCE_WINDOWS + 60
+    moving = second
+    imu = imu_stream(moving - 0.5, roll_deg=3.0)
+    while not all(channel.mode == "moved" for channel in memory.channels.values()):
+        step(second, far, both)
+        second += 1
+        assert second < moving + 20
+    moved_at = second
+    step(second, far, mid, directions=wait_fan)
+    second += 1
+    assert memory.channels["jt128"].mode == "stale" and memory.channels["mid360"].mode == "moved"
+    assert memory.rig_outcome != RigOutcome.RELEARNING
+    while memory.rig_outcome != RigOutcome.RELEARNING:
+        # Still moved on the way in. The window that relearns resets every channel to normal.
+        assert memory.channels["jt128"].mode == "stale" and memory.channels["mid360"].mode == "moved"
+        step(second, far, mid, directions=wait_fan)
+        second += 1
+        assert second <= moved_at + 62, "the silent JT128 blocked the relearn"
+    assert second - moved_at >= 60
+    assert memory.state == MemoryState.BUILDING
+    assert memory.channels["mid360"].builder is not None and memory.channels["jt128"].cloud is None
 
 
 def test_a_sensor_silent_through_a_realignment_realigns_when_it_returns():
