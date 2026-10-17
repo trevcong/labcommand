@@ -10,10 +10,10 @@ Modern scientific DAQ / telescope control meets a pro-audio deck: deep charcoal,
 
 The Mid-360 control loop is inviolable:
 
-- Mac never talks to the Livox. SSH/Tailscale → `spark-capture.sh` → local `ws://localhost:8765` only.
+- Mac never talks to the Livox. SSH/Tailscale → `spark-capture.sh` → local `ws://localhost:8765` only. **Superseded** by the v1.0 addendum below and by #40 (D50, `docs/ROOM-MEMORY-PROTOCOL.md` §3.14): `scripts/spark-capture.sh` is deleted. The Mac opens two SSH tunnels (`RigService`: Foxglove `:8765`, command-center API `:8766`) and does not pipe a capture script.
 - **Link → Stream → View → Record** and **Start path / Record / Stop all** stay the fastest path.
 - **Stop all** is record → `docker stop -t 60` → close tunnel (FAST-LIO PCD flush).
-- Bags are format-1 / CustomMsg + sidecar. `/Laser_map` is forbidden.
+- Bags are format-1 / CustomMsg + sidecar. `/Laser_map` is forbidden. **Superseded in part by #40 (D50):** the Mac provenance sidecar was `CaptureManifest`, and that file is deleted. This note does not replace the v0.4 format rule.
 - Spark-offline is a first-class calm state. Missing keys render **unavailable**, never `0 Hz`.
 
 ## Before / after critique
@@ -139,7 +139,7 @@ Density first: the four-stage rail is one row; health is a single strip above it
 | ⌘⇧F | Focus mode |
 | ⌘⇧D | Diagnose primary block |
 
-Menu-bar **CAP** shows honest Link/Stream/View/Record verbs and the health band. It never prints a point rate unless `CaptureTelemetry.pointRateHz` is non-nil.
+Menu-bar **CAP** shows honest Link/Stream/View/Record verbs and the health band. It never prints a point rate unless `CaptureTelemetry.pointRateHz` is non-nil. **Superseded by #40 (D50):** `struct CaptureTelemetry` is gone. The menu-bar extra prints a rate only when `StatusDots` has a non-nil `SensorReading.pointRateHz` and that sensor's state is `.streaming` (`LabCommandApp.rebuildStatusMenu`), formatted by `TelemetryFormat.hz`.
 
 ## Architecture (SwiftUI)
 
