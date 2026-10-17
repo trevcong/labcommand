@@ -1,5 +1,5 @@
-"""The rig guard's files in ``<state_dir>/<room_id>/``, next to the references (PLAN.md "Rig guard",
-persistence). No ROS imports; the C++ twin is ``room_memory_cpp/src/state.cpp``.
+"""The rig guard's files in ``<state_dir>/<room_id>/``, next to the references
+(PLAN-RIGGUARD.md, Design 6). No ROS imports; the C++ twin is ``room_memory_cpp/src/state.cpp``.
 
 - ``registration-<sensor>.bin``: the sensor's registration cloud. Magic ``LCRG``, u32 version 1, the
   sensor name (u32 length, bytes), u64 ``frame_epoch``, u32 count, ``count`` x 3 float32, all little
@@ -11,7 +11,7 @@ persistence). No ROS imports; the C++ twin is ``room_memory_cpp/src/state.cpp``.
 - ``prev/<seq>-<name>/``: archived copies, the newest ARCHIVE_KEEP kept.
 
 Each file is written atomically (temp file, fsync, rename). The set is bound by ``rig_state``'s
-sizes and CRCs; it is not one transaction (PLAN.md v1 defers the generation manifest).
+sizes and CRCs; it is not one transaction (PLAN-RIGGUARD.md, "Later": a transactional manifest).
 """
 
 import math

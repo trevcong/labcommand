@@ -11,7 +11,7 @@
 // - prev/<seq>-<name>/: archived copies, the newest kArchiveKeep kept.
 //
 // Each file is written atomically (temp file, fsync, rename). The set is bound by rig_state's sizes
-// and CRCs; it is not one transaction (PLAN.md v1 defers the generation manifest).
+// and CRCs; it is not one transaction (PLAN-RIGGUARD.md, "Later": a transactional manifest).
 #pragma once
 
 #include <cstdint>

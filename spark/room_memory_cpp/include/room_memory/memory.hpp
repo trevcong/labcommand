@@ -295,7 +295,7 @@ struct MemoryConfig {
     double delta_period_s = 5.0;
     double keyframe_period_s = 60.0;
     double keyframe_delta_ratio = 0.5;
-    // The rig-pose guard (PLAN.md). Off: no check, transform, IMU or extra file, so outputs and
+    // The rig-pose guard (PLAN-RIGGUARD.md). Off: no check, transform, IMU or extra file, so outputs and
     // files are today's exactly. On: triggers (an IMU shock or tilt past tilt_trigger_deg,
     // pose_offset above pose_trigger_m on 2 windows, every guard_check_period_s, a saved-state
     // start, a sensor back after 5 s) start a check that holds promotion and learning for up to

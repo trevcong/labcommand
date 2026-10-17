@@ -8,7 +8,7 @@ samples and cannot report a shock until then, so a stream restart is never a sho
 samples; any sample above either threshold disturbs, and the IMU is quiet ``quiet_s`` after the last
 disturbance. Gravity is the mean acceleration direction of the undisturbed samples of a window. From a
 shock until quiet the bias-corrected rates are integrated (header stamps) into the rotation of the new
-sensor frame in the old one: the increment ``D`` of PLAN.md's conventions. Times are receive times in
+sensor frame in the old one: the increment ``D`` of guard.py's conventions. Times are receive times in
 nanoseconds; samples arrive in order.
 """
 

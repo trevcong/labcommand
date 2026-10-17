@@ -805,7 +805,7 @@ class MemoryConfig:
     delta_period_s: float = 5.0
     keyframe_period_s: float = 60.0
     keyframe_delta_ratio: float = 0.5
-    # The rig-pose guard (PLAN.md; measured defaults in room_memory_cpp/PLAN.md "Rig guard"). Off: no
+    # The rig-pose guard (PLAN-RIGGUARD.md; defaults not yet measured on the Spark). Off: no
     # check, transform, IMU or extra file, so outputs and files are today's exactly. On: triggers (an
     # IMU shock or tilt past tilt_trigger_deg, pose_offset above pose_trigger_m on 2 windows, every
     # guard_check_period_s, a saved-state start, a sensor back after 5 s) start a check that holds

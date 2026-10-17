@@ -2,7 +2,7 @@
 // ICP against it. The C++ port of room_memory/guard.py; read its docstrings for the algorithms.
 // No ROS dependency.
 //
-// Conventions (PLAN.md "Rig guard", both engines):
+// Conventions (both engines; PLAN-RIGGUARD.md is the design):
 // - A channel's pose T = (R, t) maps a point in the sensor's current frame into its reference
 //   frame: p_ref = R p + t. Composition is (A o B)(p) = A(B(p)).
 // - A physical move of the rig is an increment D in the pre-move sensor frame, so the new pose is
@@ -11,7 +11,7 @@
 //
 // The same algorithms run in the same order as the Python oracle (the same grids, tie rules,
 // Jacobi sweeps and iteration limits), so the engines reach the same decisions; sums are not
-// order-free, so their floats agree to rounding, not to the bit (PLAN.md v1, "Parity").
+// order-free, so their floats agree to rounding, not to the bit (PLAN-RIGGUARD.md, Design 7).
 #pragma once
 
 #include <array>

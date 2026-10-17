@@ -974,8 +974,8 @@ def rig_messages(out):
 
 
 def assert_rig_alike(cpp, py):
-    """RigPose outcomes, causes, results, counters and stamps exact; floats within PLAN.md's v1
-    relaxation (0.1 mm, 0.001 degrees; metrics to 1e-4)."""
+    """RigPose outcomes, causes, results, counters and stamps exact; floats within the v1
+    relaxation of PLAN-RIGGUARD.md, Design 7 (0.1 mm, 0.001 degrees; metrics to 1e-4)."""
     assert len(cpp) == len(py)
     for a, b in zip(cpp, py):
         assert (a.header, a.outcome, a.causes, a.sensors, a.channel, a.frame_epoch, a.n_realigned, a.imu_ok,
@@ -1022,7 +1022,7 @@ def imu_samples(shock_at=None, rate=50):
 
 def test_rig_guard_never_realigned_is_byte_identical(tmp_path):
     """Guard on, static, an IMU shock and a periodic check: every status, event and map byte for
-    byte, the files too except rig_state's floats; RigPose outcomes exact (PLAN.md "Parity")."""
+    byte, the files too except rig_state's floats; RigPose outcomes exact (PLAN-RIGGUARD.md)."""
     import rooms
     script = guard_script(tmp_path, [rooms.Pose()] * 50, imu_samples(shock_at=14.5))
     cpp, py, cpp_state, py_state = run_sides(tmp_path, script)

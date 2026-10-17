@@ -5,9 +5,9 @@ point-to-plane stages against the cloud's normals for the final pose. No ROS imp
 
 Point-to-point alone is biased between two different samplings of the same surfaces: on the
 synthetic room it settles 2-8 mm and 0.15-0.2 degrees off at zero noise, against 0.03 mm and 0.0003
-degrees for the point-to-plane finish (PLAN.md "Rig guard", tests/test_guard.py).
+degrees for the point-to-plane finish (tests/test_guard.py).
 
-Conventions (PLAN.md "Rig guard", both engines):
+Conventions (both engines; PLAN-RIGGUARD.md is the design):
 
 - A channel's pose ``T = (R, t)`` maps a point in the sensor's *current* frame into its reference
   frame: ``p_ref = R p + t``. Composition is ``(A ∘ B)(p) = A(B(p))``.
@@ -17,8 +17,8 @@ Conventions (PLAN.md "Rig guard", both engines):
 
 The C++ twin is ``room_memory_cpp/src/guard.cpp``. It runs the same algorithms in the same order
 (the same grids, tie rules, Jacobi sweeps and iteration limits), so the two engines reach the same
-decisions; sums are not order-free, so their floats agree to rounding, not to the bit (PLAN.md v1,
-"Parity").
+decisions; sums are not order-free, so their floats agree to rounding, not to the bit
+(PLAN-RIGGUARD.md, Design 7: the v1 relaxation).
 """
 
 import math
