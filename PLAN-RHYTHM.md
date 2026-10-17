@@ -30,7 +30,7 @@ Catch errors after that sensor's detection (`catch (...)` / `except Exception`, 
 
 `try_enqueue` uses 8×41004-byte slots (40+4096×10+4). The callback does no filesystem I/O. A full queue drops the record and sets the loss flag. The writer appends, then publishes if `rhythm_publish` is set, and drops a publish that would block.
 
-No table or thread when `rhythm_enable` is false, or with no directory and publish false (bench `state_dir: null`). Enabled median wall, p99 wall, and p99 CPU stay within `max(1 ms, 10% of the disabled median wall)`. Callback wall stays under 50 ms if `write`/`fsync` blocks for 500 ms.
+No table or thread when `rhythm_enable` is false, or with no directory and publish false (bench `state_dir: null`). Enabled median wall and median CPU, from interleaved off/on closes, stay within `max(1 ms, 10% of the disabled median wall)`. The budget is that paired median. Callback wall stays under 50 ms if `write`/`fsync` blocks for 500 ms.
 
 ## File
 
@@ -78,7 +78,7 @@ Sum `rhythm-*.rhy`, `*.superseded-*`, and `*.bad-*` (both sensors) before every 
 `spark/room_memory/tests/test_rhythm.py` and `tests/test_rhythm.cpp` (one CTest) share the header + 60-window hex.
 
 - Reject a bad float32 ratio, period, and file cap above the directory cap (0 stays legal). Floor pins, dims 2/3, the 15/3 pin, omitted zeros, empty vs unavailable, and a one-sensor BUILDING skip (no second occupancy).
-- The first miss sets bit 3 and stops the window, including past 4096 regions, inside the allowance. A throw mid-insert discards the bin; the other sensor still detects.
+- The first miss sets bit 3 and stops the window, including past 4096 regions, inside the allowance. Those closes reuse the cached slots. A minute seal packs the sorted cache and enqueues one full record per sensor. A throw mid-insert discards the bin; the other sensor still detects.
 - CRC `0x046E226A`, torn tail, superseded and bad magic. A short write whose retry fails is truncated to the pre-append offset before the marker. A failed truncate leaves nothing after the tear and opens no new file; the next start keeps the prefix, and the next fragment has bit 1. Stamps 60/61/59 stay one fragment; a gap writes no filler; an in-minute restart is two unmerged fragments. Rotations stay within the byte cap. A blocking store keeps the callback under 50 ms. A full queue drops. Rhythm on and off match on event, map, and status bytes.
 - One LE `RhythmMinute` golden round-trips with `sensor` 1; the BE twin decodes; `sensor` 2 is a distinct message; any other `sensor` is rejected; old goldens stay. A stamped generation round-trips and generation 0 is invalid; the legacy CDR prefix is unchanged. `colcon test` checks the publish and skips with a message if rclpy/rclcpp is missing. Spark `.rhy` bytes match for one occupied minute and one unavailable minute (skip here). `ROOM_MEMORY_RHYTHM_BUDGET=1` checks the allowance across a rotation.
 

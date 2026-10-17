@@ -36,6 +36,7 @@ from room_memory.rhythm import (
     REGION_SLOTS,
     Rhythm,
     RhythmAccumulator,
+    RhythmWriter,
     _Table,
     _record_fields,
     _replace_flags,
@@ -1307,72 +1308,200 @@ def _percent(values, fraction):
     return ordered[index]
 
 
-def _close_samples(path, enable, points, count):
-    """Time steady windows. The period is one hour so a minute seal is not in the sample."""
-    memory = RoomMemory(config(
-        path, state_dir=None, rhythm_enable=enable, rhythm_dir="" if not enable else str(path),
-        rhythm_publish=False, rhythm_period_s=3600, reference_windows=1, max_range=None,
-        sensors=("mid360",),
-    ), START, GENERATION)
+def _median(values):
+    return _percent(values, 0.5)
+
+
+class _Work:
+    """Probes, slot sorts, cache packs, and enqueued bytes for one enabled close."""
+
+    def __init__(self):
+        self.armed = False
+        self.reset()
+
+    def reset(self):
+        self.slot = 0
+        self.occupied = 0
+        self.pack = 0
+        self.bytes = 0
+
+
+def _watch(work):
+    """Count callback work. The returned callable puts the real methods back."""
+    saved = {}
+
+    def wrap(name, field):
+        real = getattr(_Table, name)
+        saved[name] = real
+
+        def wrapped(self, *args, _real=real, _field=field, **kwargs):
+            if work.armed:
+                setattr(work, _field, getattr(work, _field) + 1)
+            return _real(self, *args, **kwargs)
+
+        setattr(_Table, name, wrapped)
+
+    wrap("_slot", "slot")
+    wrap("_occupied", "occupied")
+    wrap("_pack_cached", "pack")
+    real_enqueue = RhythmWriter.try_enqueue
+    saved["try_enqueue"] = real_enqueue
+
+    def counted_enqueue(self, sensor, data):
+        if work.armed:
+            work.bytes += len(data)
+        return real_enqueue(self, sensor, data)
+
+    RhythmWriter.try_enqueue = counted_enqueue
+
+    def restore():
+        for name, real in saved.items():
+            if name == "try_enqueue":
+                RhythmWriter.try_enqueue = real
+            else:
+                setattr(_Table, name, real)
+
+    return restore
+
+
+def _drive(memory, sensors, points, second):
+    for sensor in sensors:
+        memory.add_points(sensor, points)
+    memory.close_window(stamp(second))
+    memory.enqueue_rhythm()
+
+
+def _time_drive(memory, sensors, points, second):
+    for sensor in sensors:
+        memory.add_points(sensor, points)
+    started = time.perf_counter()
+    cpu = time.process_time()
+    memory.close_window(stamp(second))
+    memory.enqueue_rhythm()
+    wall = (time.perf_counter() - started) * 1000
+    return wall, (time.process_time() - cpu) * 1000
+
+
+def _minute(second, period):
+    absolute = START.sec + second
+    return absolute - absolute % period
+
+
+def _interleaved_closes(root, points, count, sensors, warmup, stamp_at, checker=None, before=None, **changes):
+    """Time ``count`` closes with rhythm off and on back to back.
+
+    The pair alternates which side runs first. A stall then lands on one pair, and the
+    median of the pairs stays on the logger's cost. ``checker``, when set, sees each
+    enabled close's :class:`_Work` after that close.
+    """
+    period = changes.get("rhythm_period_s", 60)
+    work = _Work()
+    restore = _watch(work) if checker is not None else None
+    off = None
+    on = None
     try:
-        memory.add_points("mid360", points)
-        memory.close_window(stamp(0))
-        for warm in range(3):
-            memory.add_points("mid360", points)
-            memory.close_window(stamp(1 + warm))
-            memory.enqueue_rhythm()
-        walls, cpus = [], []
+        off = RoomMemory(config(
+            root / "off", state_dir=None, rhythm_enable=False, rhythm_dir="",
+            rhythm_publish=False, sensors=sensors, **changes,
+        ), START, GENERATION)
+        on = RoomMemory(config(
+            root / "on", state_dir=None, rhythm_enable=True, rhythm_dir=str(root / "on"),
+            rhythm_publish=False, sensors=sensors, **changes,
+        ), START, GENERATION)
+        if before is not None:
+            before(on, off)
+        for second in warmup:
+            _drive(off, sensors, points, second)
+            _drive(on, sensors, points, second)
+        previous = _minute(warmup[-1], period)
+        off_wall, off_cpu, on_wall, on_cpu, seals = [], [], [], [], []
         for index in range(count):
-            memory.add_points("mid360", points)
-            started = time.perf_counter()
-            cpu = time.process_time()
-            memory.close_window(stamp(10 + index))
-            memory.enqueue_rhythm()
-            walls.append((time.perf_counter() - started) * 1000)
-            cpus.append((time.process_time() - cpu) * 1000)
-        return walls, cpus
+            second = stamp_at(index)
+            minute = _minute(second, period)
+            is_seal = minute != previous
+            previous = minute
+            if is_seal:
+                seals.append(index)
+
+            def enabled_close():
+                if checker is not None:
+                    work.reset()
+                    work.armed = True
+                measured = _time_drive(on, sensors, points, second)
+                if checker is not None:
+                    work.armed = False
+                    checker(index, is_seal, work)
+                return measured
+
+            if index % 2 == 0:
+                off_sample = _time_drive(off, sensors, points, second)
+                on_sample = enabled_close()
+            else:
+                on_sample = enabled_close()
+                off_sample = _time_drive(off, sensors, points, second)
+            off_wall.append(off_sample[0])
+            off_cpu.append(off_sample[1])
+            on_wall.append(on_sample[0])
+            on_cpu.append(on_sample[1])
+        return off_wall, off_cpu, on_wall, on_cpu, seals
     finally:
-        memory.close()
+        if restore is not None:
+            restore()
+        if on is not None:
+            on.close()
+        if off is not None:
+            off.close()
+
+
+def _paired_allowance(off_wall, off_cpu, on_wall, on_cpu, seals):
+    """Median paired wall and CPU deltas of the steady closes, and the allowance.
+
+    Argument order matches :func:`_interleaved_closes`: disabled wall, disabled CPU,
+    enabled wall, enabled CPU, seal indexes. The enabled sample minus the disabled
+    sample is the logger's cost for that pair.
+    """
+    skip = set(seals)
+    wall_delta, cpu_delta, off_steady = [], [], []
+    for index, (off_w, off_c, on_w, on_c) in enumerate(zip(off_wall, off_cpu, on_wall, on_cpu)):
+        if index in skip:
+            continue
+        off_steady.append(off_w)
+        wall_delta.append(on_w - off_w)
+        cpu_delta.append(on_c - off_c)
+    allowance = max(1.0, 0.10 * _median(off_steady))
+    return _median(wall_delta), _median(cpu_delta), allowance
 
 
 def _assert_within_allowance(root, points, trials=5):
-    """Enabled median wall, p99 wall, and p99 CPU stay within the allowance.
+    """Enabled median wall and median CPU stay within the allowance.
 
-    The allowance is ``max(1 ms, 10% of the disabled median wall)``. On a quiet trial the
-    disabled p99 sits within that of the disabled median, and the enabled median, p99, and
-    CPU p99 are judged against the disabled median. A scheduler stall is larger than the
-    allowance and shows up with rhythm off; that trial is judged against the same percentile
-    of the disabled run, so the stall is not charged to the logger. The first passing trial
-    is enough. An overrun that is actually the logger fails every trial.
+    The allowance is ``max(1 ms, 10% of the disabled median wall)``. Off and on run
+    as interleaved pairs and the medians are of those differences. The period is one
+    hour, so a minute seal is outside the sample. With about a hundred closes, the
+    99th percentile is one or two samples; a shared runner moves those by more than
+    the allowance while the close does the same work. The first passing trial is
+    enough. A cost that is actually the logger fails every trial.
     """
     seen = []
     for trial in range(trials):
-        off_wall, off_cpu = _close_samples(root / f"off{trial}", False, points, 100)
-        on_wall, on_cpu = _close_samples(root / f"on{trial}", True, points, 100)
-        off_med = _percent(off_wall, 0.5)
-        off_tail = _percent(off_wall, 0.99)
-        off_cpu_med = _percent(off_cpu, 0.5)
-        off_cpu_tail = _percent(off_cpu, 0.99)
-        allowance = max(1.0, 0.10 * off_med)
-        quiet = (off_tail - off_med) <= allowance and (off_cpu_tail - off_cpu_med) <= allowance
-        if quiet:
-            deltas = (
-                _percent(on_wall, 0.5) - off_med,
-                _percent(on_wall, 0.99) - off_med,
-                _percent(on_cpu, 0.99) - off_cpu_med,
-            )
-        else:
-            deltas = (
-                _percent(on_wall, 0.5) - off_med,
-                _percent(on_wall, 0.99) - off_tail,
-                _percent(on_cpu, 0.99) - off_cpu_tail,
-            )
-        seen.append((tuple(round(delta, 3) for delta in deltas), round(allowance, 3), quiet))
-        if all(delta <= allowance for delta in deltas):
+        series = _interleaved_closes(
+            root / f"t{trial}", points, 100, ("mid360",),
+            warmup=(0, 1, 2, 3), stamp_at=lambda index: 10 + index,
+            rhythm_period_s=3600, reference_windows=1, max_range=None,
+        )
+        assert series[4] == []
+        wall, cpu, allowance = _paired_allowance(*series)
+        seen.append((round(wall, 3), round(cpu, 3), round(allowance, 3)))
+        if wall <= allowance and cpu <= allowance:
             return
-    median, tail, cpu = seen[-1][0]
-    allowance = seen[-1][1]
-    assert median <= allowance and tail <= allowance and cpu <= allowance, seen
+    wall, cpu, allowance = seen[-1]
+    assert wall <= allowance and cpu <= allowance, seen
+
+
+def test_paired_allowance_is_enabled_minus_disabled():
+    """The series order is disabled wall, disabled CPU, enabled wall, enabled CPU."""
+    wall, cpu, allowance = _paired_allowance([10.0, 10.0], [9.0, 9.0], [12.0, 12.0], [11.0, 11.0], [])
+    assert wall == 2 and cpu == 2 and allowance == 1
 
 
 def test_enabled_callback_stays_within_the_allowance(tmp_path):
@@ -1399,94 +1528,47 @@ def _overflow_cloud():
     return np.vstack([grid, extra])
 
 
-def _overflow_samples(path, enable, points, count):
-    """Time overflowing windows. The first closes fill the table and are not sampled.
+def _check_overflow_work(index, is_seal, work):
+    """A steady close applies the cache. A seal packs it and enqueues two full records.
 
-    ``boundaries`` are the sampled closes that seal a minute. A cache that dies on
-    the overflow miss slows every close. A cache that dies on the seal slows those.
+    Probing the miss walks every slot, and a seal that sorts the table calls
+    ``_occupied``. Either one fails here. Three seal samples are too few to time:
+    the same stall that moves a p99 moves their median.
     """
-    memory = RoomMemory(config(
-        path, state_dir=None, rhythm_enable=enable, rhythm_dir="" if not enable else str(path),
-        rhythm_publish=False, rhythm_cell_m=0.05, rhythm_period_s=60, reference_windows=1,
-        max_range=15.0, sensors=("mid360", "jt128"),
-    ), START, GENERATION)
-    try:
-        occupied = occupancy_map(points, memory.change)
-        assert len(occupied.occupied) == 4097
-        for warm in range(3):
-            memory.add_points("mid360", points)
-            memory.add_points("jt128", points)
-            memory.close_window(stamp(warm))
-            memory.enqueue_rhythm()
-        walls, cpus, boundaries = [], [], []
-        previous = None
-        for index in range(count):
-            second = 30 + index
-            memory.add_points("mid360", points)
-            memory.add_points("jt128", points)
-            started = time.perf_counter()
-            cpu = time.process_time()
-            memory.close_window(stamp(second))
-            memory.enqueue_rhythm()
-            walls.append((time.perf_counter() - started) * 1000)
-            cpus.append((time.process_time() - cpu) * 1000)
-            minute = (START.sec + second) - (START.sec + second) % 60
-            if previous is not None and minute != previous:
-                boundaries.append(index)
-            previous = minute
-        assert len(boundaries) >= 3
-        return walls, cpus, boundaries
-    finally:
-        memory.close()
-
-
-def _without(values, indexes):
-    skip = set(indexes)
-    return [value for index, value in enumerate(values) if index not in skip]
+    expect_pack = 2 if is_seal else 0
+    expect_bytes = expect_pack * MAX_RECORD_BYTES
+    assert work.slot == 0 and work.occupied == 0 and work.pack == expect_pack and work.bytes == expect_bytes, (
+        index, is_seal, work.slot, work.occupied, work.pack, work.bytes, expect_bytes,
+    )
 
 
 def test_overflowing_callback_stays_within_the_allowance(tmp_path):
     """Two sensors, 4097 regions each, across more than one minute seal.
 
-    Steady closes use the same allowance as the other callback test. The seal
-    closes are judged on their own median, against the disabled seal at the same
-    stamp, so one scheduler stall is not the logger and a seal that probes the
-    full table cannot hide in the steady median.
+    Steady closes use the same paired median as the other callback test. The seal
+    closes are counted, per :func:`_check_overflow_work`, because a cache that dies
+    on the seal sorts 4096 slots inside the steady median's noise.
     """
     points = _overflow_cloud()
+
+    def before(on, _off):
+        assert len(occupancy_map(points, on.change).occupied) == 4097
+
     seen = []
     for trial in range(5):
-        off_wall, off_cpu, off_at = _overflow_samples(tmp_path / f"off{trial}", False, points, 140)
-        on_wall, on_cpu, on_at = _overflow_samples(tmp_path / f"on{trial}", True, points, 140)
-        assert off_at == on_at
-        off_steady, on_steady = _without(off_wall, off_at), _without(on_wall, on_at)
-        off_cpu_steady, on_cpu_steady = _without(off_cpu, off_at), _without(on_cpu, on_at)
-        off_med = _percent(off_steady, 0.5)
-        off_tail = _percent(off_steady, 0.99)
-        off_cpu_med = _percent(off_cpu_steady, 0.5)
-        off_cpu_tail = _percent(off_cpu_steady, 0.99)
-        allowance = max(1.0, 0.10 * off_med)
-        quiet = (off_tail - off_med) <= allowance and (off_cpu_tail - off_cpu_med) <= allowance
-        if quiet:
-            deltas = [
-                _percent(on_steady, 0.5) - off_med,
-                _percent(on_steady, 0.99) - off_med,
-                _percent(on_cpu_steady, 0.99) - off_cpu_med,
-            ]
-        else:
-            deltas = [
-                _percent(on_steady, 0.5) - off_med,
-                _percent(on_steady, 0.99) - off_tail,
-                _percent(on_cpu_steady, 0.99) - off_cpu_tail,
-            ]
-        seal = [on_wall[index] - off_wall[index] for index in on_at]
-        deltas.append(_percent(seal, 0.5))
-        seen.append((tuple(round(delta, 3) for delta in deltas), round(allowance, 3), quiet))
-        if all(delta <= allowance for delta in deltas):
+        series = _interleaved_closes(
+            tmp_path / f"t{trial}", points, 140, ("mid360", "jt128"),
+            warmup=(0, 1, 2), stamp_at=lambda index: 30 + index,
+            checker=_check_overflow_work, before=before,
+            rhythm_cell_m=0.05, rhythm_period_s=60, reference_windows=1, max_range=15.0,
+        )
+        assert len(series[4]) >= 3
+        wall, cpu, allowance = _paired_allowance(*series)
+        seen.append((round(wall, 3), round(cpu, 3), round(allowance, 3), len(series[4])))
+        if wall <= allowance and cpu <= allowance:
             return
-    median, tail, cpu, seal = seen[-1][0]
-    allowance = seen[-1][1]
-    assert median <= allowance and tail <= allowance and cpu <= allowance and seal <= allowance, seen
+    wall, cpu, allowance, _seals = seen[-1]
+    assert wall <= allowance and cpu <= allowance, seen
 
 
 @pytest.mark.skipif(
