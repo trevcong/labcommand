@@ -42,6 +42,13 @@ public enum RoomCleartextDecision: Equatable, Sendable {
     case blocked(String)
 }
 
+/// What to do with one HTTP redirect during the WebSocket handshake.
+/// `refuse` carries the line the Room screen shows. The task must not follow that request.
+public enum RoomRedirectDecision: Equatable, Sendable {
+    case follow
+    case refuse(String)
+}
+
 /// The room-memory WebSocket address: parse, the built-in default, and `UserDefaults`.
 ///
 /// The built-in host is `CaptureRecipe.tailscaleDNS`, port 8767. `URLSession` resolves that
@@ -50,7 +57,8 @@ public enum RoomCleartextDecision: Equatable, Sendable {
 /// a fallback. A live screenshot that must show the IP sets `LABCOMMAND_ROOM_URL`.
 ///
 /// `ws://` is cleartext. It is dialed only for a private address, Tailscale CGNAT (`100.64.0.0/10`),
-/// or a `*.ts.net` host, and only when cleartext is permitted. The saved switch defaults to off.
+/// or a `*.ts.net` host, and only when the saved switch is on. The switch defaults to off.
+/// `LABCOMMAND_ROOM_URL` chooses the address. It does not turn the switch on, on this launch or the next.
 public enum RoomMemoryEndpoint {
     public static let defaultsKey = "roomMemoryEndpoint"
     public static let cleartextDefaultsKey = "roomMemoryAllowCleartextWebSocket"
@@ -144,10 +152,32 @@ public enum RoomMemoryEndpoint {
         return .allowed
     }
 
+    /// The handshake may follow `proposed` only when that destination would itself be dialed.
+    /// A secure URL redirected to `ws://` or `http://` is refused: the operator did not confirm
+    /// that downgrade. The saved switch is not confirmation of a server-chosen cleartext hop.
+    /// `http` and `https` are judged as `ws` and `wss`. A destination `parse` rejects is refused.
+    public static func decideRedirect(from original: URL, to proposed: URL, allowCleartext: Bool) -> RoomRedirectDecision {
+        if isSecureScheme(original.scheme), isCleartextScheme(proposed.scheme) {
+            return .refuse("Refused a redirect from \(original.absoluteString) to cleartext \(proposed.absoluteString).")
+        }
+        let destination = asWebSocket(proposed)
+        switch parse(destination.absoluteString) {
+        case .failure:
+            return .refuse("Refused a redirect to \(proposed.absoluteString).")
+        case .success(let url):
+            switch admit(url, allowCleartext: allowCleartext) {
+            case .allowed:
+                return .follow
+            case .blocked(let message):
+                return .refuse("Refused a redirect to \(url.absoluteString). \(message)")
+            }
+        }
+    }
+
     /// Process start only. A valid `LABCOMMAND_ROOM_URL` wins and is not written, except a `ws://`
     /// value does not replace a saved `wss://` address. Then a valid saved string. Then `defaultURL`.
-    /// An invalid environment value or saved string is skipped. This does not apply the cleartext rule;
-    /// dialing does.
+    /// An invalid environment value or saved string is skipped. This does not apply the cleartext rule
+    /// and does not grant cleartext. Dialing does, from the saved switch alone.
     public static func resolve(environment: [String: String], defaults: UserDefaults) -> URL {
         let saved = defaults.string(forKey: defaultsKey).flatMap { raw -> URL? in
             if case .success(let url) = parse(raw) { return url }
@@ -166,6 +196,28 @@ public enum RoomMemoryEndpoint {
     /// Writes the canonical string. Callers pass a URL `parse` already accepted.
     public static func save(_ url: URL, to defaults: UserDefaults) {
         defaults.set(url.absoluteString, forKey: defaultsKey)
+    }
+
+    private static func isSecureScheme(_ scheme: String?) -> Bool {
+        switch scheme?.lowercased() {
+        case "wss", "https": return true
+        default: return false
+        }
+    }
+
+    private static func isCleartextScheme(_ scheme: String?) -> Bool {
+        switch scheme?.lowercased() {
+        case "ws", "http": return true
+        default: return false
+        }
+    }
+
+    /// The handshake is HTTP. A redirect `Location` may say `http` or `https` for a WebSocket hop.
+    private static func asWebSocket(_ url: URL) -> URL {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return url }
+        guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        parts.scheme = scheme == "http" ? "ws" : "wss"
+        return parts.url ?? url
     }
 
     private static func allowsCleartextIPv4(_ host: String) -> Bool {
@@ -238,39 +290,21 @@ public enum RoomMemoryEndpoint {
 @MainActor
 public final class RoomMemoryEndpointStore {
     public private(set) var current: URL
-    /// The saved switch. Off when the key is absent. Distinct from `cleartextPermitted`.
+    /// The saved switch. Off when the key is absent. This is the only cleartext grant.
     public private(set) var allowCleartext: Bool
     private let defaults: UserDefaults
-    /// This process was launched with an allowed `ws://` in `LABCOMMAND_ROOM_URL`.
-    /// Dropped once the operator sets the switch or commits a different address.
-    private var environmentCleartextGrant: Bool
-    private var userChoseCleartext = false
 
-    /// The saved switch, or a launch that named an allowed cleartext host. A later `setAllowCleartext`
-    /// wins, including turning the launch grant off.
-    public var cleartextPermitted: Bool {
-        if userChoseCleartext || allowCleartext { return allowCleartext }
-        return environmentCleartextGrant
-    }
+    /// The saved switch. Absent and explicit false are both off. An environment URL never turns this on.
+    public var cleartextPermitted: Bool { allowCleartext }
 
     public init(environment: [String: String], defaults: UserDefaults) {
         self.defaults = defaults
         allowCleartext = defaults.bool(forKey: RoomMemoryEndpoint.cleartextDefaultsKey)
         current = RoomMemoryEndpoint.resolve(environment: environment, defaults: defaults)
-        environmentCleartextGrant = false
-        if let raw = environment[RoomMemoryEndpoint.environmentKey],
-           case .success(let url) = RoomMemoryEndpoint.parse(raw),
-           url.absoluteString == current.absoluteString,
-           url.scheme == "ws",
-           case .allowed = RoomMemoryEndpoint.admit(url, allowCleartext: true) {
-            environmentCleartextGrant = true
-        }
     }
 
     public func setAllowCleartext(_ allow: Bool) {
-        userChoseCleartext = true
         allowCleartext = allow
-        environmentCleartextGrant = false
         defaults.set(allow, forKey: RoomMemoryEndpoint.cleartextDefaultsKey)
     }
 
@@ -300,8 +334,6 @@ public final class RoomMemoryEndpointStore {
             }
             RoomMemoryEndpoint.save(url, to: defaults)
             current = url
-            // The launch grant applied only to the address this process started with.
-            environmentCleartextGrant = false
             client?.retarget(url)
             return .saved
         }

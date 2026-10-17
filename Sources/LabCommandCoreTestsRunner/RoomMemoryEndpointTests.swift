@@ -1,5 +1,6 @@
 import Foundation
 import LabCommandCore
+import Network
 
 // The room bridge used to be `ws://100.118.187.99:8767` inside `LiveRoomClient`. These tests pin
 // the replacement: a parsed, persisted endpoint whose default is a hostname, and a retarget that
@@ -466,23 +467,6 @@ func testCleartextDowngradeRequiresConfirmation() {
     expect(endpointString(store.current) == "ws://10.0.0.8:8767", "a refused host does not replace the current address")
     expect(endpointString(client.url) == "ws://10.0.0.8:8767", "a refused host does not retarget")
 
-    let launch = isolatedDefaults()
-    let granted = RoomMemoryEndpointStore(
-        environment: ["LABCOMMAND_ROOM_URL": "ws://100.118.187.99:8767"],
-        defaults: launch
-    )
-    expect(granted.cleartextPermitted, "an explicit allowed ws:// launch may dial")
-    expect(!granted.allowCleartext, "the launch does not turn the saved switch on")
-    expect(launch.object(forKey: RoomMemoryEndpoint.cleartextDefaultsKey) == nil, "the launch does not write the switch")
-    expect(RoomMemoryEndpoint.admit(granted.current, allowCleartext: granted.cleartextPermitted) == .allowed,
-           "the launch URL is admitted")
-    granted.setAllowCleartext(false)
-    expect(!granted.cleartextPermitted, "setting the switch off beats the launch grant")
-    expect(launch.bool(forKey: RoomMemoryEndpoint.cleartextDefaultsKey) == false, "off is what gets saved")
-
-    let again = RoomMemoryEndpointStore(environment: [:], defaults: launch)
-    expect(!again.allowCleartext && !again.cleartextPermitted, "a new process reads the saved off switch")
-
     let unsafeLaunch = isolatedDefaults()
     let refused = RoomMemoryEndpointStore(
         environment: ["LABCOMMAND_ROOM_URL": "ws://example.com:8767"],
@@ -495,6 +479,211 @@ func testCleartextDowngradeRequiresConfirmation() {
     } else {
         expect(false, "a public launch must not be admitted")
     }
+}
+
+/// `LABCOMMAND_ROOM_URL` selects the address. Absent and explicit false both stay off across relaunch.
+@MainActor
+func testEnvironmentURLDoesNotGrantCleartext() {
+    let env = ["LABCOMMAND_ROOM_URL": "ws://100.118.187.99:8767"]
+    let key = RoomMemoryEndpoint.cleartextDefaultsKey
+
+    let absent = isolatedDefaults()
+    let first = RoomMemoryEndpointStore(environment: env, defaults: absent)
+    expect(endpointString(first.current) == "ws://100.118.187.99:8767", "the environment URL is still the address")
+    expect(!first.allowCleartext && !first.cleartextPermitted, "an absent switch is not a cleartext grant")
+    expect(absent.object(forKey: key) == nil, "the launch does not write the switch")
+    if case .blocked(let message) = RoomMemoryEndpoint.admit(first.current, allowCleartext: first.cleartextPermitted) {
+        expect(message.contains("Cleartext WebSocket is off"), "the environment URL is not dialed, got \(message)")
+    } else {
+        expect(false, "an environment ws:// with no saved switch must not be admitted")
+    }
+    let relaunchAbsent = RoomMemoryEndpointStore(environment: env, defaults: absent)
+    expect(!relaunchAbsent.allowCleartext && !relaunchAbsent.cleartextPermitted, "relaunch with an absent switch stays off")
+    expect(absent.object(forKey: key) == nil, "relaunch still does not write the switch")
+
+    let explicitOff = isolatedDefaults()
+    explicitOff.set(false, forKey: key)
+    let off = RoomMemoryEndpointStore(environment: env, defaults: explicitOff)
+    expect(!off.allowCleartext && !off.cleartextPermitted, "an explicit off switch stays off")
+    expect((explicitOff.object(forKey: key) as? Bool) == false, "the launch does not erase an explicit off")
+    let relaunchOff = RoomMemoryEndpointStore(environment: env, defaults: explicitOff)
+    expect(!relaunchOff.allowCleartext && !relaunchOff.cleartextPermitted, "relaunch with an explicit off switch stays off")
+    expect((explicitOff.object(forKey: key) as? Bool) == false, "relaunch leaves the explicit off value in place")
+    if case .blocked(let message) = RoomMemoryEndpoint.admit(relaunchOff.current, allowCleartext: relaunchOff.cleartextPermitted) {
+        expect(message.contains("Cleartext WebSocket is off"), "relaunch with the environment URL still does not dial, got \(message)")
+    } else {
+        expect(false, "relaunch with an explicit off switch must not admit ws://")
+    }
+
+    let turned = isolatedDefaults()
+    let session = RoomMemoryEndpointStore(environment: env, defaults: turned)
+    session.setAllowCleartext(false)
+    expect((turned.object(forKey: key) as? Bool) == false, "turning the switch off is what gets saved")
+    let afterOff = RoomMemoryEndpointStore(environment: env, defaults: turned)
+    expect(!afterOff.cleartextPermitted, "a later process with the same environment URL stays off")
+
+    let savedOn = isolatedDefaults()
+    savedOn.set(true, forKey: key)
+    let permitted = RoomMemoryEndpointStore(environment: env, defaults: savedOn)
+    expect(permitted.allowCleartext && permitted.cleartextPermitted, "a saved on switch still permits the environment URL")
+    expect(RoomMemoryEndpoint.admit(permitted.current, allowCleartext: permitted.cleartextPermitted) == .allowed,
+           "the environment URL dials when the saved switch is on")
+}
+
+private func redirectDecision(_ from: String, _ to: String, allowCleartext: Bool) -> RoomRedirectDecision {
+    RoomMemoryEndpoint.decideRedirect(from: URL(string: from)!, to: URL(string: to)!, allowCleartext: allowCleartext)
+}
+
+func testRedirectAdmissionPolicy() {
+    func refused(_ from: String, _ to: String, _ allowCleartext: Bool, _ needle: String) {
+        if case .refuse(let message) = redirectDecision(from, to, allowCleartext: allowCleartext) {
+            expect(message.contains(needle), "\(from) → \(to) refusal should mention \(needle), got \(message)")
+        } else {
+            expect(false, "\(from) → \(to) with cleartext \(allowCleartext) must be refused")
+        }
+    }
+
+    refused("wss://secure.example:443", "ws://10.1.2.3:8767", true, "cleartext")
+    refused("wss://secure.example:443", "ws://10.1.2.3:8767", false, "cleartext")
+    refused("wss://secure.example:443", "http://10.1.2.3:8767", true, "cleartext")
+    refused("https://secure.example:443", "ws://100.64.1.1:8767", true, "cleartext")
+    refused("ws://10.1.2.3:8767", "ws://10.9.9.9:8767", false, "Cleartext WebSocket is off")
+    refused("ws://10.1.2.3:8767", "ws://example.com:8767", true, "not allowed")
+    refused("ws://10.1.2.3:8767", "ws://10.9.9.9:8767/room", true, "Refused a redirect")
+    refused("wss://secure.example:443", "ws://example.com:443", true, "cleartext")
+
+    expect(redirectDecision("ws://10.1.2.3:8767", "ws://10.9.9.9:8767", allowCleartext: true) == .follow,
+           "an admitted cleartext hop is followed when the switch is on")
+    expect(redirectDecision("ws://10.1.2.3:8767", "http://192.168.1.9:8767", allowCleartext: true) == .follow,
+           "an http Location is judged as ws://")
+    expect(redirectDecision("wss://secure.example:443", "wss://other.example:443", allowCleartext: false) == .follow,
+           "wss:// to wss:// does not need the cleartext switch")
+    expect(redirectDecision("wss://secure.example:443", "https://other.example:8443", allowCleartext: false) == .follow,
+           "an https Location is judged as wss://")
+    expect(redirectDecision("ws://10.0.0.1:8767", "wss://secure.example:443", allowCleartext: false) == .follow,
+           "a cleartext to wss:// upgrade is not a downgrade")
+}
+
+/// Speaks raw HTTP and answers the WebSocket handshake with one redirect.
+@MainActor
+private final class LRRedirector {
+    let location: String
+    private(set) var hits = 0
+    private(set) var port: UInt16 = 0
+    private var listener: NWListener?
+    private var connections: [NWConnection] = []
+
+    init(location: String) {
+        self.location = location
+    }
+
+    func start() {
+        let parameters = NWParameters.tcp
+        parameters.requiredInterfaceType = .loopback
+        do {
+            listener = try NWListener(using: parameters, on: .any)
+        } catch {
+            expect(false, "redirector listens: \(error)")
+            return
+        }
+        listener?.newConnectionHandler = { [weak self] connection in
+            MainActor.assumeIsolated { self?.accept(connection) }
+        }
+        listener?.start(queue: .main)
+        let deadline = Date().addingTimeInterval(5)
+        while listener?.port?.rawValue ?? 0 == 0, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        port = listener?.port?.rawValue ?? 0
+        expect(port != 0, "redirector has a port")
+    }
+
+    func stop() {
+        connections.forEach { $0.cancel() }
+        listener?.cancel()
+    }
+
+    private func accept(_ connection: NWConnection) {
+        hits += 1
+        connections.append(connection)
+        connection.stateUpdateHandler = { [weak self] state in
+            guard case .ready = state else { return }
+            MainActor.assumeIsolated { self?.answer(connection) }
+        }
+        connection.start(queue: .main)
+    }
+
+    private func answer(_ connection: NWConnection) {
+        readHeader(on: connection, into: Data())
+    }
+
+    private func readHeader(on connection: NWConnection, into buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, isComplete, error in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                var next = buffer
+                if let data { next.append(data) }
+                let ready = next.range(of: Data("\r\n\r\n".utf8)) != nil || next.count >= 8192 || isComplete || error != nil
+                if ready {
+                    self.respond(on: connection)
+                } else {
+                    self.readHeader(on: connection, into: next)
+                }
+            }
+        }
+    }
+
+    private func respond(on connection: NWConnection) {
+        let header = "HTTP/1.1 302 Found\r\nLocation: \(location)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        connection.send(content: Data(header.utf8), completion: .contentProcessed { _ in
+            connection.cancel()
+        })
+    }
+}
+
+@MainActor
+private func waitingReason(_ client: LiveRoomClient) -> String? {
+    if case .waiting(_, let reason) = client.connection { return reason }
+    return nil
+}
+
+/// The delegate is on the real handshake. Cleartext off: the target is never dialed.
+/// Cleartext on, and the target an allowed host: the hop is followed and the bridge answers.
+@MainActor
+func testLiveRoomRedirectDoesNotBypassAdmission() {
+    testRedirectAdmissionPolicy()
+
+    let blocked = legacyBridge(seed: 11)
+    blocked.start()
+    let refusedHop = LRRedirector(location: blocked.url.absoluteString)
+    refusedHop.start()
+    let blockedClient = LiveRoomClient(url: URL(string: "ws://127.0.0.1:\(refusedHop.port)")!)
+    blockedClient.start()
+    endpointSpin(8) { waitingReason(blockedClient) != nil || refusedHop.hits > 0 && blocked.clientCount > 0 }
+    let refusedReason = waitingReason(blockedClient) ?? ""
+    expect(refusedHop.hits > 0, "the cleartext-off client reached the redirecting server, hits \(refusedHop.hits)")
+    expect(blocked.clientCount == 0, "a refused redirect does not dial \(blocked.url), connections \(blocked.clientCount)")
+    expect(refusedReason.contains("Refused a redirect"), "the Room failure names the redirect, got \(refusedReason)")
+    expect(refusedReason.contains("Cleartext WebSocket is off"), "the refusal is the cleartext switch, got \(refusedReason)")
+    blockedClient.stop()
+    refusedHop.stop()
+    blocked.stop()
+
+    let allowed = legacyBridge(seed: 12)
+    allowed.start()
+    let followedHop = LRRedirector(location: allowed.url.absoluteString)
+    followedHop.start()
+    let allowedClient = LiveRoomClient(url: URL(string: "ws://127.0.0.1:\(followedHop.port)")!)
+    allowedClient.setCleartextPermitted(true)
+    allowedClient.start()
+    waitForBrick(12, on: allowed, client: allowedClient)
+    expect(followedHop.hits > 0, "the admitted client reached the redirecting server")
+    expect(allowed.clientCount > 0, "an admitted redirect is followed to the bridge")
+    expect(allowedClient.url.port == Int(followedHop.port),
+           "the configured URL stays the redirecting server, got \(allowedClient.url)")
+    allowedClient.stop()
+    followedHop.stop()
+    allowed.stop()
 }
 
 func testRoomMemorySettingsSourcesAndATS() {
@@ -512,6 +701,9 @@ func testRoomMemorySettingsSourcesAndATS() {
     expect(!client.contains("100.118.187.99"), "LiveRoomClient has no tailnet IP")
     expect(!client.contains("defaultURL"), "LiveRoomClient does not own a default URL")
     expect(client.contains("func retarget"), "retarget lives on the client")
+    expect(client.contains("delegate: redirectGuard"), "the WebSocket session has a redirect delegate")
+    expect(client.contains("willPerformHTTPRedirection"), "the delegate is asked before a redirect is followed")
+    expect(client.contains("decideRedirect"), "the delegate admits the redirect destination")
 
     let endpoint = text("Sources/LabCommandCore/RoomMemoryEndpoint.swift")
     expect(!endpoint.contains("100.118.187.99"), "the endpoint type has no tailnet IP")
@@ -538,6 +730,7 @@ func testRoomMemorySettingsSourcesAndATS() {
     expect(state.contains("commitRoomEndpoint"), "one commit method")
     expect(state.contains("retargeting: room"), "commit retargets the live client")
     expect(state.contains("RoomMemoryEndpoint.admit"), "AppState admits the socket before dialing")
+    expect(state.contains("setCleartextPermitted"), "AppState tells the socket the saved cleartext switch")
     expect(state.contains("roomEndpointBlock"), "a blocked address is stored for the Room screen")
     expect(!state.contains("100.118.187.99"), "AppState does not hardcode the room IP")
 
@@ -627,10 +820,14 @@ func runRoomMemoryEndpointTests() {
         print("  room endpoint: invalid commit keeps the preference and the socket; reopen reads current"); passed()
         testCleartextDowngradeRequiresConfirmation()
         print("  room endpoint: cleartext switch, host allow-list, and wss to ws confirmation"); passed()
+        testEnvironmentURLDoesNotGrantCleartext()
+        print("  room endpoint: an environment ws:// does not grant cleartext across relaunch"); passed()
         testLiveRoomRetarget()
         print("  room endpoint: retarget swaps bridges, publishes connecting, same URL keeps bricks"); passed()
         testLiveRoomRetargetDuringHandshakeBackoffAndRapidChanges()
         print("  room endpoint: retarget during handshake and backoff; A→B→C ignores the old bridges"); passed()
+        testLiveRoomRedirectDoesNotBypassAdmission()
+        print("  room endpoint: a redirect is admitted, and wss to ws is refused"); passed()
     }
     testCleartextHostPolicy()
     print("  room endpoint: ws:// only for private, CGNAT, and .ts.net hosts"); passed()

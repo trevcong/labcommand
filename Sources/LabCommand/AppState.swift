@@ -139,6 +139,7 @@ final class AppState: ObservableObject {
             self.room = nil
             self.fixture = try? LiveRoomFixture.load(mode: mode, root: nil, now: ProcessInfo.processInfo.systemUptime)
         }
+        self.room?.setCleartextPermitted(endpointStore.cleartextPermitted)
         self.snapshot = LabStatusSnapshot(
             overall: .unknown,
             spark: .unknown,
@@ -164,10 +165,8 @@ final class AppState: ObservableObject {
     /// The endpoint this process is using. Settings copies it into the field on appear.
     var roomEndpointURL: URL { roomEndpoint.current }
 
-    /// The saved switch is on, or this launch named an allowed cleartext address.
-    var showsCleartextWarning: Bool {
-        allowCleartextRoomWebSocket || roomEndpoint.cleartextPermitted
-    }
+    /// True while the saved cleartext switch is on. An environment URL does not turn this on.
+    var showsCleartextWarning: Bool { allowCleartextRoomWebSocket }
 
     func setAllowCleartextRoomWebSocket(_ allow: Bool) {
         roomEndpoint.setAllowCleartext(allow)
@@ -206,7 +205,9 @@ final class AppState: ObservableObject {
     }
 
     /// Dials only an admitted URL. A block stops a socket that was already open.
+    /// The socket hears the switch before it dials, so a redirect is judged with the same permission.
     private func applyRoomAdmission(startIfNeeded: Bool) {
+        room?.setCleartextPermitted(roomEndpoint.cleartextPermitted)
         refreshRoomEndpointBlock()
         guard let room else { return }
         if roomEndpointBlock == nil {

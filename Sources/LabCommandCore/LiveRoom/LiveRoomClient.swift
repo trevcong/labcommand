@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import os
 
 /// The bridge as this connection found it.
 public struct LiveRoomServer: Sendable, Equatable {
@@ -52,6 +53,64 @@ public enum LiveRoomConnection: Sendable, Equatable {
     case waiting(retryIn: TimeInterval, reason: String)
 }
 
+/// Sees each HTTP redirect on the room socket and admits the destination before it is followed.
+/// `URLSession` otherwise follows the redirect, including `wss://` to cleartext, and `admit`
+/// only ran on the URL the operator configured.
+private final class RoomRedirectGuard: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private struct State {
+        var allowCleartext = false
+        var generation = 0
+        var refusal: String?
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func setCleartextPermitted(_ allowed: Bool) {
+        state.withLock { $0.allowCleartext = allowed }
+    }
+
+    /// Drops a refusal from the previous attempt. A late callback from that attempt cannot write the next one.
+    func beginAttempt() {
+        state.withLock {
+            $0.generation += 1
+            $0.refusal = nil
+        }
+    }
+
+    func refusal() -> String? {
+        state.withLock { $0.refusal }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        let snapshot = state.withLock { (allow: $0.allowCleartext, generation: $0.generation) }
+        let decision: RoomRedirectDecision
+        if let proposed = request.url, let original = task.originalRequest?.url {
+            decision = RoomMemoryEndpoint.decideRedirect(from: original, to: proposed, allowCleartext: snapshot.allow)
+        } else if let proposed = request.url {
+            decision = .refuse("Refused a redirect to \(proposed.absoluteString).")
+        } else {
+            decision = .refuse("Refused a redirect.")
+        }
+        switch decision {
+        case .follow:
+            completionHandler(request)
+        case .refuse(let message):
+            state.withLock {
+                if $0.generation == snapshot.generation {
+                    $0.refusal = message
+                }
+            }
+            completionHandler(nil)
+        }
+    }
+}
+
 /// The live room-memory link: one Foxglove WebSocket to the Spark's room-memory bridge, feeding
 /// a `RoomMemoryMirror`. Bind SwiftUI to `connection` and `mirror` (see `LiveRoom/API.md`).
 @MainActor
@@ -97,6 +156,7 @@ public final class LiveRoomClient: ObservableObject {
     public let publishRequests: Bool
     /// The room passed to `init`. The mirror may adopt a different id from the wire.
     private let boundRoomId: String?
+    private let redirectGuard = RoomRedirectGuard()
     private let session: URLSession
     private var runTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
@@ -132,7 +192,13 @@ public final class LiveRoomClient: ObservableObject {
         config.waitsForConnectivity = false
         // The silence watchdog owns timeouts; a request timeout would cut a quiet, healthy socket.
         config.timeoutIntervalForRequest = 24 * 60 * 60
-        session = URLSession(configuration: config)
+        session = URLSession(configuration: config, delegate: redirectGuard, delegateQueue: nil)
+    }
+
+    /// The saved cleartext switch. A redirect to `ws://` is admitted only while this is true.
+    /// A redirect from `wss://` to cleartext stays refused either way.
+    public func setCleartextPermitted(_ allowed: Bool) {
+        redirectGuard.setCleartextPermitted(allowed)
     }
 
     deinit {
@@ -236,6 +302,7 @@ public final class LiveRoomClient: ObservableObject {
     }
 
     private func connectOnce() async -> (opened: Bool, reason: String) {
+        redirectGuard.beginAttempt()
         let socket = session.webSocketTask(with: url, protocols: FoxgloveProtocol.subprotocols)
         socket.maximumMessageSize = Self.maxMessageBytes
         link = Link(socket: socket, startedAt: Self.now, lastMessageAt: Self.now)
@@ -261,7 +328,12 @@ public final class LiveRoomClient: ObservableObject {
                 }
             }
         } catch {
-            reason = (isCurrent() ? link?.failure : nil) ?? Self.describe(error, socket: socket)
+            reason = redirectGuard.refusal()
+                ?? (isCurrent() ? link?.failure : nil)
+                ?? Self.describe(error, socket: socket)
+        }
+        if let refusal = redirectGuard.refusal() {
+            reason = refusal
         }
         socket.cancel(with: .goingAway, reason: nil)
         guard isCurrent() else { return (false, "stopped") }
@@ -274,6 +346,10 @@ public final class LiveRoomClient: ObservableObject {
     }
 
     private func tick() {
+        if let refusal = redirectGuard.refusal() {
+            fail(refusal)
+            return
+        }
         let now = Self.now
         if let link {
             // A half-dead link would sit in receive() forever.
