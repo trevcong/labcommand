@@ -13,10 +13,15 @@ invariants.
 Live bridge facts (probed 2026-10-15, `ws://100.118.187.99:8767`, foxglove-bridge 3.6.0):
 - Topics: `/room_memory/{map_bricks,events,status,sync/map_bricks,sync/events}`; a v2 node adds
   `/room_memory/sync/end`. No `/room_memory/epoch` yet.
-- `capabilities: ["connectionGraph"]` only. **No `clientPublish`**, so the client cannot send
-  `RequestSync` over this socket. It advertises its client channel only when the server offers
-  `clientPublish`. Otherwise it hands requests to `requestSyncSink` (for the `:8766` relay, Phase 3
-  P11), and if that is nil it counts them as unsent (protocol §5.3, "No request path").
+- `capabilities: ["connectionGraph"]` only (re-probed 2026-10-16 on c5518eb, issue #21). **No
+  `clientPublish` and no `services`**, so this deployment has no request path until the image is
+  rebuilt with D39.
+- Request path (protocol D39, §5.3), in order: the node's `/room_memory/sync/request` service
+  (`labcommand_msgs/srv/RequestSync`) when the bridge offers `services` and advertises it; called
+  with the `RequestSync` CDR as payload. Else a client channel on `/room_memory/request_sync` when the
+  bridge offers `clientPublish`. Else `requestSyncSink` (for the `:8766` relay, Phase 3 P11). If none,
+  requests are counted as unsent ("No request path"). The service can appear after the mirror
+  opened, and go away when the node restarts: the client tells the mirror (`requestPathChanged`).
 - The deployed node predates publisher generations, so today the mirror runs in legacy mode
   against it (shown, unverified, never current, no requests).
 
@@ -50,13 +55,15 @@ so time-based staleness re-renders without help from the view. It subscribes to 
 | `mirror` | `RoomMemoryMirror` | the mirrored state |
 | `log` | `[String]` | last 200 diagnostic lines, newest last |
 | `requestSyncSink` | `((RoomMemory.RequestSync) -> Bool)?` | another request path (the `:8766` relay); return true if sent |
+| `requestPath` | `LiveRoomRequestPath` | `.bridgeService(id:)`, `.bridgeChannel`, `.relay` or `.unavailable` (shown as "no request path") |
 | `start()`, `stop()` | | |
 
 ### `LiveRoomConnection` (enum)
 
 - `.off`
 - `.connecting(url: URL, attempt: Int)`
-- `.connected(LiveRoomServer)`: `LiveRoomServer { name, capabilities: [String], canPublish: Bool, memoryTopics: [String] }`.
+- `.connected(LiveRoomServer)`: `LiveRoomServer { name, capabilities: [String], canPublish: Bool, memoryTopics: [String], requestServiceId: UInt32? }`
+  (`requestServiceId`: the bridge's id for the request service while it is advertised).
   `memoryTopics` is empty while the bridge is up but no `/room_memory/*` topic is advertised,
   which renders "Room memory not running on Spark", never an empty room.
 - `.waiting(retryIn: TimeInterval, reason: String)`: between attempts.

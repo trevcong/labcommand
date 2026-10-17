@@ -840,25 +840,29 @@ func runLiveRoomTests() {
     runLiveRoomTraceTests()
 }
 
-/// `swift run LabCommandCoreTestsRunner live-room-probe [seconds] [ws://host:port]`: connects a read-only
-/// `LiveRoomClient` (never advertises or publishes), runs for a while, and prints what the mirror holds.
-/// Exits non-zero when no status arrived.
+/// `swift run LabCommandCoreTestsRunner live-room-probe [seconds] [ws://host:port] [request]`: connects a
+/// `LiveRoomClient`, runs for a while, and prints what the mirror holds. Read-only (never advertises,
+/// publishes or calls a service) unless the third argument is `request`, which lets it send
+/// `RequestSync` on whatever path the bridge offers (D39). Exits non-zero when no status arrived.
 @MainActor
 func runLiveRoomProbe(arguments: [String]) -> Int32 {
     let seconds = arguments.first.flatMap(Double.init) ?? 15
     let url = arguments.dropFirst().first.flatMap(URL.init(string:)) ?? LiveRoomClient.defaultURL
-    let client = LiveRoomClient(url: url, publishRequests: false)
+    let requests = arguments.dropFirst(2).first == "request"
+    let client = LiveRoomClient(url: url, publishRequests: requests)
     client.start()
     let deadline = Date().addingTimeInterval(seconds)
     while Date() < deadline {
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
     }
     let mirror = client.mirror
+    let path = client.requestPath
     client.stop()
     RunLoop.main.run(until: Date().addingTimeInterval(0.2))
 
     for line in client.log { print("  log: \(line)") }
     print("connection: \(client.connection)")
+    print("request path: \(path)")
     for (topic, activity) in mirror.activity.topics.sorted(by: { $0.key < $1.key }) {
         print("  \(topic): \(activity.count) messages")
     }
