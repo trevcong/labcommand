@@ -48,10 +48,12 @@ def _slabs(origin, directions, low, high):
     return near, far
 
 
-def scan(pose=Pose(), room=ROOM, boxes=FURNITURE, directions=None, noise_m=0.01, seed=0, max_range_m=30.0):
+def scan(pose=Pose(), room=ROOM, boxes=FURNITURE, directions=None, noise_m=0.01, seed=0, max_range_m=30.0,
+         columns=720):
     """The returns of a sensor at ``pose`` (sensor -> room frame): binary32 ``(n, 3)`` in the sensor
-    frame. A ray without a return within ``max_range_m`` gives no point."""
-    directions = fan(seed=seed) if directions is None else directions
+    frame. A ray without a return within ``max_range_m`` gives no point. Without ``directions`` the
+    rays are ``fan(columns=columns, seed=seed)``."""
+    directions = fan(columns=columns, seed=seed) if directions is None else directions
     R = np.array(pose.R).reshape(3, 3)
     origin = np.array(pose.t)
     world = np.stack([(directions[:, 0] * R[n, 0] + directions[:, 1] * R[n, 1]) + directions[:, 2] * R[n, 2]
