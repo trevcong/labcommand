@@ -106,6 +106,35 @@ func runStatusDotsTests() {
     let recovered = StatusDots.derive(rig: pingDark, connection: connected, status: live, isStatusFresh: true)
     expect(recovered.mid360.state == .streaming && recovered.jt128.state == .streaming,
            "a fresh room rate wins over the probe's ping-then-rate rule")
+
+    expectChromeReadsDerivedDots()
+}
+
+private func expectChromeReadsDerivedDots() {
+    let bar = sourceText("Sources/LabCommand/CommandCenterView.swift")
+    expect(bar.contains("state.statusDots.sparkReachable"), "Spark chip reads derived reachability")
+    expect(bar.contains("state.statusDots.sparkHelp"), "Spark chip uses the room-link help")
+    expect(bar.contains("sensorChip(state.statusDots.mid360)"), "Mid-360 chip reads the derived sensor")
+    expect(bar.contains("sensorChip(state.statusDots.jt128)"), "JT128 chip reads the derived sensor")
+    expect(!bar.contains("ok: state.rig.sparkReachable"), "Spark chip must not paint the probe alone")
+    expect(bar.contains("sensorCard(state.rig.mid360)"), "left-column cards stay on the probe")
+
+    let menu = sourceText("Sources/LabCommand/LabCommandApp.swift")
+    expect(menu.contains("appState.statusDots"), "status menu reads the derived dots")
+    expect(!menu.contains("if !rig.sparkReachable"), "status menu must not call the Spark offline from the probe alone")
+
+    let state = sourceText("Sources/LabCommand/AppState.swift")
+    expect(state.contains("StatusDots.derive"), "AppState recomputes the dots")
+    expect(state.contains("room.objectWillChange"), "AppState watches the room client")
+}
+
+private func sourceText(_ relative: String) -> String {
+    let path = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(relative).path
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+        fputs("FAIL: \(relative) not readable — run tests from the repo root\n", stderr)
+        exit(1)
+    }
+    return text
 }
 
 private func parseProbe(_ name: String) -> RigSnapshot {
