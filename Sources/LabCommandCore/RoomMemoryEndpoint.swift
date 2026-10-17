@@ -156,6 +156,10 @@ public enum RoomMemoryEndpoint {
     /// A secure URL redirected to `ws://` or `http://` is refused: the operator did not confirm
     /// that downgrade. The saved switch is not confirmation of a server-chosen cleartext hop.
     /// `http` and `https` are judged as `ws` and `wss`. A destination `parse` rejects is refused.
+    ///
+    /// `from` is the URL that sent this redirect, or an earlier secure URL when that response does
+    /// not show one. `RoomRedirectChain` keeps that memory across hops. `URLSession` leaves
+    /// `originalRequest` on the first URL for the whole task, so a chain must not pass it every time.
     public static func decideRedirect(from original: URL, to proposed: URL, allowCleartext: Bool) -> RoomRedirectDecision {
         if isSecureScheme(original.scheme), isCleartextScheme(proposed.scheme) {
             return .refuse("Refused a redirect from \(original.absoluteString) to cleartext \(proposed.absoluteString).")
@@ -196,6 +200,10 @@ public enum RoomMemoryEndpoint {
     /// Writes the canonical string. Callers pass a URL `parse` already accepted.
     public static func save(_ url: URL, to defaults: UserDefaults) {
         defaults.set(url.absoluteString, forKey: defaultsKey)
+    }
+
+    static func isSecureURL(_ url: URL) -> Bool {
+        isSecureScheme(url.scheme)
     }
 
     private static func isSecureScheme(_ scheme: String?) -> Bool {
@@ -280,6 +288,40 @@ public enum RoomMemoryEndpoint {
             bytes.append(UInt8(truncatingIfNeeded: group))
         }
         return bytes
+    }
+}
+
+/// One WebSocket handshake's redirects.
+///
+/// `URLSession` reports each redirecting response as `HTTPURLResponse.url` and rewrites `ws`/`wss`
+/// to `http`/`https`, but `originalRequest` stays the first URL. A secure scheme on the dialed URL,
+/// on a redirecting response, or on a hop already followed makes a later `ws://` or `http://` a
+/// downgrade. The saved cleartext switch does not confirm that downgrade.
+public struct RoomRedirectChain: Equatable, Sendable {
+    /// A secure URL already on this handshake.
+    public private(set) var secureHop: URL?
+
+    public init(dialed: URL?) {
+        if let dialed, RoomMemoryEndpoint.isSecureURL(dialed) {
+            secureHop = dialed
+        }
+    }
+
+    /// `redirecting` is the URL that sent this redirect. Nil when the response has no URL.
+    /// A cleartext redirecting URL does not erase a secure hop already recorded.
+    public mutating func decide(redirecting: URL?, to proposed: URL?, allowCleartext: Bool) -> RoomRedirectDecision {
+        guard let proposed else { return .refuse("Refused a redirect.") }
+        if let redirecting, RoomMemoryEndpoint.isSecureURL(redirecting) {
+            secureHop = redirecting
+        }
+        guard let from = secureHop ?? redirecting else {
+            return .refuse("Refused a redirect to \(proposed.absoluteString).")
+        }
+        let decision = RoomMemoryEndpoint.decideRedirect(from: from, to: proposed, allowCleartext: allowCleartext)
+        if case .follow = decision, RoomMemoryEndpoint.isSecureURL(proposed) {
+            secureHop = proposed
+        }
+        return decision
     }
 }
 

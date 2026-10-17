@@ -54,19 +54,28 @@ public enum LiveRoomConnection: Sendable, Equatable {
 }
 
 /// Sees each HTTP redirect on the room socket and admits the destination before it is followed.
-/// `URLSession` otherwise follows the redirect, including `wss://` to cleartext, and `admit`
-/// only ran on the URL the operator configured.
+/// `URLSession` otherwise follows the redirect, including a later hop from TLS back to cleartext.
+/// `originalRequest` stays the first URL, so each task keeps its own `RoomRedirectChain`.
 private final class RoomRedirectGuard: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     private struct State {
         var allowCleartext = false
         var generation = 0
         var refusal: String?
+        /// `taskIdentifier` → hops already judged on that task. Not cleared in `beginAttempt`:
+        /// a late callback from the previous socket must still refuse a downgrade.
+        var chains: [Int: RoomRedirectChain] = [:]
+        /// Test fixture only. Production stays false.
+        var trustLoopbackCertificates = false
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
 
     func setCleartextPermitted(_ allowed: Bool) {
         state.withLock { $0.allowCleartext = allowed }
+    }
+
+    func setTrustLoopbackCertificatesForTesting(_ enabled: Bool) {
+        state.withLock { $0.trustLoopbackCertificates = enabled }
     }
 
     /// Drops a refusal from the previous attempt. A late callback from that attempt cannot write the next one.
@@ -88,26 +97,47 @@ private final class RoomRedirectGuard: NSObject, URLSessionTaskDelegate, @unchec
         newRequest request: URLRequest,
         completionHandler: @escaping @Sendable (URLRequest?) -> Void
     ) {
-        let snapshot = state.withLock { (allow: $0.allowCleartext, generation: $0.generation) }
-        let decision: RoomRedirectDecision
-        if let proposed = request.url, let original = task.originalRequest?.url {
-            decision = RoomMemoryEndpoint.decideRedirect(from: original, to: proposed, allowCleartext: snapshot.allow)
-        } else if let proposed = request.url {
-            decision = .refuse("Refused a redirect to \(proposed.absoluteString).")
-        } else {
-            decision = .refuse("Refused a redirect.")
+        let outcome = state.withLock { current -> (decision: RoomRedirectDecision, generation: Int) in
+            var chain = current.chains[task.taskIdentifier] ?? RoomRedirectChain(dialed: task.originalRequest?.url)
+            let decision = chain.decide(redirecting: response.url, to: request.url, allowCleartext: current.allowCleartext)
+            current.chains[task.taskIdentifier] = chain
+            return (decision, current.generation)
         }
-        switch decision {
+        switch outcome.decision {
         case .follow:
             completionHandler(request)
         case .refuse(let message):
             state.withLock {
-                if $0.generation == snapshot.generation {
+                if $0.generation == outcome.generation {
                     $0.refusal = message
                 }
             }
             completionHandler(nil)
         }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        state.withLock { _ = $0.chains.removeValue(forKey: task.taskIdentifier) }
+    }
+
+    /// A fixture's self-signed loopback certificate. Off unless a test asks, and never for another host.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        let trustLoopback = state.withLock { $0.trustLoopbackCertificates }
+        let host = challenge.protectionSpace.host.lowercased()
+        let loopback = host == "127.0.0.1" || host == "localhost" || host == "::1"
+        if trustLoopback,
+           challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+           loopback,
+           let trust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+            return
+        }
+        completionHandler(.performDefaultHandling, nil)
     }
 }
 
@@ -196,9 +226,15 @@ public final class LiveRoomClient: ObservableObject {
     }
 
     /// The saved cleartext switch. A redirect to `ws://` is admitted only while this is true.
-    /// A redirect from `wss://` to cleartext stays refused either way.
+    /// A secure hop anywhere on the handshake refuses a later cleartext hop either way.
     public func setCleartextPermitted(_ allowed: Bool) {
         redirectGuard.setCleartextPermitted(allowed)
+    }
+
+    /// Tests only. While true, a loopback server certificate is trusted so a fixture can serve the
+    /// secure hop of a redirect chain. A non-loopback host keeps the system default. The app never calls this.
+    public func trustLoopbackCertificatesForTesting(_ enabled: Bool) {
+        redirectGuard.setTrustLoopbackCertificatesForTesting(enabled)
     }
 
     deinit {

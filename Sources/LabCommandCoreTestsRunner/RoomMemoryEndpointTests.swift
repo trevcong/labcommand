@@ -562,6 +562,68 @@ func testRedirectAdmissionPolicy() {
            "an https Location is judged as wss://")
     expect(redirectDecision("ws://10.0.0.1:8767", "wss://secure.example:443", allowCleartext: false) == .follow,
            "a cleartext to wss:// upgrade is not a downgrade")
+
+    // URLSession keeps originalRequest on the first URL. A later hop is judged from the redirecting
+    // response, and a secure hop already followed still counts when that response does not show it.
+    var review = RoomRedirectChain(dialed: URL(string: "ws://10.0.0.1:8767"))
+    expect(review.decide(redirecting: URL(string: "ws://10.0.0.1:8767"), to: URL(string: "wss://bridge.ts.net:8767"), allowCleartext: true) == .follow,
+           "ws:// to wss:// is followed")
+    if case .refuse(let dropped) = review.decide(redirecting: URL(string: "wss://bridge.ts.net:8767"), to: URL(string: "ws://10.0.0.2:8767"), allowCleartext: true) {
+        expect(dropped.contains("cleartext") && dropped.contains("bridge.ts.net"),
+               "ws to wss to ws names the secure hop, got \(dropped)")
+        expect(!dropped.contains("Cleartext WebSocket is off"), "the refusal is the downgrade, not the switch, got \(dropped)")
+    } else {
+        expect(false, "ws://10.0.0.1 to wss://bridge.ts.net to ws://10.0.0.2 must be refused")
+    }
+
+    var sessionShaped = RoomRedirectChain(dialed: URL(string: "http://10.0.0.1:8767"))
+    expect(sessionShaped.decide(redirecting: URL(string: "http://10.0.0.1:8767/"), to: URL(string: "https://bridge.ts.net:8767/"), allowCleartext: true) == .follow,
+           "URLSession's http to https upgrade is followed")
+    if case .refuse(let sessionDrop) = sessionShaped.decide(redirecting: URL(string: "https://bridge.ts.net:8767/"), to: URL(string: "ws://10.0.0.2:8767/"), allowCleartext: true) {
+        expect(sessionDrop.contains("cleartext") && sessionDrop.contains("bridge.ts.net"),
+               "https to ws after an upgrade is refused, got \(sessionDrop)")
+    } else {
+        expect(false, "a URLSession-shaped https hop must refuse the later ws://")
+    }
+
+    var stuck = RoomRedirectChain(dialed: URL(string: "http://10.0.0.1:8767"))
+    expect(stuck.decide(redirecting: URL(string: "http://10.0.0.1:8767/"), to: URL(string: "https://bridge.ts.net:8767/"), allowCleartext: true) == .follow,
+           "the upgrade is followed before the stuck response URL")
+    if case .refuse(let stuckDrop) = stuck.decide(redirecting: URL(string: "http://10.0.0.1:8767/"), to: URL(string: "ws://10.0.0.2:8767"), allowCleartext: true) {
+        expect(stuckDrop.contains("cleartext") && stuckDrop.contains("bridge.ts.net"),
+               "a response URL stuck on the original cleartext hop still refuses, got \(stuckDrop)")
+    } else {
+        expect(false, "secure-hop history must refuse ws:// when the response URL stays the original")
+    }
+    expect(stuck.secureHop?.host == "bridge.ts.net", "the followed https hop stays on the chain, got \(String(describing: stuck.secureHop))")
+
+    var blind = RoomRedirectChain(dialed: URL(string: "ws://10.0.0.1:8767"))
+    expect(blind.decide(redirecting: URL(string: "ws://10.0.0.1:8767"), to: URL(string: "wss://bridge.ts.net:8767"), allowCleartext: false) == .follow,
+           "an upgrade does not need the cleartext switch")
+    if case .refuse = blind.decide(redirecting: nil, to: URL(string: "ws://10.0.0.2:8767"), allowCleartext: true) {
+    } else {
+        expect(false, "a missing redirect URL after a secure hop still refuses cleartext")
+    }
+
+    var dialedSecure = RoomRedirectChain(dialed: URL(string: "https://secure.example:443"))
+    if case .refuse(let dialedDrop) = dialedSecure.decide(redirecting: nil, to: URL(string: "ws://10.1.2.3:8767"), allowCleartext: true) {
+        expect(dialedDrop.contains("cleartext"), "a secure dial refuses cleartext when the response URL is missing, got \(dialedDrop)")
+    } else {
+        expect(false, "https dialed must refuse a cleartext redirect")
+    }
+
+    var plain = RoomRedirectChain(dialed: URL(string: "ws://10.1.2.3:8767"))
+    expect(plain.decide(redirecting: URL(string: "ws://10.1.2.3:8767"), to: URL(string: "ws://10.9.9.9:8767"), allowCleartext: true) == .follow,
+           "the first cleartext hop is followed")
+    expect(plain.decide(redirecting: URL(string: "http://10.9.9.9:8767/"), to: URL(string: "http://192.168.1.9:8767"), allowCleartext: true) == .follow,
+           "a cleartext chain is not a downgrade")
+    expect(plain.secureHop == nil, "a cleartext chain records no secure hop")
+
+    var secureChain = RoomRedirectChain(dialed: URL(string: "wss://secure.example:443"))
+    expect(secureChain.decide(redirecting: URL(string: "wss://secure.example:443"), to: URL(string: "https://other.example:8443"), allowCleartext: false) == .follow,
+           "wss to https is followed with cleartext off")
+    expect(secureChain.decide(redirecting: URL(string: "https://other.example:8443/"), to: URL(string: "wss://third.example:443"), allowCleartext: false) == .follow,
+           "a secure chain does not need the cleartext switch")
 }
 
 /// Speaks raw HTTP and answers the WebSocket handshake with one redirect.
@@ -641,6 +703,191 @@ private final class LRRedirector {
     }
 }
 
+/// Bytes read from a fixture process. The handler is not on the main actor.
+private final class LRPipeBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var text = ""
+
+    func append(_ data: Data) {
+        guard !data.isEmpty, let piece = String(data: data, encoding: .utf8) else { return }
+        lock.lock()
+        text += piece
+        lock.unlock()
+    }
+
+    func snapshot() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return text
+    }
+}
+
+/// One TLS hop. `URLSession` follows `https://127.0.0.1` only when the test asks the client to
+/// trust the fixture certificate. The process exits when its stdin closes.
+@MainActor
+private final class LRSecureRedirector {
+    let location: String
+    private(set) var hits = 0
+    private(set) var port: UInt16 = 0
+    private var process: Process?
+    private var input: Pipe?
+    private var outputHandle: FileHandle?
+    private var errorHandle: FileHandle?
+    private var directory: URL?
+    private var hitsURL: URL?
+
+    init(location: String) {
+        self.location = location
+    }
+
+    func start() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("labcommand-redirect-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Self.script.write(to: directory.appendingPathComponent("redirector.py"), atomically: true, encoding: .utf8)
+        } catch {
+            expect(false, "secure redirector directory: \(error)")
+            return
+        }
+        self.directory = directory
+        let cert = directory.appendingPathComponent("cert.pem")
+        let key = directory.appendingPathComponent("key.pem")
+        let hitsFile = directory.appendingPathComponent("hits")
+        hitsURL = hitsFile
+
+        let openssl = Process()
+        openssl.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
+        openssl.arguments = [
+            "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key.path, "-out", cert.path,
+            "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1",
+        ]
+        let opensslErr = Pipe()
+        openssl.standardError = opensslErr
+        openssl.standardOutput = Pipe()
+        openssl.standardInput = FileHandle.nullDevice
+        do {
+            try openssl.run()
+        } catch {
+            expect(false, "openssl: \(error)")
+            return
+        }
+        openssl.waitUntilExit()
+        let opensslErrorText = String(data: opensslErr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        guard openssl.terminationStatus == 0 else {
+            expect(false, "openssl certificate status \(openssl.terminationStatus): \(opensslErrorText)")
+            return
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        proc.arguments = [
+            "-u", directory.appendingPathComponent("redirector.py").path,
+            location, cert.path, key.path, hitsFile.path,
+        ]
+        proc.currentDirectoryURL = directory
+        let input = Pipe()
+        let output = Pipe()
+        let errors = Pipe()
+        proc.standardInput = input
+        proc.standardOutput = output
+        proc.standardError = errors
+        let outBuffer = LRPipeBuffer()
+        let errBuffer = LRPipeBuffer()
+        output.fileHandleForReading.readabilityHandler = { handle in
+            outBuffer.append(handle.availableData)
+        }
+        errors.fileHandleForReading.readabilityHandler = { handle in
+            errBuffer.append(handle.availableData)
+        }
+        self.input = input
+        self.process = proc
+        self.outputHandle = output.fileHandleForReading
+        self.errorHandle = errors.fileHandleForReading
+        do {
+            try proc.run()
+        } catch {
+            expect(false, "secure redirector: \(error)")
+            return
+        }
+        let deadline = Date().addingTimeInterval(8)
+        while port == 0, Date() < deadline {
+            if let line = outBuffer.snapshot().split(whereSeparator: \.isNewline).first,
+               let value = UInt16(line.trimmingCharacters(in: .whitespaces)), value != 0 {
+                port = value
+                break
+            }
+            if !proc.isRunning { break }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        expect(port != 0, "secure redirector port, stdout \(outBuffer.snapshot()) stderr \(errBuffer.snapshot())")
+    }
+
+    func refreshHits() {
+        guard let hitsURL else { return }
+        let text = (try? String(contentsOf: hitsURL, encoding: .utf8)) ?? ""
+        hits = text.split(whereSeparator: \.isNewline).filter { !$0.isEmpty }.count
+    }
+
+    func stop() {
+        outputHandle?.readabilityHandler = nil
+        errorHandle?.readabilityHandler = nil
+        process?.terminate()
+        try? input?.fileHandleForWriting.close()
+        process = nil
+        if let directory {
+            try? FileManager.default.removeItem(at: directory)
+            self.directory = nil
+        }
+    }
+
+    private static let script = """
+    import http.server
+    import os
+    import ssl
+    import sys
+    import threading
+
+    def watch():
+        try:
+            sys.stdin.read()
+        finally:
+            os._exit(0)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+    location, cert, key, hits = sys.argv[1:5]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            with open(hits, "a", encoding="utf-8") as handle:
+                handle.write("1\\n")
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+        def log_message(self, fmt, *args):
+            return
+
+    try:
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    except Exception as exc:
+        sys.stderr.write(f"{exc}\\n")
+        sys.stderr.flush()
+        os._exit(1)
+
+    sys.stdout.write(f"{server.server_address[1]}\\n")
+    sys.stdout.flush()
+    server.serve_forever()
+    """
+}
+
 @MainActor
 private func waitingReason(_ client: LiveRoomClient) -> String? {
     if case .waiting(_, let reason) = client.connection { return reason }
@@ -684,6 +931,49 @@ func testLiveRoomRedirectDoesNotBypassAdmission() {
     allowedClient.stop()
     followedHop.stop()
     allowed.stop()
+
+    let chained = legacyBridge(seed: 13)
+    chained.start()
+    let secondHop = LRRedirector(location: chained.url.absoluteString)
+    secondHop.start()
+    let firstHop = LRRedirector(location: "ws://127.0.0.1:\(secondHop.port)")
+    firstHop.start()
+    let chainedClient = LiveRoomClient(url: URL(string: "ws://127.0.0.1:\(firstHop.port)")!)
+    chainedClient.setCleartextPermitted(true)
+    chainedClient.start()
+    waitForBrick(13, on: chained, client: chainedClient)
+    expect(firstHop.hits > 0 && secondHop.hits > 0, "both hops of a cleartext chain were requested, hits \(firstHop.hits) \(secondHop.hits)")
+    expect(chained.clientCount > 0, "an admitted cleartext chain reaches the bridge")
+    chainedClient.stop()
+    firstHop.stop()
+    secondHop.stop()
+    chained.stop()
+
+    let downgraded = legacyBridge(seed: 14)
+    downgraded.start()
+    let secureHop = LRSecureRedirector(location: downgraded.url.absoluteString)
+    secureHop.start()
+    let clearHop = LRRedirector(location: "https://127.0.0.1:\(secureHop.port)/")
+    clearHop.start()
+    let downgradeClient = LiveRoomClient(url: URL(string: "ws://127.0.0.1:\(clearHop.port)")!)
+    downgradeClient.setCleartextPermitted(true)
+    downgradeClient.trustLoopbackCertificatesForTesting(true)
+    downgradeClient.start()
+    endpointSpin(8) {
+        (waitingReason(downgradeClient)?.contains("Refused a redirect") ?? false) || downgraded.clientCount > 0
+    }
+    secureHop.refreshHits()
+    let downgradeReason = waitingReason(downgradeClient) ?? ""
+    expect(clearHop.hits > 0, "the chain reached the first redirect, hits \(clearHop.hits)")
+    expect(secureHop.hits > 0, "the chain reached the secure hop, hits \(secureHop.hits)")
+    expect(downgraded.clientCount == 0, "a secure hop then ws:// does not dial \(downgraded.url), connections \(downgraded.clientCount)")
+    expect(downgradeReason.contains("Refused a redirect"), "the Room failure names the redirect, got \(downgradeReason)")
+    expect(downgradeReason.contains("cleartext"), "the refusal is the downgrade, got \(downgradeReason)")
+    expect(!downgradeReason.contains("Cleartext WebSocket is off"), "the switch is on; the refusal is the secure hop, got \(downgradeReason)")
+    downgradeClient.stop()
+    clearHop.stop()
+    secureHop.stop()
+    downgraded.stop()
 }
 
 func testRoomMemorySettingsSourcesAndATS() {
@@ -703,11 +993,15 @@ func testRoomMemorySettingsSourcesAndATS() {
     expect(client.contains("func retarget"), "retarget lives on the client")
     expect(client.contains("delegate: redirectGuard"), "the WebSocket session has a redirect delegate")
     expect(client.contains("willPerformHTTPRedirection"), "the delegate is asked before a redirect is followed")
-    expect(client.contains("decideRedirect"), "the delegate admits the redirect destination")
+    expect(client.contains("RoomRedirectChain"), "the delegate remembers a secure hop across the handshake")
+    expect(client.contains("response.url"), "the delegate judges the redirecting response")
+    expect(!client.contains("decideRedirect(from:"), "a hop is not judged by passing originalRequest to decideRedirect")
 
     let endpoint = text("Sources/LabCommandCore/RoomMemoryEndpoint.swift")
     expect(!endpoint.contains("100.118.187.99"), "the endpoint type has no tailnet IP")
     expect(endpoint.contains("CaptureRecipe.tailscaleDNS"), "the default host is the MagicDNS name")
+    expect(endpoint.contains("func decideRedirect"), "a redirect destination is admitted")
+    expect(endpoint.contains("secureHop"), "a secure hop stays on the chain")
 
     let settings = text("Sources/LabCommand/SettingsView.swift")
     expect(settings.contains("Rig diagnostics"), "recorder rows sit under Rig diagnostics")
@@ -731,6 +1025,8 @@ func testRoomMemorySettingsSourcesAndATS() {
     expect(state.contains("retargeting: room"), "commit retargets the live client")
     expect(state.contains("RoomMemoryEndpoint.admit"), "AppState admits the socket before dialing")
     expect(state.contains("setCleartextPermitted"), "AppState tells the socket the saved cleartext switch")
+    expect(!state.contains("trustLoopbackCertificatesForTesting"), "AppState does not trust fixture certificates")
+    expect(!settings.contains("trustLoopbackCertificatesForTesting"), "Settings does not trust fixture certificates")
     expect(state.contains("roomEndpointBlock"), "a blocked address is stored for the Room screen")
     expect(!state.contains("100.118.187.99"), "AppState does not hardcode the room IP")
 
@@ -827,7 +1123,7 @@ func runRoomMemoryEndpointTests() {
         testLiveRoomRetargetDuringHandshakeBackoffAndRapidChanges()
         print("  room endpoint: retarget during handshake and backoff; A→B→C ignores the old bridges"); passed()
         testLiveRoomRedirectDoesNotBypassAdmission()
-        print("  room endpoint: a redirect is admitted, and wss to ws is refused"); passed()
+        print("  room endpoint: a redirect is admitted, and a secure hop blocks a later cleartext hop"); passed()
     }
     testCleartextHostPolicy()
     print("  room endpoint: ws:// only for private, CGNAT, and .ts.net hosts"); passed()
