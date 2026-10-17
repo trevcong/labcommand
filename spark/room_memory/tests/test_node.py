@@ -223,6 +223,7 @@ def test_the_rig_guard_subscribes_to_the_imu_and_publishes_rig_pose(tmp_path):
         node._close_window()  # nothing changed: not due again within 10 s
         [message] = [RigPose.from_cdr(data) for data in sent]
         assert message.outcome == RigOutcome.IN_PLACE and message.header.room_id == "lab"
+        assert message.publisher_generation == node.generation.generation
     finally:
         node.destroy_node()
         rclpy.shutdown()

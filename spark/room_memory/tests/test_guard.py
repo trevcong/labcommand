@@ -271,6 +271,7 @@ def drive(memory, poses, first, boxes=rooms.FURNITURE, imu=None, frames=1, room=
         stamp = Time(second, 0)
         events = memory.close_window(stamp)
         rig = memory.rig_pose(stamp)
+        assert rig is None or rig.publisher_generation == memory.publisher_generation  # protocol §1.4
         trace.append(Window(second, events, memory.status(stamp, 1.0).state, rig))
     return trace
 

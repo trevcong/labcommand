@@ -979,8 +979,9 @@ def assert_rig_alike(cpp, py):
     assert len(cpp) == len(py)
     for a, b in zip(cpp, py):
         assert (a.header, a.outcome, a.causes, a.sensors, a.channel, a.frame_epoch, a.n_realigned, a.imu_ok,
-                a.moved_at) == (b.header, b.outcome, b.causes, b.sensors, b.channel, b.frame_epoch, b.n_realigned,
-                                b.imu_ok, b.moved_at)
+                a.moved_at, a.publisher_generation) == (b.header, b.outcome, b.causes, b.sensors, b.channel,
+                                                        b.frame_epoch, b.n_realigned, b.imu_ok, b.moved_at,
+                                                        b.publisher_generation)
         for pose_a, pose_b in ((a.mid360_pose, b.mid360_pose), (a.jt128_pose, b.jt128_pose)):
             assert (pose_a is None) == (pose_b is None)
             if pose_a is not None:
@@ -1030,6 +1031,7 @@ def test_rig_guard_never_realigned_is_byte_identical(tmp_path):
     rigs = rig_messages(py)
     assert_rig_alike(rig_messages(cpp), rigs)
     outcomes = [m.outcome for m in rigs]
+    assert {m.publisher_generation for m in rigs} == {1}  # "start 0 0": the replay's floor generation
     assert RigOutcome.CHECKING in outcomes and RigOutcome.MOVED not in outcomes and RigOutcome.INCONCLUSIVE not in outcomes
     assert sorted(cpp_state) == sorted(py_state)
     for name in cpp_state:

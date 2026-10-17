@@ -1755,7 +1755,7 @@ class RoomMemory:
         message = RigPose(Header(self.config.room_id, self.map_epoch, self._rig_seq, stamp), outcome, self._causes,
                           sensors, tuple(channel_results), self._frame_epoch, self._n_realigned, poses["mid360"],
                           poses["jt128"], *(tuple(pairs[name]) for name in pairs), tilt, self._imu_ok(now),
-                          self._moved_at)
+                          self._moved_at, self.publisher_generation)
         self._rig_seq += 1
         self._rig_sent = (outcome, now)
         self._rig_dirty = False

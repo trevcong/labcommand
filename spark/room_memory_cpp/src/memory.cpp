@@ -1752,6 +1752,7 @@ std::optional<msg::RigPose> RoomMemory::rig_pose(const msg::Time& stamp) {
     message.n_realigned = n_realigned_;
     message.imu_ok = imu_ok(now);
     message.moved_at = moved_at_;
+    message.publisher_generation = publisher_generation_;
     ++rig_seq_;
     rig_sent_ = std::make_pair(outcome, now);
     rig_dirty_ = false;

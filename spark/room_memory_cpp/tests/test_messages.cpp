@@ -201,6 +201,12 @@ RigPose rig_pose() {
     return p;
 }
 
+RigPose rig_pose_v2() {
+    RigPose p = rig_pose();
+    p.publisher_generation = kG;
+    return p;
+}
+
 ImuSample imu() { return ImuSample{kT10, "livox_frame", {0.015625, -0.03125, 0.5}, {0.0078125, -0.0, -1.0}}; }
 
 RequestSync request_map() { return RequestSync{head("lab", 43, 2), RequestSync::Since{43, 12}, SyncTopic::map_bricks}; }
@@ -299,8 +305,6 @@ std::optional<std::uint64_t> generation_of(const T& value) {
         return value.expected_generation;
     } else if constexpr (std::is_same_v<T, SyncEnd>) {
         return value.publisher_generation;
-    } else if constexpr (std::is_same_v<T, RigPose>) {
-        return std::nullopt;
     } else {
         return value.publisher_generation;
     }
@@ -358,6 +362,7 @@ const std::map<std::string, Golden>& goldens() {
         {"epoch_v2_be.hex", golden<Epoch>(epoch_v2, false)},
         {"activity_v2_le.hex", golden<Activity>(activity_v2, true)},
         {"rig_pose_le.hex", golden<RigPose>(rig_pose, true)},
+        {"rig_pose_v2_le.hex", golden<RigPose>(rig_pose_v2, true)},
         {"imu_le.hex", Golden{[](const Bytes& data) { return decode_imu(data) == imu(); }, [] { return imu().to_cdr(); },
                               [](const Bytes& data) { (void)decode_imu(data); }, [](const Bytes& data) { (void)decode_imu(data); return false; }, true}},
     };
@@ -374,7 +379,7 @@ Bytes u64le(std::uint64_t value) {
 }
 
 // Derived on rig-guard; the Swift suite decodes neither RigPose nor Imu, so it has no copy (PROVENANCE.md).
-bool in_swift(const std::string& name) { return name != "rig_pose_le.hex" && name != "imu_le.hex"; }
+bool in_swift(const std::string& name) { return name != "rig_pose_le.hex" && name != "rig_pose_v2_le.hex" && name != "imu_le.hex"; }
 
 Bytes inflate_all(const Bytes& data) {
     z_stream stream{};
@@ -429,7 +434,7 @@ TEST(every_hand_golden_is_covered) {
         CHECK(goldens().count(entry.path().filename().string()) == 1);
     }
     CHECK_EQ(files, goldens().size());
-    CHECK_EQ(files, std::size_t{29});
+    CHECK_EQ(files, std::size_t{30});
 }
 
 TEST(hand_goldens_match_the_swift_copies) {
@@ -574,7 +579,10 @@ TEST(activity_rejects_inconsistent_fields) {
     CHECK_THROWS(Invalid, active.to_cdr());
 }
 
-TEST(rig_pose_is_168_bytes_for_lab) { CHECK_EQ(rig_pose().to_cdr().size(), std::size_t{168}); }
+TEST(rig_pose_is_168_bytes_for_lab) {
+    CHECK_EQ(rig_pose().to_cdr().size(), std::size_t{168});
+    CHECK_EQ(rig_pose_v2().to_cdr().size(), std::size_t{180});  // v2: pad to 8, then the generation
+}
 
 TEST(rig_pose_rejects_bad_codes) {
     const std::pair<std::size_t, std::uint8_t> cases[] = {
@@ -618,6 +626,9 @@ TEST(rig_pose_rejects_inconsistent_fields) {
     CHECK_THROWS(Invalid, p.to_cdr());
     p = rig_pose();
     p.delta_m[0] = INFINITY;
+    CHECK_THROWS(Invalid, p.to_cdr());
+    p = rig_pose();
+    p.publisher_generation = 0;  // GENERATION_UNKNOWN
     CHECK_THROWS(Invalid, p.to_cdr());
 }
 

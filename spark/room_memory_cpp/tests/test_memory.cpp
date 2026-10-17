@@ -1615,6 +1615,8 @@ std::vector<Window> drive(RoomMemory& memory, const std::vector<rig::Pose>& pose
         const msg::Time t{second, 0};
         std::vector<msg::ChangeEvent> events = memory.close_window(t);
         std::optional<msg::RigPose> rig = memory.rig_pose(t);
+        // Every RigPose carries the process's publisher generation (protocol 1.4).
+        CHECK(!rig || rig->publisher_generation == memory.publisher_generation());
         trace.push_back(Window{second, std::move(events), memory.status(t, 1.0).state, std::move(rig)});
     }
     return trace;

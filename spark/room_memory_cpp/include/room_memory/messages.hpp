@@ -255,6 +255,7 @@ struct RigPose {
     std::optional<float> tilt_deg;
     bool imu_ok = false;
     Time moved_at;
+    std::optional<std::uint64_t> publisher_generation;  // empty: the legacy layout; the engine always stamps it
     friend bool operator==(const RigPose&, const RigPose&) = default;
 
     void validate() const;

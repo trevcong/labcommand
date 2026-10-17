@@ -925,6 +925,7 @@ Activity Activity::from_cdr(std::span<const std::uint8_t> data) {
 void RigPose::validate() const {
     const std::string context = "RigPose";
     header.validate(context);
+    require_generation(publisher_generation, context + ": publisher_generation");
     require_enum(outcome, 6, context + ": outcome");
     require_int(causes, 0, 0xFF, context + ": causes");
     if (causes & ~kCausesAll) throw Invalid(context + ": causes sets an undefined bit");
@@ -984,6 +985,7 @@ Bytes RigPose::to_cdr() const {
     writer.f32(tilt_deg);
     writer.u8(imu_ok ? 1 : 0);
     writer.time(moved_at);
+    if (publisher_generation) writer.u64(*publisher_generation);
     return writer.take();
 }
 
@@ -1016,6 +1018,7 @@ RigPose RigPose::from_cdr(std::span<const std::uint8_t> data) {
         if (imu_ok > 1) throw Invalid("RigPose: imu_ok " + str(std::uint64_t{imu_ok}) + " is not a bool");
         p.imu_ok = imu_ok == 1;
         p.moved_at = reader.time("moved_at");
+        if (reader.is_v2(8, "moved_at")) p.publisher_generation = reader.u64("publisher_generation");
         p.validate();
         return p;
     });

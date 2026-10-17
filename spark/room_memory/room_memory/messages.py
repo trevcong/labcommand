@@ -1147,7 +1147,8 @@ def _f32_optional(values):
 class RigPose:
     """The rig-pose guard (protocol §3.9): its outcome, what started the check, each sensor's
     result and absolute pose (``tx ty tz qx qy qz qw``, current sensor frame → its reference
-    frame), and the last check's metrics. ``None`` is NaN on the wire (a pose: NaN × 7)."""
+    frame), and the last check's metrics. ``None`` is NaN on the wire (a pose: NaN × 7).
+    ``publisher_generation`` is the v2 tail (protocol §1.4); the engine always stamps it."""
 
     header: Header
     outcome: RigOutcome
@@ -1166,6 +1167,7 @@ class RigPose:
     tilt_deg: Optional[float]
     imu_ok: bool
     moved_at: Time
+    publisher_generation: Optional[int] = None  # None: the legacy layout
 
     _PAIRS = ("delta_m", "delta_deg", "inlier_frac", "rms_m", "observe")
 
@@ -1178,6 +1180,7 @@ class RigPose:
     def validate(self):
         context = "RigPose"
         self.header.validate(context)
+        _require_generation(self.publisher_generation, f"{context}: publisher_generation")
         _enum(RigOutcome, self.outcome, f"{context}: outcome")
         _require_int(self.causes, 0, 0xFF, f"{context}: causes")
         if self.causes & ~CAUSES_ALL:
@@ -1236,6 +1239,8 @@ class RigPose:
         writer.f32(self.tilt_deg)
         writer.u8(1 if self.imu_ok else 0)
         writer.time(self.moved_at)
+        if self.publisher_generation is not None:
+            writer.u64(self.publisher_generation)
         return bytes(writer.data)
 
     @classmethod
@@ -1263,8 +1268,9 @@ class RigPose:
             if imu_ok > 1:
                 raise Invalid(f"RigPose: imu_ok {imu_ok} is not a bool")
             moved_at = reader.time("moved_at")
+            generation = reader.u64("publisher_generation") if reader.is_v2(8, "moved_at") else None
             pose = cls(header, outcome, causes, sensors, channel, frame_epoch, n_realigned, *poses, *pairs,
-                       None if math.isnan(tilt) else tilt, bool(imu_ok), moved_at)
+                       None if math.isnan(tilt) else tilt, bool(imu_ok), moved_at, generation)
             pose.validate()
             return pose
         return _decode(data, "RigPose", body)

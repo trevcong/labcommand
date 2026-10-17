@@ -45,3 +45,4 @@ float32[2] observe                # last check, lambda_min(H)/sum(w) (§3.9); Na
 float32 tilt_deg                  # IMU gravity vs the gravity baseline of the last accepted decision; NaN = no IMU
 bool imu_ok                       # IMU samples within the last second
 builtin_interfaces/Time moved_at  # first trigger of the current or last move; {0, 0} = none
+uint64 publisher_generation       # the publishing process's generation (protocol §1.4): durable, increasing per room, never 0

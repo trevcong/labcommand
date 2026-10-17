@@ -167,12 +167,13 @@ GOLDENS = {
     "epoch_v2_be.hex": (m.Epoch, lambda: replace(epoch(), publisher_generation=G), False),
     "activity_v2_le.hex": (m.Activity, lambda: replace(activity(), publisher_generation=G), True),
     "rig_pose_le.hex": (m.RigPose, rig_pose, True),
+    "rig_pose_v2_le.hex": (m.RigPose, lambda: replace(rig_pose(), publisher_generation=G), True),
     "imu_le.hex": (Imu, imu, True),
 }
 # v2 goldens whose cut at the legacy length (+ up to 3 bytes) is a valid legacy message.
 V2_EXTENDS_LEGACY = {name for name in GOLDENS if "_v2_" in name}
 # Derived on rig-guard; the Swift suite decodes neither RigPose nor Imu, so it has no copy (PROVENANCE.md).
-NOT_IN_SWIFT = {"rig_pose_le.hex", "imu_le.hex"}
+NOT_IN_SWIFT = {"rig_pose_le.hex", "rig_pose_v2_le.hex", "imu_le.hex"}
 
 
 def test_provenance_hashes():
@@ -277,6 +278,7 @@ def test_activity_rejects_inconsistent_fields():
 
 def test_rig_pose_is_168_bytes_for_lab():
     assert len(rig_pose().to_cdr()) == 168
+    assert len(replace(rig_pose(), publisher_generation=G).to_cdr()) == 180  # v2: pad to 8, then the generation
 
 
 @pytest.mark.parametrize("offset, value", [
@@ -312,7 +314,8 @@ def test_rig_pose_rejects_inconsistent_fields():
     with pytest.raises(m.Invalid):
         m.RigPose.from_cdr(bytes(data))
     for change in ({"mid360_pose": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.01)}, {"inlier_frac": (1.5, None)},
-                   {"tilt_deg": -1.0}, {"delta_m": (math.inf, None)}, {"channel": (1,)}, {"imu_ok": 1}):
+                   {"tilt_deg": -1.0}, {"delta_m": (math.inf, None)}, {"channel": (1,)}, {"imu_ok": 1},
+                   {"publisher_generation": 0}):
         with pytest.raises(m.Invalid):
             replace(rig_pose(), **change).to_cdr()
 
