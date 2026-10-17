@@ -119,7 +119,8 @@ public:
         config.keyframe_delta_ratio = declare_parameter<double>("keyframe_delta_ratio", defaults.keyframe_delta_ratio);
         config.suppress_clear_windows =
             declare_parameter<std::int64_t>("suppress_clear_windows", defaults.suppress_clear_windows);
-        // The operator service changes durable state through an unauthenticated port: off unless asked (D46).
+        // Operator actions change durable state, and neither the :8767 port nor the ROS domain authenticates
+        // a caller: no service and no topic subscription unless asked (D46).
         const bool operator_actions = declare_parameter<bool>("operator_actions", false);
         // Before any publisher: every message this process sends carries the generation. The
         // allocation holds publisher.lock until the process exits. The wall clock, not now(),
@@ -160,12 +161,13 @@ public:
                 request_serialization_.serialize_message(&request->request, &message);
                 response->accepted = answer(message);
             });
-        // Operator actions (D46). Every callback runs on the one spin thread, as do the window and
+        // Operator actions (D46), both paths behind the one flag: without it any peer on the ROS domain could
+        // confirm, dismiss or accept. Every callback runs on the one spin thread, as do the window and
         // status timers and the requests, so RoomMemory needs no lock; a multi-threaded executor would.
-        operator_topic_ = create_generic_subscription(
-            kOperatorTopic, "labcommand_msgs/msg/OperatorAction", volatile_qos(10),
-            [this](std::shared_ptr<const rclcpp::SerializedMessage> message) { act(*message); });
         if (operator_actions) {
+            operator_topic_ = create_generic_subscription(
+                kOperatorTopic, "labcommand_msgs/msg/OperatorAction", volatile_qos(10),
+                [this](std::shared_ptr<const rclcpp::SerializedMessage> message) { act(*message); });
             operator_service_ = create_service<labcommand_msgs::srv::OperatorAction>(
                 kOperatorService, [this](const std::shared_ptr<labcommand_msgs::srv::OperatorAction::Request> request,
                                          std::shared_ptr<labcommand_msgs::srv::OperatorAction::Response> response) {

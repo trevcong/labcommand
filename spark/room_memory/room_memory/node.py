@@ -8,8 +8,8 @@ codec's CDR bytes on ``/room_memory/status`` and ``/room_memory/activity`` (1 Hz
 ``/room_memory/sync/end`` (protocol §2, §5); the ``labcommand_msgs`` classes only provide the type
 support. A ``RequestSync`` also arrives as the ``/room_memory/sync/request`` service, which the :8767
 bridge exposes to the Mac (D39); its request is serialized back to the message's bytes and answered
-the same way. An ``OperatorAction`` (D46) arrives on ``/room_memory/operator`` from a relay, or, with
-``operator_actions:=true``, as the ``/room_memory/operator/action`` service; its events go out on
+the same way. An ``OperatorAction`` (D46) arrives as the ``/room_memory/operator/action`` service or on
+``/room_memory/operator`` from a relay, both only with ``operator_actions:=true``; its events go out on
 ``/room_memory/events``, and an accept's ACCEPTED right after the map message that carries it. The publisher generation is allocated (durably, under ``publisher.lock``) before any
 publisher exists; without it the node refuses to start. A rejected frame logs one warning per
 sensor per 10 s.
@@ -92,7 +92,8 @@ class RoomMemoryNode(Node):
             "suppress_clear_windows": defaults.suppress_clear_windows,
         }
         values = {name: self.declare_parameter(name, value).value for name, value in params.items()}
-        # The operator service changes durable state through an unauthenticated port: off unless asked (D46).
+        # Operator actions change durable state, and neither the :8767 port nor the ROS domain authenticates
+        # a caller: no service and no topic subscription unless asked (D46).
         operator_actions = self.declare_parameter("operator_actions", False).value
         values["sensors"] = tuple(values["sensors"])
         values["max_range"] = values["max_range"] if values["max_range"] > 0 else None
@@ -128,9 +129,10 @@ class RoomMemoryNode(Node):
         self.sync_end = self.create_publisher(SyncEndMsg, SYNC_END_TOPIC, volatile(10))
         self.create_subscription(RequestSyncMsg, REQUEST_TOPIC, self._answer, volatile(10), raw=True)
         self.create_service(RequestSyncSrv, REQUEST_SERVICE, self._serve_request)
-        # Operator actions (D46). rclpy.spin runs every callback on one thread, so RoomMemory needs no lock.
-        self.create_subscription(OperatorActionMsg, OPERATOR_TOPIC, self._act, volatile(10), raw=True)
+        # Operator actions (D46), both paths behind the one flag: without it any peer on the ROS domain could
+        # confirm, dismiss or accept. rclpy.spin runs every callback on one thread, so RoomMemory needs no lock.
         if operator_actions:
+            self.create_subscription(OperatorActionMsg, OPERATOR_TOPIC, self._act, volatile(10), raw=True)
             self.create_service(OperatorActionSrv, OPERATOR_SERVICE, self._serve_action)
         for name in self.config.sensors:
             sensor = SENSORS[name]

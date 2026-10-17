@@ -15,8 +15,9 @@ socket as the node's ``/room_memory/sync/request`` service (protocol D39): the b
 ``services`` with a ``service_whitelist`` of that one name. Every other node's services, the
 lidar drivers' parameter services included, stay hidden; the bridge enforces this whitelist
 (the default is ``.*``, so it must be set). ``operator_actions:=true`` (off by default) has the node
-offer ``/room_memory/operator/action`` and adds it to the whitelist (protocol D46): it changes
-durable state, and the port has no authentication. Client publishing stays off unless
+subscribe to ``/room_memory/operator`` and offer ``/room_memory/operator/action``, and adds the service
+to the whitelist (protocol D46): an action changes durable state, and neither the port nor the ROS
+domain authenticates a caller. Without it the node has neither, so no peer can act. Client publishing stays off unless
 ``foxglove_client_publish:=true``: foxglove_bridge parses ``client_topic_whitelist`` but does not
 enforce it (3.4.1 through 3.6.2), so client publishing would let any client that reaches the port
 publish on any topic.
@@ -64,14 +65,14 @@ ARGUMENTS = {
 
 # Node parameters that are not MemoryConfig fields (ARGUMENTS mirrors MemoryConfig exactly).
 NODE_ARGUMENTS = {
-    # The operator service changes durable state through an unauthenticated port: off unless asked (D46).
+    # The operator topic and service change durable state, and no caller is authenticated: off unless asked (D46).
     "operator_actions": ("false", bool),
 }
 
 # The node's RequestSync service, which the bridge always exposes (D39).
 REQUEST_SERVICE = "/room_memory/sync/request"
-# The node's operator service (D46): it changes durable state, so the node offers it and the bridge
-# exposes it only with operator_actions:=true.
+# The node's operator service (D46): it changes durable state, so the node offers it (and subscribes to
+# the /room_memory/operator topic) and the bridge exposes it only with operator_actions:=true.
 OPERATOR_SERVICE = "/room_memory/operator/action"
 OPERATOR_SERVICE_PATTERN = "^/room_memory/operator/action$"
 # connectionGraph is read-only (topic names, no data). services carries RequestSync through the

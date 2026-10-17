@@ -113,9 +113,33 @@ def test_the_operator_service_is_opt_in():
     assert '"\'.lower() == \'true\' else ", repr(BRIDGE_SERVICE_WHITELIST)' in source
     cpp_node = (ROOT / "spark/room_memory_cpp/node/room_memory_node.cpp").read_text()
     assert 'declare_parameter<bool>("operator_actions", false)' in cpp_node
-    assert "if (operator_actions) {" in cpp_node
     python_node = (ROOT / "spark/room_memory/room_memory/node.py").read_text()
     assert 'self.declare_parameter("operator_actions", False)' in python_node
+
+
+def _braced_block(source, opener):
+    """The text between ``opener`` (which ends in ``{``) and its matching ``}``."""
+    assert source.count(opener) == 1, opener
+    start = source.index(opener) + len(opener)
+    depth = 1
+    for index in range(start, len(source)):
+        depth += {"{": 1, "}": -1}.get(source[index], 0)
+        if depth == 0:
+            return source[start:index]
+    raise AssertionError(f"unbalanced {opener}")
+
+
+def test_the_operator_topic_is_behind_the_flag_too():
+    # Review of #31: the topic changes durable state like the service, and any peer on the ROS domain
+    # can publish on it, so without operator_actions:=true the C++ node does not subscribe at all. The
+    # C++ node is built only under colcon; test_node_operator_gate.py runs the Python node's twin.
+    cpp_node = (ROOT / "spark/room_memory_cpp/node/room_memory_node.cpp").read_text()
+    gated = _braced_block(cpp_node, "if (operator_actions) {")
+    assert "operator_topic_ = create_generic_subscription(\n                kOperatorTopic," in gated
+    assert "operator_service_ = create_service<labcommand_msgs::srv::OperatorAction>(" in gated
+    outside = cpp_node.replace(gated, "")
+    assert outside.count("kOperatorTopic") == 1, "only the constant's definition is outside the gate"
+    assert "create_generic_subscription(\n            kOperatorTopic" not in outside
 
 
 def test_every_side_names_the_same_operator_service():

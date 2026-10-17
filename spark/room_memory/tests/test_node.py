@@ -21,15 +21,16 @@ from room_memory.messages import (  # noqa: E402
     Activity, Header, MemoryState, MemoryStatus, RequestSync, SyncEnd, SyncTopic,
 )
 from room_memory.node import (  # noqa: E402
-    ACTIVITY_TOPIC, EVENTS_TOPIC, OPERATOR_SERVICE, REQUEST_SERVICE, STATUS_TOPIC, SYNC_END_TOPIC, RoomMemoryNode,
+    ACTIVITY_TOPIC, EVENTS_TOPIC, OPERATOR_SERVICE, OPERATOR_TOPIC, REQUEST_SERVICE, STATUS_TOPIC, SYNC_END_TOPIC,
+    RoomMemoryNode,
 )
 from test_messages import T10, TOKEN_A, appeared_event  # noqa: E402
 
 
-def _make_node(state_dir):
+def _make_node(state_dir, *extra):
     return RoomMemoryNode(parameter_overrides=[
         Parameter("state_dir", value=str(state_dir)), Parameter("sensors", value=["mid360"]),
-        Parameter("max_range", value=0.0),
+        Parameter("max_range", value=0.0), *extra,
     ])
 
 
@@ -211,6 +212,20 @@ def test_service_refuses_another_room(node, monkeypatch):
 def test_the_operator_service_is_off_by_default(node):
     services = dict(node.get_service_names_and_types_by_node("room_memory", "/"))
     assert OPERATOR_SERVICE not in services
+    # The topic too (review of #31): any peer on the ROS domain could publish on it.
+    assert OPERATOR_TOPIC not in {subscription.topic_name for subscription in node.subscriptions}
+
+
+def test_operator_actions_true_offers_the_topic_and_the_service(tmp_path):
+    rclpy.init()
+    node = _make_node(tmp_path, Parameter("operator_actions", value=True))
+    try:
+        assert OPERATOR_TOPIC in {subscription.topic_name for subscription in node.subscriptions}
+        assert OPERATOR_SERVICE in {service.srv_name for service in node.services}
+    finally:
+        node.destroy_node()
+        node.generation.release()
+        rclpy.shutdown()
 
 
 def test_operator_actions_answer_with_an_outcome(node, monkeypatch):

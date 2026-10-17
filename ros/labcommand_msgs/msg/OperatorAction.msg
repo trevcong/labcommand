@@ -1,7 +1,8 @@
 # labcommand_msgs/OperatorAction: one operator action on the room memory, sent from the Mac.
 # Mac -> Spark as the request of the /room_memory/operator/action service (OperatorAction.srv, the
-# :8767 bridge's services capability), or on /room_memory/operator from a relay. The service
-# response only acknowledges; the effect is the Spark's next ChangeEvent or MapBricks.
+# :8767 bridge's services capability), or on /room_memory/operator from a relay. The node has both
+# only with operator_actions:=true. The service response only acknowledges; the effect is the
+# Spark's next ChangeEvent or MapBricks.
 # Contract: docs/ROOM-MEMORY-PROTOCOL.md in the LabCommand repo (section 3.6, D46).
 
 uint8 ACTION_ACKNOWLEDGE=0        # event: the operator has seen it; logged, no state change

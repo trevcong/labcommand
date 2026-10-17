@@ -6,6 +6,9 @@
 references, ``map_epoch`` and the publisher generation), and an empty or missing one stops the node;
 an empty ``map_sensor`` publishes the JT128's reference when it is configured, else the first
 sensor's. The defaults are ``MemoryConfig``'s, measured on the static recording.
+``operator_actions:=true`` (off by default) has the node subscribe to ``/room_memory/operator`` and
+offer ``/room_memory/operator/action`` (protocol D46); without it neither exists, because an
+operator action changes durable state and no caller on the ROS domain is authenticated.
 """
 
 from launch import LaunchDescription
@@ -47,7 +50,7 @@ ARGUMENTS = {
 
 # Node parameters that are not MemoryConfig fields (ARGUMENTS mirrors MemoryConfig exactly).
 NODE_ARGUMENTS = {
-    # The operator service changes durable state: off unless asked (D46).
+    # The operator topic and service change durable state: off unless asked (D46).
     "operator_actions": ("false", bool),
 }
 

@@ -136,7 +136,7 @@ The topic set, QoS and durability are protocol §2 (D18, D24), including the ope
 | `/room_memory/sync/events` | S→M | `ChangeEvent` | answers | reliable, volatile, keep-last 200 | — |
 | `/room_memory/sync/end` | S→M | `SyncEnd` (protocol §3.8) | one per `RequestSync` answer, after its messages | reliable, volatile, keep-last 10 | P17 as revised by D36; replaces `/room_memory/sync/events_fallback` and `EventsFallback`; published by both nodes |
 | `/room_memory/request_sync` | M→S | `RequestSync` | on connect and on a gap | reliable, volatile, keep-last 10 | carried as CDR bytes over `:8766` and relayed on the Spark (P11); not on the bridge |
-| `/room_memory/operator` | M→S | `OperatorAction` (protocol §3.6) | operator actions | reliable, volatile, keep-last 10 | same relay (P11) |
+| `/room_memory/operator` | M→S | `OperatorAction` (protocol §3.6) | operator actions; the node subscribes only with `operator_actions:=true` (D46) | reliable, volatile, keep-last 10 | same relay (P11) |
 
 The request transport in the last two rows is P11, a proposal. Protocol D28 and Q5 leave it open, with the data path: the dedicated bridge on :8767 or the existing one on :8765, and requests over bridge client publishing or over this relay. Trevor decides.
 
@@ -189,7 +189,7 @@ Protocol §2 (D24) makes `status`, `activity` and `epoch` transient_local. Both 
 | `activity` | transient_local (done) | 1 | the last `Activity` published, then the live stream |
 | `epoch` | transient_local (PR 2.4) | 1 | the last `Epoch` published, then the live stream |
 | `map_bricks`, `events`, the three sync topics | volatile, declared explicitly | 10, 100, 10, 200, 10 | nothing published before it subscribed; the Mac gets the map and recent events by `RequestSync` |
-| `request_sync`, `operator` (node subscriptions) | volatile | 10 | nothing stored; a restarted node never sees an old request or action again |
+| `request_sync`, `operator` (node subscriptions; `operator` only with `operator_actions:=true`, D46) | volatile | 10 | nothing stored; a restarted node never sees an old request or action again |
 
 **What a late joiner gets, in practice.**
 - The late joiner is usually the dedicated bridge, when the first Mac subscribes. It takes transient_local for a topic only if all of that topic's publishers are transient_local ([F2]).
@@ -381,7 +381,7 @@ Compared with the bridge's `clientPublish`:
 
 **Feasibility.** Publishing a `labcommand_msgs` type needs that type in `command_center.py`'s environment. If the API runs outside the ROS environment, it forwards the bytes instead to a localhost-only endpoint in the node, which publishes them. Either way the bytes are unchanged.
 
-`OperatorAction` (protocol §3.6) uses the same relay.
+`OperatorAction` (protocol §3.6) uses the same relay. The node subscribes to `/room_memory/operator` only with `operator_actions:=true` (D46), so a relay deployment turns that on.
 
 **Answers** follow protocol §5:
 - **Replay**, if `expected_generation` is the node's generation (D35), the requested `seq` is in the ring buffer and the epoch matches. Nothing, if the map `since` is already the newest.
@@ -508,7 +508,7 @@ XCDR1 has no extensibility. Decoders reject 4 or more unread trailing bytes and 
 
 ### 4.11 Operator actions (stage S5)
 
-The operator's actions change state on the Spark: acknowledge, accept, dismiss, label, mark ground truth, pause, resume and re-reference (re-baseline). P6's message for them is now in the protocol draft. It is defined once, in protocol §3.6 (D25) and `ros/labcommand_msgs/msg/OperatorAction.msg`, and is not repeated here. Topic `/room_memory/operator`, reliable, volatile, keep-last 10 (protocol §2). The Mac originates it, the relay (P11) publishes it on the Spark, and the node is its only subscriber.
+The operator's actions change state on the Spark: acknowledge, accept, dismiss, label, mark ground truth, pause, resume and re-reference (re-baseline). P6's message for them is now in the protocol draft. It is defined once, in protocol §3.6 (D25) and `ros/labcommand_msgs/msg/OperatorAction.msg`, and is not repeated here. Topic `/room_memory/operator`, reliable, volatile, keep-last 10 (protocol §2). The Mac originates it, the relay (P11) publishes it on the Spark, and the node is its only subscriber, only when it runs with `operator_actions:=true` (D46): any peer on the ROS domain can publish there.
 
 What Phase 3 adds around the message:
 - **No reply message.** The answer is what the Spark already publishes: the event's next transition, a status change, or for ACCEPT a delta with a `map_epoch` bump, then the ACCEPTED transition (protocol §4.2). During a bucket hold (§3.3) that pair waits together, and the event stays CONFIRMED on every Mac until the delta goes out. Acknowledge, label and ground-truth marks change nothing on the wire, so in v1 only the Mac that sent them shows them.
@@ -759,7 +759,7 @@ Each stage has an owner, go/no-go criteria and a rollback.
 | **S2** Spark shadow | PR 2.3 and 2.4 merged, including the room frame (P14) and the bucket (P15); room-memory container running `room_memory_cpp` only, no bridge; memory topics recorded to MCAP | Trevor deploys | room frame in the state directory (both transforms, or `frame_sensor` alone until the extrinsic, Q10); every recorded `MapBricks` and `ChangeEvent` in it, with z up; 24 h with no crash; p99 window < 200 ms; static-room false CONFIRMED ≤ Q3 bar; rig nudge → RIG_MOVED and no events; Spark goldens decode on the Mac | `docker stop` the memory container; the lidar stack is untouched |
 | **S3** read-only mirror | the dedicated bridge starts in the memory container (`address`, whitelist, `capabilities: []`); Tailscale grant for 8767; keyframes on (protocol D29, always; no relay yet); Mac connects with the flag on | Trevor (Spark, grant), Claude Code (app) | 24 h soak (§7.5): 0 wrong-current, 0 violations, ≤ 5 KB/s every hour; bridge kill → STALE ≤ 5 s → CURRENT within one P1 period (≤ 60 s) with no wrong frame | stop the dedicated bridge (the node keeps running); app flag off. If P12 is rejected: the `:8765` bridge image is rebuilt with `labcommand_msgs` and the memory topics are added to its whitelist, a scheduled bridge restart that interrupts LIVE; rollback is the previous pinned image |
 | **S4** resync requests | `:8766` relay (P11) live; keyframes stay on | Trevor (`command_center.py`), Claude Code | a forced gap recovers by replay; a forced 2-minute outage recovers by one snapshot; storm test within P3/P4 bounds | disable the relay endpoint; the Mac behaves as at S3 (keyframes only) |
-| **S5** operator actions | P6 accepted (the `.msg` and protocol §3.6 are in PR #13). **Built by D46:** the codecs and goldens in Swift, Python and C++, confirm/dismiss/accept in both engines (suppressions, the held ACCEPTED), both nodes' handler and log behind `operator_actions:=true`, and the app's buttons and outcomes. Still to do: `colcon build`, and LABEL, MARK_GROUND_TRUTH, PAUSE, RESUME and REREFERENCE (refused UNSUPPORTED) | Claude Code; Codex | accept bumps `map_epoch` on both ends and arrives as one delta followed by the ACCEPTED transition; an accept during a bucket hold keeps the overlay until its delta is applied; double-click is a no-op; a stale accept is refused and logged | disable the action endpoint; the app hides the buttons |
+| **S5** operator actions | P6 accepted (the `.msg` and protocol §3.6 are in PR #13). **Built by D46:** the codecs and goldens in Swift, Python and C++, confirm/dismiss/accept in both engines (suppressions, the held ACCEPTED), both nodes' handler and log, service and topic subscription alike, behind `operator_actions:=true`, and the app's buttons and outcomes. Still to do: `colcon build`, and LABEL, MARK_GROUND_TRUTH, PAUSE, RESUME and REREFERENCE (refused UNSUPPORTED) | Claude Code; Codex | accept bumps `map_epoch` on both ends and arrives as one delta followed by the ACCEPTED transition; an accept during a bucket hold keeps the overlay until its delta is applied; double-click is a no-op; a stale accept is refused and logged | disable the action endpoint; the app hides the buttons |
 | **S6** soak and product bar | 7-day soak; PR 3.2 scripted sessions | Trevor, Claude Code | §7.5 passes all week; PR 3.2 bar met (Q2, Q3) | stay at S5 and fix; memory mode stays opt-in |
 
 **Spark data rollback.**
@@ -777,7 +777,7 @@ None of these is in effect until accepted. Each would change `ROOM-MEMORY-PROTOC
 | P3 | Mac: memory-socket reconnect floor 5 s, failure count not reset by connections under 60 s; request backoff 5 → 30 s | protocol §5 | bounds reconnect and request storms (§3.2) |
 | P4 | Spark: ≤ 1 snapshot answer per topic per 15 s across clients; `events` answers through a shared 3 KB/s bucket with a 48 KB burst, repeats of a waiting `since` answered once; request inputs rate-limited | protocol §5 | the sync topics are shared, so answers multiply with clients |
 | P5 | No `mask` on CANDIDATE transitions | protocol §3.2 (allowed; this makes it the rule) | walk-throughs would otherwise cost 2–3 KB/s |
-| P6 | New `OperatorAction` message and `/room_memory/operator` topic (§4.11). **Written into protocol §3.6 and `OperatorAction.msg` by PR #13 (D25).** Codecs, goldens, the node handler and the `/room_memory/operator/action` service (off by default) are D46 (S5) | protocol §2, §3.6 (D25) | acknowledge, accept, dismiss, label, ground truth, pause, resume, re-reference |
+| P6 | New `OperatorAction` message and `/room_memory/operator` topic (§4.11). **Written into protocol §3.6 and `OperatorAction.msg` by PR #13 (D25).** Codecs, goldens, the node handler, the `/room_memory/operator/action` service and the topic subscription (both off by default) are D46 (S5) | protocol §2, §3.6 (D25) | acknowledge, accept, dismiss, label, ground truth, pause, resume, re-reference |
 | P7 | A snapshot instead of a delta whose payload would exceed half a snapshot's | protocol §3.1 | a large delta costs more than a snapshot and cannot be replayed cheaply |
 | P8 | The Mac requests right after subscribing, without the 5 s wait, with each topic's saved `since` (`SINCE_NONE` only without a usable baseline, §4.3). **Revised by D37:** right after the connection's first status names the publisher generation, with `expected_generation` and a fresh token (D35) | protocol §5 | the node cannot see a later client's connect through a shared bridge subscription (§4.3) |
 | P9 | Re-referencing after RIG_MOVED without alignment starts a new `room_id` generation | protocol §1.2, §4.1 | pre-move events are in a different frame (§4.9) |

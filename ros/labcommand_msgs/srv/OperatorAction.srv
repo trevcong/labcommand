@@ -1,6 +1,6 @@
 # labcommand_msgs/OperatorAction service: carries one OperatorAction to the room-memory node through
 # the :8767 bridge's services capability (protocol D46), on /room_memory/operator/action. The node
-# offers it only with operator_actions:=true.
+# offers it, and subscribes to the /room_memory/operator topic, only with operator_actions:=true.
 # Contract: docs/ROOM-MEMORY-PROTOCOL.md in the LabCommand repo (section 3.6).
 #
 # The request is exactly one OperatorAction, so its CDR has the message's layout. The response
