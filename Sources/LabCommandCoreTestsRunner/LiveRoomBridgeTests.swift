@@ -16,6 +16,8 @@ import Network
 @MainActor
 final class LRFakeBridge {
     static let serviceId: UInt32 = 41
+    /// The node's operator service (D46), advertised only when `operatorOutcome` or `operatorFailure` is set.
+    static let operatorServiceId: UInt32 = 43
     static let channelIds: [LiveRoomTopic: UInt32] = [
         .status: 1, .events: 2, .mapBricks: 3, .syncEvents: 4, .syncMapBricks: 5, .syncEnd: 6,
     ]
@@ -28,6 +30,11 @@ final class LRFakeBridge {
     private(set) var calls: [(callId: UInt32, encoding: String, request: RM.RequestSync?)] = []
     /// Every binary frame the client sent, by opcode.
     private(set) var clientOpcodes: [UInt8] = []
+    /// The operator service's answer to every call; with `operatorFailure`, a `serviceCallFailure` instead.
+    var operatorOutcome: RM.OperatorOutcome?
+    var operatorFailure: String?
+    /// Every operator call the client made, decoded.
+    private(set) var operatorCalls: [RM.OperatorAction] = []
     private var listener: NWListener?
     private var connection: NWConnection?
     private var subscriptions: [UInt32: UInt32] = [:]
@@ -94,6 +101,7 @@ final class LRFakeBridge {
         }
         send(text: json(["op": "advertise", "channels": channels]))
         if let serviceType { advertiseService(type: serviceType) }
+        if operatorOutcome != nil || operatorFailure != nil { advertiseOperatorService() }
         statusTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.publishStatus() }
         }
@@ -107,6 +115,16 @@ final class LRFakeBridge {
             // Another node's service the client must not take for the request path.
             ["id": Self.serviceId + 1, "name": "/other/sync/request", "type": LiveRoomClient.requestServiceType],
         ]]))
+    }
+
+    func advertiseOperatorService() {
+        send(text: json(["op": "advertiseServices", "services": [
+            ["id": Self.operatorServiceId, "name": LiveRoomClient.operatorService, "type": LiveRoomClient.operatorServiceType],
+        ]]))
+    }
+
+    func withdrawOperatorService() {
+        send(text: json(["op": "unadvertiseServices", "serviceIds": [Self.operatorServiceId]]))
     }
 
     func withdrawService() {
@@ -165,6 +183,21 @@ final class LRFakeBridge {
         }
         let serviceId = word(1), callId = word(5), length = Int(word(9))
         let encoding = String(decoding: bytes[13..<(13 + length)], as: UTF8.self)
+        if serviceId == Self.operatorServiceId {
+            if let action = try? RM.OperatorAction.decode(cdr: Data(bytes[(13 + length)...])) { operatorCalls.append(action) }
+            if let operatorFailure {
+                send(text: json(["op": "serviceCallFailure", "serviceId": serviceId, "callId": callId, "message": operatorFailure]))
+                return
+            }
+            var response = Data([FoxgloveProtocol.serviceCallResponseOpcode])
+            for value in [serviceId, callId, UInt32(3)] {
+                withUnsafeBytes(of: value.littleEndian) { response.append(contentsOf: $0) }
+            }
+            response.append(Data("cdr".utf8))
+            response.append(Data([0x00, 0x01, 0x00, 0x00, operatorOutcome?.rawValue ?? 0]))
+            send(binary: response)
+            return
+        }
         let request = try? RM.RequestSync.decode(cdr: Data(bytes[(13 + length)...]))
         calls.append((callId, encoding, request))
         guard serviceId == Self.serviceId, let request else { return }

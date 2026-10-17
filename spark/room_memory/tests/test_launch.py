@@ -120,6 +120,9 @@ def test_every_side_names_the_same_operator_service():
     cpp_node = (ROOT / "spark/room_memory_cpp/node/room_memory_node.cpp").read_text()
     assert f'constexpr const char* kOperatorService = "{OPERATOR_SERVICE}";' in cpp_node
     assert 'constexpr const char* kOperatorTopic = "/room_memory/operator";' in cpp_node
+    swift = (ROOT / "Sources/LabCommandCore/LiveRoom/LiveRoomClient.swift").read_text()
+    assert f'public static let operatorService = "{OPERATOR_SERVICE}"' in swift
+    assert 'public static let operatorServiceType = "labcommand_msgs/srv/OperatorAction"' in swift
 
 
 def test_operator_service_is_one_action_and_one_outcome():

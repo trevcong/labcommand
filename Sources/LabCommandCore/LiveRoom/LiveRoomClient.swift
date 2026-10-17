@@ -14,14 +14,18 @@ public struct LiveRoomServer: Sendable, Equatable {
     /// The bridge's id for the node's `RequestSync` service (D39), while it is advertised and this
     /// client may send requests. Nil until `advertiseServices` names it, and again after a withdrawal.
     public var requestServiceId: UInt32?
+    /// The bridge's id for the node's `OperatorAction` service (D46), while it is advertised. Nil
+    /// for a Spark that takes no actions (the service is off by default).
+    public var operatorServiceId: UInt32?
 
     public init(name: String, capabilities: [String], canPublish: Bool, memoryTopics: [String],
-                requestServiceId: UInt32? = nil) {
+                requestServiceId: UInt32? = nil, operatorServiceId: UInt32? = nil) {
         self.name = name
         self.capabilities = capabilities
         self.canPublish = canPublish
         self.memoryTopics = memoryTopics
         self.requestServiceId = requestServiceId
+        self.operatorServiceId = operatorServiceId
     }
 }
 
@@ -72,6 +76,10 @@ public final class LiveRoomClient: ObservableObject {
     /// `RequestSync`, so the call carries the message's CDR unchanged.
     public static let requestService = "/room_memory/sync/request"
     public static let requestServiceType = "labcommand_msgs/srv/RequestSync"
+    /// The node's service for `OperatorAction` (D46): one action in, one outcome back. The effect
+    /// is observed on the wire, as for `RequestSync`.
+    public static let operatorService = "/room_memory/operator/action"
+    public static let operatorServiceType = "labcommand_msgs/srv/OperatorAction"
     /// URLSession's default cap is 1 MiB; a snapshot may reach 16 MiB raw (D22).
     static let maxMessageBytes = 64 << 20
     static let logCapacity = 200
@@ -80,6 +88,8 @@ public final class LiveRoomClient: ObservableObject {
     @Published public private(set) var mirror: RoomMemoryMirror
     /// Diagnostics, newest last.
     @Published public private(set) var log: [String] = []
+    /// The operator's actions and their outcomes (D46).
+    @Published public private(set) var operatorDesk = LiveRoomOperator()
 
     /// Another path for `RequestSync` (the `:8766` relay, Phase 3 P11). Return true when sent.
     /// Used when the bridge offers neither the request service nor `clientPublish`. Set it before `start()`.
@@ -94,6 +104,12 @@ public final class LiveRoomClient: ObservableObject {
         return requestSyncSink != nil ? .relay : .unavailable
     }
 
+    /// The node's operator service is advertised and this client may call it.
+    public var operatorPath: Bool {
+        guard publishRequests, case .connected(let server) = connection else { return false }
+        return server.operatorServiceId != nil
+    }
+
     public let url: URL
     /// False keeps the client read-only: it never advertises a channel or sends a request.
     public let publishRequests: Bool
@@ -103,6 +119,12 @@ public final class LiveRoomClient: ObservableObject {
     /// Bumped by `start()`; a cancelled run that is still unwinding must not touch the new one.
     private var runGeneration = 0
     private var link: Link?
+
+    /// What a service call asked: a `RequestSync` (described) or an `OperatorAction` (its action id).
+    private enum PendingCall {
+        case requestSync(String)
+        case operatorAction(String)
+    }
 
     /// Per-connection socket state.
     private struct Link {
@@ -118,8 +140,8 @@ public final class LiveRoomClient: ObservableObject {
         /// The bridge offers `services` and this client may send requests.
         var mayCallServices = false
         var nextCallId: UInt32 = 1
-        /// Service calls awaiting a response or failure: call id → what was asked.
-        var pendingCalls: [UInt32: String] = [:]
+        /// Service calls awaiting a response or failure.
+        var pendingCalls: [UInt32: PendingCall] = [:]
         var failure: String?
     }
 
@@ -165,6 +187,7 @@ public final class LiveRoomClient: ObservableObject {
             if current.mirrorOpened { mirror.connectionClosed(at: Self.now) }
             link = nil
         }
+        operatorDesk.connectionLost()
         connection = .off
     }
 
@@ -223,6 +246,7 @@ public final class LiveRoomClient: ObservableObject {
             mirror.connectionClosed(at: Self.now)
         }
         link = nil
+        operatorDesk.connectionLost()
         return (opened, reason)
     }
 
@@ -237,6 +261,7 @@ public final class LiveRoomClient: ObservableObject {
             }
         }
         perform(mirror.tick(at: now))
+        operatorDesk.reconcile(mirror, at: now)
     }
 
     private func fail(_ reason: String) {
@@ -351,24 +376,54 @@ public final class LiveRoomClient: ObservableObject {
         guard var current = link, var server = current.server else { return }
         switch message {
         case .advertise(let services):
-            guard current.mayCallServices,
-                  let service = services.first(where: { $0.name == Self.requestService }) else { return }
-            guard service.type == Self.requestServiceType else {
-                note("\(service.name) advertised as \(service.type); not used")
-                return
+            guard current.mayCallServices else { return }
+            var changed = false
+            for service in services {
+                let expected: String
+                switch service.name {
+                case Self.requestService: expected = Self.requestServiceType
+                case Self.operatorService: expected = Self.operatorServiceType
+                default: continue
+                }
+                guard service.type == expected else {
+                    note("\(service.name) advertised as \(service.type); not used")
+                    continue
+                }
+                if service.name == Self.requestService {
+                    server.requestServiceId = service.id
+                    note("RequestSync goes through the bridge's \(service.name) service")
+                } else {
+                    server.operatorServiceId = service.id
+                    note("operator actions go through the bridge's \(service.name) service")
+                }
+                changed = true
             }
-            server.requestServiceId = service.id
-            note("RequestSync goes through the bridge's \(service.name) service")
+            guard changed else { return }
         case .unadvertise(let ids):
-            guard let id = server.requestServiceId, ids.contains(id) else { return }
-            server.requestServiceId = nil
-            note("\(Self.requestService) withdrawn")
+            var changed = false
+            if let id = server.requestServiceId, ids.contains(id) {
+                server.requestServiceId = nil
+                note("\(Self.requestService) withdrawn")
+                changed = true
+            }
+            if let id = server.operatorServiceId, ids.contains(id) {
+                server.operatorServiceId = nil
+                note("\(Self.operatorService) withdrawn")
+                changed = true
+            }
+            guard changed else { return }
         case .failure(_, let callId, let reason):
             guard let asked = current.pendingCalls.removeValue(forKey: callId) else { return }
             link = current
-            // The bridge did not reach the node: the request was not carried.
-            mirror.noteRequestUnsent()
-            note("RequestSync \(asked) failed on the bridge: \(reason)")
+            switch asked {
+            case .requestSync(let what):
+                // The bridge did not reach the node: the request was not carried.
+                mirror.noteRequestUnsent()
+                note("RequestSync \(what) failed on the bridge: \(reason)")
+            case .operatorAction(let actionId):
+                operatorDesk.callFailed(actionId: actionId, reason: reason)
+                note("OperatorAction \(actionId) failed on the bridge: \(reason)")
+            }
             return
         }
         current.server = server
@@ -381,11 +436,17 @@ public final class LiveRoomClient: ObservableObject {
 
     private func handle(frame: Data) {
         if let response = FoxgloveProtocol.parseServiceCallResponse(frame) {
-            let asked = link?.pendingCalls.removeValue(forKey: response.callId) ?? "call \(response.callId)"
-            switch Self.requestAccepted(response) {
-            case true?: note("RequestSync \(asked) accepted by the node")
-            case false?: note("RequestSync \(asked) refused by the node (bad request or another room)")
-            case nil: note("RequestSync \(asked): unreadable response (\(response.payload.count) bytes)")
+            switch link?.pendingCalls.removeValue(forKey: response.callId) {
+            case .operatorAction(let actionId):
+                let outcome = response.encoding == FoxgloveProtocol.cdrEncoding
+                    ? RoomMemory.OperatorOutcome.decodeResponse(response.payload) : nil
+                operatorDesk.response(actionId: actionId, outcome: outcome, at: Self.now)
+                operatorDesk.reconcile(mirror, at: Self.now)
+                note("OperatorAction \(actionId): \(outcome.map { "\($0)" } ?? "unreadable response (\(response.payload.count) bytes)")")
+            case .requestSync(let asked):
+                logRequestResponse(response, asked: asked)
+            case nil:
+                logRequestResponse(response, asked: "call \(response.callId)")
             }
             return
         }
@@ -398,6 +459,61 @@ public final class LiveRoomClient: ObservableObject {
         if mirror.activity.rejected > rejected {
             note("\(topic.rawValue): message rejected (\(data.payload.count) bytes)")
         }
+        operatorDesk.reconcile(mirror, at: Self.now)
+    }
+
+    private func logRequestResponse(_ response: FoxgloveProtocol.ServiceCallResponse, asked: String) {
+        switch Self.requestAccepted(response) {
+        case true?: note("RequestSync \(asked) accepted by the node")
+        case false?: note("RequestSync \(asked) refused by the node (bad request or another room)")
+        case nil: note("RequestSync \(asked): unreadable response (\(response.payload.count) bytes)")
+        }
+    }
+
+    // MARK: Operator actions
+
+    /// The name an action carries: the `operatorName` default when set, else the macOS user name,
+    /// cut to 64 UTF-8 bytes. Self-asserted, not authenticated.
+    public nonisolated static func operatorName(_ defaults: UserDefaults = .standard) -> String {
+        let chosen = defaults.string(forKey: "operatorName")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var name = (chosen?.isEmpty == false ? chosen : nil) ?? NSUserName()
+        while name.utf8.count > RoomMemory.OperatorAction.operatorIdMaxBytes { name.removeLast() }
+        return name.isEmpty ? "operator" : name
+    }
+
+    /// Sends `kind` on `entry` as the operator sees it now. False when nothing went out (no
+    /// operator service, or the action does not apply); the desk says why.
+    @discardableResult
+    public func act(_ kind: LiveRoomOperator.Kind, on entry: LiveRoomEvent, note text: String = "") -> Bool {
+        guard let action = LiveRoomOperator.make(
+            kind, entry: entry, mirror: mirror, seq: operatorDesk.takeSeq(), operatorId: Self.operatorName(),
+            stamp: RoomMemory.Time(date: Date()), actionId: UUID().uuidString.lowercased(), text: text
+        ) else { return false }
+        return deliver(action, kind: kind)
+    }
+
+    /// Sends an action whose outcome is unknown again, with the same id and payload.
+    @discardableResult
+    public func retry(actionId: String) -> Bool {
+        guard let pending = operatorDesk.retry(actionId: actionId, mirror: mirror) else { return false }
+        return deliver(pending.action, kind: pending.kind)
+    }
+
+    private func deliver(_ action: RoomMemory.OperatorAction, kind: LiveRoomOperator.Kind) -> Bool {
+        var delivered = false
+        if operatorPath, case .connected(let server) = connection, let serviceId = server.operatorServiceId,
+           let payload = try? action.encodedCDR(), var current = link {
+            let callId = current.nextCallId
+            current.nextCallId &+= 1
+            current.pendingCalls[callId] = .operatorAction(action.actionId)
+            link = current
+            send(.data(FoxgloveProtocol.serviceCallRequest(serviceId: serviceId, callId: callId, payload: payload)))
+            delivered = true
+        }
+        operatorDesk.sent(action, kind: kind, mirror: mirror, delivered: delivered, at: Self.now)
+        note("OperatorAction \(action.action) event \(action.eventId.map(String.init) ?? "NONE") id \(action.actionId) " +
+             (delivered ? "sent to \(Self.operatorService)" : "not sent: no operator service"))
+        return delivered
     }
 
     // MARK: Requests
@@ -425,7 +541,7 @@ public final class LiveRoomClient: ObservableObject {
             guard let payload = try? request.encodedCDR(), var current = link else { return nil }
             let callId = current.nextCallId
             current.nextCallId &+= 1
-            current.pendingCalls[callId] = asked
+            current.pendingCalls[callId] = .requestSync(asked)
             link = current
             send(.data(FoxgloveProtocol.serviceCallRequest(serviceId: serviceId, callId: callId, payload: payload)))
             return "sent to \(Self.requestService)"
