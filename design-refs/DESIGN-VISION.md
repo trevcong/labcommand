@@ -124,7 +124,7 @@ Density first: the four-stage rail is one row; health is a single strip above it
 - `StageCell` — label, verb+pip, detail, optional telemetry rows, Diagnose if blocked.
 - `ActionRow` — Start path / Record / Stop all, always present in Capture and Focus.
 - `HealthStrip` — band word + headline reason; score only if non-nil.
-- `MissionLine` — `HH:mm:ss` + kind + text from `MissionLog`.
+- `MissionLine` — `yyyy-MM-dd HH:mm:ss` + kind + text from `MissionLog`.
 - `SessionRow` — file-derived bytes/points/PTP/tags; notes from disk.
 
 ## Keyboard and menu-bar

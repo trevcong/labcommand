@@ -98,6 +98,9 @@ int main(int argc, char** argv) {
     std::int64_t max_run[2] = {0, 0};
     std::vector<double> tracking_ms;
     std::vector<double> building_ms;
+    std::vector<double> icp_ms;         // with rig_guard: the guard's ICP time in each window that ran it
+    std::vector<double> icp_window_ms;  // and those windows' whole close_window + map_update time
+    std::int64_t icp_estimates = 0;
 
     const auto close_window = [&] {
         const msg::Time stamp = time_of(window_end);
@@ -108,9 +111,16 @@ int main(int argc, char** argv) {
         const bool tracking = memory->state() != msg::MemoryState::building;
         (tracking ? tracking_ms : building_ms).push_back(ms);
         if (tracking && tracking_since < 0) tracking_since = window_end;
-        std::printf("window %" PRId64 " %.3f %s %.2f ms frames %" PRId64 " %" PRId64 "\n", windows,
+        std::printf("window %" PRId64 " %.3f %s %.2f ms frames %" PRId64 " %" PRId64, windows,
                     static_cast<double>(window_end - first_ns) / 1e9, msg::name(memory->state()), ms, frames[0],
                     frames[1]);
+        if (memory->window_estimates() > 0) {
+            icp_ms.push_back(memory->window_estimate_ms());
+            icp_window_ms.push_back(ms);
+            icp_estimates += memory->window_estimates();
+            std::printf(" icp %" PRId64 " %.2f ms", memory->window_estimates(), memory->window_estimate_ms());
+        }
+        std::printf("\n");
         frames[0] = frames[1] = 0;
         for (int sensor = 0; sensor < 2; ++sensor) {
             if (std::find(config.sensors.begin(), config.sensors.end(), names[sensor]) == config.sensors.end()) continue;
@@ -226,6 +236,11 @@ int main(int argc, char** argv) {
     const auto maximum = [](const std::vector<double>& values) {
         return values.empty() ? 0.0 : *std::max_element(values.begin(), values.end());
     };
+    const auto p95 = [](std::vector<double> values) {
+        if (values.empty()) return 0.0;
+        std::sort(values.begin(), values.end());
+        return values[std::min(values.size() - 1, (values.size() * 95 + 99) / 100 - 1)];
+    };
     const double duration = static_cast<double>(window_end - window_ns - first_ns) / 1e9;
     const double tracked = tracking_since < 0 ? 0.0 : static_cast<double>(window_end - window_ns - tracking_since) / 1e9;
     std::printf(
@@ -235,11 +250,14 @@ int main(int argc, char** argv) {
         ", \"activity\": %" PRIu64 "}, \"messages\": {\"snapshot\": %" PRIu64 ", \"delta\": %" PRIu64
         ", \"status\": %" PRIu64 ", \"events\": %" PRIu64 ", \"activity\": %" PRIu64 ", \"active\": %" PRId64
         "}, \"max_run\": {\"mid360\": %" PRId64 ", \"jt128\": %" PRId64 "}, \"window_ms\": {\"building_median\": %.2f, \"building_max\": %.2f, "
-        "\"tracking_median\": %.2f, \"tracking_max\": %.2f}}\n",
+        "\"tracking_median\": %.2f, \"tracking_max\": %.2f}, \"icp\": {\"windows\": %zu, \"estimates\": %" PRId64
+        ", \"ms_median\": %.2f, \"ms_p95\": %.2f, \"ms_max\": %.2f, \"window_ms_median\": %.2f, "
+        "\"window_ms_p95\": %.2f, \"window_ms_max\": %.2f}}\n",
         duration, windows, tracking_since < 0 ? -1.0 : static_cast<double>(tracking_since - first_ns) / 1e9, tracked,
         events_total, snapshots.bytes, deltas.bytes, statuses.bytes, events.bytes, activities.bytes, snapshots.count,
         deltas.count, statuses.count, events.count, activities.count, active_messages, max_run[0], max_run[1],
         median(building_ms), maximum(building_ms), median(tracking_ms),
-        maximum(tracking_ms));
+        maximum(tracking_ms), icp_ms.size(), icp_estimates, median(icp_ms), p95(icp_ms), maximum(icp_ms),
+        median(icp_window_ms), p95(icp_window_ms), maximum(icp_window_ms));
     return 0;
 }

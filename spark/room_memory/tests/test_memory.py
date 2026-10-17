@@ -929,6 +929,8 @@ def test_launch_files_carry_the_memory_config_defaults(launch):
         value = getattr(defaults, field.name)
         if field.name == "sensors":
             assert ast.literal_eval(text) == list(value)
+        elif isinstance(value, bool):
+            assert text == str(value).lower(), field.name
         elif isinstance(value, str):
             assert text == value, field.name
         else:
@@ -969,6 +971,17 @@ def test_a_gap_breaks_the_run():
     box = region("appeared", block(0))
     tracker = CandidateTracker(5, 1, 1, 20, 0.9)
     assert run_tracker(tracker, [[box]] * 4 + [None] + [[box]] * 5) == [9]
+
+
+def test_a_hold_defers_promotion_to_the_first_window_without_it():
+    """A rig guard check holds every promotion; the run keeps counting and promotes once released."""
+    box = region("appeared", block(0))
+    tracker = CandidateTracker(3, 1, 1, 20, 0.9)
+    ids = iter(range(100, 1000))
+    held = [tracker.update([box], stamp(n), lambda: next(ids), None, True) for n in range(5)]
+    assert held == [[]] * 5 and tracker.pending[0].windows == 5
+    [(state, candidate)] = tracker.update([box], stamp(5), lambda: next(ids))
+    assert state == EventState.CANDIDATE and candidate.event_id == 100
 
 
 def test_a_gap_window_in_the_engine_interrupts_pending_regions():

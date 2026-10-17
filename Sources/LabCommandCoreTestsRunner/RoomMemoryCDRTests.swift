@@ -4,7 +4,8 @@ import LabCommandCore
 // MARK: - Hand-Derived Goldens (PR 0.2)
 
 // Tests/Fixtures/room/golden/hand/*.hex were written byte by byte from the .msg files and the
-// CDR rules, not produced by the encoder, so encoding to them is not circular. Spark goldens
+// CDR rules (imu_le.hex from ROS 2 Jazzy's sensor_msgs/msg/Imu.msg), not produced by the encoder,
+// so encoding to them is not circular. Spark goldens
 // from rclpy (scripts/spark/make_room_memory_goldens.py, same values) are a follow-up.
 // DEFLATE and LZFSE output is not canonical, so the compressed goldens carry hand-built stored
 // blocks: they pin the bytes up to the payload, and the uncompressed payload the encoder's stream
@@ -85,6 +86,33 @@ private let goldenActivityIdle = Room.Activity(
     centroid: nil,
     aabb: nil,
     sinceS: nil
+)
+
+private let goldenRigPose = Room.RigPose(
+    header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 22, stamp: t10),
+    outcome: .realigned,
+    causes: [.imuShock, .periodic],
+    sensors: .all,
+    channel: .init(mid360: .moved, jt128: .inPlace),
+    frameEpoch: 40,
+    realignedCount: 16_909_060,
+    mid360Pose: .init(translation: SIMD3(0.03125, -0.0625, 0), rotation: SIMD4(0.5, 0.5, 0.5, 0.5)),
+    jt128Pose: .init(translation: .zero, rotation: SIMD4(0, 0, 0, 1)),
+    deltaM: .init(mid360: 0.03125, jt128: nil),
+    deltaDeg: .init(mid360: 0.5, jt128: nil),
+    inlierFrac: .init(mid360: 0.75, jt128: 0.875),
+    rmsM: .init(mid360: 0.0078125, jt128: 0.00390625),
+    observe: .init(mid360: 0.25, jt128: 0.125),
+    tiltDeg: 0.25,
+    imuOK: true,
+    movedAt: Room.Time(sec: 1_760_400_005, nanosec: 500_000_000)
+)
+
+private let goldenImu = Room.ImuSample(
+    stamp: t10,
+    frameId: "livox_frame",
+    angularVelocity: SIMD3(0.015625, -0.03125, 0.5),
+    linearAcceleration: SIMD3(0.0078125, -0.0, -1.0)
 )
 
 private let goldenDelta = Room.MapBricks(
@@ -187,6 +215,7 @@ private func v2<M>(_ message: M, _ set: (inout M) -> Void) -> M {
 private let goldenStatusV2 = v2(goldenStatus) { $0.publisherGeneration = goldenGeneration }
 private let goldenEpochV2 = v2(goldenEpoch) { $0.publisherGeneration = goldenGeneration }
 private let goldenActivityV2 = v2(goldenActivity) { $0.publisherGeneration = goldenGeneration }
+private let goldenRigPoseV2 = v2(goldenRigPose) { $0.publisherGeneration = goldenGeneration }
 private let goldenDeltaV2 = v2(goldenDelta) { $0.publisherGeneration = goldenGeneration }
 private let goldenAppearedV2 = v2(goldenAppeared) { $0.publisherGeneration = goldenGeneration }
 private let goldenMovedV2 = v2(goldenMoved) {
@@ -230,6 +259,7 @@ private let v2LegacyTwin: [String: String] = [
     "epoch_v2_le": "epoch_le",
     "epoch_v2_be": "epoch_be",
     "activity_v2_le": "activity_le",
+    "rig_pose_v2_le": "rig_pose_le",
 ]
 
 /// Where a compressed golden keeps its payload, in stream positions (after the 4-byte header).
@@ -292,6 +322,9 @@ private let littleEndianGoldens: [Golden] = [
     golden("activity_idle_le", goldenActivityIdle, decode: Room.Activity.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("activity_v2_le", goldenActivityV2, decode: Room.Activity.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("epoch_v2_le", goldenEpochV2, decode: Room.Epoch.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("rig_pose_le", goldenRigPose, decode: Room.RigPose.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("rig_pose_v2_le", goldenRigPoseV2, decode: Room.RigPose.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("imu_le", goldenImu, decode: Room.ImuSample.decode(cdr:), encode: { try $0.encodedCDR() }),
 ]
 
 private let bigEndianGoldens: [Golden] = [
@@ -383,6 +416,27 @@ func testRoomGoldenSemantics() {
     expect(goldenRequestNone.since == nil && goldenRequestMap.since?.seq == 12, "SINCE_NONE decodes to a nil since")
     expect(Room.MapBricks(header: goldenDelta.header, kind: .snapshot, baseEpoch: 0, voxelSize: 0.05, bricks: []).compression == .zlib,
            "MapBricks compresses with zlib unless told otherwise")
+    do {
+        let rig = try Room.RigPose.decode(cdr: goldenBytes("rig_pose_le"))
+        expect(rig.deltaM.jt128 == nil && rig.deltaDeg.jt128 == nil && rig.deltaM.mid360 == 0.03125,
+               "golden rig pose: a NaN pair entry is nil next to a measured one")
+        expect(rig.jt128Pose?.rotation == SIMD4(0, 0, 0, 1) && rig.movedAt?.sec == 1_760_400_005,
+               "golden rig pose: the identity JT128 pose and moved_at are kept")
+        var none = goldenRigPose
+        none.mid360Pose = nil
+        none.tiltDeg = nil
+        none.movedAt = nil
+        let bytes = try none.encodedCDR()
+        let decodedNone = try Room.RigPose.decode(cdr: bytes)
+        expect(bytes[(4 + 52)..<(4 + 80)] == Data((0..<7).flatMap { _ in f32(.nan) }) && decodedNone == none,
+               "rig pose: an unconfigured sensor (NaN × 7), no tilt and moved_at {0, 0} decode to nil")
+        expect(bytes[(4 + 156)..<(4 + 164)] == Data(count: 8), "rig pose: a nil moved_at is {0, 0} on the wire")
+        let imu = try Room.ImuSample.decode(cdr: goldenBytes("imu_le"))
+        expect(imu.linearAcceleration.y.sign == .minus && imu.linearAcceleration.z == -1,
+               "golden imu: the sign of -0.0 survives the float64 decode")
+    } catch {
+        expect(false, "rig pose and imu semantics: \(error)")
+    }
 }
 
 func testRoomLayoutDetection() {
@@ -400,6 +454,10 @@ func testRoomLayoutDetection() {
         expect(goldenBytes("map_bricks_delta_v2_le").count == goldenBytes("map_bricks_delta_le").count + 6 + 8, "delta v2 = legacy + 6 pad + 8")
         expect(goldenBytes("change_event_appeared_v2_le").count == 148, "appeared v2 event is 148 bytes")
         expect(goldenBytes("change_event_moved_mask_v2_le").count == 364, "masked v2 event is 364 bytes")
+        // RigPose: moved_at ends at 164, 4 short of 8-alignment.
+        expect(goldenBytes("rig_pose_v2_le").count == goldenBytes("rig_pose_le").count + 4 + 8, "rig pose v2 = legacy + 4 pad + 8")
+        expect(goldenBytes("rig_pose_v2_le").count == 180, "v2 rig pose for lab is 180 bytes, the header included")
+        expect(goldenBytes("imu_le").count == 4 + 320, "Imu with a 12-byte frame_id is 320 bytes")
         // SyncEnd: an empty list is followed by the next count at once; elements align to 8.
         expect(try goldenSyncEndEmpty.encodedCDR().count == 84, "SyncEnd d=0 u=0 is 84 bytes")
         expect(try v2(goldenSyncEndEmpty) { $0.bound = 5; $0.delivered = [0...5] }.encodedCDR().count == 88 + 16, "SyncEnd d=1 u=0")
@@ -468,6 +526,8 @@ func testRoomTruncationAlwaysThrows() {
                "v2 epoch cut at its state is the legacy golden")
         expect(try Room.Activity.decode(cdr: goldenBytes("activity_v2_le").prefix(84 + 4)) == goldenActivity,
                "v2 activity cut at since_s is the legacy golden")
+        expect(try Room.RigPose.decode(cdr: goldenBytes("rig_pose_v2_le").prefix(164 + 4)) == goldenRigPose,
+               "v2 rig pose cut at moved_at is the legacy golden")
     } catch {
         expect(false, "v2 goldens cut at the legacy length decode: \(error)")
     }
@@ -617,6 +677,9 @@ private func v2MalformedCases() -> [(String, Outcome, () throws -> Bool)] {
     let epoch = { (data: Data) in try Room.Epoch.decode(cdr: data) == goldenEpochV2 }
     let activity = { (data: Data) in try Room.Activity.decode(cdr: data) == goldenActivity }
     let idle = { (data: Data) in try Room.Activity.decode(cdr: data) == goldenActivityIdle }
+    let rig = { (data: Data) in try Room.RigPose.decode(cdr: data) == goldenRigPose }
+    let imu = { (data: Data) in try Room.ImuSample.decode(cdr: data) == goldenImu }
+    let pose = "rig_pose_le"
     let legacyStatus = goldenBytes("memory_status_le")
     let legacyRequest = goldenBytes("request_sync_events_none_le")
     let end = "sync_end_events_fallback_le"
@@ -644,6 +707,26 @@ private func v2MalformedCases() -> [(String, Outcome, () throws -> Bool)] {
         ("Activity undefined sensor bit", .invalid, { try activity(patched("activity_le", at: 33, [7])) }),
         ("Activity since_s negative", .invalid, { try activity(patched("activity_le", at: 80, f32(-1))) }),
         ("inactive Activity with a region", .invalid, { try idle(patched("activity_idle_le", at: 36, le32(1))) }),
+        ("v2 rig pose generation 0", .invalid, { try rig(patched("rig_pose_v2_le", at: 168, le64(0))) }),
+        ("v2 rig pose + 4 trailing bytes", .invalid, { try rig(goldenBytes("rig_pose_v2_le") + Data(count: 4)) }),
+        ("RigPose outcome 6", .invalid, { try rig(patched(pose, at: 32, [6])) }),
+        ("RigPose undefined cause bit", .invalid, { try rig(patched(pose, at: 33, [0x49])) }),
+        ("RigPose undefined sensor bit", .invalid, { try rig(patched(pose, at: 34, [7])) }),
+        ("RigPose channel 5", .invalid, { try rig(patched(pose, at: 35, [5])) }),
+        ("RigPose IN_PLACE for a sensor outside sensors", .invalid, { try rig(patched(pose, at: 34, [1])) }),
+        ("RigPose pose partly NaN", .invalid, { try rig(patched(pose, at: 52, f32(.nan))) }),
+        ("RigPose pose infinite", .invalid, { try rig(patched(pose, at: 80, f32(.infinity))) }),
+        ("RigPose quaternion norm 1.1", .invalid, { try rig(patched(pose, at: 104, f32(1.1))) }),
+        ("RigPose delta_deg 181", .invalid, { try rig(patched(pose, at: 116, f32(181))) }),
+        ("RigPose inlier_frac 1.5", .invalid, { try rig(patched(pose, at: 124, f32(1.5))) }),
+        ("RigPose rms_m negative", .invalid, { try rig(patched(pose, at: 132, f32(-0.01))) }),
+        ("RigPose observe infinite", .invalid, { try rig(patched(pose, at: 140, f32(.infinity))) }),
+        ("RigPose tilt_deg 181", .invalid, { try rig(patched(pose, at: 148, f32(181))) }),
+        ("RigPose imu_ok 2", .invalid, { try rig(patched(pose, at: 152, [2])) }),
+        ("RigPose moved_at nanosec 1e9", .invalid, { try rig(patched(pose, at: 160, le32(1_000_000_000))) }),
+        ("Imu angular_velocity NaN", .invalid, { try imu(patched("imu_le", at: 128, le64(Double.nan.bitPattern))) }),
+        ("Imu linear_acceleration infinite", .invalid, { try imu(patched("imu_le", at: 240, le64(Double.infinity.bitPattern))) }),
+        ("Imu frame_id length past the end", .truncated, { try imu(patched("imu_le", at: 8, le32(0xFFFF_FFFF))) }),
         ("SyncEnd generation 0", .invalid, { try empty(patched("sync_end_events_empty_le", at: 32, le64(0))) }),
         ("SyncEnd topic 2", .invalid, { try fallback(patched(end, at: 56, [2])) }),
         ("SyncEnd bound below a delivered range", .invalid, { try fallback(patched(end, at: 64, le64(119))) }),
@@ -725,6 +808,11 @@ func testRoomEncoderEnforcesContract() {
     let endAdjacent = v2(goldenSyncEndFallback) { $0.delivered = [10...20, 21...120]; $0.unavailable = [] }
     let endOverlap = v2(goldenSyncEndFallback) { $0.unavailable = [11...21] }
     let endMapUnavailable = v2(goldenSyncEndFallback) { $0.topic = .mapBricks }
+    let rigZeroMovedAt = v2(goldenRigPose) { $0.movedAt = Room.Time(sec: 0, nanosec: 0) }
+    let rigChannelOutside = v2(goldenRigPose) { $0.sensors = .jt128 }
+    let rigGenerationZero = v2(goldenRigPose) { $0.publisherGeneration = 0 }
+    let rigNegativeDelta = v2(goldenRigPose) { $0.deltaM.jt128 = -1 }
+    let imuInfinite = v2(goldenImu) { $0.angularVelocity.x = .infinity }
 
     let cases: [(String, () throws -> Data)] = [
         ("duplicate brick", { try unsorted.encodedCDR() }),
@@ -765,6 +853,11 @@ func testRoomEncoderEnforcesContract() {
         ("SyncEnd adjacent ranges", { try endAdjacent.encodedCDR() }),
         ("SyncEnd delivered overlaps unavailable", { try endOverlap.encodedCDR() }),
         ("SyncEnd map answer with unavailable", { try endMapUnavailable.encodedCDR() }),
+        ("RigPose moved_at {0, 0} as a value", { try rigZeroMovedAt.encodedCDR() }),
+        ("RigPose MOVED for a sensor outside sensors", { try rigChannelOutside.encodedCDR() }),
+        ("RigPose generation 0", { try rigGenerationZero.encodedCDR() }),
+        ("RigPose negative delta_m", { try rigNegativeDelta.encodedCDR() }),
+        ("Imu infinite angular velocity", { try imuInfinite.encodedCDR() }),
     ]
     for (label, body) in cases {
         do {
@@ -953,6 +1046,43 @@ private struct MessageFactory {
             state: Room.MemoryState.allCases[below(5)]
         )
     }
+
+    mutating func rigPose() -> Room.RigPose {
+        let sensors = Room.Sensors(rawValue: UInt8(below(4)))
+        func channel(_ bit: Room.Sensors, _ factory: inout MessageFactory) -> Room.RigPose.Channel {
+            let outside: [Room.RigPose.Channel] = [.none, .unavailable]
+            return sensors.contains(bit) ? Room.RigPose.Channel.allCases[factory.below(5)] : outside[factory.below(2)]
+        }
+        func pose(_ factory: inout MessageFactory) -> Room.RigPose.Pose? {
+            guard factory.coin() else { return nil }
+            let q = SIMD4(factory.coordinate(), factory.coordinate(), factory.coordinate(), factory.coordinate())
+            let norm = (q * q).sum().squareRoot()
+            return .init(translation: factory.vector(), rotation: norm > 0.1 ? q / norm : SIMD4(0, 0, 0, 1))
+        }
+        func pair(_ high: Float, _ factory: inout MessageFactory) -> Room.SensorPair<Float?> {
+            .init(mid360: factory.coin() ? factory.fraction() * high : nil, jt128: factory.coin() ? factory.fraction() * high : nil)
+        }
+        return Room.RigPose(
+            header: header(),
+            outcome: Room.RigPose.Outcome.allCases[below(6)],
+            causes: Room.RigPose.Causes(rawValue: UInt8(below(64))),
+            sensors: sensors,
+            channel: .init(mid360: channel(.mid360, &self), jt128: channel(.jt128, &self)),
+            frameEpoch: random.next(),
+            realignedCount: UInt32(truncatingIfNeeded: random.next()),
+            mid360Pose: pose(&self),
+            jt128Pose: pose(&self),
+            deltaM: pair(0.5, &self),
+            deltaDeg: pair(180, &self),
+            inlierFrac: pair(1, &self),
+            rmsM: pair(0.05, &self),
+            observe: pair(1, &self),
+            tiltDeg: coin() ? fraction() * 180 : nil,
+            imuOK: coin(),
+            movedAt: coin() ? nil : time(),
+            publisherGeneration: generation()
+        )
+    }
 }
 
 private func roundTrip<M: Equatable>(_ message: M, encode: (M) throws -> Data, decode: (Data) throws -> M, _ label: String) {
@@ -967,7 +1097,7 @@ private func roundTrip<M: Equatable>(_ message: M, encode: (M) throws -> Data, d
 }
 
 private let roundTripRounds = 300
-private let roundTripTypes = 6
+private let roundTripTypes = 7
 private let fuzzRoundsPerGolden = 1000
 
 func testRoomRandomRoundTrips() {
@@ -980,6 +1110,7 @@ func testRoomRandomRoundTrips() {
         roundTrip(factory.epoch(), encode: { try $0.encodedCDR() }, decode: Room.Epoch.decode(cdr:), "Epoch round trip \(index)")
         roundTrip(factory.requestSync(), encode: { try $0.encodedCDR() }, decode: Room.RequestSync.decode(cdr:), "RequestSync round trip \(index)")
         roundTrip(factory.syncEnd(), encode: { try $0.encodedCDR() }, decode: Room.SyncEnd.decode(cdr:), "SyncEnd round trip \(index)")
+        roundTrip(factory.rigPose(), encode: { try $0.encodedCDR() }, decode: Room.RigPose.decode(cdr:), "RigPose round trip \(index)")
     }
     // Tokens: UUID v4 bits, never zero, different on every draw.
     var random = SplitMix64(seed: 7)

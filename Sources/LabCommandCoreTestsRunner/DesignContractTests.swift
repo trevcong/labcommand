@@ -88,3 +88,108 @@ func testNoPlaceholderScaffolding() {
         expect(!body.contains("case product"), "Dest.product is gone from the enum")
     }
 }
+
+private func repoFile(_ relative: String) -> String {
+    let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(relative)
+    return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+}
+
+/// The window opens on Room, titles itself LabCommand - <tab>, and the event
+/// column does not print the wire vocabulary.
+func testRoomFirstShell() {
+    let app = repoFile("Sources/LabCommand/LabCommandApp.swift")
+    let desk = repoFile("Sources/LabCommandCore/RigDesk.swift")
+    let state = repoFile("Sources/LabCommand/AppState.swift")
+    let chrome = repoFile("Sources/LabCommand/CommandCenterView.swift")
+    let room = repoFile("Sources/LabCommandCore/LiveRoomView.swift")
+    expect(!app.isEmpty && !desk.isEmpty && !state.isEmpty && !chrome.isEmpty && !room.isEmpty,
+           "room-first sources are readable from the repo root")
+
+    expect(!app.contains("Rig command"), "the app does not title the window Rig command")
+    expect(app.contains("windowTitle"), "the app takes the window title from Dest")
+    expect(app.contains("win.title = appState.dest.windowTitle"), "the initial title is the current destination")
+    expect(app.contains("$dest"), "the title follows destination changes")
+    expect(!desk.contains("Rig command"), "the rig desk title is not Rig command")
+    expect(desk.contains("static let title = \"Rig\""), "the rig desk title is Rig")
+
+    expect(state.contains("var windowTitle: String { \"LabCommand - \\(label)\" }"),
+           "window titles are declared on Dest")
+    expect(state.contains("static var navCases: [Dest] { [.liveRoom, .settings, .workspace] }"),
+           "nav order is Room, Settings, Rig")
+    expect(state.contains("navCases.firstIndex(of: self)"), "the shortcut is the tab's place in nav order")
+    expect(state.contains("String(index + 1)"), "the first tab is ⌘1 and the third is ⌘3")
+    expect(!chrome.contains("KeyEquivalent(Character(d.shortcutKey))"),
+           "nav buttons do not also register ⌘1 and ⌘3")
+    expect(app.contains("keyEquivalent: d.shortcutKey"), "the View menu carries the tab shortcuts")
+    expect(state.contains("var dest: Dest = .liveRoom"), "a normal launch opens on Room")
+    expect(state.contains("launch.isolates && !roomLaunch.opensRoom"), "snapshot isolation is the Rig exception")
+    expect(state.contains("dest = .workspace"), "the snapshot tool still has a Rig assignment")
+
+    expect(chrome.contains("case .workspace") && chrome.contains("case .settings") && chrome.contains("case .liveRoom"),
+           "every destination still renders")
+    expect(!chrome.contains("dual-lidar rig"), "the top bar no longer says dual-lidar rig")
+    expect(chrome.contains("room memory"), "the top bar says room memory")
+
+    let banned = [
+        "\"candidate\"",
+        "\"candidates\"",
+        "uncalibrated",
+        "no request path",
+        "may be outdated",
+        "\"evidence ",
+        "\"α ",
+        " voxels\"",
+        "history complete through",
+        "cannot request resync",
+    ]
+    for phrase in banned {
+        expect(!room.contains(phrase), "room screen still prints \(phrase)")
+    }
+    expect(room.contains("case .candidate:"), "the wire state stays .candidate")
+}
+
+/// The Dock, menus, and window wordmark say LabCommand. The binary and the
+/// ~/Applications install path stay LabCommand.app.
+func testVisibleAppName() {
+    let plist = repoFile("Info.plist")
+    let app = repoFile("Sources/LabCommand/LabCommandApp.swift")
+    let chrome = repoFile("Sources/LabCommand/CommandCenterView.swift")
+    let build = repoFile("build.sh")
+    expect(!plist.isEmpty && !app.isEmpty && !chrome.isEmpty && !build.isEmpty,
+           "name sources are readable from the repo root")
+
+    expect(plist.contains("<key>CFBundleDisplayName</key>\n\t<string>LabCommand</string>"),
+           "the Dock and Finder name is LabCommand")
+    expect(plist.contains("<key>CFBundleName</key>\n\t<string>LabCommand</string>"),
+           "the app menu title is LabCommand")
+    expect(plist.contains("<key>CFBundleExecutable</key>\n\t<string>LabCommand</string>"),
+           "the binary stays LabCommand")
+    expect(!plist.contains("<string>Lab</string>"), "the bundle does not name itself Lab")
+    expect(plist.contains("LabCommand reads Desktop/lidar-sessions"),
+           "the Desktop prompt names LabCommand")
+
+    expect(app.contains("\"About LabCommand\""), "About names LabCommand")
+    expect(app.contains("\"Quit LabCommand\""), "Quit names LabCommand")
+    expect(app.contains("\"Show LabCommand\""), "the status menu names LabCommand")
+    expect(app.contains("button?.title = \"LabCommand\""), "the status item names LabCommand")
+    expect(!app.contains("\"About Lab\"") && !app.contains("\"Quit Lab\"") && !app.contains("\"Show Lab\""),
+           "menus do not say Lab")
+
+    expect(chrome.contains("Text(\"LabCommand\")"), "the window wordmark is LabCommand")
+    expect(chrome.contains(".accessibilityLabel(\"LabCommand\")"), "the wordmark label is LabCommand")
+    expect(!chrome.contains("Text(\"Lab\")"), "the window does not say Lab")
+
+    expect(build.contains("APP_NAME=\"LabCommand\""), "the .app filename and binary stay LabCommand")
+    expect(build.contains("INSTALL_DIR=\"${HOME}/Applications\""), "install stays ~/Applications")
+}
+
+/// Operator clocks that used to be a time of day now keep the local date.
+func testClockSurfacesIncludeTheDate() {
+    let chrome = repoFile("Sources/LabCommand/CommandCenterView.swift")
+    let scrubber = repoFile("Sources/LabCommand/ChangeScrubberView.swift")
+    let room = repoFile("Sources/LabCommandCore/LiveRoomView.swift")
+    expect(chrome.contains("MissionLog.clock.string(from: event.at)"), "the rig event log prints the dated clock")
+    expect(!chrome.contains("date: .omitted"), "the rig event log does not drop the date")
+    expect(!scrubber.contains("width: 64"), "scrubber end labels are wide enough for the date")
+    expect(room.contains("yyyy-MM-dd HH:mm:ss"), "room clocks include the date with the local time")
+}

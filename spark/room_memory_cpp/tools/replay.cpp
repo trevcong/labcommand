@@ -16,6 +16,8 @@
 //   map <sec> <nanosec>         map_update
 //   sync <sec> <nanosec> <hex>  sync with a CDR RequestSync: "sync <n>", the answer's messages as
 //                               "data" lines, then "end <SyncEnd hex>" ("end none" for another room)
+//   imu <sec> <nanosec> <hex>   add_imu with a CDR sensor_msgs/Imu received at that time
+//   rig <sec> <nanosec>         the RigPose due, as CDR hex, or none
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
@@ -128,6 +130,23 @@ int main(int argc, char** argv) {
                 {"delta_period_s", std::to_string(d.delta_period_s)},
                 {"keyframe_period_s", std::to_string(d.keyframe_period_s)},
                 {"keyframe_delta_ratio", std::to_string(d.keyframe_delta_ratio)},
+                {"rig_guard", d.rig_guard ? "true" : "false"}, {"imu_topic", d.imu_topic},
+                {"imu_shock_frac", std::to_string(d.imu_shock_frac)}, {"imu_gyro_dps", std::to_string(d.imu_gyro_dps)},
+                {"imu_quiet_s", std::to_string(d.imu_quiet_s)}, {"tilt_trigger_deg", std::to_string(d.tilt_trigger_deg)},
+                {"pose_trigger_m", std::to_string(d.pose_trigger_m)},
+                {"guard_check_period_s", std::to_string(d.guard_check_period_s)},
+                {"check_max_s", std::to_string(d.check_max_s)}, {"move_min_m", std::to_string(d.move_min_m)},
+                {"move_min_deg", std::to_string(d.move_min_deg)}, {"align_max_m", std::to_string(d.align_max_m)},
+                {"align_max_deg", std::to_string(d.align_max_deg)},
+                {"align_inlier_ratio", std::to_string(d.align_inlier_ratio)},
+                {"align_max_rms_m", std::to_string(d.align_max_rms_m)},
+                {"align_stable_windows", std::to_string(d.align_stable_windows)},
+                {"observe_min_eig", std::to_string(d.observe_min_eig)},
+                {"gross_inlier_ratio", std::to_string(d.gross_inlier_ratio)},
+                {"relearn_after_s", std::to_string(d.relearn_after_s)}, {"auto_relearn", d.auto_relearn ? "true" : "false"},
+                {"reg_voxel_m", std::to_string(d.reg_voxel_m)}, {"reg_max_points", std::to_string(d.reg_max_points)},
+                {"src_voxel_m", std::to_string(d.src_voxel_m)}, {"src_max_points", std::to_string(d.src_max_points)},
+                {"icp_max_range_m", std::to_string(d.icp_max_range_m)},
             };
             for (const auto& [key, value] : fields) std::cout << "default " << key << " " << value << "\n";
         } else if (command == "start") {
@@ -186,6 +205,14 @@ int main(int argc, char** argv) {
                 for (const msg::Bytes& message : answer.messages) std::cout << "data " << hex(message) << "\n";
                 std::cout << "end " << (answer.end ? hex(answer.end->to_cdr()) : "none") << "\n";
             }
+        } else if (command == "imu") {
+            const msg::Time received = time_of(words);
+            std::string value;
+            words >> value;
+            std::cout << "imu " << (memory->add_imu(unhex(value), received) ? 1 : 0) << "\n";
+        } else if (command == "rig") {
+            const std::optional<msg::RigPose> message = memory->rig_pose(time_of(words));
+            std::cout << "rig " << (message ? hex(message->to_cdr()) : "none") << "\n";
         } else {
             std::cerr << "room_memory_replay: unknown command " << command << "\n";
             return 2;

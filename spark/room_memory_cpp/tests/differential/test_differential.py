@@ -22,8 +22,8 @@ import replay
 import scenes
 from room_memory import offline
 from room_memory.messages import (
-    Activity, ChangeEvent, EventKind, EventState, Header, MapBricks, MapKind, MemoryStatus, RequestSync, SyncEnd,
-    SyncTopic, Time, ZERO_TOKEN,
+    Activity, ChangeEvent, EventKind, EventState, Header, ImuSample, MapBricks, MapKind, MemoryStatus, RequestSync,
+    RigOutcome, RigPose, SyncEnd, SyncTopic, Time, ZERO_TOKEN,
 )
 
 OFFLINE = os.environ.get("ROOM_MEMORY_OFFLINE")
@@ -946,3 +946,112 @@ def test_sync_across_restarts_with_two_generations(tmp_path):
     assert maps_end[0][0] == [] and maps_end[0][1].delivered == ()
     for messages, end in maps_end[1:]:
         assert len(messages) == 1 and end.delivered == ((0, 0),) and MapBricks.from_cdr(messages[0]).publisher_generation == 9
+
+
+# MARK: Rig guard
+
+
+def run_sides(tmp_path, script):
+    """``run_both`` without the equality: (C++ output, Python output, C++ state, Python state)."""
+    outputs, states = [], []
+    for side in ("cpp", "py"):
+        state = tmp_path / f"state-{side}"
+        text = script.replace("{state}", str(state))
+        if side == "cpp":
+            path = tmp_path / "script.txt"
+            path.write_text(text)
+            outputs.append(subprocess.run([REPLAY, str(path)], capture_output=True, check=True).stdout.decode())
+        else:
+            outputs.append(replay.run(text))
+        states.append({str(p.relative_to(state)): p.read_bytes() for p in sorted(state.rglob("*")) if p.is_file()}
+                      if state.exists() else {})
+    return (*outputs, *states)
+
+
+def rig_messages(out):
+    return [RigPose.from_cdr(bytes.fromhex(line.split()[1])) for line in out.splitlines()
+            if line.startswith("rig ") and line != "rig none"]
+
+
+def assert_rig_alike(cpp, py):
+    """RigPose outcomes, causes, results, counters and stamps exact; floats within the v1
+    relaxation of PLAN-RIGGUARD.md, Design 7 (0.1 mm, 0.001 degrees; metrics to 1e-4)."""
+    assert len(cpp) == len(py)
+    for a, b in zip(cpp, py):
+        assert (a.header, a.outcome, a.causes, a.sensors, a.channel, a.frame_epoch, a.n_realigned, a.imu_ok,
+                a.moved_at, a.publisher_generation) == (b.header, b.outcome, b.causes, b.sensors, b.channel,
+                                                        b.frame_epoch, b.n_realigned, b.imu_ok, b.moved_at,
+                                                        b.publisher_generation)
+        for pose_a, pose_b in ((a.mid360_pose, b.mid360_pose), (a.jt128_pose, b.jt128_pose)):
+            assert (pose_a is None) == (pose_b is None)
+            if pose_a is not None:
+                assert np.allclose(pose_a[:3], pose_b[:3], atol=1e-4) and np.allclose(pose_a[3:], pose_b[3:], atol=1e-5)
+        for name, tolerance in (("delta_m", 1e-4), ("delta_deg", 1e-3), ("inlier_frac", 1e-4), ("rms_m", 1e-4),
+                                ("observe", 1e-3)):
+            for x, y in zip(getattr(a, name), getattr(b, name)):
+                assert (x is None) == (y is None), name
+                if x is not None:
+                    assert abs(x - y) <= tolerance, (name, x, y)
+        assert (a.tilt_deg is None) == (b.tilt_deg is None)
+
+
+def guard_script(tmp_path, poses, imu=None, extra=""):
+    """A mid360 run on the ray-cast room (tests/rooms.py), one scan per window at seconds 1, 2, ...,
+    with close, map, status and rig after each; ``imu(second)`` gives the samples of that second."""
+    import rooms
+    lines = [f"config sensors=mid360 reference_windows=10 rig_guard=true state_dir={{state}} {extra}", "start 0 0"]
+    for second, pose in enumerate(poses, 1):
+        for sample in imu(second) if imu else ():
+            lines.append(f"imu {sample.stamp.sec} {sample.stamp.nanosec} {sample.to_cdr().hex()}")
+        lines.append(f"points mid360 {floats(tmp_path, f'scan-{second}', rooms.scan(pose, seed=second))}")
+        lines += [f"close {second} 0", f"map {second} 0", f"status {second} 0 1.0", f"rig {second} 0"]
+    return "\n".join(lines)
+
+
+def imu_samples(shock_at=None, rate=50):
+    def samples(second):
+        out = []
+        for n in range(rate):
+            t = (second - 1) + n / rate
+            a = (0.3, 0.0, -1.2) if shock_at is not None and shock_at <= t < shock_at + 0.2 else (0.0, 0.0, -1.0)
+            ns = int(round(t * 1e9))
+            out.append(ImuSample(Time(ns // 1_000_000_000, ns % 1_000_000_000), "livox_frame", (0.0, 0.0, 0.0), a))
+        return out
+    return samples
+
+
+def test_rig_guard_never_realigned_is_byte_identical(tmp_path):
+    """Guard on, static, an IMU shock and a periodic check: every status, event and map byte for
+    byte, the files too except rig_state's floats; RigPose outcomes exact (PLAN-RIGGUARD.md)."""
+    import rooms
+    script = guard_script(tmp_path, [rooms.Pose()] * 50, imu_samples(shock_at=14.5))
+    cpp, py, cpp_state, py_state = run_sides(tmp_path, script)
+    strip = lambda out: [line for line in out.splitlines() if not line.startswith("rig ")]
+    assert strip(cpp) == strip(py)
+    rigs = rig_messages(py)
+    assert_rig_alike(rig_messages(cpp), rigs)
+    outcomes = [m.outcome for m in rigs]
+    assert {m.publisher_generation for m in rigs} == {1}  # "start 0 0": the replay's floor generation
+    assert RigOutcome.CHECKING in outcomes and RigOutcome.MOVED not in outcomes and RigOutcome.INCONCLUSIVE not in outcomes
+    assert sorted(cpp_state) == sorted(py_state)
+    for name in cpp_state:
+        if name != "lab/rig_state":
+            assert cpp_state[name] == py_state[name], name
+
+
+def test_rig_guard_push_realigns_alike(tmp_path):
+    """A 10 cm + 2 degree push: the same outcome sequence, no events, the same status states, and
+    poses within 0.1 mm / 0.001 degrees."""
+    import rooms
+    truth = rooms.rig(0.10, yaw_deg=2.0)
+    cpp, py, _, _ = run_sides(tmp_path, guard_script(tmp_path, [rooms.Pose()] * 12 + [truth] * 15))
+    assert "event " not in cpp and "event " not in py
+    states = [[MemoryStatus.from_cdr(bytes.fromhex(line.split()[1])).state for line in out.splitlines()
+               if line.startswith("status ")] for out in (cpp, py)]
+    assert states[0] == states[1]
+    rigs = rig_messages(py)
+    assert_rig_alike(rig_messages(cpp), rigs)
+    outcomes = [m.outcome for n, m in enumerate(rigs) if n == 0 or m.outcome != rigs[n - 1].outcome]  # repeats collapsed
+    assert outcomes[-3:] == [RigOutcome.IN_PLACE, RigOutcome.MOVED, RigOutcome.REALIGNED]
+    final = rigs[-1].mid360_pose
+    assert np.allclose(final[:3], truth.t, atol=0.005)

@@ -59,6 +59,9 @@ public struct SensorReading: Sendable, Equatable {
     public var clockOffsetMs: Double?
     /// JT128 only: PTC control port answering.
     public var ptcOpen: Bool?
+    /// Replaces `detail` when the state copy would claim a probe fact this reading
+    /// did not measure. The room link sets it for a measured rate on an unprobed sensor.
+    var detailOverride: String? = nil
 
     public init(
         id: SensorID,
@@ -77,6 +80,7 @@ public struct SensorReading: Sendable, Equatable {
     }
 
     public var detail: String {
+        if let detailOverride { return detailOverride }
         switch state {
         case .dark:
             return "unpowered — plug in and the watchdog restarts the stack"

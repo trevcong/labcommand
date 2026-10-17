@@ -731,6 +731,217 @@ extension RoomMemory.SyncEnd {
     }
 }
 
+extension RoomMemory.RigPose {
+    /// Encodes the message as CDR little endian, including the encapsulation header.
+    ///
+    /// - Throws: `RoomMemoryCDRError.invalid` when the message breaks the protocol contract.
+    public func encodedCDR() throws -> Data {
+        try validate()
+        var writer = RoomCDRWriter()
+        writer.header(header)
+        writer.u8(outcome.rawValue)
+        writer.u8(causes.rawValue)
+        writer.u8(sensors.rawValue)
+        writer.u8(channel.mid360.rawValue)
+        writer.u8(channel.jt128.rawValue)
+        writer.u64(frameEpoch)
+        writer.u32(realignedCount)
+        for pose in [mid360Pose, jt128Pose] {
+            writer.vector(pose?.translation ?? SIMD3(repeating: .nan))
+            let rotation = pose?.rotation ?? SIMD4(repeating: .nan)
+            for index in 0..<4 { writer.f32(rotation[index]) }
+        }
+        for pair in [deltaM, deltaDeg, inlierFrac, rmsM, observe] {
+            writer.f32(pair.mid360 ?? .nan)
+            writer.f32(pair.jt128 ?? .nan)
+        }
+        writer.f32(tiltDeg ?? .nan)
+        writer.u8(imuOK ? 1 : 0)
+        writer.time(movedAt ?? RoomMemory.Time(sec: 0, nanosec: 0))
+        if let publisherGeneration {
+            writer.u64(publisherGeneration)
+        }
+        return writer.data
+    }
+
+    /// Decodes a CDR `labcommand_msgs/RigPose`, including the encapsulation header.
+    ///
+    /// Accepts either byte order. The input may be a slice.
+    ///
+    /// - Throws: `RoomMemoryCDRError` on truncated or invalid input.
+    public static func decode(cdr data: Data) throws -> RoomMemory.RigPose {
+        try RoomCDR.decode(data, message: "RigPose") { reader in
+            let header = try reader.header("")
+            let outcomeValue = try reader.u8("outcome")
+            guard let outcome = Outcome(rawValue: outcomeValue) else {
+                throw RoomMemoryCDRError.invalid("RigPose: outcome \(outcomeValue) is not an OUTCOME_* value")
+            }
+            let causes = Causes(rawValue: try reader.u8("causes"))
+            let sensors = RoomMemory.Sensors(rawValue: try reader.u8("sensors"))
+            func channel(_ index: Int) throws -> Channel {
+                let value = try reader.u8("channel[\(index)]")
+                guard let channel = Channel(rawValue: value) else {
+                    throw RoomMemoryCDRError.invalid("RigPose: channel[\(index)] \(value) is not a CHANNEL_* value")
+                }
+                return channel
+            }
+            let channels = RoomMemory.SensorPair(mid360: try channel(0), jt128: try channel(1))
+            let frameEpoch = try reader.u64("frame_epoch")
+            let realignedCount = try reader.u32("n_realigned")
+            // Each pose is all NaN (not configured) or finite-or-invalid; never partly NaN.
+            func pose(_ name: String) throws -> Pose? {
+                let values = try (0..<7).map { try reader.f32("\(name)[\($0)]") }
+                switch values.filter(\.isNaN).count {
+                case 7: return nil
+                case 0: return Pose(translation: SIMD3(values[0], values[1], values[2]),
+                                    rotation: SIMD4(values[3], values[4], values[5], values[6]))
+                default: throw RoomMemoryCDRError.invalid("RigPose: \(name) \(values) is partly NaN")
+                }
+            }
+            let mid360Pose = try pose("mid360_pose")
+            let jt128Pose = try pose("jt128_pose")
+            func pair(_ name: String) throws -> RoomMemory.SensorPair<Float?> {
+                let mid360 = try reader.f32("\(name)[0]")
+                let jt128 = try reader.f32("\(name)[1]")
+                return .init(mid360: mid360.isNaN ? nil : mid360, jt128: jt128.isNaN ? nil : jt128)
+            }
+            let deltaM = try pair("delta_m")
+            let deltaDeg = try pair("delta_deg")
+            let inlierFrac = try pair("inlier_frac")
+            let rmsM = try pair("rms_m")
+            let observe = try pair("observe")
+            let tilt = try reader.f32("tilt_deg")
+            let imuOK = try reader.u8("imu_ok")
+            guard imuOK <= 1 else {
+                throw RoomMemoryCDRError.invalid("RigPose: imu_ok \(imuOK) is not a bool")
+            }
+            let movedAt = try reader.time("moved_at")
+            let generation = try reader.isV2(fields: 8, after: "moved_at") ? try reader.u64("publisher_generation") : nil
+            let rig = RoomMemory.RigPose(
+                header: header,
+                outcome: outcome,
+                causes: causes,
+                sensors: sensors,
+                channel: channels,
+                frameEpoch: frameEpoch,
+                realignedCount: realignedCount,
+                mid360Pose: mid360Pose,
+                jt128Pose: jt128Pose,
+                deltaM: deltaM,
+                deltaDeg: deltaDeg,
+                inlierFrac: inlierFrac,
+                rmsM: rmsM,
+                observe: observe,
+                tiltDeg: tilt.isNaN ? nil : tilt,
+                imuOK: imuOK == 1,
+                movedAt: movedAt == RoomMemory.Time(sec: 0, nanosec: 0) ? nil : movedAt,
+                publisherGeneration: generation
+            )
+            try rig.validate()
+            return rig
+        }
+    }
+
+    func validate() throws {
+        let context = "RigPose"
+        try header.validate(context)
+        try RoomCDR.requireGeneration(publisherGeneration, "\(context): publisher_generation")
+        guard Causes.all.isSuperset(of: causes) else {
+            throw RoomMemoryCDRError.invalid("\(context): causes 0x\(String(causes.rawValue, radix: 16)) sets an undefined bit")
+        }
+        guard RoomMemory.Sensors.all.isSuperset(of: sensors) else {
+            throw RoomMemoryCDRError.invalid("\(context): sensors 0x\(String(sensors.rawValue, radix: 16)) sets an undefined bit")
+        }
+        for (index, result, bit) in [(0, channel.mid360, RoomMemory.Sensors.mid360), (1, channel.jt128, .jt128)]
+        where !sensors.contains(bit) && result != .none && result != .unavailable {
+            throw RoomMemoryCDRError.invalid("\(context): channel[\(index)] \(result) for a sensor outside sensors")
+        }
+        for (name, pose) in [("mid360_pose", mid360Pose), ("jt128_pose", jt128Pose)] {
+            guard let pose else { continue }
+            try RoomCDR.requireFinite(pose.translation, "\(context): \(name) translation")
+            guard pose.rotation.x.isFinite, pose.rotation.y.isFinite, pose.rotation.z.isFinite, pose.rotation.w.isFinite else {
+                throw RoomMemoryCDRError.invalid("\(context): \(name) rotation \(pose.rotation) is not finite")
+            }
+            let q = SIMD4<Double>(pose.rotation)
+            let norm = (q * q).sum().squareRoot()
+            guard abs(norm - 1) <= 1e-3 else {
+                throw RoomMemoryCDRError.invalid("\(context): \(name) quaternion norm \(norm) is not 1")
+            }
+        }
+        let limits: [(String, RoomMemory.SensorPair<Float?>, Float?)] = [
+            ("delta_m", deltaM, nil), ("delta_deg", deltaDeg, 180), ("inlier_frac", inlierFrac, 1), ("rms_m", rmsM, nil), ("observe", observe, nil),
+        ]
+        for (name, pair, high) in limits {
+            for value in [pair.mid360, pair.jt128] {
+                if let value, !(value.isFinite && value >= 0 && value <= (high ?? .greatestFiniteMagnitude)) {
+                    throw RoomMemoryCDRError.invalid("\(context): \(name) \(value) must be finite and in [0, \(high.map { "\($0)" } ?? "inf")], or NaN")
+                }
+            }
+        }
+        if let tiltDeg, !(tiltDeg.isFinite && (0...180).contains(tiltDeg)) {
+            throw RoomMemoryCDRError.invalid("\(context): tilt_deg \(tiltDeg) must be finite and in [0, 180], or NaN")
+        }
+        if let movedAt {
+            guard movedAt != RoomMemory.Time(sec: 0, nanosec: 0) else {
+                throw RoomMemoryCDRError.invalid("\(context): moved_at {0, 0} is the none sentinel; use a nil moved_at")
+            }
+            try RoomCDR.requireValid(movedAt, "\(context): moved_at")
+        }
+    }
+}
+
+extension RoomMemory.ImuSample {
+    /// Encodes the sample as CDR little endian with identity orientation and every covariance 0
+    /// (tests and replay tools), including the encapsulation header.
+    ///
+    /// - Throws: `RoomMemoryCDRError.invalid` when a rate or acceleration is not finite.
+    public func encodedCDR() throws -> Data {
+        try validate()
+        var writer = RoomCDRWriter()
+        writer.time(stamp)
+        writer.string(frameId)
+        for value in [0, 0, 0, 1] as [Double] { writer.f64(value) }
+        let zeros = [Double](repeating: 0, count: 9)
+        for vector in [nil, angularVelocity, nil, linearAcceleration, nil] as [SIMD3<Double>?] {
+            for value in vector.map { [$0.x, $0.y, $0.z] } ?? zeros { writer.f64(value) }
+        }
+        return writer.data
+    }
+
+    /// Decodes a CDR `sensor_msgs/Imu`: `std_msgs/Header`, orientation and its covariance, angular
+    /// velocity and its covariance, linear acceleration and its covariance.
+    ///
+    /// Accepts either byte order. The input may be a slice.
+    ///
+    /// - Throws: `RoomMemoryCDRError` on truncated input, or non-finite rates or accelerations.
+    public static func decode(cdr data: Data) throws -> RoomMemory.ImuSample {
+        try RoomCDR.decode(data, message: "Imu") { reader in
+            let stamp = try reader.time("header.stamp")
+            let frameId = try reader.string("header.frame_id")
+            for index in 0..<(4 + 9) { _ = try reader.f64("orientation[\(index)]") }
+            func vector(_ name: String) throws -> SIMD3<Double> {
+                let value = SIMD3(try reader.f64("\(name).x"), try reader.f64("\(name).y"), try reader.f64("\(name).z"))
+                for index in 0..<9 { _ = try reader.f64("\(name)_covariance[\(index)]") }
+                return value
+            }
+            let angular = try vector("angular_velocity")
+            let linear = try vector("linear_acceleration")
+            let sample = RoomMemory.ImuSample(stamp: stamp, frameId: frameId, angularVelocity: angular, linearAcceleration: linear)
+            try sample.validate()
+            return sample
+        }
+    }
+
+    func validate() throws {
+        try RoomCDR.requireValid(stamp, "Imu: stamp")
+        for (name, value) in [("angular_velocity", angularVelocity), ("linear_acceleration", linearAcceleration)] {
+            guard value.x.isFinite, value.y.isFinite, value.z.isFinite else {
+                throw RoomMemoryCDRError.invalid("Imu: \(name) \(value) is not finite")
+            }
+        }
+    }
+}
+
 extension RoomMemory.Header {
     func validate(_ context: String) throws {
         guard !roomId.isEmpty else {
@@ -934,6 +1145,7 @@ struct RoomCDRWriter {
     mutating func u32(_ value: UInt32) { append(value) }
     mutating func u64(_ value: UInt64) { append(value) }
     mutating func f32(_ value: Float) { append(value.bitPattern) }
+    mutating func f64(_ value: Double) { append(value.bitPattern) }
     mutating func raw(_ value: [UInt8]) { bytes.append(contentsOf: value) }
 
     mutating func vector(_ value: SIMD3<Float>) {
@@ -1045,6 +1257,10 @@ struct RoomCDRReader {
 
     mutating func f32(_ what: @autoclosure () -> String) throws -> Float {
         Float(bitPattern: try load(UInt32.self, what()))
+    }
+
+    mutating func f64(_ what: @autoclosure () -> String) throws -> Double {
+        Double(bitPattern: try load(UInt64.self, what()))
     }
 
     mutating func vector(_ what: @autoclosure () -> String) throws -> SIMD3<Float> {

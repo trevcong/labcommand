@@ -67,6 +67,9 @@ add_library(room_memory_core
   src/messages.cpp
   src/memory.cpp
   src/generation.cpp
+  src/guard.cpp
+  src/imu.cpp
+  src/state.cpp
   src/rejectlog.cpp
 )
 set_target_properties(room_memory_core PROPERTIES POSITION_INDEPENDENT_CODE ON)

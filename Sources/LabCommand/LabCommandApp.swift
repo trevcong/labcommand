@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let appState = AppState()
     private var statusItem: NSStatusItem?
     private var statusWatch: AnyCancellable?
+    private var titleWatch: AnyCancellable?
     private var visibilityObservers: [NSObjectProtocol] = []
     private var keyMonitor: Any?
 
@@ -36,7 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             backing: .buffered,
             defer: false
         )
-        win.title = "Rig command"
+        win.title = appState.dest.windowTitle
         win.contentView = hosting
         win.setContentSize(NSSize(width: 1180, height: 800))
         win.center()
@@ -46,6 +47,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         win.backgroundColor = NSColor(red: 0.043, green: 0.051, blue: 0.063, alpha: 1)
         win.makeKeyAndOrderFront(nil)
         window = win
+        titleWatch = appState.$dest.receive(on: DispatchQueue.main).sink { [weak self] dest in
+            self?.window?.title = dest.windowTitle
+        }
         watchVisibility(of: win)
 
         appState.start()
@@ -167,13 +171,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let appMenu = NSMenu()
         appMenuItem.submenu = appMenu
         appMenu.addItem(
-            withTitle: "About Lab",
+            withTitle: "About LabCommand",
             action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
             keyEquivalent: ""
         )
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(
-            withTitle: "Quit Lab",
+            withTitle: "Quit LabCommand",
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )
@@ -190,6 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let viewMenu = NSMenu(title: "View")
         viewItem.submenu = viewMenu
 
+        // ⌘1 is the first tab in navCases. The buttons do not register these keys too.
         for (idx, d) in Dest.navCases.enumerated() {
             let item = NSMenuItem(
                 title: d.label,
@@ -237,7 +242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func installStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "LAB"
+        item.button?.title = "LabCommand"
         item.button?.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
         item.menu = makeStatusMenu()
         statusItem = item
@@ -254,8 +259,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         guard let menu = statusItem?.menu else { return }
         menu.removeAllItems()
         let rig = appState.rig
-        menu.addItem(header("Mid-360  \(rig.mid360.state.displayLabel)"))
-        menu.addItem(header("JT128    \(rig.jt128.state.displayLabel)"))
+        let dots = appState.statusDots
+        menu.addItem(header("Mid-360  \(dots.mid360.state.displayLabel)"))
+        menu.addItem(header("JT128    \(dots.jt128.state.displayLabel)"))
         menu.addItem(header("Clocks   \(rig.clock.state.displayLabel)"))
         menu.addItem(header("Record   \(rig.recording.active ? "Live" : "Idle")"))
         if appState.isolatesNetwork {
@@ -263,14 +269,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             menu.addItem(header("Spark    local"))
         } else {
             menu.addItem(header("Health   \(appState.health.label)"))
-            if !rig.sparkReachable {
+            if !dots.sparkReachable {
                 menu.addItem(header("Spark    offline"))
             }
         }
-        if let hz = rig.mid360.pointRateHz, rig.mid360.state == .streaming {
+        if let hz = dots.mid360.pointRateHz, dots.mid360.state == .streaming {
             menu.addItem(header("Mid rate \(TelemetryFormat.hz(hz))"))
         }
-        if let hz = rig.jt128.pointRateHz, rig.jt128.state == .streaming {
+        if let hz = dots.jt128.pointRateHz, dots.jt128.state == .streaming {
             menu.addItem(header("JT rate  \(TelemetryFormat.hz(hz))"))
         }
         menu.addItem(.separator())
@@ -281,7 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         addStatusAction(menu, title: "Diagnose", action: #selector(menuDiagnose), enabled: true)
         addStatusAction(menu, title: appState.focusMode ? "Exit Focus" : "Focus Mode", action: #selector(menuFocus), enabled: true)
         menu.addItem(.separator())
-        addStatusAction(menu, title: "Show Lab", action: #selector(showWindow), enabled: true)
+        addStatusAction(menu, title: "Show LabCommand", action: #selector(showWindow), enabled: true)
     }
 
     private func header(_ title: String) -> NSMenuItem {

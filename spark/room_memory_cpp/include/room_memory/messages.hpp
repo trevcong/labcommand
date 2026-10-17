@@ -1,5 +1,5 @@
-// CDR codecs for the labcommand_msgs room-memory messages, with no ROS dependency: the C++ port
-// of room_memory/messages.py. The contract is docs/ROOM-MEMORY-PROTOCOL.md (Phase 0).
+// CDR codecs for the labcommand_msgs room-memory messages and sensor_msgs/Imu, with no ROS dependency: the
+// C++ port of room_memory/messages.py. The contract is docs/ROOM-MEMORY-PROTOCOL.md (Phase 0).
 //
 // Classic CDR (XCDR1): a 4-byte encapsulation header (00 01 little endian, 00 00 big endian),
 // every primitive aligned to its own size counted from the byte after the header, strings as
@@ -76,8 +76,20 @@ enum class EventKind : std::uint8_t { appeared = 0, disappeared = 1, moved = 2 }
 enum class EventState : std::uint8_t { candidate = 0, confirmed = 1, accepted = 2, reverted = 3, expired = 4 };
 enum class MemoryState : std::uint8_t { building = 0, tracking = 1, rig_moved = 2, degraded = 3, paused = 4 };
 enum class SyncTopic : std::uint8_t { map_bricks = 0, events = 1 };
+// RigPose (protocol 3.9): the guard's outcome and each sensor's result in the reported decision.
+enum class RigOutcome : std::uint8_t { in_place = 0, checking = 1, moved = 2, realigned = 3, relearning = 4, inconclusive = 5 };
+enum class RigChannel : std::uint8_t { none = 0, in_place = 1, moved = 2, rejected = 3, unavailable = 4 };
+inline constexpr std::int64_t kCauseImuShock = 1;
+inline constexpr std::int64_t kCauseImuTilt = 2;
+inline constexpr std::int64_t kCausePoseOffset = 4;
+inline constexpr std::int64_t kCausePeriodic = 8;
+inline constexpr std::int64_t kCauseStartup = 16;
+inline constexpr std::int64_t kCauseSensorResumed = 32;
+inline constexpr std::int64_t kCausesAll = 63;
 
 const char* name(MemoryState state);
+const char* name(RigOutcome outcome);
+const char* name(RigChannel channel);
 const char* name(Compression compression);
 
 // True when this build decodes compressed LZFSE blocks (Apple's Compression framework).
@@ -220,6 +232,55 @@ struct Activity {
     Bytes to_cdr() const;
     static Activity from_cdr(std::span<const std::uint8_t> data);
 };
+
+// The rig-pose guard (protocol 3.9): its outcome, what started the check, each sensor's result and
+// absolute pose (tx ty tz qx qy qz qw, current sensor frame -> its reference frame), and the last
+// check's metrics. An empty optional is NaN on the wire (a pose: NaN x 7). [0] Mid-360, [1] JT128.
+struct RigPose {
+    using Pair = std::array<std::optional<float>, 2>;
+    Header header;
+    RigOutcome outcome = RigOutcome::in_place;
+    std::int64_t causes = 0;
+    std::int64_t sensors = 0;
+    std::array<RigChannel, 2> channel{RigChannel::none, RigChannel::none};
+    std::uint64_t frame_epoch = 0;
+    std::int64_t n_realigned = 0;
+    std::optional<std::array<float, 7>> mid360_pose;
+    std::optional<std::array<float, 7>> jt128_pose;
+    Pair delta_m;
+    Pair delta_deg;
+    Pair inlier_frac;
+    Pair rms_m;
+    Pair observe;
+    std::optional<float> tilt_deg;
+    bool imu_ok = false;
+    Time moved_at;
+    std::optional<std::uint64_t> publisher_generation;  // empty: the legacy layout; the engine always stamps it
+    friend bool operator==(const RigPose&, const RigPose&) = default;
+
+    void validate() const;
+    Bytes to_cdr() const;
+    static RigPose from_cdr(std::span<const std::uint8_t> data);
+};
+
+// The fields of one sensor_msgs/Imu the rig guard reads: the header stamp, angular velocity (rad/s)
+// and linear acceleration (the driver's unit: g or m/s^2), binary64.
+struct ImuSample {
+    Time stamp;
+    std::string frame_id;
+    std::array<double, 3> angular_velocity{};
+    std::array<double, 3> linear_acceleration{};
+    friend bool operator==(const ImuSample&, const ImuSample&) = default;
+
+    void validate() const;
+    // CDR little endian: identity orientation, every covariance 0 (tests and replay tools).
+    Bytes to_cdr() const;
+};
+
+// Decodes one CDR sensor_msgs/Imu (std_msgs/Header, orientation and its covariance, angular velocity
+// and its covariance, linear acceleration and its covariance). Throws Truncated or Invalid
+// (non-finite rates or accelerations).
+ImuSample decode_imu(std::span<const std::uint8_t> data);
 
 // Mac -> Spark resync request (protocol 3.5). `since` is (epoch, seq) or empty.
 // expected_generation and token are both empty (the legacy layout) or both set.
