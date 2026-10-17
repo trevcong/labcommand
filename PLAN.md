@@ -1,10 +1,12 @@
 # Rig-bump guard and acceptance suite (room_memory), v1
 
-A nudged tripod must not flag the whole room. The node detects a rig move (Mid-360 IMU + ICP), re-aligns the sensor pose, or relearns if it cannot, and reports RIG_MOVED. Plan only: no code, no commit, no Spark. Long version: `~/Developer/lc-tasks/plans/rigguard.full.md`.
+A nudged tripod must not flag the whole room. The node detects a rig move (Mid-360 IMU + ICP), re-aligns the sensor pose, or relearns if it cannot, and reports RIG_MOVED. Long version: `~/Developer/lc-tasks/plans/rigguard.full.md`.
+
+**v1 is PR #19: phases 1 and 2** (both engines, the wire, unit and differential tests) and the guard's ICP cost measured on the Mac. The replay suite (phase 3) and the physical acceptance suite (phase 4) are later PRs; Phases says why.
 
 ## Base
 
-- Code is on `room-memory-cpp` @ 5291df5 (`~/Developer/labcommand-spark`); paths are relative to it. Branch `rig-guard` from it.
+- `rig-guard` is on `main` after protocol v2 (#18, #20); paths are relative to the repository.
 - C++ node `spark/room_memory_cpp` is primary; Python `spark/room_memory` is the reference.
 - Facts: per-sensor references; 1 s windows, 40 s candidate gate; `pose_offset` is translation-only; `STATE_RIG_MOVED=2` is reserved; `static5m{,-b}` lack `/livox/imu`.
 
@@ -54,14 +56,14 @@ The nodes run `close_window`, and so the guard's ICP, in the window timer on the
 ## Tests
 
 - **Unit** (ctest `guard`, `memory`, `messages`; pytest `test_guard.py`, same cases): convergence grid (≤ 0.30 m, 10° yaw, 3° tilt) to 5 mm / 0.05°, with 20 % outliers; corridor/plane → `REJECTED`, never RIG_MOVED; IMU shock/tilt/gap; state machine incl. hold and expiry; relearn; `rig_shifted` golden (+5 cm → 0 regions after re-align); codec goldens.
-- **Default off:** existing tests and differential byte-identical to 5291df5.
-- **Replay** (`test_rig_guard.py`; skip if `~/Developer/lc-tasks/recordings/static5m{,-b}` absent). `bag_stream.py` gains `--rig-move`, `--imu-synth`, `--drop`, `--strip-imu`; `bag.cpp` gains an IMU record kind, `state_from=<dir>`, and a read-only `probe=<box>` (per window: reference voxels occupied / free / unknown).
+- **Default off:** existing tests and differential byte-identical to `main`.
+- **Replay, phase 3 (a later PR, not in #19)** (`test_rig_guard.py`; skip if `~/Developer/lc-tasks/recordings/static5m{,-b}` absent). `bag_stream.py` gains `--rig-move`, `--imu-synth`, `--drop`, `--strip-imu`; `bag.cpp` gains an IMU record kind, `state_from=<dir>`, and a read-only `probe=<box>` (per window: reference voxels occupied / free / unknown).
   - Static, guard on: 0 events, 0 RIG_MOVED, 0 INCONCLUSIVE.
   - 2–10 cm, 0.5–5° yaw: RIG_MOVED → REALIGNED, 0 events, error ≤ 5 mm / 0.05°; a cube injected after it is found within 0.25 m.
   - 0.5 m + 20°: RELEARNING. Shock only: CHECKING → IN_PLACE. Cube moved on an unmoved rig: never RIG_MOVED.
   - Non-vacuity: with `rig_guard=false` the moves give ≥ 10 CANDIDATEs.
 
-## Physical acceptance suite
+## Physical acceptance suite (phase 4, later; not in #19)
 
 **Recorded:** one mcap per scenario in `~/Developer/lc-tasks/recordings/acceptance/<scenario>/` (lidars, IMU, outputs), plus `initial_state/` and `truth.json` (Spark-clock marks, taped box positions). Replayed by `room_memory_bag state_from=initial_state`, judged by `tests/acceptance/evaluate.py` (ctest `acceptance_replay`).
 
@@ -81,13 +83,18 @@ The nodes run `close_window`, and so the guard's ICP, in the window timer on the
 
 ## Phases
 
-| phase | gate |
-|---|---|
-| 0. Measure: ICP noise, `pose_offset` yaw response, thresholds, cost; `/livox/imu`? | defaults in `spark/room_memory_cpp/PLAN.md`; a gross-mismatch threshold separates 0.5 m + 20° from a person 0.8 m away and 30 % rearranged, else drop it and E5 is IMU-only |
-| 1. Python: `guard.py`, `imu.py`, codec | pytest green |
-| 2. C++: `guard.*`, `imu.*`, `memory.*`, `messages.*`, `RigPose.msg`, node, launch, protocol | ctest green; guard-off byte-identical; parity per Design 7 |
-| 3. Replay tooling and `test_rig_guard.py` | green on both recordings |
-| 4. Five recordings and live runs | every criterion PASSes; a FAIL blocks |
+| phase | gate | status |
+|---|---|---|
+| 0. Measure: ICP noise, `pose_offset` yaw response, thresholds, cost; `/livox/imu`? | defaults in `spark/room_memory_cpp/PLAN.md`; a gross-mismatch threshold separates 0.5 m + 20° from a person 0.8 m away and 30 % rearranged, else drop it and E5 is IMU-only | partly: the ICP cost on the Mac (Measured, above). The rest needs the Spark and real recordings, so v1's defaults are this plan's values |
+| 1. Python: `guard.py`, `imu.py`, codec | pytest green | #19 |
+| 2. C++: `guard.*`, `imu.*`, `memory.*`, `messages.*`, `RigPose.msg`, node, launch, protocol | ctest green; guard-off byte-identical; parity per Design 7 | #19 |
+| 3. Replay tooling and `test_rig_guard.py` | green on both recordings | later PR: `bag_stream.py` `--rig-move`, `--imu-synth`, `--drop`, `--strip-imu`; `bag.cpp`'s IMU record kind, `state_from=<dir>` and `probe=<box>`; `test_rig_guard.py` |
+| 4. Five recordings and live runs | every criterion PASSes; a FAIL blocks | later, on the Spark: the recordings with `initial_state/` and `truth.json`, `tests/acceptance/evaluate.py`, ctest `acceptance_replay` |
+
+Phases 3 and 4 are not in #19, by decision:
+- `evaluate.py` and `acceptance_replay` judge phase 4's recordings, which do not exist yet: they are made on the Spark, outside this PR. Written now, they would be code against a `truth.json` no data has checked.
+- Phase 3's replay tooling is a second implementation of its own (synthetic moves, synthetic IMU, dropouts, a probe), to be validated before it validates anything. #19 already holds both engines; its unit and differential tests cover v1's claims (convergence, rejection never as evidence, the state machine, relearn, persistence, parity) on ray-cast rooms.
+- Order after #19: phase 3 against the merged v1, then the read-only Spark measurement (ICP cost per check, `/livox/imu`), then phase 4.
 
 ## Safety
 
