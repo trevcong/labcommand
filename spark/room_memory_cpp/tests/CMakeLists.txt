@@ -47,6 +47,16 @@ foreach(threads ${THREAD_COUNTS})
   endforeach()
 endforeach()
 add_test(NAME messages COMMAND test_messages)
+add_executable(test_rhythm test_rhythm.cpp)
+target_link_libraries(test_rhythm PRIVATE room_memory_test_support)
+add_test(NAME rhythm COMMAND test_rhythm)
+# No ROS: the node names labcommand_msgs types, and every .msg in that package is generated.
+add_executable(test_interface test_interface.cpp)
+target_link_libraries(test_interface PRIVATE room_memory_test_support)
+target_compile_definitions(test_interface PRIVATE
+  ROOM_MEMORY_MSGS_DIR="${REPO_ROOT}/ros/labcommand_msgs"
+  ROOM_MEMORY_NODE_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/../node/room_memory_node.cpp")
+add_test(NAME interface COMMAND test_interface)
 # The messages suite encodes real compressed LZFSE payloads with the same framework.
 if(ROOM_MEMORY_APPLE_LZFSE)
   target_compile_definitions(test_messages PRIVATE ROOM_MEMORY_APPLE_LZFSE)

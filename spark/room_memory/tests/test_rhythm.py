@@ -4,10 +4,14 @@ The header + 60-window hex below is the shared pin (the C++ CTest uses the same 
 It is little endian. ``crc32(b"RHY1")`` is ``0x046E226A``.
 """
 
+import ast
+import dataclasses
 import datetime
 import errno
 import math
 import os
+import pathlib
+import re
 import struct
 import time
 import zlib
@@ -37,12 +41,14 @@ from room_memory.rhythm import (
     header_identity,
     parse_record,
     rhythm_active,
+    scan_records,
     validate_rhythm,
     voxels_per_cell,
     windows_per_period,
 )
 
 START = Time(1_700_000_000, 0)
+GENERATION = 7
 # Minute 60, epoch 4, room lab, Mid-360, dims 2, 10 voxels/cell, 0.05 m voxels, 0.50 m cells,
 # period 60. Fifteen windows of 10 voxels in cell (0, 0) and 45 windows of one voxel in cell
 # (1, 0): hit 15, mean 3, and hit 45, mean 1. pose_ok 0. No flags.
@@ -88,8 +94,10 @@ def rhythm(tmp_path):
         publish = changes.pop("publish", None)
         would_block = changes.pop("publish_would_block", None)
         directory = path if path is not None else tmp_path / f"r{len(opened)}"
+        generation = changes.pop("publisher_generation", None)
         obj = Rhythm(
             config(directory, **changes), store=store, publish=publish, publish_would_block=would_block,
+            publisher_generation=generation,
         )
         opened.append(obj)
         return obj
@@ -214,7 +222,78 @@ def test_float32_ratio_period_and_file_cap_are_rejected_without_clamping():
     with pytest.raises(ValueError, match="rhythm_enable"):
         validate_rhythm(MemoryConfig(state_dir=None, rhythm_enable=1))
     with pytest.raises(ValueError):
-        RoomMemory(MemoryConfig(state_dir=None, rhythm_cell_m=0.03), START)
+        RoomMemory(MemoryConfig(state_dir=None, rhythm_cell_m=0.03), START, GENERATION)
+
+
+def test_node_declares_rhythm_dir_and_the_cpp_logger_is_built():
+    """The startup KeyError and the unlinked C++ logger. Every MemoryConfig field is a parameter,
+    and an empty window can index ``rhythm_dir`` because that key was declared."""
+    package = pathlib.Path(__file__).resolve().parents[1]
+    tree = ast.parse((package / "room_memory" / "node.py").read_text())
+    node = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "RoomMemoryNode")
+    init = next(item for item in node.body if isinstance(item, ast.FunctionDef) and item.name == "__init__")
+    params = next(
+        stmt.value for stmt in init.body
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == "params"
+    )
+    keys = [ast.literal_eval(key) for key in params.keys]
+    fields = [field.name for field in dataclasses.fields(MemoryConfig)]
+    assert set(keys) == set(fields)
+    assert "rhythm_dir" in keys
+    source = (package / "room_memory" / "node.py").read_text()
+    assert 'values["rhythm_dir"]' in source
+    defaults = MemoryConfig()
+    values = {name: getattr(defaults, name) for name in keys}
+    values["sensors"] = tuple(values["sensors"])
+    values["max_range"] = values["max_range"] if values["max_range"] > 0 else None
+    values["state_dir"] = values["state_dir"] or None
+    values["rhythm_dir"] = values["rhythm_dir"] or ""
+    assert MemoryConfig(**values) == defaults
+
+    cpp = package.parent / "room_memory_cpp"
+    declared = set(re.findall(
+        r'declare_parameter<.+?>\(\s*"([^"]+)"',
+        (cpp / "node" / "room_memory_node.cpp").read_text(),
+    ))
+    assert declared == set(fields)
+    node_cpp = (cpp / "node" / "room_memory_node.cpp").read_text()
+    assert "enqueue_rhythm" in node_cpp and "memory_->close()" in node_cpp
+    library = (cpp / "CMakeLists.txt").read_text()
+    assert "src/rhythm.cpp" in library and "Threads::Threads" in library
+    tests = (cpp / "tests" / "CMakeLists.txt").read_text()
+    assert tests.count("add_test(NAME rhythm COMMAND test_rhythm)") == 1
+    assert "test_rhythm" not in tests.split("foreach(suite")[1].split(")", 1)[0]
+    assert "add_test(NAME interface COMMAND test_interface)" in tests
+    msgs = (package.parent.parent / "ros" / "labcommand_msgs" / "CMakeLists.txt").read_text()
+    assert "msg/RhythmMinute.msg" in msgs
+    assert "struct RhythmMinute" in (cpp / "include" / "room_memory" / "messages.hpp").read_text()
+    assert "std::make_unique<Rhythm>" in (cpp / "src" / "memory.cpp").read_text()
+
+
+def test_an_empty_window_returns_and_a_directory_records_it(tmp_path):
+    """``close_window`` used to raise AttributeError before it could return, because ``_rhythm``
+    was never initialized. With a directory the same empty window is one unavailable minute."""
+    quiet = RoomMemory(MemoryConfig(state_dir=None, sensors=("mid360",)), START, GENERATION)
+    assert quiet._rhythm is None and quiet.close_window(Time(60, 0)) == []
+
+    memory = RoomMemory(MemoryConfig(
+        sensors=("mid360",), state_dir=str(tmp_path), max_range=None,
+        rhythm_keep_days=0, rhythm_fsync_s=0,
+    ), START, GENERATION)
+    try:
+        assert memory._rhythm is not None
+        assert memory.close_window(Time(60, 0)) == []
+        memory.enqueue_rhythm()
+    finally:
+        memory.close()
+    path = tmp_path / "lab" / "rhythm" / "rhythm-mid360-19700101.rhy"
+    data = path.read_bytes()
+    identity = header_identity(data)
+    assert identity["sensor"] == 1 and identity["room_id"] == "lab"
+    offset, minute = scan_records(data)
+    record = parse_record(data[identity["header_bytes"]:offset])
+    assert minute == 60 and record["unavailable"] == 1 and record["closed"] == 0
+    assert record["with_points"] == 0 and record["regions"] == () and record["flags"] & FLAG_UNAVAILABLE
 
 
 def test_defaults_record_and_do_not_publish_and_off_allocates_nothing(tmp_path):
@@ -227,10 +306,10 @@ def test_defaults_record_and_do_not_publish_and_off_allocates_nothing(tmp_path):
     assert rhythm_active(MemoryConfig(state_dir=None)) is False
     assert rhythm_active(MemoryConfig(state_dir=None, rhythm_publish=True)) is True
     assert rhythm_active(MemoryConfig(state_dir=str(tmp_path), rhythm_enable=False)) is False
-    quiet = RoomMemory(MemoryConfig(state_dir=None), START)
-    disabled = RoomMemory(MemoryConfig(state_dir=str(tmp_path), rhythm_enable=False), START)
+    quiet = RoomMemory(MemoryConfig(state_dir=None), START, GENERATION)
+    disabled = RoomMemory(MemoryConfig(state_dir=str(tmp_path), rhythm_enable=False), START, GENERATION)
     assert quiet._rhythm is None and disabled._rhythm is None
-    publish_only = RoomMemory(MemoryConfig(state_dir=None, rhythm_publish=True, rhythm_keep_days=0), START)
+    publish_only = RoomMemory(MemoryConfig(state_dir=None, rhythm_publish=True, rhythm_keep_days=0), START, GENERATION)
     try:
         assert publish_only._rhythm is not None and publish_only._rhythm.writer.directory is None
     finally:
@@ -421,7 +500,7 @@ def test_pose_ok_requires_every_point_window_and_this_engine_stores_zero(tmp_pat
     assert pose([(60, 0.0), (61, None), (62, 0.0)]) == 1
     assert pose([(60, None)]) == 0
 
-    memory = RoomMemory(config(tmp_path, reference_windows=1, max_range=None), START)
+    memory = RoomMemory(config(tmp_path, reference_windows=1, max_range=None), START, GENERATION)
     try:
         memory.add_points("mid360", scenes.room_shell())
         memory.close_window(stamp(0))
@@ -599,6 +678,19 @@ def test_rhythm_minute_golden_round_trips_and_rejects_other_sensors():
         RhythmMinute(
             "lab", 1, 4, 1, Time(60, 0), 0, 0, 0, 0, 0, 0, 0,
             (0,), (0,), (0,), (1,), (1,),
+        ).to_cdr()
+    stamped = RhythmMinute(
+        "lab", 1, 4, 1, Time(60, 0), 60, 60, 0, 0, 0, 0, 0,
+        (0, 1), (0, 0), (0, 0), (15, 45), (3, 1), GENERATION,
+    )
+    stamped_bytes = stamped.to_cdr()
+    assert stamped_bytes.startswith(message.to_cdr())
+    assert RhythmMinute.from_cdr(stamped_bytes).publisher_generation == GENERATION
+    assert RhythmMinute.from_cdr(message.to_cdr()).publisher_generation is None
+    with pytest.raises(Invalid):
+        RhythmMinute(
+            "lab", 1, 4, 1, Time(60, 0), 60, 60, 0, 0, 0, 0, 0,
+            (0, 1), (0, 0), (0, 0), (15, 45), (3, 1), 0,
         ).to_cdr()
 
 
@@ -838,7 +930,7 @@ def test_a_blocking_store_keeps_the_callback_under_50ms(rhythm, tmp_path):
         samples.append(time.perf_counter() - started)
     assert max(samples) < 0.05
 
-    memory = RoomMemory(config(tmp_path / "callback", reference_windows=1, max_range=None), START)
+    memory = RoomMemory(config(tmp_path / "callback", reference_windows=1, max_range=None), START, GENERATION)
     try:
         blocker = BlockingStore()
         memory._rhythm.writer.store = blocker
@@ -860,6 +952,7 @@ def test_publish_drops_when_it_would_block_and_markers_carry_sensor(rhythm, tmp_
     directory = tmp_path / "pub"
     log = rhythm(
         path=directory, rhythm_publish=True, publish=published.append, sensors=("mid360", "jt128"),
+        publisher_generation=GENERATION,
     )
     log.add("mid360", 60, key(0, 0, 0), 4)
     log.add("jt128", 60, key(10, 0, 0), 4)
@@ -867,6 +960,7 @@ def test_publish_drops_when_it_would_block_and_markers_carry_sensor(rhythm, tmp_
     messages = [RhythmMinute.from_cdr(blob) for blob in published]
     assert sorted(message.sensor for message in messages) == [1, 2]
     assert {message.room_id for message in messages} == {"lab"}
+    assert {message.publisher_generation for message in messages} == {GENERATION}
     jt = directory / "lab" / "rhythm" / "rhythm-jt128-19700101.rhy"
     assert header_identity(jt.read_bytes())["sensor"] == 2
 
@@ -892,7 +986,7 @@ def test_startup_disk_error_logs_once_and_detection_still_starts(tmp_path):
     assert len(logs) == 1
     memory = RoomMemory(
         config(blocked, rhythm_keep_days=0),
-        START,
+        START, GENERATION,
     )
     try:
         assert memory._rhythm is not None
@@ -928,7 +1022,9 @@ def test_building_skip_does_not_run_a_second_occupancy(tmp_path, monkeypatch):
 
     monkeypatch.setattr(memory_module, "occupancy_map", counted)
     memory = RoomMemory(
-        config(tmp_path, sensors=("mid360", "jt128"), reference_windows=1, max_range=None), START,
+        config(tmp_path, sensors=("mid360", "jt128"), reference_windows=1, max_range=None,
+               occupied_min_hits=1, occupied_min_ratio=0, free_min_seen=1),
+        START, GENERATION,
     )
     try:
         room = scenes.room_shell()
@@ -949,7 +1045,11 @@ def test_building_skip_does_not_run_a_second_occupancy(tmp_path, monkeypatch):
 
 def test_a_throw_discards_only_that_sensor(tmp_path, monkeypatch):
     memory = RoomMemory(
-        config(tmp_path, sensors=("mid360", "jt128"), reference_windows=1, max_range=None), START,
+        config(tmp_path, sensors=("mid360", "jt128"), reference_windows=1, max_range=None,
+               occupied_min_hits=1, occupied_min_ratio=0, free_min_seen=1,
+               candidate_windows=1, expire_windows=1, fresh_min_voxels=1, fresh_min_fraction=0,
+               activity_radius_m=0, min_voxels=1, min_extent=1),
+        START, GENERATION,
     )
     try:
         room = scenes.room_shell()
@@ -990,7 +1090,7 @@ def test_rhythm_on_and_off_match_event_map_and_status_bytes(tmp_path):
         memory = RoomMemory(config(
             path / "rhythm", state_dir=str(path / "state"), rhythm_enable=enable,
             rhythm_dir=str(path / "rhythm") if enable else "", reference_windows=1, max_range=None,
-        ), START)
+        ), START, GENERATION)
         try:
             room = scenes.room_shell()
             changed = np.concatenate([room, scenes.box_shell((0.3, 1.2, 0.3))])
@@ -999,10 +1099,11 @@ def test_rhythm_on_and_off_match_event_map_and_status_bytes(tmp_path):
             memory.add_points("mid360", changed)
             second = memory.close_window(stamp(1))
             memory.enqueue_rhythm()
-            status = memory.status(stamp(2), 1.0, events_seq=second[-1].header.seq if second else None)
+            status = memory.status(stamp(2), 1.0)
+            maps = [memory.map_update(stamp(0)), memory.map_update(stamp(2))]
             reference = reference_path(path / "state", "lab", "mid360").read_bytes()
             events = [event.to_cdr() for event in first + second]
-            return events, status.to_cdr(), reference
+            return events, maps, status.to_cdr(), reference
         finally:
             memory.close()
 
@@ -1021,7 +1122,7 @@ def _close_samples(path, enable, points, count):
         path, state_dir=None, rhythm_enable=enable, rhythm_dir="" if not enable else str(path),
         rhythm_publish=False, rhythm_period_s=3600, reference_windows=1, max_range=None,
         sensors=("mid360",),
-    ), START)
+    ), START, GENERATION)
     try:
         memory.add_points("mid360", points)
         memory.close_window(stamp(0))

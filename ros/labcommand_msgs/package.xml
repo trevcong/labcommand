@@ -3,7 +3,7 @@
 <package format="3">
   <name>labcommand_msgs</name>
   <version>0.1.0</version>
-  <description>Room-memory messages between the Spark room_memory node and the LabCommand Mac app: MapBricks, ChangeEvent, MemoryStatus, Activity, Epoch, RhythmMinute (Spark to Mac) and RequestSync (Mac to Spark, a topic and the RequestSync service).</description>
+  <description>Room-memory messages between the Spark room_memory node and the LabCommand Mac app: MapBricks, ChangeEvent, MemoryStatus, Activity, Epoch, OperatorAction, SyncEnd, RhythmMinute (Spark to Mac) and RequestSync (Mac to Spark, a topic and the RequestSync service).</description>
   <maintainer email="taconger@students.unwsp.edu">Trevor Conger</maintainer>
   <license>Proprietary</license>
 

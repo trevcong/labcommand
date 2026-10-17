@@ -24,6 +24,7 @@
 #include "room_memory/change_detection.hpp"
 #include "room_memory/key_set.hpp"
 #include "room_memory/messages.hpp"
+#include "room_memory/rhythm.hpp"
 
 namespace room_memory {
 
@@ -282,6 +283,18 @@ struct MemoryConfig {
     double delta_period_s = 5.0;
     double keyframe_period_s = 60.0;
     double keyframe_delta_ratio = 0.5;
+    // Rhythm log. Disk follows rhythm_dir, or state_dir when that is empty. The topic stays off
+    // unless rhythm_publish is set. A bad value fails before any subscription; nothing is clamped.
+    bool rhythm_enable = true;
+    double rhythm_cell_m = 0.5;
+    std::int64_t rhythm_dims = 2;
+    std::int64_t rhythm_period_s = 60;
+    bool rhythm_publish = false;
+    std::string rhythm_dir;
+    std::int64_t rhythm_keep_days = 90;
+    std::int64_t rhythm_max_bytes = 536870912;
+    std::int64_t rhythm_max_file_bytes = 33554432;
+    std::int64_t rhythm_fsync_s = 600;
 
     // The core config: evidence on, sensor origin (0, 0, 0) in each sensor's frame.
     Config change_config() const;
@@ -354,6 +367,7 @@ public:
     // which gives the same events and exists to measure and prove that.
     RoomMemory(MemoryConfig config, const msg::Time& start, std::uint64_t publisher_generation,
                const RayBackend* backend = nullptr, DiffScope scope = DiffScope::regions);
+    ~RoomMemory();
 
     // Queues positions (3 floats per point, meters, sensor frame) for the current window.
     void add_points(const std::string& sensor, std::span<const float> xyz);
@@ -386,6 +400,14 @@ public:
     // Writes every sensor's reference and the room's epoch file with the current map_epoch.
     // No-op without state_dir.
     void save(const msg::Time& stamp);
+    // Flush open rhythm bins, drain the writer, and fsync once. No-op when rhythm is off.
+    // Safe to call twice. Joins the writer while a rhythm publisher can still be alive.
+    void close();
+    // Copy finished rhythm records into the writer queue. The callback does no filesystem I/O.
+    void enqueue_rhythm();
+    void set_rhythm_publish(Rhythm::Publish publish, std::function<bool()> publish_would_block = {});
+    void fail_next_rhythm_insert(const std::string& sensor);
+    RhythmSensorView rhythm_sensor(const std::string& sensor) const;
 
     const MemoryConfig& config() const { return config_; }
     msg::MemoryState state() const { return state_; }
@@ -411,6 +433,10 @@ private:
     msg::MapBricks map_message(msg::MapKind kind, const msg::Time& stamp) const;
     msg::Bytes publish_map(const msg::MapBricks& message);
     void log_event(const msg::ChangeEvent& event);
+    RhythmSettings rhythm_settings() const;
+    enum class RhythmKind { add, empty, unavailable };
+    void observe_rhythm(const Channel& channel, RhythmKind kind, const Keys& occupied, const msg::Time& stamp,
+                        bool tracking);
 
     MemoryConfig config_;
     std::uint64_t publisher_generation_;
@@ -447,6 +473,7 @@ private:
     std::size_t delta_bytes_ = 0;
     std::deque<Logged> map_log_;
     std::deque<Logged> event_log_;
+    std::unique_ptr<Rhythm> rhythm_;
     std::map<std::uint64_t, Logged> open_latest_;  // event_id -> latest message, open events only
     std::optional<float> coverage_;
 };

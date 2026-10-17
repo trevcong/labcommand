@@ -51,6 +51,8 @@ struct RhythmSettings {
     std::int64_t max_bytes = 536870912;
     std::int64_t max_file_bytes = 33554432;
     std::int64_t fsync_s = 600;
+    // Stamped on RhythmMinute when set. Empty keeps the legacy layout (pinned goldens). Never 0.
+    std::optional<std::uint64_t> publisher_generation;
 };
 
 struct RhythmRegion {

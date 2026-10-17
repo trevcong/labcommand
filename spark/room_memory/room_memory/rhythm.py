@@ -3,8 +3,9 @@
 The accumulator only counts occupied voxel keys ``close_window`` already built. It does not
 cast rays, diff, or pack bricks. Disk and the optional ``/room_memory/rhythm`` publish run
 on one writer thread. The window callback copies a finished record into a fixed queue and
-returns. This checkout has no pose residual, so a bin stores ``pose_ok`` 0 unless a caller
-passes a tracking residual explicitly.
+returns. ``pose_ok`` is 1 only when the caller passes a tracking residual at or below
+``learn_max_offset_m``. The ``.rhy`` record does not carry ``publisher_generation``; the
+``RhythmMinute`` message does, when this writer was given one.
 """
 
 import datetime
@@ -679,9 +680,11 @@ class _OpenSegment:
 class RhythmWriter:
     """One thread. Append, fsync, rotate, and prune. The callback only ``try_enqueue``."""
 
-    def __init__(self, config, directory, store=None, publish=None, publish_would_block=None, log_fn=None):
+    def __init__(self, config, directory, store=None, publish=None, publish_would_block=None, log_fn=None,
+                 publisher_generation=None):
         self.config = config
         self.directory = directory
+        self.publisher_generation = publisher_generation
         self.store = store or _Store()
         self.publish = publish
         self.publish_would_block = publish_would_block or (lambda: False)
@@ -1305,6 +1308,7 @@ class RhythmWriter:
                 tuple(region[2] for region in record["regions"]),
                 tuple(region[3] for region in record["regions"]),
                 tuple(region[4] for region in record["regions"]),
+                self.publisher_generation,
             )
             self.publish(message.to_cdr())
             self._seq += 1
@@ -1331,7 +1335,7 @@ def _shift_yyyymmdd(yyyymmdd, days):
 class Rhythm:
     """Accumulator plus writer. ``enqueue`` is the only callback-side output."""
 
-    def __init__(self, config, store=None, publish=None, publish_would_block=None):
+    def __init__(self, config, store=None, publish=None, publish_would_block=None, publisher_generation=None):
         validate_rhythm(config)
         self.config = config
         self.hook_errors = 0
@@ -1341,7 +1345,10 @@ class Rhythm:
             config.sensors, voxels_per_cell(config.rhythm_cell_m, config.voxel_size), config.rhythm_dims,
             config.rhythm_period_s, windows_per_period(config.rhythm_period_s, config.window_s),
         )
-        self.writer = RhythmWriter(config, directory, store=store, publish=publish, publish_would_block=publish_would_block)
+        self.writer = RhythmWriter(
+            config, directory, store=store, publish=publish, publish_would_block=publish_would_block,
+            publisher_generation=publisher_generation,
+        )
         for sensor, flag in self.writer._force_disc.items():
             if flag:
                 self.accumulator._sensors[sensor]["force_disc"] = True

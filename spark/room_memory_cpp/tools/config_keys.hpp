@@ -85,6 +85,29 @@ inline void configure(MemoryConfig& config, const std::string& key, const std::s
         config.keyframe_period_s = real(value);
     } else if (key == "keyframe_delta_ratio") {
         config.keyframe_delta_ratio = real(value);
+    } else if (key == "rhythm_enable" || key == "rhythm_publish") {
+        const bool on = value == "true" || value == "True" || value == "1";
+        if (!on && value != "false" && value != "False" && value != "0") {
+            throw std::invalid_argument("not a bool: " + value);
+        }
+        if (key == "rhythm_enable") config.rhythm_enable = on;
+        else config.rhythm_publish = on;
+    } else if (key == "rhythm_cell_m") {
+        config.rhythm_cell_m = real(value);
+    } else if (key == "rhythm_dims") {
+        config.rhythm_dims = integer(value);
+    } else if (key == "rhythm_period_s") {
+        config.rhythm_period_s = integer(value);
+    } else if (key == "rhythm_dir") {
+        config.rhythm_dir = value;
+    } else if (key == "rhythm_keep_days") {
+        config.rhythm_keep_days = integer(value);
+    } else if (key == "rhythm_max_bytes") {
+        config.rhythm_max_bytes = integer(value);
+    } else if (key == "rhythm_max_file_bytes") {
+        config.rhythm_max_file_bytes = integer(value);
+    } else if (key == "rhythm_fsync_s") {
+        config.rhythm_fsync_s = integer(value);
     } else {
         throw std::runtime_error("unknown config key " + key);
     }

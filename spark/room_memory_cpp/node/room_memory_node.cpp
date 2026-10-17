@@ -115,6 +115,16 @@ public:
         config.delta_period_s = declare_parameter<double>("delta_period_s", defaults.delta_period_s);
         config.keyframe_period_s = declare_parameter<double>("keyframe_period_s", defaults.keyframe_period_s);
         config.keyframe_delta_ratio = declare_parameter<double>("keyframe_delta_ratio", defaults.keyframe_delta_ratio);
+        config.rhythm_enable = declare_parameter<bool>("rhythm_enable", defaults.rhythm_enable);
+        config.rhythm_cell_m = declare_parameter<double>("rhythm_cell_m", defaults.rhythm_cell_m);
+        config.rhythm_dims = declare_parameter<std::int64_t>("rhythm_dims", defaults.rhythm_dims);
+        config.rhythm_period_s = declare_parameter<std::int64_t>("rhythm_period_s", defaults.rhythm_period_s);
+        config.rhythm_publish = declare_parameter<bool>("rhythm_publish", defaults.rhythm_publish);
+        config.rhythm_dir = declare_parameter<std::string>("rhythm_dir", defaults.rhythm_dir);
+        config.rhythm_keep_days = declare_parameter<std::int64_t>("rhythm_keep_days", defaults.rhythm_keep_days);
+        config.rhythm_max_bytes = declare_parameter<std::int64_t>("rhythm_max_bytes", defaults.rhythm_max_bytes);
+        config.rhythm_max_file_bytes = declare_parameter<std::int64_t>("rhythm_max_file_bytes", defaults.rhythm_max_file_bytes);
+        config.rhythm_fsync_s = declare_parameter<std::int64_t>("rhythm_fsync_s", defaults.rhythm_fsync_s);
         // Before any publisher: every message this process sends carries the generation. The
         // allocation holds publisher.lock until the process exits. The wall clock, not now(),
         // which may be sim time.
@@ -134,7 +144,7 @@ public:
         // 1 Hz, so a late subscriber (the bridge, when the first Mac subscribes) gets the last one at once;
         // a copy delivered again repeats its seq in its generation. Everything else is volatile: the Mac
         // gets the map and recent events by RequestSync, and a restarted node never receives an old
-        // request. Same QoS as node.py.
+        // request. Rhythm, when published, is the same latched full-state QoS as status. Same QoS as node.py.
         const auto volatile_qos = [](std::size_t depth) { return rclcpp::QoS(depth).reliable().durability_volatile(); };
         const auto latched_qos = [] { return rclcpp::QoS(1).reliable().transient_local(); };
         events_ = create_generic_publisher(kEventsTopic, kEventType, volatile_qos(100));
@@ -144,6 +154,13 @@ public:
         sync_map_ = create_generic_publisher(kSyncMapTopic, kMapType, volatile_qos(10));
         sync_events_ = create_generic_publisher(kSyncEventsTopic, kEventType, volatile_qos(200));
         sync_end_ = create_generic_publisher(kSyncEndTopic, "labcommand_msgs/msg/SyncEnd", volatile_qos(10));
+        if (config.rhythm_publish) {
+            rhythm_pub_ = create_generic_publisher("/room_memory/rhythm", "labcommand_msgs/msg/RhythmMinute", latched_qos());
+            auto publisher = rhythm_pub_;
+            memory_->set_rhythm_publish([publisher](std::span<const std::uint8_t> bytes) {
+                publisher->publish(serialized(msg::Bytes(bytes.begin(), bytes.end())));
+            });
+        }
         requests_ = create_generic_subscription(
             kRequestTopic, "labcommand_msgs/msg/RequestSync", volatile_qos(10),
             [this](std::shared_ptr<const rclcpp::SerializedMessage> message) { answer(*message); });
@@ -171,6 +188,11 @@ public:
                     static_cast<unsigned long long>(memory_->publisher_generation()));
     }
 
+    // Join the writer while the rhythm publisher is still alive.
+    ~RoomMemoryNode() override {
+        if (memory_) memory_->close();
+    }
+
 private:
     msg::Time stamp() {
         const std::int64_t ns = now().nanoseconds();
@@ -195,6 +217,7 @@ private:
         for (const msg::ChangeEvent& event : events) events_->publish(serialized(event.to_cdr()));
         const std::optional<msg::Bytes> map = memory_->map_update(now_stamp);
         if (map) map_->publish(serialized(*map));
+        memory_->enqueue_rhythm();
         const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         RCLCPP_INFO(get_logger(), "window %.1f ms wall, %.1f ms cpu, %zu event messages, map %zu B, state %s", elapsed,
                     cpu_ms() - cpu, events.size(), map ? map->size() : std::size_t{0}, msg::name(memory_->state()));
@@ -252,6 +275,7 @@ private:
     std::shared_ptr<rclcpp::GenericPublisher> sync_map_;
     std::shared_ptr<rclcpp::GenericPublisher> sync_events_;
     std::shared_ptr<rclcpp::GenericPublisher> sync_end_;
+    std::shared_ptr<rclcpp::GenericPublisher> rhythm_pub_;
     std::shared_ptr<rclcpp::GenericSubscription> requests_;
     rclcpp::Service<labcommand_msgs::srv::RequestSync>::SharedPtr request_service_;
     rclcpp::Serialization<labcommand_msgs::msg::RequestSync> request_serialization_;
@@ -273,7 +297,20 @@ int main(int argc, char** argv) {
         rclcpp::shutdown();
         return 1;
     }
+    // The startup test sets this and waits for the file. Absent in normal launches.
+    // Activity is created even with rhythm_publish false, before this returns.
+    if (const char* mark = std::getenv("ROOM_MEMORY_STARTUP_MARK")) {
+        std::ofstream out(mark, std::ios::out | std::ios::trunc);
+        if (!out) {
+            RCLCPP_ERROR(node->get_logger(), "could not write startup mark %s", mark);
+            rclcpp::shutdown();
+            return 2;
+        }
+        out << "ready\n";
+        out.close();
+    }
     rclcpp::spin(node);
+    node.reset();
     rclcpp::shutdown();
     return 0;
 }

@@ -931,6 +931,10 @@ def test_launch_files_carry_the_memory_config_defaults(launch):
             assert ast.literal_eval(text) == list(value)
         elif isinstance(value, str):
             assert text == value, field.name
+        elif isinstance(value, bool):
+            # Launch files spell bools as the words true and false. bool("false") is True.
+            assert text.lower() in ("true", "false"), field.name
+            assert (text.lower() == "true") is value, field.name
         else:
             assert type(value)(text) == value, field.name
 

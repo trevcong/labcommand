@@ -83,6 +83,16 @@ class RoomMemoryNode(Node):
             "delta_period_s": defaults.delta_period_s,
             "keyframe_period_s": defaults.keyframe_period_s,
             "keyframe_delta_ratio": defaults.keyframe_delta_ratio,
+            "rhythm_enable": defaults.rhythm_enable,
+            "rhythm_cell_m": defaults.rhythm_cell_m,
+            "rhythm_dims": defaults.rhythm_dims,
+            "rhythm_period_s": defaults.rhythm_period_s,
+            "rhythm_publish": defaults.rhythm_publish,
+            "rhythm_dir": defaults.rhythm_dir,
+            "rhythm_keep_days": defaults.rhythm_keep_days,
+            "rhythm_max_bytes": defaults.rhythm_max_bytes,
+            "rhythm_max_file_bytes": defaults.rhythm_max_file_bytes,
+            "rhythm_fsync_s": defaults.rhythm_fsync_s,
         }
         values = {name: self.declare_parameter(name, value).value for name, value in params.items()}
         values["sensors"] = tuple(values["sensors"])
@@ -118,6 +128,10 @@ class RoomMemoryNode(Node):
         self.sync_map = self.create_publisher(MapBricksMsg, SYNC_MAP_TOPIC, volatile(10))
         self.sync_events = self.create_publisher(ChangeEventMsg, SYNC_EVENTS_TOPIC, volatile(200))
         self.sync_end = self.create_publisher(SyncEndMsg, SYNC_END_TOPIC, volatile(10))
+        if self.config.rhythm_publish:
+            from labcommand_msgs.msg import RhythmMinute as RhythmMinuteMsg
+            self.rhythm = self.create_publisher(RhythmMinuteMsg, "/room_memory/rhythm", latched())
+            self.memory.set_rhythm_publish(lambda data: self.rhythm.publish(data))
         self.create_subscription(RequestSyncMsg, REQUEST_TOPIC, self._answer, volatile(10), raw=True)
         self.create_service(RequestSyncSrv, REQUEST_SERVICE, self._serve_request)
         for name in self.config.sensors:
@@ -152,6 +166,7 @@ class RoomMemoryNode(Node):
         message = self.memory.map_update(stamp)
         if message is not None:
             self.map.publish(message)
+        self.memory.enqueue_rhythm()
         elapsed_ms = (time.perf_counter() - start) * 1000
         cpu_ms = (time.process_time() - cpu) * 1000
         self.get_logger().info(
@@ -193,6 +208,12 @@ class RoomMemoryNode(Node):
         self._last_status = now
         self.status.publish(message.to_cdr())
         self.activity.publish(self.memory.activity(stamp).to_cdr())
+
+    def destroy_node(self):
+        memory = getattr(self, "memory", None)
+        if memory is not None:
+            memory.close()
+        super().destroy_node()
 
 
 def main(args=None):

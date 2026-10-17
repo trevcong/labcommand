@@ -34,6 +34,7 @@ set(ROOM_MEMORY_PYTHON "${ROOM_MEMORY_PYTHON_DEFAULT}" CACHE FILEPATH
     "Python with numpy and pytest for the differential and recording tests (empty: they report skipped)")
 
 find_package(ZLIB REQUIRED)
+find_package(Threads REQUIRED)
 
 if(ROOM_MEMORY_OPENMP)
   if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
@@ -68,6 +69,7 @@ add_library(room_memory_core
   src/memory.cpp
   src/generation.cpp
   src/rejectlog.cpp
+  src/rhythm.cpp
 )
 set_target_properties(room_memory_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(room_memory_core PUBLIC
@@ -85,7 +87,7 @@ if(ROOM_MEMORY_NATIVE)
     target_compile_options(room_memory_core PRIVATE -march=native)
   endif()
 endif()
-target_link_libraries(room_memory_core PUBLIC ZLIB::ZLIB)
+target_link_libraries(room_memory_core PUBLIC ZLIB::ZLIB Threads::Threads)
 if(ROOM_MEMORY_OPENMP)
   target_link_libraries(room_memory_core PUBLIC OpenMP::OpenMP_CXX)
 endif()

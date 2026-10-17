@@ -24,3 +24,6 @@ int16[] iy
 int16[] iz
 uint16[] hit_windows
 uint16[] mean_voxels
+# Protocol v2 (section 1.4). The hand codec omits this when absent (the legacy layout).
+# Never 0. The live publisher always writes the process generation.
+uint64 publisher_generation

@@ -6,6 +6,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -391,6 +392,14 @@ TEST(rhythm_minute_golden_round_trips_both_endians) {
     msg::Bytes rejected = other;
     rejected[12] = 9;
     CHECK_THROWS(std::invalid_argument, msg::RhythmMinute::from_cdr(rejected));
+    message.publisher_generation = 7;
+    const msg::Bytes stamped = message.to_cdr();
+    CHECK(stamped.size() > encoded.size());
+    CHECK(std::equal(encoded.begin(), encoded.end(), stamped.begin()));
+    CHECK(msg::RhythmMinute::from_cdr(stamped).publisher_generation == std::uint64_t{7});
+    CHECK(!msg::RhythmMinute::from_cdr(encoded).publisher_generation);
+    message.publisher_generation = 0;
+    CHECK_THROWS(std::invalid_argument, message.to_cdr());
 }
 
 TEST(bad_rhythm_config_is_rejected_before_a_bin_exists) {
@@ -416,8 +425,8 @@ TEST(bad_rhythm_config_is_rejected_before_a_bin_exists) {
 TEST(rhythm_on_matches_rhythm_off_and_a_throw_drops_only_that_bin) {
     TempDir dir;
     const msg::Time start{0, 0};
-    RoomMemory enabled(loose(dir.path.string(), true), start);
-    RoomMemory disabled(loose(std::nullopt, false), start);
+    RoomMemory enabled(loose(dir.path.string(), true), start, 7);
+    RoomMemory disabled(loose(std::nullopt, false), start, 7);
     const Snapshot on = drive(enabled, false);
     const Snapshot off = drive(disabled, false);
     CHECK(!on.events.empty());
@@ -436,8 +445,8 @@ TEST(rhythm_on_matches_rhythm_off_and_a_throw_drops_only_that_bin) {
     CHECK(stored && stored->with_points == 2 && stored->pose_ok == 0);
 
     TempDir other;
-    RoomMemory throwing(loose(other.path.string(), true), start);
-    RoomMemory quiet(loose(std::nullopt, false), start);
+    RoomMemory throwing(loose(other.path.string(), true), start, 7);
+    RoomMemory quiet(loose(std::nullopt, false), start, 7);
     const Snapshot boom = drive(throwing, true);
     const auto mid = throwing.rhythm_sensor("mid360");
     const auto jt = throwing.rhythm_sensor("jt128");
@@ -447,6 +456,41 @@ TEST(rhythm_on_matches_rhythm_off_and_a_throw_drops_only_that_bin) {
     CHECK_EQ(boom.events, still.events);
     CHECK_EQ(boom.maps, still.maps);
     CHECK_EQ(boom.status, still.status);
+}
+
+// An empty window used to be unreachable once the engine touched an uninitialized logger.
+// With a directory it is one unavailable minute; with the logger off it still returns.
+TEST(an_empty_window_returns_and_records_one_unavailable_minute) {
+    TempDir dir;
+    MemoryConfig config;
+    config.sensors = {"mid360"};
+    config.max_range = std::nullopt;
+    config.state_dir = dir.path.string();
+    config.rhythm_keep_days = 0;
+    config.rhythm_fsync_s = 0;
+    {
+        RoomMemory memory(config, msg::Time{60, 0}, 7);
+        CHECK(memory.close_window(msg::Time{60, 0}).empty());
+        memory.enqueue_rhythm();
+        memory.close();
+    }
+    const auto path = dir.path / "lab" / "rhythm" / "rhythm-mid360-19700101.rhy";
+    const auto bytes = harness::read_bytes(path);
+    const auto identity = room_memory::header_identity(bytes);
+    CHECK(identity && identity->sensor == 1 && identity->room_id == "lab");
+    const auto scanned = room_memory::scan_records(bytes);
+    CHECK(scanned && scanned->second && *scanned->second == 60);
+    const auto stored = room_memory::parse_record(std::span<const std::uint8_t>(
+        bytes.data() + static_cast<std::size_t>(identity->header_bytes),
+        scanned->first - static_cast<std::size_t>(identity->header_bytes)));
+    CHECK(stored && stored->unavailable == 1 && stored->closed == 0 && stored->with_points == 0);
+    CHECK(stored->regions.empty());
+    CHECK((stored->flags & room_memory::kFlagUnavailable) != 0);
+
+    config.rhythm_enable = false;
+    RoomMemory quiet(config, msg::Time{60, 0}, 7);
+    CHECK(quiet.close_window(msg::Time{60, 0}).empty());
+    CHECK(!quiet.rhythm_sensor("mid360").open);
 }
 
 TEST_MAIN

@@ -57,6 +57,16 @@ ARGUMENTS = {
     "delta_period_s": ("5.0", float),
     "keyframe_period_s": ("60.0", float),
     "keyframe_delta_ratio": ("0.5", float),
+    "rhythm_enable": ("true", bool),
+    "rhythm_cell_m": ("0.5", float),
+    "rhythm_dims": ("2", int),
+    "rhythm_period_s": ("60", int),
+    "rhythm_publish": ("false", bool),
+    "rhythm_dir": ("", str),
+    "rhythm_keep_days": ("90", int),
+    "rhythm_max_bytes": ("536870912", int),
+    "rhythm_max_file_bytes": ("33554432", int),
+    "rhythm_fsync_s": ("600", int),
 }
 
 # The node's RequestSync service, the only one the bridge exposes (D39).

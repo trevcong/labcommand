@@ -211,12 +211,13 @@ TEST(activity_msg_matches_the_hand_golden_layout) {
         {"n_regions", 36},
         {"voxel_count", 40},
         {"centroid", 44},
-        {"aabb_min", 56},
-        {"aabb_max", 68},
+        {"aabb", 56},
         {"since_s", 80},
+        // Protocol v2 (D38). The hand goldens omit it; alignment pads 4 bytes after since_s.
+        {"publisher_generation", 88},
     };
     if (fields.size() != sizeof(expect) / sizeof(expect[0])) {
-        throw harness::Failure("Activity.msg field count is " + std::to_string(fields.size()) + ", golden layout has 13");
+        throw harness::Failure("Activity.msg field count is " + std::to_string(fields.size()) + ", layout has 13");
     }
     for (std::size_t n = 0; n < fields.size(); ++n) {
         if (fields[n].name != expect[n].first) {
@@ -228,7 +229,11 @@ TEST(activity_msg_matches_the_hand_golden_layout) {
             throw harness::Failure(fields[n].name + " is not at golden offset " + std::to_string(expect[n].second));
         }
     }
-    if (layout.end != 84) throw harness::Failure("Activity payload for room_id lab is not 84 bytes");
+    if (layout.end != 96) throw harness::Failure("Activity payload for room_id lab is not 96 bytes with publisher_generation");
+    // The hand goldens are the legacy layout: generation omitted, payload ends on since_s.
+    if (layout.offset.at("since_s") + 4 != 84) {
+        throw harness::Failure("legacy Activity payload does not end at 84 bytes");
+    }
     // bool, then the two uint8 sensor fields, then the pad the golden annotates before n_regions.
     if (fields[4].type != "bool" || fields[5].type != "uint8" || fields[6].type != "uint8") {
         throw harness::Failure("active, sensors and largest_sensor are not bool, uint8, uint8");

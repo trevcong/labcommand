@@ -22,6 +22,7 @@ import numpy as np
 
 from .core import Config, OccupancyMap, Region, cast_rays, decode_pointcloud2, diff, occupancy_map
 from .core.change_detection import contains, in_range, pack, unpack, validate
+from .rhythm import Rhythm, rhythm_active, validate_rhythm
 from .messages import (
     Activity,
     BRICK_DIM,
@@ -780,6 +781,18 @@ class MemoryConfig:
     delta_period_s: float = 5.0
     keyframe_period_s: float = 60.0
     keyframe_delta_ratio: float = 0.5
+    # Rhythm log. Disk follows rhythm_dir, or state_dir when that is empty. The topic stays off
+    # unless rhythm_publish is set. A bad value fails before any subscription; nothing is clamped.
+    rhythm_enable: bool = True
+    rhythm_cell_m: float = 0.5
+    rhythm_dims: int = 2
+    rhythm_period_s: int = 60
+    rhythm_publish: bool = False
+    rhythm_dir: str = ""
+    rhythm_keep_days: int = 90
+    rhythm_max_bytes: int = 536870912
+    rhythm_max_file_bytes: int = 33554432
+    rhythm_fsync_s: int = 600
 
     def change_config(self):
         """The core config: evidence on, sensor origin (0, 0, 0) in each sensor's frame."""
@@ -830,6 +843,7 @@ class RoomMemory:
     """
 
     def __init__(self, config, start, publisher_generation):
+        self._rhythm = None
         if not isinstance(publisher_generation, int) or not 1 <= publisher_generation <= UINT64_MAX:
             raise ValueError(f"publisher_generation must be in 1...{UINT64_MAX}, got {publisher_generation!r}")
         unknown = [name for name in config.sensors if name not in SENSORS]
@@ -891,7 +905,34 @@ class RoomMemory:
         self._map_log = deque(maxlen=MAP_LOG_DEPTH)
         self._event_log = deque(maxlen=EVENT_LOG_DEPTH)
         self._open_latest = {}  # event_id -> latest Logged message, open events only
+        validate_rhythm(config)
         self._load(start)
+        if rhythm_active(config):
+            self._rhythm = Rhythm(config, publisher_generation=self.publisher_generation)
+
+    def close(self):
+        """Flush open rhythm bins, drain the writer, and fsync once. No-op when rhythm is off."""
+        rhythm = self._rhythm
+        if rhythm is None:
+            return
+        self._rhythm = None
+        rhythm.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def enqueue_rhythm(self):
+        """Copy finished rhythm records into the writer queue. The callback does no filesystem I/O."""
+        if self._rhythm is not None:
+            self._rhythm.enqueue()
+
+    def set_rhythm_publish(self, publish, would_block=None):
+        """Hand the writer a non-blocking publisher. A publish that would block is dropped."""
+        if self._rhythm is not None:
+            self._rhythm.writer.set_publish(publish, would_block)
 
     def _paths(self):
         return {name: reference_path(self.config.state_dir, self.config.room_id, name) for name in self.channels}
@@ -1007,6 +1048,11 @@ class RoomMemory:
                         channel.stats.add(observed.occupied, observed.known)
                         channel.reference_windows += 1
                         self._set_reference(channel, channel.stats.settled(self.config.settle_rule()))
+                        self._observe_rhythm(channel, "add", window.occupied, stamp, tracking)
+                    else:
+                        self._observe_rhythm(channel, "empty", None, stamp, tracking)
+                else:
+                    self._observe_rhythm(channel, "unavailable", None, stamp, tracking)
                 continue
             points = np.concatenate(frames) if frames else _NO_POINTS
             window = occupancy_map(points, self.change) if frames else None
@@ -1014,6 +1060,7 @@ class RoomMemory:
             if window is None or not len(window.occupied):
                 channel.recent.append(_NO_POINTS)
                 channel.tracker.interrupt()
+                self._observe_rhythm(channel, "empty", None, stamp, tracking)
                 continue
             channel.recent.append(points)
             reference = channel.reference
@@ -1041,6 +1088,7 @@ class RoomMemory:
                 events.append(self._event(channel, state, candidate, stamp))
                 self._log_event(events[-1])
             activity.extend((channel.sensor.bit, report.regions[index]) for index in channel.tracker.activity)
+            self._observe_rhythm(channel, "add", window.occupied, stamp, tracking)
         if dropped:
             self.dropped_windows += 1
         self.last_window_dropped = dropped
@@ -1067,6 +1115,26 @@ class RoomMemory:
         if self._rhythm is not None:
             self._rhythm.note_epoch(self.map_epoch)
         return events
+
+    def _observe_rhythm(self, channel, kind, occupied, stamp, tracking):
+        """Count this sensor's window after its detection. A failure drops only this bin."""
+        rhythm = self._rhythm
+        if rhythm is None:
+            return
+        name = channel.sensor.name
+        try:
+            if kind == "add":
+                if tracking:
+                    rhythm.add(name, stamp.sec, occupied, self.map_epoch, tracking=True,
+                               residual=channel.residual, learn_max_offset_m=self.config.learn_max_offset_m)
+                else:
+                    rhythm.add(name, stamp.sec, occupied, self.map_epoch)
+            elif kind == "empty":
+                rhythm.add_empty(name, stamp.sec, self.map_epoch)
+            else:
+                rhythm.note_unavailable(name, stamp.sec, self.map_epoch)
+        except Exception:
+            rhythm.discard(name, stamp.sec, self.map_epoch)
 
     def activity(self, stamp):
         """The ``Activity`` message at ``stamp`` (call at 1 Hz): the newest tracking window with

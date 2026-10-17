@@ -105,6 +105,7 @@ public:
         for (std::size_t b = 0; b < size; ++b) data_.push_back(static_cast<std::uint8_t>(value >> (8 * b)));
     }
     void u16(std::uint64_t value) { put(value, 2); }
+    void i16(std::int64_t value) { put(static_cast<std::uint16_t>(value), 2); }
     void u32(std::uint64_t value) { put(value, 4); }
     void u64(std::uint64_t value) { put(value, 8); }
     void f32(std::optional<float> value) {
@@ -194,6 +195,7 @@ public:
 
     std::uint8_t u8(const std::string& what) { return data_[take(1, what)]; }
     std::uint16_t u16(const std::string& what) { return static_cast<std::uint16_t>(get(2, what)); }
+    std::int64_t i16(const std::string& what) { return static_cast<std::int16_t>(u16(what)); }
     std::uint32_t u32(const std::string& what) { return static_cast<std::uint32_t>(get(4, what)); }
     std::int32_t i32(const std::string& what) { return static_cast<std::int32_t>(u32(what)); }
     std::uint64_t u64(const std::string& what) { return get(8, what); }
@@ -1021,6 +1023,131 @@ SyncEnd SyncEnd::from_cdr(std::span<const std::uint8_t> data) {
         e.unavailable = reader.ranges("unavailable");
         e.validate();
         return e;
+    });
+}
+
+void RhythmMinute::validate() const {
+    const std::string context = "RhythmMinute";
+    if (room_id.empty()) throw Invalid(context + ": room_id is empty");
+    if (room_id.find('\0') != std::string::npos) throw Invalid(context + ": room_id contains a NUL");
+    if (sensor != kSensorMid360 && sensor != kSensorJT128) {
+        throw Invalid(context + ": sensor " + str(sensor) + " is not 1 (Mid-360) or 2 (JT128)");
+    }
+    stamp.validate(context + ": stamp");
+    require_generation(publisher_generation, context + ": publisher_generation");
+    require_int(windows_closed, 0, 0xFFFF, context + ": windows_closed");
+    require_int(windows_with_points, 0, 0xFFFF, context + ": windows_with_points");
+    require_int(windows_unavailable, 0, 0xFFFF, context + ": windows_unavailable");
+    require_int(clipped, 0, (std::int64_t{1} << 32) - 1, context + ": clipped");
+    require_int(regions_dropped, 0, (std::int64_t{1} << 32) - 1, context + ": regions_dropped");
+    if (pose_ok != 0 && pose_ok != 1) throw Invalid(context + ": pose_ok " + str(pose_ok) + " is not 0 or 1");
+    require_int(flags, 0, 255, context + ": flags");
+    const std::size_t count = ix.size();
+    if (iy.size() != count || iz.size() != count || hit_windows.size() != count || mean_voxels.size() != count) {
+        throw Invalid(context + ": region array lengths disagree");
+    }
+    if (count > 65535) throw Invalid(context + ": n_regions " + str(std::uint64_t{count}) + " does not fit in uint16");
+    if (windows_with_points == 0 && count != 0) {
+        throw Invalid(context + ": a minute with no point-windows stores no regions");
+    }
+    std::optional<std::array<std::int64_t, 3>> previous;
+    for (std::size_t n = 0; n < count; ++n) {
+        const std::string at = "[" + str(std::uint64_t{n}) + "]";
+        require_int(ix[n], -(std::int64_t{1} << 15), (std::int64_t{1} << 15) - 1, context + ": ix" + at);
+        require_int(iy[n], -(std::int64_t{1} << 15), (std::int64_t{1} << 15) - 1, context + ": iy" + at);
+        require_int(iz[n], -(std::int64_t{1} << 15), (std::int64_t{1} << 15) - 1, context + ": iz" + at);
+        require_int(hit_windows[n], 1, 0xFFFF, context + ": hit_windows" + at);
+        require_int(mean_voxels[n], 0, 0xFFFF, context + ": mean_voxels" + at);
+        if (windows_with_points > 0 && hit_windows[n] > windows_with_points) {
+            throw Invalid(context + ": hit_windows" + at + " " + str(hit_windows[n]) + " exceeds windows_with_points");
+        }
+        const std::array<std::int64_t, 3> current{ix[n], iy[n], iz[n]};
+        if (previous) {
+            const auto& prev = *previous;
+            const bool after = current[0] > prev[0] ||
+                               (current[0] == prev[0] &&
+                                (current[1] > prev[1] || (current[1] == prev[1] && current[2] > prev[2])));
+            if (!after) throw Invalid(context + ": regions are not strictly increasing at " + str(std::uint64_t{n}));
+        }
+        previous = current;
+    }
+}
+
+Bytes RhythmMinute::to_cdr() const {
+    validate();
+    Writer writer;
+    writer.string(room_id);
+    writer.u8(static_cast<std::uint8_t>(sensor));
+    writer.u64(map_epoch);
+    writer.u64(seq);
+    writer.time(stamp);
+    writer.u16(static_cast<std::uint64_t>(windows_closed));
+    writer.u16(static_cast<std::uint64_t>(windows_with_points));
+    writer.u16(static_cast<std::uint64_t>(windows_unavailable));
+    writer.u32(static_cast<std::uint64_t>(clipped));
+    writer.u32(static_cast<std::uint64_t>(regions_dropped));
+    writer.u8(static_cast<std::uint8_t>(pose_ok));
+    writer.u8(static_cast<std::uint8_t>(flags));
+    writer.u16(ix.size());
+    const auto put_i = [&](const std::vector<std::int64_t>& values) {
+        writer.u32(values.size());
+        for (const std::int64_t value : values) writer.i16(value);
+    };
+    const auto put_u = [&](const std::vector<std::int64_t>& values) {
+        writer.u32(values.size());
+        for (const std::int64_t value : values) writer.u16(static_cast<std::uint64_t>(value));
+    };
+    put_i(ix);
+    put_i(iy);
+    put_i(iz);
+    put_u(hit_windows);
+    put_u(mean_voxels);
+    if (publisher_generation) writer.u64(*publisher_generation);
+    return writer.take();
+}
+
+RhythmMinute RhythmMinute::from_cdr(std::span<const std::uint8_t> data) {
+    return decode<RhythmMinute>(data, "RhythmMinute", [](Reader& reader) {
+        RhythmMinute message;
+        message.room_id = reader.string("room_id");
+        message.sensor = reader.u8("sensor");
+        message.map_epoch = reader.u64("map_epoch");
+        message.seq = reader.u64("seq");
+        message.stamp = reader.time("stamp");
+        message.windows_closed = reader.u16("windows_closed");
+        message.windows_with_points = reader.u16("windows_with_points");
+        message.windows_unavailable = reader.u16("windows_unavailable");
+        message.clipped = reader.u32("clipped");
+        message.regions_dropped = reader.u32("regions_dropped");
+        message.pose_ok = reader.u8("pose_ok");
+        message.flags = reader.u8("flags");
+        const int declared = reader.u16("n_regions");
+        const auto series = [&](const char* name, bool signed_value) {
+            const std::uint32_t count = reader.u32(std::string(name) + " length");
+            if (count > 65535) {
+                throw Invalid(std::string("RhythmMinute: ") + name + " length " + str(std::uint64_t{count}) +
+                              " is above 65535");
+            }
+            std::vector<std::int64_t> values;
+            values.reserve(count);
+            for (std::uint32_t n = 0; n < count; ++n) {
+                const std::string at = std::string(name) + "[" + str(std::uint64_t{n}) + "]";
+                values.push_back(signed_value ? reader.i16(at) : static_cast<std::int64_t>(reader.u16(at)));
+            }
+            return values;
+        };
+        message.ix = series("ix", true);
+        message.iy = series("iy", true);
+        message.iz = series("iz", true);
+        message.hit_windows = series("hit_windows", false);
+        message.mean_voxels = series("mean_voxels", false);
+        if (static_cast<std::size_t>(declared) != message.ix.size()) {
+            throw Invalid("RhythmMinute: n_regions " + str(std::int64_t{declared}) + " does not match ix length " +
+                          str(std::uint64_t{message.ix.size()}));
+        }
+        if (reader.is_v2(8, "mean_voxels")) message.publisher_generation = reader.u64("publisher_generation");
+        message.validate();
+        return message;
     });
 }
 

@@ -4,7 +4,7 @@ Log each lidar's occupied fraction per region once a minute, for a later fit of 
 
 ## Where
 
-Python reference: `spark/room_memory` here (no pose residual). C++ node, CTest, and the live image: `spark/room_memory_cpp` in this checkout. Python oracle for that image: `spark/room_memory_oracle` (the spark engine, with the same rhythm hook). The labcommand-spark worktree is not edited; this branch carries the engine plus the hook.
+Both nodes in this checkout are the protocol v2 engine (Activity, pose residual, `publisher_generation`): `spark/room_memory` and `spark/room_memory_cpp`. Differential tests compare those two. The `.rhy` layout is unchanged. `RhythmMinute` ends with `publisher_generation` (protocol §1.4); the hand codec omits it on the legacy layout. The labcommand-spark worktree is not edited.
 
 Mac `close_window` without the logger is ~16.5 ms per 1 s window (one thread, both sensors). No SSH. Clouds and status share that thread, so the callback only enqueues. One writer does `write`, `fsync`, rotate, and prune.
 
@@ -20,7 +20,7 @@ A region is a grid cell in that lidar's frame. Sensors stay separate.
 
 `minute_unix = sec - sec % period_s` (skip sec < 0). ≤2 s before an open bin, in the previous period, stays there (60, 61, 59 → minute 60). A longer forward gap sets bit 1 and writes no filler. Any other backward step flushes and opens the earlier minute with bit 1.
 
-`pose_ok` is 1 only for tracking windows with residual ≤ `learn_max_offset_m`. This checkout, and any bin with no points, stores 0.
+`pose_ok` is 1 only when every point-window was tracking and its residual was ≤ `learn_max_offset_m`. A window is observed with the state it entered in, so the window that crosses BUILDING → TRACKING is not tracking. A bin with no point-windows stores 0.
 
 ## Hot path
 
@@ -48,7 +48,7 @@ Before spin, scan the open append file only (≤32 MiB) and truncate to the last
 
 ## Topic
 
-`labcommand_msgs/RhythmMinute` on `/room_memory/rhythm`, from the writer: reliable, keep-last 1, transient local. Record fields minus the pad, plus `room_id`, `sensor` (u8 immediately after `room_id`: 1 Mid-360, 2 JT128, the file-header codes), `map_epoch`, `seq`, and the minute `stamp`. Every message carries `sensor`, including a loss marker. The `.rhy` record layout stays unchanged; the two lidars share this topic and use different frames.
+`labcommand_msgs/RhythmMinute` on `/room_memory/rhythm`, from the writer: reliable, keep-last 1, transient local. Record fields minus the pad, plus `room_id`, `sensor` (u8 immediately after `room_id`: 1 Mid-360, 2 JT128, the file-header codes), `map_epoch`, `seq`, and the minute `stamp`. Every message carries `sensor`, including a loss marker. The live publisher stamps `publisher_generation` (never 0), the same field other v2 Spark→Mac messages end with. Absent, the hand codec keeps the legacy layout so the pinned goldens stay. The `.rhy` record layout stays unchanged and does not carry the generation; the two lidars share this topic and use different frames.
 
 ## Config
 
@@ -80,7 +80,7 @@ Sum `rhythm-*.rhy`, `*.superseded-*`, and `*.bad-*` (both sensors) before every 
 - Reject a bad float32 ratio, period, and file cap above the directory cap (0 stays legal). Floor pins, dims 2/3, the 15/3 pin, omitted zeros, empty vs unavailable, and a one-sensor BUILDING skip (no second occupancy).
 - The first miss sets bit 3 and stops the window, including past 4096 regions, inside the allowance. A throw mid-insert discards the bin; the other sensor still detects.
 - CRC `0x046E226A`, torn tail, superseded and bad magic. A short write whose retry fails is truncated to the pre-append offset before the marker. A failed truncate leaves nothing after the tear and opens no new file; the next start keeps the prefix, and the next fragment has bit 1. Stamps 60/61/59 stay one fragment; a gap writes no filler; an in-minute restart is two unmerged fragments. Rotations stay within the byte cap. A blocking store keeps the callback under 50 ms. A full queue drops. Rhythm on and off match on event, map, and status bytes.
-- One LE `RhythmMinute` golden round-trips with `sensor` 1; the BE twin decodes; `sensor` 2 is a distinct message; any other `sensor` is rejected; old goldens stay. `colcon test` checks the publish and skips with a message if rclpy/rclcpp is missing. Spark `.rhy` bytes match for one occupied minute and one unavailable minute (skip here). `ROOM_MEMORY_RHYTHM_BUDGET=1` checks the allowance across a rotation.
+- One LE `RhythmMinute` golden round-trips with `sensor` 1; the BE twin decodes; `sensor` 2 is a distinct message; any other `sensor` is rejected; old goldens stay. A stamped generation round-trips and generation 0 is invalid; the legacy CDR prefix is unchanged. `colcon test` checks the publish and skips with a message if rclpy/rclcpp is missing. Spark `.rhy` bytes match for one occupied minute and one unavailable minute (skip here). `ROOM_MEMORY_RHYTHM_BUDGET=1` checks the allowance across a rotation.
 
 ## Deploy (room-memory container only)
 

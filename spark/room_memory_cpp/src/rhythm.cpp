@@ -1483,6 +1483,7 @@ private:
                 message.hit_windows.push_back(region.hits);
                 message.mean_voxels.push_back(region.mean);
             }
+            message.publisher_generation = settings_.publisher_generation;
             publish_(message.to_cdr());
         } catch (const std::exception&) {
             ++publish_dropped_;
