@@ -130,6 +130,18 @@ def test_sparse_membership_matches_the_dense_grid(name, monkeypatch):
     assert (text + "\n").encode() == (goldens.SWIFT_DIR / f"{name}.json").read_bytes()
 
 
+@pytest.mark.parametrize("name", ["indoor-moved", "jitter", "boundary-endpoint"])
+def test_free_cells_without_keep_match_the_sorted_dedupe(name, monkeypatch):
+    """Without keep (the room engine's free evidence) the walked cells are deduped in a dense grid
+    over the walk's box when it fits, else sorted: the same keys either way."""
+    build, flags = goldens.SCENES[name]
+    config = config_for(flags)
+    after = occupancy_map(build()[1], config)
+    dense = change_detection.cast_rays(after, config)
+    monkeypatch.setattr(change_detection._Membership, "DENSE_CELLS", 0)
+    assert len(dense) and np.array_equal(change_detection.cast_rays(after, config), dense)
+
+
 def test_clear_line_is_the_spec_literal():
     report, text = record(scenes.column(list(range(20, 28)) + [40]), scenes.column([40]), evidence())
     assert text == CLEAR_LINE_GOLDEN
