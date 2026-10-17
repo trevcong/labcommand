@@ -105,7 +105,7 @@ WORKSHEET = """\
 Label worksheet. Resolve it before the scored session. skip does not make a true detection.
 Sensor 1 is the Mid-360 (/livox/lidar, mid360_hz). Sensor 2 is the JT128 (/lidar_points, jt128_hz).
 A region line is in that sensor's frame. Copy message.sensors from the harness topics.jsonl line.
-message.sensors is a bitmask. 3 means both sensors. Do not paste region 3. Split it into region 1 and region 2, or use event GEN ID.
+message.sensors is a bitmask. 3 means both sensors. Do not paste region 3. Paste event GEN ID.
 Do not reuse one sensor's box for the other sensor.
   region SENSOR x0 y0 z0 x1 y1 z1 [from x y z]
   region 1 0 0 0 1 1 1
@@ -128,9 +128,10 @@ RECOVERY_TEXT = (
 )
 
 HANDOFF_TEXT = """\
-HANDOFF. Stop this script. On the machine whose docker already sees the container, start PR #36.
+HANDOFF. Stop this script. Needs Trevor. The room-memory container name is room-memory. Read docker ps --format '{{.Names}} {{.Image}}' first. Never name a lidar or driver container. lidar-center, lidar-dual, and ptp-master must never be named.
+On the machine whose docker already sees the container, start PR #36.
 Do not pass scenario-marks.json to acceptance score. The clocks are not the same clock.
-PYTHONPATH=spark/room_memory python3 -m acceptance run --transport ros2 --container NAME --out HARNESS_DIR
+PYTHONPATH=spark/room_memory python3 -m acceptance run --transport ros2 --container room-memory --out HARNESS_DIR
 PYTHONPATH=spark/room_memory python3 -m acceptance score --log HARNESS_DIR/topics.jsonl --marks HARNESS_DIR/marks.json --out HARNESS_DIR
 """
 

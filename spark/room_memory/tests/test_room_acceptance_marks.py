@@ -605,6 +605,29 @@ def _capture_source(text):
     return text[start:text.index("\nPY\n", start)]
 
 
+def _assert_exec_gates(runbook):
+    """Both subscribe-only execs name room-memory only after the read-only check."""
+    ps = "docker ps --format '{{.Names}} {{.Image}}'"
+    bump = runbook.index("docker exec -i room-memory bash -lc")
+    scored = runbook.index("acceptance run --transport ros2 --container room-memory")
+    for command in (bump, scored):
+        gate = runbook.rfind("Needs Trevor", 0, command)
+        check = runbook.rfind(ps, 0, command)
+        assert 0 <= gate < check < command
+        assert "room-memory" in runbook[gate:command]
+    for name in ("lidar-center", "lidar-dual", "ptp-master"):
+        assert name in runbook
+    assert "Never name a lidar or driver container." in runbook
+    assert "must never be named" in runbook
+    assert "Allow cleartext WebSocket (ws://)" in runbook
+    assert "LABCOMMAND_ALLOW_CLEARTEXT=1" in runbook
+    assert "Confirm Room is connected." in runbook
+    assert "Tracking" in runbook
+    assert "Rig moved: changes suspended · N m" in runbook
+    assert "docker exec -i NAME" not in runbook
+    assert "--container NAME" not in runbook
+
+
 def test_runbook_capture_prefix_matches_transport():
     """The bump capture has to source ROS the way acceptance/transport.py does.
 
@@ -613,9 +636,10 @@ def test_runbook_capture_prefix_matches_transport():
     """
     setup = _transport_setup()
     text = RUNBOOK.read_text(encoding="utf-8")
-    prefix = "docker exec -i NAME bash -lc '%s' > bump-topics.jsonl <<'PY'" % setup
+    prefix = "docker exec -i room-memory bash -lc '%s' > bump-topics.jsonl <<'PY'" % setup
     assert prefix in text
     assert "docker exec -i NAME python3 -u -" not in text
+    assert "docker exec -i NAME " not in text
 
 
 def test_runbook_capture_stamps_each_line():
@@ -635,16 +659,23 @@ def test_runbook_states_the_bump_pass_and_the_both_sensor_label():
     )
     both = (
         "message.sensors is a bitmask. 3 means both sensors. Do not paste region 3. "
-        "Split it into region 1 and region 2, or use event GEN ID."
+        "Paste event GEN ID."
     )
     runbook = RUNBOOK.read_text(encoding="utf-8").replace("`", "")
     assert phrase in runbook
     assert "observed alone is not a pass" in runbook.lower()
     assert both in runbook
+    assert "Split it into region 1" not in runbook
+    assert "Split it into region 1" not in module.WORKSHEET
     assert phrase in module.RECOVERY_TEXT
     assert "observed alone is not a pass" in module.RECOVERY_TEXT
     assert both in module.WORKSHEET
     assert "A stop during the post-close read writes the rows already taken and exits 130." in runbook
+    _assert_exec_gates(runbook)
+    protocol = (ROOT / "docs" / "ROOM-MEMORY-PROTOCOL.md").read_text(encoding="utf-8")
+    assert "**D49. Physical acceptance is an operator procedure**" in protocol
+    assert "§3.10–§3.13 are reserved" not in protocol
+    assert "§3.13 is D49, the physical acceptance procedure" in protocol
 
 
 def test_empty_scenario_list_is_refused(tmp_path):

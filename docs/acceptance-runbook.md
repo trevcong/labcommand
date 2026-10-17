@@ -1,6 +1,6 @@
 # G5 physical acceptance runbook (D49, section 3.13)
 
-This file is decision D49 and protocol section 3.13. `~/Developer/lc-tasks/NUMBERING.md` reserves that pair for this checkout. It is the operator procedure for one room visit. It does not add a message, a topic, or a threshold, and it does not amend `docs/ROOM-MEMORY-PROTOCOL.md`.
+This file is decision D49 and protocol section 3.13. `~/Developer/lc-tasks/NUMBERING.md` reserves that pair for this checkout. Section 8 of `docs/ROOM-MEMORY-PROTOCOL.md` records D49, and the reservation note under §3.14 records that §3.13 is this procedure. It is the operator procedure for one room visit. It does not add a message, a topic, or a threshold.
 
 The scored session is the harness in `spark/room_memory/acceptance/` (PR #36). Main has that harness at the merge `5a51554`. The commands, label grammar, and exit codes below were read from commit `1225db5`, subject "Do not deny acceptance for a lifetime dropped-window count" (`README.md`, `session.py`, `score.py`). If that harness changes, re-read those files before the visit. This procedure does not edit them. This checkout contains that harness. Run it from this tree.
 
@@ -41,14 +41,17 @@ Do this in the room. The marks script does not deploy, restart, set a parameter,
 
 Section 4 is a different process. `acceptance run` starts one subscribe-only `docker exec -i` inside the container. That exec belongs to the harness, not to the marks script. The bump capture in section 3 is the same kind of subscribe-only exec, in its own terminal, and it uses the same `bash -lc` setup prefix as `acceptance/transport.py`. It does not restart the node and it does not set a parameter.
 
-- The room-memory container is already up. Leave it up.
-- A display you already have (LabCommand Room, or the node log already on screen) is how you read `TRACKING` and `RIG_MOVED`. This script does not open a socket. LabCommand Room does not subscribe to `/room_memory/rig`, and the node log does not print `auto_relearn`, `relearn_after_s`, or `imu_ok`. Those three come from the files in section 3, not from the display.
+Needs Trevor before either `docker exec -i`. The room-memory container name is `room-memory`. Run the read-only check `docker ps --format '{{.Names}} {{.Image}}'` first. Never name a lidar or driver container. `lidar-center`, `lidar-dual`, and `ptp-master` must never be named. Sections 3 and 4 repeat this gate at the command.
+
+- The room-memory container `room-memory` is already up. Leave it up.
+- LabCommand Room is the display for the live state. The node log is the other display, and it prints the enum names `state TRACKING` and `state RIG_MOVED`. This script does not open a socket. LabCommand Room does not subscribe to `/room_memory/rig`, and the node log does not print `auto_relearn`, `relearn_after_s`, or `imu_ok`. Those three come from the files in section 3, not from the display.
+- Turn on Allow cleartext WebSocket (ws://) in Settings, or launch with `LABCOMMAND_ALLOW_CLEARTEXT=1`. That flag permits cleartext for this launch and does not change the saved switch. Confirm Room is connected. A fresh Room status line includes `Tracking`. While the rig is moved the banner is `Rig moved: changes suspended · N m` (`N` is `poseResidualM` in meters, two decimal places). A missing residual shows `Rig moved: changes suspended · guard not run`.
 - Both launch files default `rig_guard` to false, `auto_relearn` to true, `relearn_after_s` to 60, `imu_quiet_s` to 2, and `check_max_s` to 10. A default counts as an observation only when the inspect file names `room_memory.launch.py` or `room_memory_cpp.launch.py`, that argument is absent, and the command has no params file. Remembering the default does not count. If the command does not name one of those two files, an absent argument stays `unknown`.
 - Three distinct objects, taped, with the real names in your notes:
   - PLACE: not in the frozen reference. The spot is empty in that reference.
   - REMOVE: a different object that is already in the reference.
   - MOVE: a third object that is already in the reference. You will move it about 1 m and stay under 1.5 m.
-- `TRACKING` does not prove the reference contains those objects. A saved reference is not checked by the harness.
+- `Tracking` on the Room status line does not prove the reference contains those objects. A saved reference is not checked by the harness.
 
 ### Label worksheet
 
@@ -94,7 +97,7 @@ Sensor numbers are the `ChangeEvent.sensors` bit, and the coordinates are in tha
 
 Copy `message.sensors`. Do not translate a Mid-360 box into sensor 2, or the other way around. The two frames are not one frame.
 
-`message.sensors` is a bitmask. 3 means both sensors. Do not paste region 3. Split it into region 1 and region 2, or use event GEN ID. The one-liner prints the integer as-is, so a both-sensor event comes out as `region 3 …`. `parse_label` accepts any integer, including 3. The scorer matches a region only when that number equals `message.sensors`, so `region 1` does not match an event whose sensors value is 3. For that event, paste the `event` line. It does not use the bitmask.
+`message.sensors` is a bitmask. 3 means both sensors. Do not paste region 3. Paste `event GEN ID`. The one-liner prints the integer as-is, so a both-sensor event comes out as `region 3 …`. `parse_label` accepts any integer, including 3. The scorer matches a region only when that number equals `message.sensors`, so a region line does not match an event whose sensors value is 3. The `event` line does not use the bitmask.
 
 Syntax the harness accepts (`session.py` `parse_label`). Several clauses are separated by semicolons. Anything else is asked again. The recording stays up.
 
@@ -160,15 +163,31 @@ These files count. A visit that passes them and types `unknown` can finish `bump
 
 Save the two process files any time the container is up. They do not describe the push. The topics file does, so it has to keep running across the push and be read after you close it.
 
+Needs Trevor. The room-memory container name is `room-memory`. Before `docker inspect`, `docker logs`, or the capture `docker exec -i` below, run this read-only check and read the lines with Trevor:
+
 ```text
-docker inspect NAME > inspect.json
-docker logs NAME > node.log
+docker ps --format '{{.Names}} {{.Image}}'
+```
+
+Never name a lidar or driver container. `lidar-center`, `lidar-dual`, and `ptp-master` must never be named. These commands name only `room-memory`. If that name is not in the check, stop. Do not exec.
+
+```text
+docker inspect room-memory > inspect.json
+docker logs room-memory > node.log
 ```
 
 Start the topics capture before you start the marks script, so the file exists. In another terminal, on the machine whose docker already sees the container. `docker exec` does not run the image entrypoint, and the entrypoint is what sources ROS. A bare `python3` raises `ModuleNotFoundError` on `labcommand_msgs` (and on `rclpy`). The traceback stays on the terminal and `bump-topics.jsonl` stays empty. Use the same prefix as the harness (`acceptance/transport.py`): `bash -lc` with `source /opt/ros/jazzy/setup.bash && source /ws/install/setup.bash && python3 -u -`.
 
+Needs Trevor. This is the capture `docker exec -i`. The room-memory container name is `room-memory`. Run the read-only check first:
+
 ```text
-docker exec -i NAME bash -lc 'source /opt/ros/jazzy/setup.bash && source /ws/install/setup.bash && python3 -u -' > bump-topics.jsonl <<'PY'
+docker ps --format '{{.Names}} {{.Image}}'
+```
+
+Never name a lidar or driver container. `lidar-center`, `lidar-dual`, and `ptp-master` must never be named.
+
+```text
+docker exec -i room-memory bash -lc 'source /opt/ros/jazzy/setup.bash && source /ws/install/setup.bash && python3 -u -' > bump-topics.jsonl <<'PY'
 import json, sys, time
 import rclpy
 from rclpy.node import Node
@@ -266,7 +285,7 @@ PY
 
 That process only subscribes. It turns rosout, the parameter services, and the logger service off, and it does not advertise `/parameter_events`. Every line carries `mono_ns` (`time.monotonic_ns()`, the container clock) and `wall_ns` (`time.time_ns()`, UTC nanoseconds). Before and after in the marks file are still the first and last sample. Use `mono_ns` deltas inside this file for RIG_MOVED timing and relearn delay. Set `wall_ns` next to the marks file's `wall_start_utc` and `wall_end_utc` (those are whole seconds). `mono_ns` here is not the Mac `push_mono_ns`. Stop the capture by Ctrl-C in its own terminal, or `kill` that PID. Do not kill the container. Do not send keystrokes to LabCommand or to any other app. If the guard is off there is no `/room_memory/rig` publisher; the capture still records status and events, and IMU stays `unknown`.
 
-Leave the capture running through the push and the restore. After the leg is back, stop the capture, rewrite `node.log` if you want the log from this visit (`docker logs NAME > node.log`), then press Enter at the script's close prompt. The script reads the files then. It does not read them before the push, and a dry-run read is not a bump observation. `read_after_bump` on the stored summary is true only for that post-close read. `applied_to_bump` is true only for a source that filled an answer.
+Leave the capture running through the push and the restore. After the leg is back, stop the capture, rewrite `node.log` if you want the log from this visit (`docker logs room-memory > node.log`), then press Enter at the script's close prompt. The script reads the files then. It does not read them before the push, and a dry-run read is not a bump observation. `read_after_bump` on the stored summary is true only for that post-close read. `applied_to_bump` is true only for a source that filled an answer.
 
 ```text
 python3 scripts/room_acceptance_marks.py --live --inspect inspect.json --log node.log --topics bump-topics.jsonl --out DIR
@@ -297,14 +316,22 @@ A bump passes only when bump_evaluation is observed, RIG_MOVED is seen, recovery
 
 Do not point `--topics` at the harness `topics.jsonl`. That log is not the bump, and the script will not treat it as one.
 
-If recovery was `relearning`, do not start the harness on the new epoch until a reference is frozen again and the three objects are checked again. If it realigned, confirm the display is back to `TRACKING` after the leg is home, and check the three objects again. The physical spots moved with the tripod until you put it back.
+If recovery was `relearning`, do not start the harness on the new epoch until a reference is frozen again and the three objects are checked again. If it realigned, confirm the Room status line is back to `Tracking` after the leg is home, and check the three objects again. The physical spots moved with the tripod until you put it back.
 
 ## 4. Scored session
 
-Stop the marks script. On the machine whose `docker` already sees the container (no `--ssh`, no default container name). The harness runs `docker exec -i NAME` of a process that only subscribes, with the same `bash -lc` setup prefix as the bump capture. The marks script is not part of that, and it never execs. The bump capture is a separate exec and it has already been stopped.
+Stop the marks script. On the machine whose `docker` already sees the container (no `--ssh`, no default container name). The harness runs `docker exec -i room-memory` of a process that only subscribes, with the same `bash -lc` setup prefix as the bump capture. The marks script is not part of that, and it never execs. The bump capture is a separate exec and it has already been stopped.
+
+Needs Trevor. This is the harness `docker exec -i` inside `acceptance run --container room-memory`. The room-memory container name is `room-memory`. Run the read-only check first:
 
 ```text
-PYTHONPATH=spark/room_memory python3 -m acceptance run --transport ros2 --container NAME --out HARNESS_DIR
+docker ps --format '{{.Names}} {{.Image}}'
+```
+
+Never name a lidar or driver container. `lidar-center`, `lidar-dual`, and `ptp-master` must never be named. Pass `--container room-memory` and no other name.
+
+```text
+PYTHONPATH=spark/room_memory python3 -m acceptance run --transport ros2 --container room-memory --out HARNESS_DIR
 PYTHONPATH=spark/room_memory python3 -m acceptance score --log HARNESS_DIR/topics.jsonl --marks HARNESS_DIR/marks.json --out HARNESS_DIR
 ```
 
