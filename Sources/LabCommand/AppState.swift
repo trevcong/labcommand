@@ -87,9 +87,11 @@ final class AppState: ObservableObject {
     /// Resolved once, from the environment and then saved defaults. Settings reads this.
     /// It does not resolve again on appear.
     private let roomEndpoint: RoomMemoryEndpointStore
-    /// Cleartext permission for this process. The saved switch, or `LABCOMMAND_ALLOW_CLEARTEXT=1`.
-    /// Off until one of those is set. The environment flag is not saved.
+    /// Saved cleartext switch. Off until the operator turns it on.
+    /// `LABCOMMAND_ALLOW_CLEARTEXT=1` does not change this and is not saved.
     @Published private(set) var allowCleartextRoomWebSocket: Bool
+    /// This process was started with `LABCOMMAND_ALLOW_CLEARTEXT=1`. The switch stays on the saved value.
+    let cleartextFromEnvironment: Bool
     /// Set when the current address must not be dialed. The Room screen shows this string.
     @Published private(set) var roomEndpointBlock: String?
     /// The Room block asked to show the cleartext switch. Settings scrolls to it and clears this.
@@ -125,6 +127,7 @@ final class AppState: ObservableObject {
         let endpointStore = RoomMemoryEndpointStore(environment: environment, defaults: .standard)
         self.roomEndpoint = endpointStore
         self.allowCleartextRoomWebSocket = endpointStore.allowCleartext
+        self.cleartextFromEnvironment = endpointStore.cleartextFromEnvironment
         self.roomEndpointBlock = nil
         self.service = service ?? ConnectivityService()
         self.rigIO = rigIO ?? MockMode.createRigService(isolates: launch.isolates)
@@ -166,8 +169,9 @@ final class AppState: ObservableObject {
     /// The endpoint this process is using. Settings copies it into the field on appear.
     var roomEndpointURL: URL { roomEndpoint.current }
 
-    /// True while the saved cleartext switch is on. An environment URL does not turn this on.
-    var showsCleartextWarning: Bool { allowCleartextRoomWebSocket }
+    /// True when this process may dial cleartext. The saved switch or the environment flag.
+    /// An environment URL does not turn this on.
+    var showsCleartextWarning: Bool { allowCleartextRoomWebSocket || cleartextFromEnvironment }
 
     func setAllowCleartextRoomWebSocket(_ allow: Bool) {
         roomEndpoint.setAllowCleartext(allow)

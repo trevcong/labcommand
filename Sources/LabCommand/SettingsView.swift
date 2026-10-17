@@ -9,18 +9,26 @@ struct SettingsView: View {
     @State private var endpointReady = false
     @State private var pendingDowngrade = false
     @State private var rigDiagnosticsOpen = false
+    /// Viewport height of the settings scroll view. Zero until it has been laid out.
+    @State private var settingsPageHeight: CGFloat = 0
 
     private static let cleartextToggleID = "cleartextToggle"
 
     var body: some View {
         ScrollViewReader { proxy in
             settingsBody
-                .onAppear {
-                    loadEndpointDraft()
-                    revealCleartextToggle(proxy)
-                }
+                .onAppear { loadEndpointDraft() }
                 .onChange(of: state.showCleartextToggle) { _, shown in
-                    if shown { revealCleartextToggle(proxy) }
+                    if shown { revealCleartextToggle(proxy, height: settingsPageHeight) }
+                }
+                .background {
+                    GeometryReader { geo in
+                        Color.clear
+                            .onAppear { noteSettingsHeight(geo.size.height, proxy: proxy) }
+                            .onChange(of: geo.size.height) { _, height in
+                                noteSettingsHeight(height, proxy: proxy)
+                            }
+                    }
                 }
         }
     }
@@ -104,6 +112,13 @@ struct SettingsView: View {
                     .padding(.vertical, 10)
                     .id(Self.cleartextToggleID)
                     .accessibilityIdentifier("allowCleartextWebSocket")
+                    if state.cleartextFromEnvironment {
+                        Text(RoomMemoryEndpoint.cleartextEnvironmentNote)
+                            .font(LabTheme.t(11))
+                            .foregroundStyle(LabTheme.warn)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.bottom, 4)
+                    }
                     Text(state.showsCleartextWarning
                          ? RoomMemoryEndpoint.cleartextWarning
                          : RoomMemoryEndpoint.cleartextOffNote)
@@ -222,11 +237,22 @@ struct SettingsView: View {
         .background(LabTheme.bg)
     }
 
+    private func noteSettingsHeight(_ height: CGFloat, proxy: ScrollViewProxy) {
+        if settingsPageHeight != height { settingsPageHeight = height }
+        revealCleartextToggle(proxy, height: height)
+    }
+
     /// The Room block opens this page on the switch. Showing it does not turn the switch on.
-    private func revealCleartextToggle(_ proxy: ScrollViewProxy) {
-        guard state.showCleartextToggle else { return }
-        proxy.scrollTo(Self.cleartextToggleID, anchor: .center)
-        state.cleartextToggleWasShown()
+    /// `onAppear` can run before the scroll view has a height. Scrolling then does nothing,
+    /// so the request stays until a pass reports a height, and is cleared on the next turn.
+    private func revealCleartextToggle(_ proxy: ScrollViewProxy, height: CGFloat) {
+        guard state.showCleartextToggle, height > 0 else { return }
+        let app = state
+        DispatchQueue.main.async {
+            guard app.showCleartextToggle else { return }
+            proxy.scrollTo(Self.cleartextToggleID, anchor: .center)
+            app.cleartextToggleWasShown()
+        }
     }
 
     /// The draft is the process's current endpoint, not a fresh environment resolve.

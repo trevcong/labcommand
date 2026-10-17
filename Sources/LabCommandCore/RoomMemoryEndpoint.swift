@@ -26,7 +26,7 @@ public enum RoomMemoryEndpointError: Error, Equatable, Sendable {
         case .path: return "The endpoint has no path."
         case .query: return "The endpoint has no query."
         case .fragment: return "The endpoint has no fragment."
-        case .ambiguousAddress: return "Write the IPv4 address as four decimal numbers, without leading zeros."
+        case .ambiguousAddress: return "Write the IPv4 address as four decimal numbers, without leading zeros or a trailing dot."
         case .unparseable: return "That is not a WebSocket URL."
         }
     }
@@ -72,6 +72,8 @@ public enum RoomMemoryEndpoint {
 
     public static let cleartextWarning = "Warning: cleartext WebSocket sends room memory without encryption. ws:// is limited to private addresses, Tailscale CGNAT (100.64.0.0/10), and .ts.net hosts."
     public static let cleartextOffNote = "Cleartext is off. A ws:// address is not used until you turn this on. wss:// is always allowed."
+    /// Shown beside the switch. The switch itself stays on the saved value.
+    public static let cleartextEnvironmentNote = "LABCOMMAND_ALLOW_CLEARTEXT=1 allows cleartext for this launch. The switch shows the saved setting and does not turn this launch off."
     public static let downgradePrompt = "This replaces a secure wss:// address with cleartext ws://. Room memory will travel without encryption."
 
     /// `ws://<MagicDNS>:8767`. See the type discussion for when that name resolves.
@@ -128,23 +130,29 @@ public enum RoomMemoryEndpoint {
     }
 
     /// Private ranges (RFC1918, loopback, link-local), CGNAT `100.64.0.0/10`, or a `*.ts.net` name.
-    /// An IPv4 host counts only as strict dotted decimal. Public names and public addresses are
-    /// false. `localhost` is false; use `127.0.0.1`.
+    /// An IPv4 host counts only as strict dotted decimal, classified as given: a trailing dot is
+    /// not removed before that check. One trailing dot is stripped only for a `.ts.net` name.
+    /// Public names and public addresses are false. `localhost` is false; use `127.0.0.1`.
     public static func allowsCleartextHost(_ host: String) -> Bool {
         var name = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if name.hasSuffix(".") { name.removeLast() }
         if name.isEmpty || name.contains("%") { return false }
         if name.hasPrefix("[") && name.hasSuffix("]") {
             name = String(name.dropFirst().dropLast())
         }
-        // A trailing dot is an absolute DNS name. It is not part of a dotted-decimal address.
+        if name.contains(":") { return allowsCleartextIPv6(name) }
+        // The address is classified as written. Stripping a trailing dot here would approve
+        // 10.0.0.1. and a later dial would look that name up.
+        if allowsCleartextIPv4(name) { return true }
+        return allowsCleartextTailnetName(name)
+    }
+
+    /// One trailing dot is an absolute DNS name (`spark.ts.net.`). A second dot stays, so
+    /// `spark.ts.net..` is not a tailnet name.
+    private static func allowsCleartextTailnetName(_ name: String) -> Bool {
         let absolute = name.hasSuffix(".") ? String(name.dropLast()) : name
-        if absolute.hasSuffix(".ts.net") {
-            let prefix = absolute.dropLast(".ts.net".count)
-            return !prefix.isEmpty && !prefix.hasSuffix(".")
-        }
-        if name.contains(":") { return allowsCleartextIPv6(absolute) }
-        return allowsCleartextIPv4(name)
+        guard absolute.hasSuffix(".ts.net") else { return false }
+        let prefix = absolute.dropLast(".ts.net".count)
+        return !prefix.isEmpty && !prefix.hasSuffix(".")
     }
 
     public static let cleartextDisabledPrefix = "Cleartext WebSocket is off."
@@ -261,11 +269,21 @@ public enum RoomMemoryEndpoint {
     }
 
     /// The host stored on a parsed URL. A strict IPv4 literal is its canonical dotted form,
-    /// which is the same string. A legacy literal is refused so nothing later dials it.
+    /// which is the same string. A legacy literal, or a strict address with a trailing dot,
+    /// is refused so nothing later dials a different name.
     private static func hostForDial(_ host: String) -> Result<String, RoomMemoryEndpointError> {
         if let strict = canonicalDottedIPv4(host) { return .success(strict) }
-        if isLegacyIPv4Literal(host) { return .failure(.ambiguousAddress) }
+        if isLegacyIPv4Literal(host) || isStrictIPv4WithTrailingDot(host) {
+            return .failure(.ambiguousAddress)
+        }
         return .success(host)
+    }
+
+    /// `10.0.0.1.` is the strict address plus one trailing dot. `inet_pton` rejects the dot,
+    /// and a dial looks the text up as a name instead of using 10.0.0.1.
+    private static func isStrictIPv4WithTrailingDot(_ host: String) -> Bool {
+        guard host.hasSuffix(".") else { return false }
+        return canonicalDottedIPv4(String(host.dropLast())) != nil
     }
 
     /// `inet_pton(AF_INET)` accepts a leading zero as decimal on this OS (`010` → 10).
@@ -397,20 +415,21 @@ public struct RoomRedirectChain: Equatable, Sendable {
 @MainActor
 public final class RoomMemoryEndpointStore {
     public private(set) var current: URL
-    /// The saved switch, or a process-local opt-in. Off when neither is set.
+    /// The saved switch. Absent and explicit false are both off.
+    /// `LABCOMMAND_ALLOW_CLEARTEXT=1` does not change this and is not written.
     public private(set) var allowCleartext: Bool
+    /// This process was started with `LABCOMMAND_ALLOW_CLEARTEXT=1`. Never written.
+    public let cleartextFromEnvironment: Bool
     private let defaults: UserDefaults
 
-    /// Absent and explicit false are both off. An environment URL never turns this on.
-    /// `LABCOMMAND_ALLOW_CLEARTEXT=1` permits this process only and is not written.
-    public var cleartextPermitted: Bool { allowCleartext }
+    /// The saved switch, or the process-local opt-in. Off when neither is set.
+    /// An environment URL never turns this on.
+    public var cleartextPermitted: Bool { allowCleartext || cleartextFromEnvironment }
 
     public init(environment: [String: String], defaults: UserDefaults) {
         self.defaults = defaults
         allowCleartext = defaults.bool(forKey: RoomMemoryEndpoint.cleartextDefaultsKey)
-        if RoomMemoryEndpoint.environmentAllowsCleartext(environment) {
-            allowCleartext = true
-        }
+        cleartextFromEnvironment = RoomMemoryEndpoint.environmentAllowsCleartext(environment)
         current = RoomMemoryEndpoint.resolve(environment: environment, defaults: defaults)
     }
 
@@ -433,7 +452,7 @@ public final class RoomMemoryEndpointStore {
         case .success(let url):
             if url.absoluteString == current.absoluteString { return .saved }
             if url.scheme == "ws" {
-                switch RoomMemoryEndpoint.admit(url, allowCleartext: allowCleartext) {
+                switch RoomMemoryEndpoint.admit(url, allowCleartext: cleartextPermitted) {
                 case .blocked(let message):
                     return .rejected(message)
                 case .allowed:

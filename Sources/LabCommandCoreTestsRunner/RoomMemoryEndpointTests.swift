@@ -356,7 +356,7 @@ func testCleartextHostPolicy() {
     deny("0x0a.0.0.1")
     deny("10.1")
     deny("167772161")
-    for host in ["010.0.0.1", "0127.1.1.1", "0100.0100.0.1", "0x0a.0.0.1", "10.1", "167772161"] {
+    for host in ["010.0.0.1", "0127.1.1.1", "0100.0100.0.1", "0x0a.0.0.1", "10.1", "167772161", "10.0.0.1."] {
         if case .success(let url) = RoomMemoryEndpoint.parse("ws://\(host):8767") {
             expect(false, "\(host) must not become a dial string, got \(url.absoluteString)")
         }
@@ -377,6 +377,13 @@ func testCleartextHostPolicy() {
     } else {
         expect(false, "010.0.0.1 must not parse")
     }
+    deny("10.0.0.1.")
+    deny("10.0.0.1..")
+    if case .failure(let error) = RoomMemoryEndpoint.parse("ws://10.0.0.1.:8767") {
+        expect(error == .ambiguousAddress, "a trailing dot is refused before it can be saved, got \(error)")
+    } else {
+        expect(false, "10.0.0.1. must not parse")
+    }
     deny("localhost")
     deny("example.com")
     deny("notts.net")
@@ -386,6 +393,8 @@ func testCleartextHostPolicy() {
     allow("spark-1f3e.tail8dfdc7.ts.net")
     allow("Spark-1F3E.TAIL8DFDC7.TS.NET")
     allow("foo.bar.ts.net.")
+    deny("foo.bar.ts.net..")
+    deny("spark.ts.net..")
     deny(".ts.net")
     deny("foo..ts.net")
     allow("::1")
@@ -509,6 +518,7 @@ func testFreshInstallCleartextBlock() {
         defaults: opted
     )
     expect(flagged.cleartextPermitted, "the explicit flag permits cleartext for this process")
+    expect(!flagged.allowCleartext && flagged.cleartextFromEnvironment, "the flag does not turn the saved switch on")
     expect(opted.object(forKey: key) == nil, "the flag does not save the switch")
     expect(RoomMemoryEndpoint.admit(flagged.current, allowCleartext: flagged.cleartextPermitted) == .allowed,
            "the flagged run may dial the pinned address")
@@ -526,7 +536,19 @@ func testFreshInstallCleartextBlock() {
         defaults: pinnedOff
     )
     expect(overOff.cleartextPermitted, "the flag permits a process whose saved switch is off")
+    expect(!overOff.allowCleartext && overOff.cleartextFromEnvironment, "the saved switch stays off under the flag")
     expect((pinnedOff.object(forKey: key) as? Bool) == false, "the flag does not erase a saved off")
+    expect(overOff.commit("ws://10.1.2.3:8767", retargeting: nil) == .saved,
+           "the launch flag admits ws:// while the saved switch stays off")
+    expect(!overOff.allowCleartext, "saving an address does not turn the saved switch on")
+    expect((pinnedOff.object(forKey: key) as? Bool) == false, "saving an address does not write the switch")
+    overOff.setAllowCleartext(true)
+    expect(overOff.allowCleartext && overOff.cleartextPermitted, "the switch can save on without dropping the flag")
+    expect((pinnedOff.object(forKey: key) as? Bool) == true, "the switch writes the saved value")
+    overOff.setAllowCleartext(false)
+    expect(!overOff.allowCleartext && overOff.cleartextPermitted && overOff.cleartextFromEnvironment,
+           "saving off does not revoke the launch flag")
+    expect((pinnedOff.object(forKey: key) as? Bool) == false, "saving off writes the saved value")
 
     for value in ["", "true", "yes", "0", "1 "] {
         let defaults = isolatedDefaults()
@@ -1167,6 +1189,13 @@ func testRoomMemorySettingsSourcesAndATS() {
     expect(settings.contains("showCleartextToggle"), "Settings reacts when the Room block asks for the switch")
     expect(settings.contains("allowCleartextWebSocket"), "the switch has an identifier")
     expect(settings.contains("cleartextToggleWasShown"), "showing the switch does not leave the request set")
+    expect(settings.contains("height > 0"), "the scroll request waits until the page has a height")
+    expect(settings.contains("cleartextFromEnvironment"), "the env flag is shown apart from the saved switch")
+    expect(settings.contains("cleartextEnvironmentNote"), "the env override has its own line")
+    expect(state.contains("endpointStore.allowCleartext"), "Settings is given the saved switch")
+    expect(state.contains("cleartextFromEnvironment"), "AppState keeps the env flag off the saved switch")
+    expect(!state.contains("allowCleartextRoomWebSocket = endpointStore.cleartextPermitted"),
+           "the switch is not bound to the env override")
 
     let script = text("scripts/live-room-shots.sh")
     expect(script.contains("export LABCOMMAND_ROOM_URL=\"ws://100.118.187.99:8767\""), "live shots pin the grep URL")
