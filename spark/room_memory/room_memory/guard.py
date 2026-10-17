@@ -27,7 +27,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from .core.change_detection import contains, in_range, pack, unpack
+from .core.change_detection import LIMIT, contains, in_range, pack, unpack
 
 F32 = np.float32
 
@@ -350,11 +350,48 @@ def _runs(starts, counts):
     return np.repeat(starts - (np.cumsum(counts) - counts), counts) + np.arange(total)
 
 
+def _as_float64(points):
+    """``points`` as binary64. A float64 array is returned as itself, so ``is`` still selects the
+    kept-column path. Any other dtype is cast: binary32 ``floor(p / cell)`` can disagree."""
+    points = np.asarray(points)
+    if points.dtype == np.float64:
+        return points
+    return np.ascontiguousarray(points, dtype=np.float64)
+
+
+def _cell_range_error(cell):
+    return ValueError(
+        f"cell index floor(p / {cell:g}) +/- 1 must lie in {-LIMIT}..{LIMIT - 1} "
+        "so every neighbour packs into a 21-bit key")
+
+
+def _outside_cell_range(floored):
+    """True when a floor index is non-finite or +/- 1 falls outside ``-LIMIT .. LIMIT-1``."""
+    return not np.isfinite(floored).all() or (floored < -LIMIT + 1).any() or (floored > LIMIT - 2).any()
+
+
+def _require_cell_range(points, cell):
+    """Target points are stored under their cell keys, so each must be finite and in range.
+    A non-finite query is not stored; ``nearest`` leaves those rows to ``pack``."""
+    if len(points) == 0:
+        return
+    with np.errstate(over="ignore", invalid="ignore"):
+        floored = np.floor(points / cell)
+    if _outside_cell_range(floored):
+        raise _cell_range_error(cell)
+
+
 class TargetGrid:
     """A cell table over the target points: per cell (sorted keys) the start and count of its kept
-    indices (every k-th of the cell's points in target order, at most ``cap``)."""
+    indices (every k-th of the cell's points in target order, at most ``cap``).
+
+    Points are cast to binary64. ``floor(p / cell) +/- 1`` must lie in ``-LIMIT .. LIMIT-1`` on
+    every axis, the range that packs into a 21-bit key; outside it the neighbour table and the
+    cell pruning are not exact, so construction raises ``ValueError``."""
 
     def __init__(self, points, cell, cap):
+        points = _as_float64(points)
+        _require_cell_range(points, cell)
         self.cell = cell
         keys = _cells(points, cell)
         order = np.argsort(keys, kind="stable")
@@ -388,11 +425,19 @@ class TargetGrid:
         """``(counts, starts)``, each ``(len(queries), 27)``: the kept slots of each query's neighbour
         cells in offset order, a count of 0 where the grid has no such cell or, with ``prune``, where
         the cell's box is provably farther than ``radius``. ``q`` is the queries' binary64 columns."""
-        base = np.floor(queries / self.cell).astype(np.int64)
+        queries = _as_float64(queries)
+        with np.errstate(over="ignore", invalid="ignore"):
+            floored = np.floor(queries / self.cell)
+        # key + constant is the neighbour key only while every lane of the index +/- 1 packs, and the
+        # box prune uses those indices. A finite query outside that range would search the wrong cells.
+        finite = np.isfinite(queries).all(axis=1)
+        if finite.any() and _outside_cell_range(floored[finite]):
+            raise _cell_range_error(self.cell)
+        base = floored.astype(np.int64)
         # The grid cells (or -1) of the 27 neighbours, found once per distinct query cell. Where every
         # lane of base +- 1 packs, a neighbour's key is the cell's key plus a constant: an occupied
-        # cell reads them from the neighbour table, an empty one searches its 27 keys. Any other query
-        # (non-finite or far out) searches its own exact pack() keys.
+        # cell reads them from the neighbour table, an empty one searches its 27 keys. A non-finite
+        # query has no cell and searches its own exact pack() keys.
         lanes = (base[:, 0], base[:, 1], base[:, 2])
         packs = in_range(*(lane - 1 for lane in lanes)) & in_range(*(lane + 1 for lane in lanes))
         good, bad = np.nonzero(packs)[0], np.nonzero(~packs)[0]
@@ -428,12 +473,18 @@ class TargetGrid:
         return np.where(far, 0, counts), starts
 
     def nearest(self, queries, points, radius):
-        """For each binary64 query, the nearest kept target within ``radius`` in the 27 cells around
-        it (ties to the lower target index): (index or -1, squared distance or inf)."""
+        """For each query, the nearest kept target within ``radius`` in the 27 cells around it (ties
+        to the lower target index): (index or -1, squared distance or inf).
+
+        Queries and ``points`` are cast to binary64. A finite query whose ``floor(p / cell) +/- 1``
+        falls outside ``-LIMIT .. LIMIT-1`` raises ``ValueError``."""
+        queries = _as_float64(queries)
         best = np.full(len(queries), np.inf)
         best_index = np.full(len(queries), -1, dtype=np.int64)
         if not len(queries) or not len(self.keys):
             return best_index, best
+        if points is not self._points:
+            points = _as_float64(points)
         q = [np.ascontiguousarray(queries[:, axis], dtype=np.float64) for axis in range(3)]
         kept = self._kept if points is self._points else None
         counts, starts = self._around(queries, q, radius, prune=kept is not None)
