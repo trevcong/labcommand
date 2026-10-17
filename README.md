@@ -2,7 +2,7 @@
 
 LabCommand is room memory for the Livox Mid-360 and Hesai JT128 on the DGX Spark, and the Mac app that mirrors it. The Spark node integrates the clouds, keeps the reference, and publishes changes. The Mac draws that state.
 
-A normal launch (`LABCOMMAND_LIVE_ROOM` unset) opens the Room tab, connects the room socket, and still probes the rig. `LABCOMMAND_LIVE_ROOM=live` is the gate launch: it still connects the room socket, and it skips probes and the lidar client. That flag does not select the tab. Any other value is fixture mode (`LiveRoomLaunch`). The named values are `map`, `status`, `stale`, `lost`, `restart`, `legacy`, and `unavailable`. An unknown value loads the `unavailable` fixture. Fixture mode never opens a socket. It skips probes and leaves the lidar client dark. The menu-bar item is **LabCommand**.
+A normal launch (`LABCOMMAND_LIVE_ROOM` unset) opens the Room tab, connects the room socket, and still probes the rig. `LABCOMMAND_LIVE_ROOM=live` is the gate launch: it still connects the room socket, and it skips probes and the lidar client. That flag does not select the tab. Any other value is fixture mode (`LiveRoomLaunch`). The named values are `map`, `status`, `stale`, `lost`, `restart`, `legacy`, and `unavailable`. An unknown value loads the `unavailable` fixture. Fixture mode never opens a socket. It skips probes and leaves the lidar client dark. The menu-bar extra is **LAB**. The tooltip, the accessibility label, and the menu say LabCommand.
 
 ## Tabs
 
@@ -16,7 +16,7 @@ Order and shortcuts follow `Dest.navCases`. The window title is `LabCommand - <t
 
 The 3D view stays off until Snapshot or Live. At launch the sample cloud may stand in, badged `OFF · SAMPLE — not live data`. Snapshot takes one frame per sensor (`/livox/lidar`, `/lidar_points`) with a 10 second limit, then closes. Live stops after 120 seconds, or when the window is hidden, minimized, or covered. The last frames stay on screen. `--snapshot-on-launch` and `--live-on-launch` run those paths without a click.
 
-The mission log shows the last five lines, stamped local `yyyy-MM-dd HH:mm:ss`. That log is the recorder's. The room's change list is the other one.
+The mission log shows the last five lines, stamped with `MissionLog.clock` (`yyyy-MM-dd HH:mm:ss` in the live system zone). That formatter rebuilds when the system time zone changes. That log is the recorder's. The room's change list is the other one.
 
 The record call sends `<code>_<tag>` (`RigDesk.recordName`). `sessionFolderPreview` is called from `testDeskDualSessionNaming` in the test runner. No view calls it.
 
@@ -33,7 +33,7 @@ From the repository root, on macOS 14 or newer:
 open ./build/LabCommand.app
 ```
 
-`./build.sh` with no flag also replaces `~/Applications/LabCommand.app`. `--no-install` leaves that copy alone. The script builds the release binary, ad-hoc codesigns the bundle, and copies `scripts/spark-capture.sh`, `fixtures/api`, the room hand goldens, and `fixtures/pointclouds/mid360-frame.pcd`.
+`./build.sh` with no flag also replaces `~/Applications/LabCommand.app`. `--no-install` leaves that copy alone. The script builds the release binary, ad-hoc codesigns the bundle, and copies `fixtures/api`, the room hand goldens, and `fixtures/pointclouds/mid360-frame.pcd`.
 
 The hosted Mac job is macOS 15 with Xcode 16.4. It runs `swift build -c release --product LabCommand`. It does not run `./build.sh`, and it does not install the app.
 
@@ -49,7 +49,7 @@ The C++ launch file also starts foxglove_bridge on **8767**. The topic whitelist
 
 `rig_guard` defaults to false. With `rig_guard:=true` the node publishes `RigPose` on `/room_memory/rig` (reliable, transient_local, on change and every 10 seconds). `state_dir` defaults to `~/room-memory`. An empty `state_dir` value, or a directory that does not exist, stops the node; it never creates one. References are saved in `<state_dir>/<room_id>/`. With the guard, registration clouds and `rig_state` are saved there too. The event log is not.
 
-**Protocol.** [docs/ROOM-MEMORY-PROTOCOL.md](docs/ROOM-MEMORY-PROTOCOL.md) is classic CDR. The Mac mirror follows §5 (publisher generation, `RequestSync`, `SyncEnd`). The `.msg` files are in `ros/labcommand_msgs/`. `OperatorAction` is a `.msg` only: no codec and no node handler (§3.6, §9).
+**Protocol.** [docs/ROOM-MEMORY-PROTOCOL.md](docs/ROOM-MEMORY-PROTOCOL.md) is classic CDR. The Mac mirror follows §5 (publisher generation, `RequestSync`, `SyncEnd`). D50 (§3.14) records that the retired v0 Mac capture path is not a message and changes no wire byte. The `.msg` files are in `ros/labcommand_msgs/`. `OperatorAction` is a `.msg` only: no codec and no node handler (§3.6, §9).
 
 **Mac mirror.** `LiveRoomClient.defaultURL` is the literal `ws://100.118.187.99:8767` (`LiveRoomClient.swift`). The address is the same string as `CaptureRecipe.tailscaleIP`. The client does not read that constant. It subscribes to the `/room_memory/*` topics it knows — `map_bricks`, `events`, `status`, `activity`, `epoch`, and the sync topics including `sync/end` — and reduces them in `RoomMemoryMirror`. The Room page binds to that mirror ([Sources/LabCommandCore/LiveRoom/API.md](Sources/LabCommandCore/LiveRoom/API.md)). Swift can decode `RigPose`. The app does not subscribe to `/room_memory/rig`, and the Room page does not show it.
 
@@ -130,7 +130,7 @@ Only pip downloads are cached, keyed by the requirements file. CMake and Swift o
 
 | Path | What it is |
 |---|---|
-| [docs/ROOM-MEMORY-PROTOCOL.md](docs/ROOM-MEMORY-PROTOCOL.md) | Wire protocol, including D30 and D34–D44. §9: the Mac does not subscribe to `/room_memory/rig` |
+| [docs/ROOM-MEMORY-PROTOCOL.md](docs/ROOM-MEMORY-PROTOCOL.md) | Wire protocol, including D30, D34–D44, and D50. §3.14: the v0 Mac capture path is not a message. §9: the Mac does not subscribe to `/room_memory/rig` |
 | [Sources/LabCommandCore/LiveRoom/API.md](Sources/LabCommandCore/LiveRoom/API.md) | Mac mirror: client, mirror, screen strings |
 | [docs/CHANGE-DETECTION.md](docs/CHANGE-DETECTION.md) | Occupancy diff shared by Swift, Python, and C++ |
 | [spark/room_memory_cpp/PLAN.md](spark/room_memory_cpp/PLAN.md) | Production C++ node and windows. `Epoch` is not published. Its `rig_guard` note points at [PLAN-RIGGUARD.md](PLAN-RIGGUARD.md) |

@@ -31,8 +31,6 @@ fi
 mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
 cp -f "${BIN}" "${APP}/Contents/MacOS/${APP_NAME}"
 cp -f "${ROOT}/Info.plist" "${APP}/Contents/Info.plist"
-cp -f "${ROOT}/scripts/spark-capture.sh" "${APP}/Contents/Resources/spark-capture.sh"
-chmod +x "${APP}/Contents/Resources/spark-capture.sh"
 
 # Copy API fixtures for mock mode
 if [[ -d "${ROOT}/fixtures/api" ]]; then

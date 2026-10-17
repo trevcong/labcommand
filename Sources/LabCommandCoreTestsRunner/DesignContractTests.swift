@@ -148,8 +148,9 @@ func testRoomFirstShell() {
     expect(room.contains("case .candidate:"), "the wire state stays .candidate")
 }
 
-/// The Dock, menus, and window wordmark say LabCommand. The binary and the
-/// ~/Applications install path stay LabCommand.app.
+/// The Dock, menus, and window wordmark say LabCommand. The menu-bar extra
+/// is the short label LAB; its tooltip and menu say LabCommand. The binary
+/// and the ~/Applications install path stay LabCommand.app.
 func testVisibleAppName() {
     let plist = repoFile("Info.plist")
     let app = repoFile("Sources/LabCommand/LabCommandApp.swift")
@@ -171,7 +172,12 @@ func testVisibleAppName() {
     expect(app.contains("\"About LabCommand\""), "About names LabCommand")
     expect(app.contains("\"Quit LabCommand\""), "Quit names LabCommand")
     expect(app.contains("\"Show LabCommand\""), "the status menu names LabCommand")
-    expect(app.contains("button?.title = \"LabCommand\""), "the status item names LabCommand")
+    expect(app.contains("header(\"LabCommand\")"), "the status menu leads with LabCommand")
+    expect(app.contains("button?.title = \"LAB\""), "the status item is the short label")
+    expect(app.contains("button?.toolTip = \"LabCommand\""), "the status item tooltip names LabCommand")
+    expect(app.contains("button?.setAccessibilityLabel(\"LabCommand\")"),
+           "the status item identifies itself as LabCommand")
+    expect(!app.contains("button?.title = \"LabCommand\""), "the status item is not the wide name")
     expect(!app.contains("\"About Lab\"") && !app.contains("\"Quit Lab\"") && !app.contains("\"Show Lab\""),
            "menus do not say Lab")
 
