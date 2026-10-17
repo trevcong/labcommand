@@ -1,0 +1,46 @@
+# sensor_msgs/Imu, CDR little endian. Derived by hand from sensor_msgs/msg/Imu.msg (ROS 2 Jazzy):
+# std_msgs/Header (stamp, then frame_id; no seq), then geometry_msgs Quaternion/Vector3 as float64 and three
+# float64[9] covariances. Covers: the float64 alignment after the 12-byte frame_id (already at 24, no pad),
+# the sign bit of -0.0, little-endian float64 (320 bytes after the encapsulation header).
+00 01 00 00                 # encapsulation CDR_LE, options 0
+8a 92 ed 68                 # pos 0   header.stamp.sec 1760400010
+80 b2 e6 0e                 # pos 4   header.stamp.nanosec 250000000
+0c 00 00 00                 # pos 8   header.frame_id length 12
+6c 69 76 6f 78 5f 66 72 61 6d 65 00# pos 12  "livox_frame\0"
+00 00 00 00 00 00 00 00     # pos 24  orientation.x 0.0
+00 00 00 00 00 00 00 00     # pos 32  orientation.y 0.0
+00 00 00 00 00 00 00 00     # pos 40  orientation.z 0.0
+00 00 00 00 00 00 f0 3f     # pos 48  orientation.w 1.0
+00 00 00 00 00 00 00 00     # pos 56  orientation_covariance[0] 0
+00 00 00 00 00 00 00 00     # pos 64  orientation_covariance[1] 0
+00 00 00 00 00 00 00 00     # pos 72  orientation_covariance[2] 0
+00 00 00 00 00 00 00 00     # pos 80  orientation_covariance[3] 0
+00 00 00 00 00 00 00 00     # pos 88  orientation_covariance[4] 0
+00 00 00 00 00 00 00 00     # pos 96  orientation_covariance[5] 0
+00 00 00 00 00 00 00 00     # pos 104 orientation_covariance[6] 0
+00 00 00 00 00 00 00 00     # pos 112 orientation_covariance[7] 0
+00 00 00 00 00 00 00 00     # pos 120 orientation_covariance[8] 0
+00 00 00 00 00 00 90 3f     # pos 128 angular_velocity.x 0.015625
+00 00 00 00 00 00 a0 bf     # pos 136 angular_velocity.y -0.03125
+00 00 00 00 00 00 e0 3f     # pos 144 angular_velocity.z 0.5
+00 00 00 00 00 00 00 00     # pos 152 angular_velocity_covariance[0] 0
+00 00 00 00 00 00 00 00     # pos 160 angular_velocity_covariance[1] 0
+00 00 00 00 00 00 00 00     # pos 168 angular_velocity_covariance[2] 0
+00 00 00 00 00 00 00 00     # pos 176 angular_velocity_covariance[3] 0
+00 00 00 00 00 00 00 00     # pos 184 angular_velocity_covariance[4] 0
+00 00 00 00 00 00 00 00     # pos 192 angular_velocity_covariance[5] 0
+00 00 00 00 00 00 00 00     # pos 200 angular_velocity_covariance[6] 0
+00 00 00 00 00 00 00 00     # pos 208 angular_velocity_covariance[7] 0
+00 00 00 00 00 00 00 00     # pos 216 angular_velocity_covariance[8] 0
+00 00 00 00 00 00 80 3f     # pos 224 linear_acceleration.x 0.0078125
+00 00 00 00 00 00 00 80     # pos 232 linear_acceleration.y -0.0
+00 00 00 00 00 00 f0 bf     # pos 240 linear_acceleration.z -1.0
+00 00 00 00 00 00 00 00     # pos 248 linear_acceleration_covariance[0] 0
+00 00 00 00 00 00 00 00     # pos 256 linear_acceleration_covariance[1] 0
+00 00 00 00 00 00 00 00     # pos 264 linear_acceleration_covariance[2] 0
+00 00 00 00 00 00 00 00     # pos 272 linear_acceleration_covariance[3] 0
+00 00 00 00 00 00 00 00     # pos 280 linear_acceleration_covariance[4] 0
+00 00 00 00 00 00 00 00     # pos 288 linear_acceleration_covariance[5] 0
+00 00 00 00 00 00 00 00     # pos 296 linear_acceleration_covariance[6] 0
+00 00 00 00 00 00 00 00     # pos 304 linear_acceleration_covariance[7] 0
+00 00 00 00 00 00 00 00     # pos 312 linear_acceleration_covariance[8] 0

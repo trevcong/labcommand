@@ -6,7 +6,9 @@
 // spec DDA from the sensor origin. Each sensor keeps its own reference and recent layers, in
 // its own frame, until the JT128 <-> Mid-360 extrinsic exists (brief 5 R1). The reference is
 // the settled part of per-voxel window counts (VoxelStats); one sensor's reference is the map
-// the node publishes as MapBricks snapshots and deltas.
+// the node publishes as MapBricks snapshots and deltas. With rig_guard on, the rig-pose guard
+// (guard.hpp, imu.hpp, state.hpp) checks each sensor's pose against its registration cloud and
+// re-aligns it.
 #pragma once
 
 #include <algorithm>
@@ -22,8 +24,11 @@
 #include <vector>
 
 #include "room_memory/change_detection.hpp"
+#include "room_memory/guard.hpp"
+#include "room_memory/imu.hpp"
 #include "room_memory/key_set.hpp"
 #include "room_memory/messages.hpp"
+#include "room_memory/state.hpp"
 
 namespace room_memory {
 
@@ -99,10 +104,6 @@ std::filesystem::path expand_user(const std::string& path);
 // <state_dir>/<room_id>, with a leading ~ expanded. Throws std::invalid_argument unless room_id is
 // a plain name ([A-Za-z0-9._-], no leading dot).
 std::filesystem::path room_dir(const std::string& state_dir, const std::string& room_id);
-// Temp file, fsync, rename, then fsync the directory, so the rename survives a crash. Creates
-// missing parent directories only with make_parents. Throws std::runtime_error (or
-// std::filesystem::filesystem_error) on any failure.
-void write_atomic(const std::filesystem::path& path, std::span<const std::uint8_t> data, bool make_parents = true);
 // <state_dir>/<room_id>/reference-<sensor>.cdr. Same room_id rule as room_dir.
 std::filesystem::path reference_path(const std::string& state_dir, const std::string& room_id, const std::string& sensor);
 // Writes `layer` as one zlib MapBricks snapshot, atomically (write_atomic), in the legacy layout:
@@ -187,7 +188,8 @@ std::int64_t box_gap(const Box& a, const Box& b);
 // `radius` voxels (box gap, either pose) sets its run to 0: a change next to motion only counts
 // once the motion has settled. No `tolerance` skips the shape check, no `radius` the activity
 // check. Last, every entry whose run reached `candidate_windows` becomes a CANDIDATE (and gets its
-// event id), in region order.
+// event id), in region order, unless `hold` is set (a rig guard check): then nothing promotes, and an
+// entry whose run reached the gate promotes on the first window without the hold.
 class CandidateTracker {
 public:
     CandidateTracker(std::int64_t candidate_windows = 1, std::int64_t expire_windows = 1,
@@ -203,11 +205,22 @@ public:
     // event id. `fresh` holds one flag per region, empty when every region is fresh.
     template <typename NextId>
     std::vector<std::pair<msg::EventState, Candidate>> update(const std::vector<Region>& regions, const msg::Time& stamp,
-                                                              NextId&& next_id, const std::vector<bool>& fresh = {});
+                                                              NextId&& next_id, const std::vector<bool>& fresh = {},
+                                                              bool hold = false);
     // A window without usable points: no pending run bridges it.
     void interrupt() {
         pending_.clear();
         activity_.clear();
+    }
+    // A moved channel: every pending entry goes, and the open candidates are returned (to expire)
+    // by event id.
+    std::vector<Candidate> drop_all() {
+        std::vector<Candidate> open = std::move(open_);
+        open_.clear();
+        pending_.clear();
+        activity_.clear();
+        std::sort(open.begin(), open.end(), [](const Candidate& a, const Candidate& b) { return a.event_id < b.event_id; });
+        return open;
     }
     const std::vector<Candidate>& open() const { return open_; }
     const std::vector<Candidate>& pending() const { return pending_; }
@@ -282,6 +295,44 @@ struct MemoryConfig {
     double delta_period_s = 5.0;
     double keyframe_period_s = 60.0;
     double keyframe_delta_ratio = 0.5;
+    // The rig-pose guard (PLAN-RIGGUARD.md). Off: no check, transform, IMU or extra file, so outputs and
+    // files are today's exactly. On: triggers (an IMU shock or tilt past tilt_trigger_deg,
+    // pose_offset above pose_trigger_m on 2 windows, every guard_check_period_s, a saved-state
+    // start, a sensor back after 5 s) start a check that holds promotion and learning for up to
+    // check_max_s and aligns each sensor against its registration cloud (reg_voxel_m points of the
+    // BUILDING windows, at most reg_max_points; the window's first point per src_voxel_m, at most
+    // src_max_points, within max_range or icp_max_range_m). An estimate is fit with inlier_frac >=
+    // align_inlier_ratio x its baseline, RMS <= align_max_rms_m and lambda_min / sum w >=
+    // observe_min_eig; it moved when its increment reaches move_min_m or move_min_deg. Move evidence
+    // (a fit move; IMU tilt; every channel below gross_inlier_ratio x baseline on 2 windows
+    // unwatched by a quiet IMU) gives RIG_MOVED; align_stable_windows agreeing estimates within
+    // align_max_m / align_max_deg of the frame re-align; none for relearn_after_s relearns
+    // (auto_relearn). imu_topic is the node's subscription ("": none).
+    bool rig_guard = false;
+    std::string imu_topic = "/livox/imu";
+    double imu_shock_frac = 0.05;
+    double imu_gyro_dps = 2.0;
+    double imu_quiet_s = 2.0;
+    double tilt_trigger_deg = 0.2;
+    double pose_trigger_m = 0.015;
+    double guard_check_period_s = 30.0;
+    double check_max_s = 10.0;
+    double move_min_m = 0.015;
+    double move_min_deg = 0.25;
+    double align_max_m = 0.3;
+    double align_max_deg = 10.0;
+    double align_inlier_ratio = 0.9;
+    double align_max_rms_m = 0.02;
+    std::int64_t align_stable_windows = 3;
+    double observe_min_eig = 0.02;
+    double gross_inlier_ratio = 0.5;
+    double relearn_after_s = 60.0;
+    bool auto_relearn = true;
+    double reg_voxel_m = 0.02;
+    std::int64_t reg_max_points = 300000;
+    double src_voxel_m = 0.1;
+    std::int64_t src_max_points = 50000;
+    double icp_max_range_m = 30.0;
 
     // The core config: evidence on, sensor origin (0, 0, 0) in each sensor's frame.
     Config change_config() const;
@@ -300,6 +351,13 @@ inline constexpr std::size_t kMapLogDepth = 10;
 inline constexpr std::size_t kEventLogDepth = 100;
 // pose_residual_m: the registration search reaches this many voxels along each axis.
 inline constexpr std::int64_t kPoseSearchVoxels = 4;
+// Rig guard: a sensor silent this long and back triggers a check; RigPose goes out at least this
+// often; an ICP source needs this many points; re-alignment needs consecutive estimates this close.
+inline constexpr std::int64_t kResumeSilenceNs = 5'000'000'000;
+inline constexpr std::int64_t kRigPosePeriodNs = 10'000'000'000;
+inline constexpr std::size_t kMinSourcePoints = 30;
+inline constexpr double kStableM = 0.005;
+inline constexpr double kStableDeg = 0.1;
 
 // The translation (meters) that best registers `recent` (occupied keys) onto the reference
 // occupancy, as one number: for each axis, the shift of -kPoseSearchVoxels .. kPoseSearchVoxels
@@ -308,6 +366,10 @@ inline constexpr std::int64_t kPoseSearchVoxels = 4;
 // the result is the norm of the three per-axis shifts. Empty when no shift overlaps at all.
 // Binary64 like the Python oracle, so the learning gate decides alike; status rounds to float.
 std::optional<double> pose_offset(const Keys& recent, const Membership& reference, double voxel_size);
+// The same search per axis (meters): adding it to the recent points moves them onto the reference.
+std::optional<rig::Vec3d> pose_shift(const Keys& recent, const Membership& reference, double voxel_size);
+// The norm of a pose_shift in binary64, summed in axis order (pose_residual_m).
+double shift_norm(const rig::Vec3d& shift);
 
 // Why add_cdr rejected a frame: the error's type name and message.
 struct RejectedFrame {
@@ -347,6 +409,27 @@ public:
         std::optional<std::int64_t> hz;
         std::optional<double> residual;      // pose_offset of the last tracking window with points
         std::shared_ptr<const Membership> reference_index;  // over reference.occupied
+        // Rig guard. pose maps this window's points into the reference frame; config is the change
+        // config for them (origin at the pose, no range clip: the transform pass clipped).
+        enum class Mode { normal, moved, stale };  // moved: no diff until re-aligned; stale: moved while silent
+        rig::Pose pose;
+        Config config;
+        std::vector<float> window;            // this window's points, sensor frame
+        std::optional<rig::Vec3d> shift;      // pose_shift of the last window with points
+        std::optional<rig::RegistrationBuilder> builder;
+        std::shared_ptr<const rig::RegistrationCloud> cloud;  // once the reference is built
+        std::optional<RegistrationFile> registration;         // as last written or loaded
+        Mode mode = Mode::normal;
+        std::optional<double> baseline;        // inlier_frac at the last accepted decision
+        std::vector<msg::RigChannel> results;  // of the current check, in order
+        std::vector<rig::Estimate> estimates;  // fit estimates while moved, the newest last
+        std::optional<rig::Estimate> last_estimate;
+        bool last_fit = false;
+        std::optional<std::pair<double, double>> delta;  // (m, deg) of the last applied increment
+        std::int64_t pose_over = 0;  // consecutive windows with pose_offset above pose_trigger_m
+        std::optional<std::int64_t> silent_since;
+        bool learn_off = false;  // rejected by an inconclusive check, until a check finds it in place
+        bool available = false;
     };
 
     // Throws std::invalid_argument on a bad config, a publisher_generation of 0, or inconsistent
@@ -383,9 +466,35 @@ public:
     // legacy request included, as generation 0 with an all-zero token) the request is answered
     // as SINCE_NONE.
     SyncAnswer sync(const msg::RequestSync& request, const msg::Time& stamp);
-    // Writes every sensor's reference and the room's epoch file with the current map_epoch.
-    // No-op without state_dir.
+    // Writes every sensor's reference and the room's epoch file with the current map_epoch, and
+    // with the rig guard its registration clouds and rig_state (save_rig: one ordered commit, the
+    // references inside it; the epoch file is already written, by record_epoch). No-op without
+    // state_dir.
     void save(const msg::Time& stamp);
+    // Feeds one CDR sensor_msgs/Imu received at `received` to the rig guard. False when the guard is
+    // off or the frame does not decode (counted in imu_failed, never thrown).
+    bool add_imu(std::span<const std::uint8_t> data, const msg::Time& received);
+    // The RigPose due at `stamp` (call once per window, after close_window): on every change of the
+    // outcome or decision and every 10 s. Empty with the guard off or when not due.
+    std::optional<msg::RigPose> rig_pose(const msg::Time& stamp);
+    // MOVED while a channel is moved, CHECKING during a check, else the last decision.
+    msg::RigOutcome rig_outcome() const;
+    std::int64_t imu_failed() const { return imu_failed_; }
+    // Measurement only, in no output: the guard's ICP estimates in the last close_window and their
+    // wall time (source cloud, seed with its yaw sweep, alignment). close_window runs on the node's
+    // single-threaded executor, so this time holds every other callback.
+    std::int64_t window_estimates() const { return window_estimates_; }
+    double window_estimate_ms() const { return window_estimate_ms_; }
+    // The rig files on disk lag the guard: a write or the relearn's archive failed (disk full,
+    // permissions). The guard runs on from memory and close_window retries every window; until
+    // the archive goes through, the old frame's files stay as they are. rig_save_failed counts the
+    // failed attempts, a held epoch write (record_epoch) included, and rig_save_error is the last
+    // one's message. epoch_held: the last epoch write failed, so the build's end or a settle waits
+    // for it (no save is pending for that).
+    bool rig_save_pending() const { return rig_save_pending_; }
+    std::int64_t rig_save_failed() const { return rig_save_failed_; }
+    const std::string& rig_save_error() const { return rig_save_error_; }
+    bool epoch_held() const { return epoch_held_; }
 
     const MemoryConfig& config() const { return config_; }
     msg::MemoryState state() const { return state_; }
@@ -402,6 +511,10 @@ private:
     // A built reference: its quota of windows and some settled occupancy, which tracking needs
     // (pose_offset registers on it, and without it no window may teach the reference).
     bool reference_ready(const Channel& channel) const;
+    void build(Channel& channel, std::size_t frames, const std::vector<float>& points);
+    bool built(std::int64_t now) const;
+    // A sensor silent through the build has not built its reference yet (guard only).
+    bool building() const;
     std::vector<std::filesystem::path> paths() const;
     void load(const msg::Time& start);
     std::uint64_t next_id();
@@ -411,6 +524,42 @@ private:
     msg::MapBricks map_message(msg::MapKind kind, const msg::Time& stamp) const;
     msg::Bytes publish_map(const msg::MapBricks& message);
     void log_event(const msg::ChangeEvent& event);
+    // Rig guard.
+    struct Check {
+        std::int64_t start = 0;
+        std::int64_t causes = 0;
+        std::int64_t decisions = 0;
+    };
+    void load_rig(const std::filesystem::path& room, const std::filesystem::path& path);
+    // With the rig guard, writes `epoch` to the room's epoch file before anything carries it, so the
+    // file never falls behind an epoch in use, whatever else of a save fails. False when the write
+    // fails (disk full, permissions; counted like a failed save): the caller holds what would take
+    // the epoch (the build's end, a settle) and the next window tries again. Without the guard or
+    // state_dir it writes nothing and returns true: save writes the epoch file first and a failure
+    // throws, as before the guard.
+    bool record_epoch(std::uint64_t epoch);
+    void save_rig();
+    void set_pose(Channel& channel, const rig::Pose& pose);
+    bool imu_ok(std::int64_t now) const;
+    bool any_moved() const;
+    bool move_unresolved() const;
+    void start_check(std::int64_t now, std::int64_t causes);
+    void end_check(std::int64_t now, msg::RigOutcome outcome);
+    void guard_triggers(std::int64_t now);
+    void guard_building(std::int64_t now);
+    void guard_built(std::int64_t now);
+    void finish_cloud(Channel& channel);
+    void joined(Channel& channel, const msg::Time& stamp);
+    void restart_build(Channel& channel);
+    void guard_step(std::int64_t now, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
+    std::optional<rig::Mat3> rotation_prior(const Channel& channel) const;
+    msg::RigChannel estimate(Channel& channel, const std::optional<rig::Pose>& seed_from_last = std::nullopt);
+    msg::RigChannel align_channel(Channel& channel, const std::optional<rig::Pose>& seed_from_last);
+    void decide(std::int64_t now, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
+    void enter_moved(std::int64_t now, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
+    void channel_moved(Channel& channel, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
+    void track_moved(std::int64_t now, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
+    void relearn(const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
 
     MemoryConfig config_;
     std::uint64_t publisher_generation_;
@@ -449,12 +598,41 @@ private:
     std::deque<Logged> event_log_;
     std::map<std::uint64_t, Logged> open_latest_;  // event_id -> latest message, open events only
     std::optional<float> coverage_;
+    // Rig guard, room level.
+    std::optional<ImuDetector> detector_;
+    std::int64_t imu_failed_ = 0;
+    std::int64_t window_estimates_ = 0;
+    double window_estimate_ms_ = 0.0;
+    bool rig_save_pending_ = false;
+    std::int64_t rig_save_failed_ = 0;
+    std::string rig_save_error_;
+    bool epoch_held_ = false;
+    std::optional<msg::Header> references_due_;  // a save's references, not yet written (save_rig)
+    std::optional<std::string> archive_due_;     // the relearned frame's prev/ name, not yet archived
+    std::optional<rig::Vec3d> gravity_;  // the newest window's gravity
+    std::optional<rig::Vec3d> g_base_;   // gravity at the last accepted decision
+    std::optional<rig::Mat3> gyro_;      // the gyro rotation of the last shock, until the check or move uses it
+    bool watched_ = false;               // a quiet IMU streamed since the last accepted decision
+    std::optional<Check> check_;
+    msg::RigOutcome outcome_ = msg::RigOutcome::in_place;
+    std::int64_t causes_ = 0;
+    std::optional<std::int64_t> next_check_;
+    std::optional<std::int64_t> moved_since_;
+    msg::Time moved_at_{0, 0};
+    std::int64_t n_realigned_ = 0;
+    std::uint64_t frame_epoch_ = 0;
+    std::int64_t tilt_run_ = 0;
+    std::int64_t gross_run_ = 0;
+    std::map<std::string, msg::RigChannel> decision_;  // sensor -> result in the last decision window
+    std::uint64_t rig_seq_ = 0;
+    std::optional<std::pair<msg::RigOutcome, std::int64_t>> rig_sent_;  // (outcome, ns) of the last RigPose
+    bool rig_dirty_ = true;
 };
 
 template <typename NextId>
 std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(const std::vector<Region>& regions,
                                                                             const msg::Time& stamp, NextId&& next_id,
-                                                                            const std::vector<bool>& fresh) {
+                                                                            const std::vector<bool>& fresh, bool hold) {
     std::vector<std::pair<msg::EventState, Candidate>> transitions;
     std::vector<bool> open_matched(open_.size(), false);
     std::vector<bool> pending_matched(pending_.size(), false);
@@ -710,7 +888,7 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
     std::vector<Candidate> promoted;
     for (const std::size_t n : order) {
         Step& step = steps[n];
-        if (step.entry->windows < candidate_windows_) continue;
+        if (hold || step.entry->windows < candidate_windows_) continue;
         step.promoted = true;
         Candidate c = *step.entry;
         c.event_id = next_id();

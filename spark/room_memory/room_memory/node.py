@@ -11,8 +11,13 @@ bridge exposes to the Mac (D39); its request is serialized back to the message's
 the same way. The publisher generation is allocated (durably, under ``publisher.lock``) before any
 publisher exists; without it the node refuses to start. A rejected frame logs one warning per
 sensor per 10 s.
+
+With ``rig_guard`` it also feeds ``imu_topic`` (raw ``sensor_msgs/Imu``, sensor-data QoS; "" for none)
+to the guard and publishes ``RigPose`` on ``/room_memory/rig`` after each window, when ``rig_pose``
+has one (reliable, transient_local, keep-last 1).
 """
 
+import dataclasses
 import time
 
 import rclpy
@@ -22,11 +27,12 @@ from labcommand_msgs.msg import MapBricks as MapBricksMsg
 from labcommand_msgs.msg import MemoryStatus as MemoryStatusMsg
 from labcommand_msgs.msg import RequestSync as RequestSyncMsg
 from labcommand_msgs.msg import SyncEnd as SyncEndMsg
+from labcommand_msgs.msg import RigPose as RigPoseMsg
 from labcommand_msgs.srv import RequestSync as RequestSyncSrv
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.serialization import serialize_message
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import Imu, PointCloud2
 
 from .generation import GenerationError, allocate_generation
 from .memory import SENSORS, MemoryConfig, RoomMemory
@@ -42,6 +48,7 @@ REQUEST_SERVICE = "/room_memory/sync/request"
 SYNC_MAP_TOPIC = "/room_memory/sync/map_bricks"
 SYNC_EVENTS_TOPIC = "/room_memory/sync/events"
 SYNC_END_TOPIC = "/room_memory/sync/end"
+RIG_TOPIC = "/room_memory/rig"
 
 
 def _time(node):
@@ -55,35 +62,9 @@ class RoomMemoryNode(Node):
     def __init__(self, **kwargs):
         super().__init__("room_memory", **kwargs)
         defaults = MemoryConfig()
-        params = {
-            "room_id": defaults.room_id,
-            "sensors": list(defaults.sensors),
-            "voxel_size": defaults.voxel_size,
-            "max_range": defaults.max_range,
-            "tolerance": defaults.tolerance,
-            "min_voxels": defaults.min_voxels,
-            "min_extent": defaults.min_extent,
-            "window_s": defaults.window_s,
-            "reference_windows": defaults.reference_windows,
-            "recent_windows": defaults.recent_windows,
-            "state_dir": defaults.state_dir,
-            "occupied_min_hits": defaults.occupied_min_hits,
-            "occupied_min_ratio": defaults.occupied_min_ratio,
-            "free_min_seen": defaults.free_min_seen,
-            "free_max_ratio": defaults.free_max_ratio,
-            "candidate_windows": defaults.candidate_windows,
-            "expire_windows": defaults.expire_windows,
-            "fresh_min_voxels": defaults.fresh_min_voxels,
-            "fresh_min_fraction": defaults.fresh_min_fraction,
-            "stable_min_fraction": defaults.stable_min_fraction,
-            "activity_radius_m": defaults.activity_radius_m,
-            "learn_max_offset_m": defaults.learn_max_offset_m,
-            "learn_windows": defaults.learn_windows,
-            "map_sensor": defaults.map_sensor,
-            "delta_period_s": defaults.delta_period_s,
-            "keyframe_period_s": defaults.keyframe_period_s,
-            "keyframe_delta_ratio": defaults.keyframe_delta_ratio,
-        }
+        # Every MemoryConfig field, with its default (the launch files carry the same table).
+        params = {field.name: getattr(defaults, field.name) for field in dataclasses.fields(MemoryConfig)}
+        params["sensors"] = list(defaults.sensors)
         values = {name: self.declare_parameter(name, value).value for name, value in params.items()}
         values["sensors"] = tuple(values["sensors"])
         values["max_range"] = values["max_range"] if values["max_range"] > 0 else None
@@ -125,7 +106,16 @@ class RoomMemoryNode(Node):
                 PointCloud2, sensor.topic, lambda data, name=name: self._on_cloud(name, data),
                 qos_profile_sensor_data, raw=True,
             )
+        self.rig = None
+        if self.config.rig_guard:
+            # RigPose is full state too (on change and every 10 s): latched like status (protocol D42).
+            self.rig = self.create_publisher(RigPoseMsg, RIG_TOPIC, latched())
+            if self.config.imu_topic:
+                self.create_subscription(Imu, self.config.imu_topic, self._on_imu, qos_profile_sensor_data, raw=True)
         self._last_status = time.monotonic()
+        self._rig_save_failed = 0  # memory.rig_save_failed at the last window
+        self._rig_save_failed_at = 0  # its value before the current run of failures
+        self._rig_save_lagging = False
         self.create_timer(self.config.window_s, self._close_window)
         self.create_timer(1.0, self._publish_status)
         self.get_logger().info(
@@ -141,6 +131,9 @@ class RoomMemoryNode(Node):
         if line is not None:
             self.get_logger().warning(line)
 
+    def _on_imu(self, data):
+        self.memory.add_imu(data, _time(self))
+
     def _close_window(self):
         start = time.perf_counter()
         cpu = time.process_time()
@@ -151,18 +144,40 @@ class RoomMemoryNode(Node):
         message = self.memory.map_update(stamp)
         if message is not None:
             self.map.publish(message)
+        if self.rig is not None:  # created with rig_guard only; rig_pose is None without it
+            rig = self.memory.rig_pose(stamp)
+            if rig is not None:
+                self.rig.publish(rig.to_cdr())
+            self._report_rig_save()
         elapsed_ms = (time.perf_counter() - start) * 1000
         cpu_ms = (time.process_time() - cpu) * 1000
         self.get_logger().info(
             f"window {elapsed_ms:.1f} ms wall, {cpu_ms:.1f} ms cpu, {len(events)} event messages, "
             f"state {self.memory.state.name}"
         )
+        if self.memory.window_estimates:
+            self.get_logger().info(f"rig guard: {self.memory.window_estimates} ICP estimates, "
+                                   f"{self.memory.window_estimate_ms:.1f} ms of the window")
         if elapsed_ms > self.config.window_s * 1000:
             self.get_logger().warning(f"window took {elapsed_ms:.0f} ms, longer than window_s")
 
     def _serve_request(self, request, response):
         response.accepted = self._answer(serialize_message(request.request))
         return response
+
+    def _report_rig_save(self):
+        """One warning when the rig files start lagging the guard (or a relearn archive fails, or the
+        epoch file cannot take a new epoch), one line when a retry catches up; not one per window while
+        the disk stays full. A held epoch write is not a pending save, so both count."""
+        failed = self.memory.rig_save_failed
+        lagging = self.memory.rig_save_pending or self.memory.epoch_held
+        if lagging and not self._rig_save_lagging:
+            self.get_logger().warning(f"rig state not saved: {self.memory.rig_save_error}; "
+                                      "the guard runs on and retries every window")
+            self._rig_save_failed_at = self._rig_save_failed
+        elif self._rig_save_lagging and not lagging:
+            self.get_logger().info(f"rig state saved after {failed - self._rig_save_failed_at} failed attempts")
+        self._rig_save_failed, self._rig_save_lagging = failed, lagging
 
     def _answer(self, data):
         """Publishes the answer and its ``SyncEnd``; False when the request was dropped."""

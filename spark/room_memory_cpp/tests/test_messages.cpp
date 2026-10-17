@@ -179,6 +179,36 @@ Activity activity_idle() {
     return a;
 }
 
+RigPose rig_pose() {
+    RigPose p;
+    p.header = head("lab", 43, 22);
+    p.outcome = RigOutcome::realigned;
+    p.causes = kCauseImuShock | kCausePeriodic;
+    p.sensors = kSensorMid360 | kSensorJT128;
+    p.channel = {RigChannel::moved, RigChannel::in_place};
+    p.frame_epoch = 40;
+    p.n_realigned = 16909060;
+    p.mid360_pose = std::array<float, 7>{f32(0.03125), f32(-0.0625), 0.0f, 0.5f, 0.5f, 0.5f, 0.5f};
+    p.jt128_pose = std::array<float, 7>{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    p.delta_m = {f32(0.03125), std::nullopt};
+    p.delta_deg = {f32(0.5), std::nullopt};
+    p.inlier_frac = {f32(0.75), f32(0.875)};
+    p.rms_m = {f32(0.0078125), f32(0.00390625)};
+    p.observe = {f32(0.25), f32(0.125)};
+    p.tilt_deg = f32(0.25);
+    p.imu_ok = true;
+    p.moved_at = Time{1760400005, 500000000};
+    return p;
+}
+
+RigPose rig_pose_v2() {
+    RigPose p = rig_pose();
+    p.publisher_generation = kG;
+    return p;
+}
+
+ImuSample imu() { return ImuSample{kT10, "livox_frame", {0.015625, -0.03125, 0.5}, {0.0078125, -0.0, -1.0}}; }
+
 RequestSync request_map() { return RequestSync{head("lab", 43, 2), RequestSync::Since{43, 12}, SyncTopic::map_bricks}; }
 
 RequestSync request_events_none() {
@@ -331,6 +361,10 @@ const std::map<std::string, Golden>& goldens() {
         {"epoch_v2_le.hex", golden<Epoch>(epoch_v2, true)},
         {"epoch_v2_be.hex", golden<Epoch>(epoch_v2, false)},
         {"activity_v2_le.hex", golden<Activity>(activity_v2, true)},
+        {"rig_pose_le.hex", golden<RigPose>(rig_pose, true)},
+        {"rig_pose_v2_le.hex", golden<RigPose>(rig_pose_v2, true)},
+        {"imu_le.hex", Golden{[](const Bytes& data) { return decode_imu(data) == imu(); }, [] { return imu().to_cdr(); },
+                              [](const Bytes& data) { (void)decode_imu(data); }, [](const Bytes& data) { (void)decode_imu(data); return false; }, true}},
     };
     return table;
 }
@@ -397,7 +431,7 @@ TEST(every_hand_golden_is_covered) {
         CHECK(goldens().count(entry.path().filename().string()) == 1);
     }
     CHECK_EQ(files, goldens().size());
-    CHECK_EQ(files, std::size_t{27});
+    CHECK_EQ(files, std::size_t{30});
 }
 
 TEST(hand_goldens_match_the_swift_copies) {
@@ -409,7 +443,9 @@ TEST(hand_goldens_match_the_swift_copies) {
     for (const auto& [name, g] : goldens()) expected.insert(name);
     CHECK(copies == expected);
     for (const auto& [name, g] : goldens()) {
-        if (hexfile(name, kSwiftHand) != hexfile(name)) throw harness::Failure("Swift copy differs: " + name);
+        if (hexfile(name, kSwiftHand) != hexfile(name)) {
+            throw harness::Failure("Swift copy differs: " + name);
+        }
     }
     CHECK(memory_status().to_cdr() == hexfile("memory_status_le.hex", kSwiftHand));
 }
@@ -536,6 +572,66 @@ TEST(activity_rejects_inconsistent_fields) {
     Activity active = activity();
     active.since_s = std::nullopt;
     CHECK_THROWS(Invalid, active.to_cdr());
+}
+
+TEST(rig_pose_is_168_bytes_for_lab) {
+    CHECK_EQ(rig_pose().to_cdr().size(), std::size_t{168});
+    CHECK_EQ(rig_pose_v2().to_cdr().size(), std::size_t{180});  // v2: pad to 8, then the generation
+}
+
+TEST(rig_pose_rejects_bad_codes) {
+    const std::pair<std::size_t, std::uint8_t> cases[] = {
+        {32, 6},   // outcome past INCONCLUSIVE
+        {33, 64},  // an undefined cause bit
+        {34, 4},   // an undefined sensor bit
+        {35, 5},   // channel past UNAVAILABLE
+        {152, 2},  // imu_ok is a bool
+    };
+    for (const auto& [offset, value] : cases) {
+        Bytes data = hexfile("rig_pose_le.hex");
+        data[4 + offset] = value;
+        CHECK_THROWS(Invalid, RigPose::from_cdr(data));
+    }
+}
+
+TEST(rig_pose_rejects_inconsistent_fields) {
+    Bytes data = hexfile("rig_pose_le.hex");
+    data[4 + 34] = static_cast<std::uint8_t>(kSensorJT128);  // the Mid-360 is outside sensors but has a MOVED result
+    CHECK_THROWS(Invalid, RigPose::from_cdr(data));
+    data[4 + 35] = static_cast<std::uint8_t>(RigChannel::unavailable);  // UNAVAILABLE is allowed for it
+    CHECK(RigPose::from_cdr(data).channel[0] == RigChannel::unavailable);
+    const Bytes nan = {0x00, 0x00, 0xc0, 0x7f};
+    data = hexfile("rig_pose_le.hex");
+    std::copy(nan.begin(), nan.end(), data.begin() + 4 + 52);  // mid360 tx NaN, the rest finite
+    CHECK_THROWS(Invalid, RigPose::from_cdr(data));
+    for (std::size_t n = 0; n < 7; ++n) std::copy(nan.begin(), nan.end(), data.begin() + 4 + 52 + 4 * n);
+    CHECK(!RigPose::from_cdr(data).mid360_pose);  // NaN x 7: not configured
+    data = hexfile("rig_pose_le.hex");
+    const Bytes inf = {0x00, 0x00, 0x80, 0x7f};
+    std::copy(inf.begin(), inf.end(), data.begin() + 4 + 124);  // inlier_frac[0] infinite
+    CHECK_THROWS(Invalid, RigPose::from_cdr(data));
+    RigPose p = rig_pose();
+    (*p.mid360_pose)[6] = 1.01f;
+    CHECK_THROWS(Invalid, p.to_cdr());
+    p = rig_pose();
+    p.inlier_frac[0] = 1.5f;
+    CHECK_THROWS(Invalid, p.to_cdr());
+    p = rig_pose();
+    p.tilt_deg = -1.0f;
+    CHECK_THROWS(Invalid, p.to_cdr());
+    p = rig_pose();
+    p.delta_m[0] = INFINITY;
+    CHECK_THROWS(Invalid, p.to_cdr());
+    p = rig_pose();
+    p.publisher_generation = 0;  // GENERATION_UNKNOWN
+    CHECK_THROWS(Invalid, p.to_cdr());
+}
+
+TEST(decode_imu_rejects_non_finite_values) {
+    Bytes data = hexfile("imu_le.hex");
+    const Bytes nan = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x7f};
+    std::copy(nan.begin(), nan.end(), data.begin() + 4 + 128);
+    CHECK_THROWS(Invalid, decode_imu(data));
 }
 
 TEST(payload_size_and_stream_checks) {

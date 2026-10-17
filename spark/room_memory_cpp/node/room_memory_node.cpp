@@ -8,6 +8,10 @@
 // start. A rejected frame logs one warning per sensor per 10 s (RejectionLog), with the
 // decoder's error.
 //
+// With rig_guard it also feeds imu_topic (raw sensor_msgs/Imu, sensor-data QoS; "" for none) to the
+// guard and publishes RigPose on /room_memory/rig after each window, when RoomMemory::rig_pose has
+// one (reliable, transient_local, keep-last 1).
+//
 // Subscriptions and publishers are generic (serialized), so frames go through the tested
 // decode_pointcloud2 and outputs are the codec's CDR bytes; sensor_msgs and labcommand_msgs
 // only provide the type support at run time. The service is typed (Jazzy has no generic
@@ -48,6 +52,7 @@ constexpr const char* kRequestService = "/room_memory/sync/request";
 constexpr const char* kSyncMapTopic = "/room_memory/sync/map_bricks";
 constexpr const char* kSyncEventsTopic = "/room_memory/sync/events";
 constexpr const char* kSyncEndTopic = "/room_memory/sync/end";
+constexpr const char* kRigTopic = "/room_memory/rig";
 constexpr const char* kMapType = "labcommand_msgs/msg/MapBricks";
 constexpr const char* kEventType = "labcommand_msgs/msg/ChangeEvent";
 
@@ -113,6 +118,31 @@ public:
         config.delta_period_s = declare_parameter<double>("delta_period_s", defaults.delta_period_s);
         config.keyframe_period_s = declare_parameter<double>("keyframe_period_s", defaults.keyframe_period_s);
         config.keyframe_delta_ratio = declare_parameter<double>("keyframe_delta_ratio", defaults.keyframe_delta_ratio);
+        config.rig_guard = declare_parameter<bool>("rig_guard", defaults.rig_guard);
+        config.imu_topic = declare_parameter<std::string>("imu_topic", defaults.imu_topic);
+        config.imu_shock_frac = declare_parameter<double>("imu_shock_frac", defaults.imu_shock_frac);
+        config.imu_gyro_dps = declare_parameter<double>("imu_gyro_dps", defaults.imu_gyro_dps);
+        config.imu_quiet_s = declare_parameter<double>("imu_quiet_s", defaults.imu_quiet_s);
+        config.tilt_trigger_deg = declare_parameter<double>("tilt_trigger_deg", defaults.tilt_trigger_deg);
+        config.pose_trigger_m = declare_parameter<double>("pose_trigger_m", defaults.pose_trigger_m);
+        config.guard_check_period_s = declare_parameter<double>("guard_check_period_s", defaults.guard_check_period_s);
+        config.check_max_s = declare_parameter<double>("check_max_s", defaults.check_max_s);
+        config.move_min_m = declare_parameter<double>("move_min_m", defaults.move_min_m);
+        config.move_min_deg = declare_parameter<double>("move_min_deg", defaults.move_min_deg);
+        config.align_max_m = declare_parameter<double>("align_max_m", defaults.align_max_m);
+        config.align_max_deg = declare_parameter<double>("align_max_deg", defaults.align_max_deg);
+        config.align_inlier_ratio = declare_parameter<double>("align_inlier_ratio", defaults.align_inlier_ratio);
+        config.align_max_rms_m = declare_parameter<double>("align_max_rms_m", defaults.align_max_rms_m);
+        config.align_stable_windows = declare_parameter<std::int64_t>("align_stable_windows", defaults.align_stable_windows);
+        config.observe_min_eig = declare_parameter<double>("observe_min_eig", defaults.observe_min_eig);
+        config.gross_inlier_ratio = declare_parameter<double>("gross_inlier_ratio", defaults.gross_inlier_ratio);
+        config.relearn_after_s = declare_parameter<double>("relearn_after_s", defaults.relearn_after_s);
+        config.auto_relearn = declare_parameter<bool>("auto_relearn", defaults.auto_relearn);
+        config.reg_voxel_m = declare_parameter<double>("reg_voxel_m", defaults.reg_voxel_m);
+        config.reg_max_points = declare_parameter<std::int64_t>("reg_max_points", defaults.reg_max_points);
+        config.src_voxel_m = declare_parameter<double>("src_voxel_m", defaults.src_voxel_m);
+        config.src_max_points = declare_parameter<std::int64_t>("src_max_points", defaults.src_max_points);
+        config.icp_max_range_m = declare_parameter<double>("icp_max_range_m", defaults.icp_max_range_m);
         // Before any publisher: every message this process sends carries the generation. The
         // allocation holds publisher.lock until the process exits. The wall clock, not now(),
         // which may be sim time.
@@ -158,6 +188,15 @@ public:
                 sensor.topic, "sensor_msgs/msg/PointCloud2", rclcpp::SensorDataQoS(),
                 [this, name](std::shared_ptr<const rclcpp::SerializedMessage> message) { on_cloud(name, *message); }));
         }
+        if (config.rig_guard) {
+            // RigPose is full state too (on change and every 10 s): latched like status (protocol D42).
+            rig_ = create_generic_publisher(kRigTopic, "labcommand_msgs/msg/RigPose", latched_qos());
+            if (!config.imu_topic.empty()) {
+                subscriptions_.push_back(create_generic_subscription(
+                    config.imu_topic, "sensor_msgs/msg/Imu", rclcpp::SensorDataQoS(),
+                    [this](std::shared_ptr<const rclcpp::SerializedMessage> message) { on_imu(*message); }));
+            }
+        }
         last_status_ = std::chrono::steady_clock::now();
         window_timer_ = rclcpp::create_timer(this, get_clock(), rclcpp::Duration::from_seconds(config.window_s),
                                              [this] { close_window(); });
@@ -185,6 +224,11 @@ private:
         }
     }
 
+    void on_imu(const rclcpp::SerializedMessage& message) {
+        const rcl_serialized_message_t& raw = message.get_rcl_serialized_message();
+        memory_->add_imu(std::span<const std::uint8_t>(raw.buffer, raw.buffer_length), stamp());
+    }
+
     void close_window() {
         const auto start = std::chrono::steady_clock::now();
         const double cpu = cpu_ms();
@@ -193,12 +237,40 @@ private:
         for (const msg::ChangeEvent& event : events) events_->publish(serialized(event.to_cdr()));
         const std::optional<msg::Bytes> map = memory_->map_update(now_stamp);
         if (map) map_->publish(serialized(*map));
+        if (rig_) {  // created with rig_guard only; rig_pose is empty without it
+            if (const std::optional<msg::RigPose> rig = memory_->rig_pose(now_stamp)) {
+                rig_->publish(serialized(rig->to_cdr()));
+            }
+            report_rig_save();
+        }
         const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         RCLCPP_INFO(get_logger(), "window %.1f ms wall, %.1f ms cpu, %zu event messages, map %zu B, state %s", elapsed,
                     cpu_ms() - cpu, events.size(), map ? map->size() : std::size_t{0}, msg::name(memory_->state()));
+        if (memory_->window_estimates() > 0) {
+            RCLCPP_INFO(get_logger(), "rig guard: %lld ICP estimates, %.1f ms of the window",
+                        static_cast<long long>(memory_->window_estimates()), memory_->window_estimate_ms());
+        }
         if (elapsed > memory_->config().window_s * 1000) {
             RCLCPP_WARN(get_logger(), "window took %.0f ms, longer than window_s", elapsed);
         }
+    }
+
+    // One warning when the rig files start lagging the guard (or a relearn archive fails, or the
+    // epoch file cannot take a new epoch), one line when a retry catches up; not one per window while
+    // the disk stays full. A held epoch write is not a pending save, so both count.
+    void report_rig_save() {
+        const std::int64_t failed = memory_->rig_save_failed();
+        const bool lagging = memory_->rig_save_pending() || memory_->epoch_held();
+        if (lagging && !rig_save_lagging_) {
+            RCLCPP_WARN(get_logger(), "rig state not saved: %s; the guard runs on and retries every window",
+                        memory_->rig_save_error().c_str());
+            rig_save_failed_at_ = rig_save_failed_;
+        } else if (rig_save_lagging_ && !lagging) {
+            RCLCPP_INFO(get_logger(), "rig state saved after %lld failed attempts",
+                        static_cast<long long>(failed - rig_save_failed_at_));
+        }
+        rig_save_failed_ = failed;
+        rig_save_lagging_ = lagging;
     }
 
     void publish_status() {
@@ -250,6 +322,7 @@ private:
     std::shared_ptr<rclcpp::GenericPublisher> sync_map_;
     std::shared_ptr<rclcpp::GenericPublisher> sync_events_;
     std::shared_ptr<rclcpp::GenericPublisher> sync_end_;
+    std::shared_ptr<rclcpp::GenericPublisher> rig_;  // with rig_guard only
     std::shared_ptr<rclcpp::GenericSubscription> requests_;
     rclcpp::Service<labcommand_msgs::srv::RequestSync>::SharedPtr request_service_;
     rclcpp::Serialization<labcommand_msgs::msg::RequestSync> request_serialization_;
@@ -257,6 +330,9 @@ private:
     rclcpp::TimerBase::SharedPtr window_timer_;
     rclcpp::TimerBase::SharedPtr status_timer_;
     std::chrono::steady_clock::time_point last_status_;
+    std::int64_t rig_save_failed_ = 0;     // RoomMemory::rig_save_failed at the last window
+    std::int64_t rig_save_failed_at_ = 0;  // its value before the current run of failures
+    bool rig_save_lagging_ = false;
 };
 
 }  // namespace
