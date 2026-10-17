@@ -29,6 +29,10 @@ PARENT_FRAME = "hesai_lidar"
 CHILD_FRAME = "livox_frame"
 CONVENTION = "p_parent = R * p_child + t"
 CHARACTERISTIC_LENGTH_M = 1.0
+# A null motion of one plane, of parallel planes, or of planes that share an axis
+# picks up about Σ w σ² from normal tilt. On the real snapshot that floor is about
+# a quarter of λ_min; those degeneracies sit near 0.9×. Two separates them.
+OBSERVABILITY_NOISE_MARGIN = 2.0
 AUTHORITATIVE_PATH = "~/room-memory/<room_id>/T_jt128_mid360.json"
 LEVEL_PATH = "~/room-memory/<room_id>/T_room_jt128.json"
 RESIDUAL_TRIM_NOTE = "fixed radius only; solver trimming is not applied"
@@ -391,15 +395,23 @@ def prepare_cloud(points, settings):
 
 
 def estimate_normals(points, settings):
-    """Unit normals from a 0.20 m PCA. Invalid rows are NaN.
+    """Unit normals from a 0.20 m PCA, and each normal's tilt variance. Invalid rows are NaN.
 
     A point is planar when the smallest eigenvalue is at most ``planarity_ratio``
     times the middle one, with at least ``normal_min_points`` neighbors. The normal
     is flipped so it points toward the target sensor origin.
+
+    The tilt variance is ``λ0 / (count * λ1)`` toward the weaker in-plane axis
+    (``λ0 ≤ λ1 ≤ λ2`` are the neighborhood covariance eigenvalues). The
+    normal/tangent entry of that covariance has variance ``λ0 * λ1 / count``, and
+    dividing by the gap ``λ1`` is the angle variance of the estimated normal. A
+    direction the surface does not constrain picks up about this much spurious
+    information from the correspondence.
     """
     normals = np.full((len(points), 3), np.nan, dtype=np.float64)
+    variance = np.full(len(points), np.nan, dtype=np.float64)
     if len(points) == 0:
-        return normals
+        return normals, variance
     spatial = SpatialHash(points, settings.search_cell_m)
     radius2 = (settings.normal_radius_m + 1e-12) ** 2
     for ids in spatial.buckets.values():
@@ -429,14 +441,17 @@ def estimate_normals(points, settings):
                 if evals[1] <= 1e-12 or evals[0] > settings.planarity_ratio * evals[1]:
                     continue
                 normal = evecs[:, 0]
-                point = points[int(ids[start + local])]
+                index = int(ids[start + local])
+                point = points[index]
                 if float(np.dot(normal, point)) > 0.0:
                     normal = -normal
                 norm = float(np.linalg.norm(normal))
                 if norm == 0.0:
                     continue
-                normals[int(ids[start + local])] = normal / norm
-    return normals
+                normals[index] = normal / norm
+                tilt = float(evals[0] / (count * evals[1]))
+                variance[index] = tilt if tilt > 0.0 else 0.0
+    return normals, variance
 
 
 def condition_ratio(jacobian):
@@ -524,15 +539,34 @@ def _empty_observability(threshold, length):
         "lambda_max_over_n": None,
         "ratio": None,
         "threshold": float(threshold),
+        "noise_floor": None,
+        "noise_margin": float(OBSERVABILITY_NOISE_MARGIN),
         "rows": 0,
         "observable": False,
     }
 
 
-def _observability(jacobian, weights, threshold, length):
+def _observability(jacobian, weights, variances, threshold, length):
+    """``λ_min / λ_max`` plus the normal-estimation floor.
+
+    The ratio has to clear ``threshold``. Copying rows multiplies both
+    eigenvalues and leaves the ratio unchanged. Normal tilt on a single plane,
+    on parallel planes, or on planes that share an axis also clears a bare
+    ``1e-4``: each correspondence leaks about its tilt variance ``σ²`` into the
+    null direction, and ``λ_min`` lands near ``Σ w σ²``. That sum is the noise
+    floor. ``λ_min`` has to reach ``OBSERVABILITY_NOISE_MARGIN`` times the floor
+    or the step is not a measured constraint. The floor scales with the copied
+    rows, so the comparison does not depend on how many times each sample was
+    repeated.
+    """
     scale = np.sqrt(weights)
     ratio, lam_min, lam_max = condition_ratio(jacobian * scale[:, None])
     rows = int(jacobian.shape[0])
+    if rows:
+        noise_floor = float(np.sum(weights * np.asarray(variances, dtype=np.float64)))
+    else:
+        noise_floor = 0.0
+    above_noise = bool(np.isfinite(noise_floor) and lam_min >= OBSERVABILITY_NOISE_MARGIN * noise_floor)
     over_n_min = lam_min / rows if rows else None
     over_n_max = lam_max / rows if rows else None
     return {
@@ -543,17 +577,20 @@ def _observability(jacobian, weights, threshold, length):
         "lambda_max_over_n": over_n_max,
         "ratio": ratio,
         "threshold": float(threshold),
+        "noise_floor": noise_floor,
+        "noise_margin": float(OBSERVABILITY_NOISE_MARGIN),
         "rows": rows,
-        "observable": bool(ratio >= threshold and lam_max > 0.0),
+        "observable": bool(ratio >= threshold and lam_max > 0.0 and above_noise),
     }
 
 
-def _gather(moved, spatial, normals, gate):
+def _gather(moved, spatial, normals, variances, gate):
     index, dist = spatial.nearest_batch(moved, gate)
     keep = dist <= gate + 1e-12
     if not np.any(keep):
         return None
-    return moved[keep], spatial.points[index[keep]], normals[index[keep]]
+    chosen = index[keep]
+    return moved[keep], spatial.points[chosen], normals[chosen], variances[chosen]
 
 
 def calibrate_points(parent, child, init=None, init_source="nominal_mount", settings=None, sources=None):
@@ -581,13 +618,14 @@ def calibrate_points(parent, child, init=None, init_source="nominal_mount", sett
     if len(parent_pts) < settings.min_points or len(child_pts) < settings.min_points:
         reason = "insufficient_points"
     else:
-        normals = estimate_normals(parent_pts, settings)
-        valid = np.isfinite(normals).all(axis=1)
+        normals, normal_variance = estimate_normals(parent_pts, settings)
+        valid = np.isfinite(normals).all(axis=1) & np.isfinite(normal_variance)
         if int(valid.sum()) < settings.min_correspondences:
             reason = "insufficient_normals"
         else:
             planar_pts = parent_pts[valid]
             planar_normals = normals[valid]
+            planar_variance = normal_variance[valid]
             target_hash = SpatialHash(parent_pts, settings.search_cell_m)
             planar_hash = SpatialHash(planar_pts, settings.search_cell_m)
             metrics_before = fixed_metrics(
@@ -601,11 +639,11 @@ def calibrate_points(parent, child, init=None, init_source="nominal_mount", sett
                 for iteration in range(settings.max_iterations):
                     iterations = iteration + 1
                     moved = apply_rigid(child_pts, rotation, translation)
-                    gathered = _gather(moved, planar_hash, planar_normals, gate)
+                    gathered = _gather(moved, planar_hash, planar_normals, planar_variance, gate)
                     if gathered is None:
                         reason = "insufficient_correspondences"
                         break
-                    src, tgt, nrm = gathered
+                    src, tgt, nrm, var = gathered
                     jacobian, residual = _plane_system(src, tgt, nrm, settings.characteristic_length_m)
                     keep = _trim_mask(
                         residual, settings.residual_trim_floor_m, settings.residual_trim_factor, gate
@@ -615,7 +653,8 @@ def calibrate_points(parent, child, init=None, init_source="nominal_mount", sett
                         break
                     weights = _huber(residual[keep], settings.huber_delta_m)
                     observability = _observability(
-                        jacobian[keep], weights, settings.condition_ratio_min, settings.characteristic_length_m
+                        jacobian[keep], weights, var[keep],
+                        settings.condition_ratio_min, settings.characteristic_length_m,
                     )
                     if not observability["observable"]:
                         reason = "unobservable"
@@ -649,13 +688,13 @@ def calibrate_points(parent, child, init=None, init_source="nominal_mount", sett
                     reason = "iteration_exhaustion"
                 if reason in (None, "iteration_exhaustion"):
                     moved = apply_rigid(child_pts, rotation, translation)
-                    gathered = _gather(moved, planar_hash, planar_normals, gate)
+                    gathered = _gather(moved, planar_hash, planar_normals, planar_variance, gate)
                     if gathered is None:
                         if reason is None:
                             reason = "insufficient_correspondences"
                         converged = False
                     else:
-                        src, tgt, nrm = gathered
+                        src, tgt, nrm, var = gathered
                         jacobian, residual = _plane_system(src, tgt, nrm, settings.characteristic_length_m)
                         keep = _trim_mask(
                             residual, settings.residual_trim_floor_m, settings.residual_trim_factor, gate
@@ -667,7 +706,8 @@ def calibrate_points(parent, child, init=None, init_source="nominal_mount", sett
                         else:
                             weights = _huber(residual[keep], settings.huber_delta_m)
                             observability = _observability(
-                                jacobian[keep], weights, settings.condition_ratio_min, settings.characteristic_length_m
+                                jacobian[keep], weights, var[keep],
+                                settings.condition_ratio_min, settings.characteristic_length_m,
                             )
                             if not observability["observable"]:
                                 reason = "unobservable"
@@ -782,6 +822,8 @@ def _payload(rotation, translation, rotation_init, translation_init, init_source
         "lambda_max_over_n": None if observability["lambda_max_over_n"] is None else _num(observability["lambda_max_over_n"]),
         "ratio": None if observability["ratio"] is None else _num(observability["ratio"]),
         "threshold": _num(observability["threshold"]),
+        "noise_floor": None if observability["noise_floor"] is None else _num(observability["noise_floor"]),
+        "noise_margin": _num(observability["noise_margin"]),
         "rows": int(observability["rows"]),
         "observable": bool(observability["observable"]),
     }

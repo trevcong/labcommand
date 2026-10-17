@@ -16,6 +16,7 @@ from tools.extrinsic.calibrate import (
     SCHEMA,
     SolverSettings,
     SpatialHash,
+    _observability,
     apply_rigid,
     calibrate_points,
     condition_ratio,
@@ -185,6 +186,104 @@ def test_two_wall_corridor_is_unobservable():
     assert_proper(result)
 
 
+def _z_noise(points, rng, sigma=0.015):
+    out = np.array(points, dtype=np.float64, copy=True)
+    out[:, 2] += rng.normal(0.0, sigma, len(out))
+    return out
+
+
+def _along(points, direction, rng, sigma=0.015):
+    direction = np.asarray(direction, dtype=np.float64)
+    direction = direction / np.linalg.norm(direction)
+    return points + rng.normal(0.0, sigma, len(points))[:, None] * direction
+
+
+def _assert_noise_rejected(result):
+    """The ratio can clear 1e-4. The noise floor is what has to reject the solve."""
+    assert result["observable"] is False
+    assert result["accepted"] is False
+    assert result["reject_reason"] == "unobservable"
+    assert result["activation"]["eligible"] is False
+    assert_proper(result)
+    assert np.allclose(result["T_parent_child"], result["T_init"])
+    obs = result["observability"]
+    assert obs["ratio"] is not None and obs["ratio"] >= obs["threshold"]
+    assert obs["noise_floor"] > 0.0
+    assert obs["lambda_min"] < obs["noise_margin"] * obs["noise_floor"]
+
+
+def test_realistic_single_plane_is_unobservable():
+    """Astra, PR #42 at 636a9a9: one plane, 1.5 cm of z noise, default solver.
+
+    z = 2, x and y in [-1.5, 1.5) every 0.06 m. ``default_rng(2)`` draws the
+    parent cloud, then the child. The seed is the identity. Unfixed, the ratio
+    is about 6.6e-4, the RMS about 0.020 m, and the solve walks about 0.014 m.
+    """
+    xs = np.arange(-1.5, 1.5, 0.06)
+    ys = np.arange(-1.5, 1.5, 0.06)
+    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    plane = np.stack([xx.ravel(), yy.ravel(), np.full(xx.size, 2.0)], axis=1)
+    rng = np.random.default_rng(2)
+    parent = _z_noise(plane, rng)
+    child = _z_noise(plane, rng)
+    result = calibrate_points(
+        parent, child, init=(np.eye(3), np.zeros(3)), init_source="matrix", settings=SolverSettings(),
+    )
+    _assert_noise_rejected(result)
+
+
+def test_two_parallel_planes_with_realistic_noise_are_unobservable():
+    rng = np.random.default_rng(2)
+    lower = grid_plane((0.0, 0.0, 2.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (-1.5, 1.5), (-1.5, 1.5), 0.06, 0.0)
+    upper = grid_plane((0.0, 0.0, 3.2), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (-1.5, 1.5), (-1.2, 1.2), 0.06, 0.0)
+    clean = np.vstack([lower, upper])
+    parent = _z_noise(clean, rng)
+    child = _z_noise(clean, rng)
+    result = calibrate_points(
+        parent, child, init=(np.eye(3), np.zeros(3)), init_source="matrix", settings=SolverSettings(),
+    )
+    _assert_noise_rejected(result)
+
+
+def test_planes_sharing_an_axis_are_unobservable():
+    """Two vertical planes. Every normal is horizontal, so translation along z is free."""
+    rng = np.random.default_rng(2)
+    wall_x = grid_plane((2.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (-1.5, 1.5), (0.2, 2.4), 0.06, 0.0)
+    wall_y = grid_plane((0.0, 2.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (-1.5, 1.5), (0.2, 2.4), 0.06, 0.0)
+
+    def cloud():
+        return np.vstack([
+            _along(wall_x, (1.0, 0.0, 0.0), rng),
+            _along(wall_y, (0.0, 1.0, 0.0), rng),
+        ])
+
+    result = calibrate_points(
+        cloud(), cloud(), init=(np.eye(3), np.zeros(3)), init_source="matrix", settings=SolverSettings(),
+    )
+    _assert_noise_rejected(result)
+
+
+def test_three_planes_with_realistic_noise_stay_observable():
+    rng = np.random.default_rng(2)
+    yaw, pitch, roll = np.radians(1.0), np.radians(-0.3), np.radians(0.2)
+    rotation = rotation_ypr(yaw, pitch, roll)
+    translation = np.array([0.010, -0.008, 0.012])
+    parent = noisy(three_planes(0.0), rng, 0.015)
+    child = noisy(child_from_parent(three_planes(0.02), rotation, translation), rng, 0.015)
+    result = calibrate_points(
+        parent, child, init=(np.eye(3), np.zeros(3)), init_source="matrix", settings=settings()
+    )
+    delta_t, delta_deg = pose_error(result, rotation, translation)
+    assert result["accepted"] is True
+    assert result["observable"] is True
+    assert result["activation"]["eligible"] is True
+    assert delta_t < 0.01
+    assert delta_deg < 0.25
+    obs = result["observability"]
+    assert obs["lambda_min"] >= obs["noise_margin"] * obs["noise_floor"]
+    assert_proper(result)
+
+
 def test_condition_ratio_is_invariant_when_rows_are_duplicated():
     rng = np.random.default_rng(5)
     jacobian = rng.normal(size=(80, 6))
@@ -203,6 +302,19 @@ def test_condition_ratio_is_invariant_when_rows_are_duplicated():
     both_dup = lam_min_dup / duplicated.shape[0]
     assert both_dup == pytest.approx(both, rel=1e-6)
     assert (lam_max_dup / duplicated.shape[0]) == pytest.approx(lam_max / count, rel=1e-6)
+    # The noise floor is a sum over the same rows, so it scales with the copies
+    # and the margin does not flip.
+    variances = rng.random(count) * 1e-3 + 1e-6
+    weights = rng.random(count) * 0.5 + 0.5
+    once = _observability(jacobian, weights, variances, 1e-4, CHARACTERISTIC_LENGTH_M)
+    copied = _observability(
+        duplicated, np.tile(weights, 4), np.tile(variances, 4), 1e-4, CHARACTERISTIC_LENGTH_M
+    )
+    assert copied["noise_floor"] / once["noise_floor"] == pytest.approx(4.0, rel=1e-12)
+    assert copied["lambda_min"] / copied["noise_floor"] == pytest.approx(
+        once["lambda_min"] / once["noise_floor"], rel=1e-9
+    )
+    assert copied["observable"] is once["observable"]
 
 
 def test_duplicated_samples_keep_the_same_observability_decision():
