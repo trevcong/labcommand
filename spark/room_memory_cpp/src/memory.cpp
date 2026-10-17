@@ -1279,7 +1279,7 @@ msg::MemoryStatus RoomMemory::status(const msg::Time& stamp, double period_s) {
     }
     msg::MemoryStatus message;
     message.header = msg::Header{config_.room_id, map_epoch_, status_seq_++, stamp};
-    if (state_ == msg::MemoryState::tracking && any_moved()) {
+    if (state_ == msg::MemoryState::tracking && move_unresolved()) {
         message.state = msg::MemoryState::rig_moved;  // outranks DEGRADED: a silent sensor does not hide a move
     } else {
         message.state = last_window_dropped_ || silent ? msg::MemoryState::degraded : state_;
@@ -1322,8 +1322,14 @@ bool RoomMemory::any_moved() const {
     return std::any_of(channels_.begin(), channels_.end(), [](const Channel& c) { return c.mode == Channel::Mode::moved; });
 }
 
+bool RoomMemory::move_unresolved() const {
+    // From the move until a realignment or a relearn: a moved sensor gone silent (stale) is
+    // still moved, only not measurable.
+    return moved_since_.has_value();
+}
+
 msg::RigOutcome RoomMemory::rig_outcome() const {
-    if (any_moved()) return msg::RigOutcome::moved;
+    if (move_unresolved()) return msg::RigOutcome::moved;
     if (check_) return msg::RigOutcome::checking;
     return outcome_;
 }
@@ -1387,7 +1393,7 @@ void RoomMemory::guard_triggers(std::int64_t now) {
     if (check_) {
         check_->causes |= causes;
         causes_ = check_->causes;
-    } else if (!any_moved()) {
+    } else if (!move_unresolved()) {
         start_check(now, causes);
     }
 }

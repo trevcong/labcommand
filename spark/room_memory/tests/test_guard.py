@@ -783,6 +783,41 @@ def test_a_failed_epoch_write_never_leaves_close_window_and_retries(tmp_path):
     assert guarded(tmp_path).map_epoch == memory.map_epoch + 1
 
 
+def test_a_moved_sensor_gone_silent_keeps_the_move(moved_window):
+    """Codex's repro: a window without points right after a detected 10 cm + 2 degree push takes the
+    sensor off line (stale), never the move: RIG_MOVED and MOVED until it realigns, and no check
+    (here a periodic one falls due) starts over the unresolved move."""
+    memory, truth, second = moved_window
+    states, rigs = [], []
+    for second in range(second, second + 3):
+        stamp = Time(second, 0)
+        memory.close_window(stamp)
+        states.append(memory.status(stamp, 1.0).state)
+        rigs.append(memory.rig_pose(stamp))
+    assert memory.channels["mid360"].mode == "stale"
+    assert states == [MemoryState.RIG_MOVED] * 3 and memory.rig_outcome == RigOutcome.MOVED
+    assert rigs[0] is not None and rigs[0].outcome == RigOutcome.MOVED and memory._check is None
+    trace = drive(memory, [truth] * 20, second + 1)
+    assert RigOutcome.REALIGNED in outcomes(trace) and trace[-1].state == MemoryState.TRACKING
+    error_m, error_deg = rooms.pose_error(memory.channels["mid360"].pose, truth)
+    assert error_m <= 0.005 and error_deg <= 0.05
+
+
+@pytest.fixture
+def moved_window():
+    """A single-sensor rig at the window its 10 cm + 2 degree push is detected (a periodic check
+    every second), and the next second."""
+    memory = guarded(guard_check_period_s=1.0)
+    truth = rooms.rig(0.10, yaw_deg=2.0)
+    drive(memory, [rooms.Pose()] * (REFERENCE_WINDOWS + 2), 1)
+    second = REFERENCE_WINDOWS + 3
+    while memory.channels["mid360"].mode != "moved":
+        drive(memory, [truth], second)
+        second += 1
+        assert second < REFERENCE_WINDOWS + 20
+    return memory, truth, second
+
+
 def test_a_failed_archive_leaves_no_partial_archive(tmp_path):
     """A copy that fails part way (an unreadable file, as a full disk would) removes the archive it
     started, so a retry takes the same number and pruning never keeps a partial copy over a whole one."""

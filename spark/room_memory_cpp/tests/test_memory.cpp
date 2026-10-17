@@ -2047,6 +2047,37 @@ TEST(a_sensor_still_building_when_the_rig_moves_starts_its_build_over) {
                       [](const Window& w) { return w.events.empty(); }));
 }
 
+TEST(a_moved_sensor_gone_silent_keeps_the_move) {
+    // Codex's repro: a window without points right after a detected 10 cm + 2 degree push takes the
+    // sensor off line (stale), never the move: RIG_MOVED and MOVED until it realigns, and no check
+    // (here a periodic one falls due) starts over the unresolved move.
+    MemoryConfig config = guarded_config();
+    config.guard_check_period_s = 1.0;
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+    const rig::Pose truth = rooms::rig(0.10, 0.0, 0.0, 2.0);
+    drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 2), 1);
+    std::int64_t second = kGuardReferenceWindows + 3;
+    while (memory.channel("mid360").mode != Channel::Mode::moved) {
+        drive(memory, repeat(truth, 1), second++);
+        CHECK(second < kGuardReferenceWindows + 20);
+    }
+    std::vector<MemoryState> states;
+    std::vector<std::optional<msg::RigPose>> rigs;
+    for (int n = 0; n < 3; ++n, ++second) {
+        const msg::Time t{second, 0};
+        memory.close_window(t);
+        states.push_back(memory.status(t, 1.0).state);
+        rigs.push_back(memory.rig_pose(t));
+    }
+    CHECK(memory.channel("mid360").mode == Channel::Mode::stale);
+    CHECK(states == std::vector<MemoryState>(3, MemoryState::rig_moved) && memory.rig_outcome() == O::moved);
+    CHECK(rigs[0] && rigs[0]->outcome == O::moved);
+    const std::vector<Window> trace = drive(memory, repeat(truth, 20), second);
+    const std::vector<O> seen = outcomes(trace);
+    CHECK(std::find(seen.begin(), seen.end(), O::realigned) != seen.end() && trace.back().state == MemoryState::tracking);
+    check_pose(memory.channel("mid360").pose, truth);
+}
+
 TEST(the_rig_state_round_trips_and_a_restart_checks_the_pose) {
     TempDir dir;
     const rig::Pose truth = rooms::rig(0.10, 0.0, 0.0, 2.0);

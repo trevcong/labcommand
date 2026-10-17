@@ -531,6 +531,7 @@ private:
     void set_pose(Channel& channel, const rig::Pose& pose);
     bool imu_ok(std::int64_t now) const;
     bool any_moved() const;
+    bool move_unresolved() const;
     void start_check(std::int64_t now, std::int64_t causes);
     void end_check(std::int64_t now, msg::RigOutcome outcome);
     void guard_triggers(std::int64_t now);

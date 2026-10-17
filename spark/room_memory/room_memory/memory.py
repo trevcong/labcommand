@@ -1391,10 +1391,16 @@ class RoomMemory:
         self._detector.add(sample, _nanoseconds(received))
         return True
 
+    def _move_unresolved(self):
+        """From the move until a realignment or a relearn: a moved sensor gone silent (stale) is
+        still moved, only not measurable."""
+        return self._moved_since is not None
+
     @property
     def rig_outcome(self):
-        """MOVED while a channel is moved, CHECKING during a check, else the last decision."""
-        if any(c.mode == "moved" for c in self.channels.values()):
+        """MOVED from a move until a realignment or a relearn, CHECKING during a check, else the last
+        decision."""
+        if self._move_unresolved():
             return RigOutcome.MOVED
         if self._check is not None:
             return RigOutcome.CHECKING
@@ -1461,7 +1467,7 @@ class RoomMemory:
         if self._check is not None:
             self._check[1] |= causes
             self._causes = self._check[1]
-        elif not any(c.mode == "moved" for c in self.channels.values()):
+        elif not self._move_unresolved():
             self._start_check(now, causes)
 
     def _guard_building(self, now):
@@ -2020,7 +2026,7 @@ class RoomMemory:
         state = self.state
         residuals = [c.residual for c in self.channels.values() if c.residual is not None]
         residual = max(residuals) if residuals and self.state != MemoryState.BUILDING else None
-        if self.state == MemoryState.TRACKING and any(c.mode == "moved" for c in self.channels.values()):
+        if self.state == MemoryState.TRACKING and self._move_unresolved():
             state = MemoryState.RIG_MOVED  # outranks DEGRADED: a silent sensor does not hide a move
         elif self.last_window_dropped or any(channel.hz == 0 for channel in self.channels.values()):
             state = MemoryState.DEGRADED
