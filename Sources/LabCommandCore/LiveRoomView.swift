@@ -757,7 +757,8 @@ private func kindWord(_ kind: RoomMemory.ChangeEvent.Kind) -> String {
     }
 }
 
-private func stateName(_ state: RoomMemory.ChangeEvent.State) -> String {
+/// The Room's word for a state: the event rows, the timeline and the action bar all print it.
+func stateName(_ state: RoomMemory.ChangeEvent.State) -> String {
     switch state {
     case .candidate: return "checking"
     case .confirmed: return "confirmed"

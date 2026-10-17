@@ -442,7 +442,7 @@ public struct LiveRoomTimeline: Sendable, Equatable {
         }
         if earlierRun { notes.append("outcome unknown") }
         let event = latest.event
-        var detail = "\(kindWord(event.kind)) · \(stateWord(event.state)) · \(context.clock(firstSeen, seconds: true))"
+        var detail = "\(kindWord(event.kind)) · \(stateName(event.state)) · \(context.clock(firstSeen, seconds: true))"
         detail += open ? " → now" : "–\(context.clock(end, seconds: true))"
         if earlierRun { detail += " · earlier run" }
         if !notes.isEmpty { detail += " · " + notes.joined(separator: " · ") }
@@ -721,16 +721,6 @@ public struct LiveRoomTimeline: Sendable, Equatable {
         case .appeared: return "appeared"
         case .disappeared: return "disappeared"
         case .moved: return "moved"
-        }
-    }
-
-    private static func stateWord(_ state: RoomMemory.ChangeEvent.State) -> String {
-        switch state {
-        case .candidate: return "candidate"
-        case .confirmed: return "confirmed"
-        case .accepted: return "accepted"
-        case .reverted: return "reverted"
-        case .expired: return "expired"
         }
     }
 }

@@ -282,7 +282,7 @@ public struct LiveRoomOperator: Sendable, Equatable {
         let what = pending.kind.title.lowercased()
         switch pending.phase {
         case .sending: return "\(what): sending…"
-        case .applied: return pending.kind == .accept ? "accepted · the map is updating" : "\(what): applied · waiting for the Spark"
+        case .applied: return pending.kind == .accept ? "saved · the map is updating" : "\(what): applied · waiting for the Spark"
         case .done(let text): return text
         case .refused(let outcome): return "\(what) refused: \(refusal(outcome))"
         case .unsent(let reason): return "\(what) \(reason)"
@@ -316,17 +316,12 @@ public struct LiveRoomOperator: Sendable, Equatable {
         case .disappeared: kind = "Disappeared"
         case .moved: kind = "Moved"
         }
-        let voxels = event.voxelCount == 1 ? "1 voxel" : "\(event.voxelCount) voxels"
-        return "\(kind) · \(stateWord(event.state)) · \(voxels)"
+        let cells = event.voxelCount == 1 ? "1 cell" : "\(event.voxelCount) cells"
+        return "\(kind) · \(stateWord(event.state)) · \(cells)"
     }
 
+    /// The event rows' words, so the bar and the column never disagree.
     public static func stateWord(_ state: RoomMemory.ChangeEvent.State) -> String {
-        switch state {
-        case .candidate: return "checking"
-        case .confirmed: return "confirmed"
-        case .accepted: return "saved"
-        case .reverted: return "put back"
-        case .expired: return "didn't last"
-        }
+        stateName(state)
     }
 }

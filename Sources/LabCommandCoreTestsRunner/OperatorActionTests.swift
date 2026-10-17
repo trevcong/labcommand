@@ -261,7 +261,7 @@ func testOperatorActionFinishesOnItsTransition() {
     desk3.sent(confirm, kind: .confirm, mirror: third, delivered: true, at: opNow)
     _ = third.receive(topic: .events, payload: LRWire.event(g1, seq: 1, id: 7, state: .expired), at: opNow + 1)
     desk3.reconcile(third, at: opNow + 1)
-    expect(desk3.latest(for: 7)?.phase == .done("the event ended: didn't last"), "operator: an EXPIRED instead ends it")
+    expect(desk3.latest(for: 7)?.phase == .done("the event ended: no longer detected"), "operator: an EXPIRED instead ends it")
 }
 
 func testOperatorUncertainOutcomes() {
@@ -291,6 +291,14 @@ func testOperatorUncertainOutcomes() {
     expect(refused.latest(for: 7)?.phase == .refused(.staleEpoch), "operator: refused")
     expect(LiveRoomOperator.describe(refused.latest(for: 7)!) == "confirm refused: the map changed since you looked; try again",
            "operator: a refusal reads plainly")
+    // The bar speaks the event rows' words (main's plain copy): saved, checking, cells.
+    var saved = refused.latest(for: 7)!
+    saved.kind = .accept
+    saved.phase = .applied(since: opNow)
+    expect(LiveRoomOperator.describe(saved) == "saved · the map is updating", "operator: an applied accept is saved")
+    expect(LiveRoomOperator.summary(entry) == "Appeared · checking · \(entry.event.voxelCount) cells"
+           && LiveRoomOperator.stateWord(.expired) == "no longer detected",
+           "operator: the selected line says checking and cells: \(LiveRoomOperator.summary(entry))")
     // A lost connection, a bridge failure, an unreadable answer.
     var lost = LiveRoomOperator()
     let call = build(.dismiss, entry, mirror, &lost, id: 3)
