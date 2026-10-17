@@ -61,7 +61,7 @@ public enum MissionLog {
     public static let clock: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "HH:mm:ss"
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return f
     }()
 }

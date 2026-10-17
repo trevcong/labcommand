@@ -180,3 +180,14 @@ func testVisibleAppName() {
     expect(build.contains("APP_NAME=\"LabCommand\""), "the .app filename and binary stay LabCommand")
     expect(build.contains("INSTALL_DIR=\"${HOME}/Applications\""), "install stays ~/Applications")
 }
+
+/// Operator clocks that used to be a time of day now keep the local date.
+func testClockSurfacesIncludeTheDate() {
+    let chrome = repoFile("Sources/LabCommand/CommandCenterView.swift")
+    let scrubber = repoFile("Sources/LabCommand/ChangeScrubberView.swift")
+    let room = repoFile("Sources/LabCommandCore/LiveRoomView.swift")
+    expect(chrome.contains("MissionLog.clock.string(from: event.at)"), "the rig event log prints the dated clock")
+    expect(!chrome.contains("date: .omitted"), "the rig event log does not drop the date")
+    expect(!scrubber.contains("width: 64"), "scrubber end labels are wide enough for the date")
+    expect(room.contains("yyyy-MM-dd HH:mm:ss"), "room clocks include the date with the local time")
+}

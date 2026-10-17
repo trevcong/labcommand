@@ -239,6 +239,23 @@ func testStagesReflectSnapshot() {
     expect(RigDesk.stageState(.stack, off) == .unknown, "stack unknown offline — not idle")
 }
 
+func testMissionClockIncludesTheDate() {
+    let date = Date(timeIntervalSince1970: 1_760_400_010)
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = .current
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    let clock = MissionLog.clock.string(from: date)
+    expect(clock == formatter.string(from: date), "mission clock is the local date and time, got \(clock)")
+    expect(clock.range(of: #"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"#, options: .regularExpression) != nil,
+           "mission clock is yyyy-MM-dd HH:mm:ss, got \(clock)")
+    let rendered = MissionLog.renderLine(
+        MissionEvent(at: date, kind: .note, text: "hello"),
+        clock: MissionLog.clock
+    )
+    expect(rendered.hasPrefix(clock + "  "), "renderLine leads with the dated clock, got \(rendered)")
+}
+
 func testMissionLogAppendAndCap() {
     var events: [MissionEvent] = []
     events = MissionLog.append(events, kind: .start, text: "start rig…")

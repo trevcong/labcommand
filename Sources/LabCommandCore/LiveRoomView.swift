@@ -768,7 +768,7 @@ private func isTerminal(_ state: RoomMemory.ChangeEvent.State) -> Bool {
     state == .accepted || state == .reverted || state == .expired
 }
 
-/// `{sec: 0, nanosec: 0}` is `time —` in every zone. Anything else is `HH:mm:ss` there.
+/// `{sec: 0, nanosec: 0}` is `time —` in every zone. Anything else is `yyyy-MM-dd HH:mm:ss` there.
 func liveRoomClock(_ time: RoomMemory.Time, timeZone: TimeZone = .current) -> String {
     if time.sec == 0, time.nanosec == 0 { return "time —" }
     let seconds = TimeInterval(time.sec) + TimeInterval(time.nanosec) / 1_000_000_000

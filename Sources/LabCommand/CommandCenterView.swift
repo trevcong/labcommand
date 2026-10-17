@@ -419,7 +419,7 @@ struct CommandCenterView: View {
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(state.missionEvents.suffix(5).reversed())) { event in
                     HStack(alignment: .top, spacing: 6) {
-                        Text(event.at.formatted(date: .omitted, time: .standard))
+                        Text(MissionLog.clock.string(from: event.at))
                             .font(LabTheme.mono(10))
                             .foregroundStyle(LabTheme.faint)
                         Text(event.text)
