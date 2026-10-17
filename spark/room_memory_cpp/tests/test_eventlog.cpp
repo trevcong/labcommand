@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
 
 #include "harness.hpp"
 #include "room_memory/eventlog.hpp"
@@ -204,6 +208,199 @@ struct TracingIo : EventLogIo {
         real.write_atomic(path, data);
     }
 };
+
+// Page cache versus disk. Writes change only the visible bytes. fsync_file makes those
+// bytes durable; fsync_dir makes the directory entries durable. power_loss() drops
+// whatever is not yet both. crash_next_file_sync dies inside fsync_file and sets dead,
+// so EventLog's failure rollback cannot truncate the visible tail. That is a process
+// crash with the page cache still warm, which is the state recovery then has to harden
+// before a power loss.
+struct Crash : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+struct CrashIo : EventLogIo {
+    struct Node {
+        bool is_dir = false;
+        std::vector<std::uint8_t> visible_data;
+        std::vector<std::uint8_t> durable_data;
+        std::map<std::string, std::unique_ptr<Node>> children;
+        std::set<std::string> visible_names;
+        std::set<std::string> durable_names;
+    };
+    struct Note {
+        bool dir = false;
+        std::string name;
+    };
+
+    std::filesystem::path root_path;
+    Node root;
+    bool dead = false;
+    bool crash_next_file_sync = false;
+    std::vector<Note> notes;
+
+    explicit CrashIo(std::filesystem::path room) : root_path(std::move(room)) { root.is_dir = true; }
+
+    void power_loss() { restore(root); }
+
+    std::optional<std::uint64_t> visible_bytes(const std::filesystem::path& path) const {
+        const Node* node = walk(path, false);
+        if (!node || node->is_dir) return std::nullopt;
+        return node->visible_data.size();
+    }
+    std::optional<std::uint64_t> durable_bytes(const std::filesystem::path& path) const {
+        const Node* node = walk(path, true);
+        if (!node || node->is_dir) return std::nullopt;
+        return node->durable_data.size();
+    }
+
+    bool exists(const std::filesystem::path& path) override { return walk(path, false) != nullptr; }
+    void create_directory(const std::filesystem::path& path) override {
+        poke("mkdir");
+        if (walk(path, false)) return;
+        Node& parent = require_dir(path.parent_path());
+        auto created = std::make_unique<Node>();
+        created->is_dir = true;
+        parent.visible_names.insert(path.filename().string());
+        parent.children[path.filename().string()] = std::move(created);
+    }
+    std::vector<std::filesystem::path> list(const std::filesystem::path& dir) override {
+        const Node* node = walk(dir, false);
+        if (!node || !node->is_dir) throw std::runtime_error("cannot list " + dir.string());
+        std::vector<std::filesystem::path> out;
+        for (const std::string& name : node->visible_names) out.push_back(dir / name);
+        return out;
+    }
+    std::uint64_t file_size(const std::filesystem::path& path) override {
+        const Node* node = walk(path, false);
+        if (!node || node->is_dir) throw std::runtime_error("cannot stat " + path.string());
+        return node->visible_data.size();
+    }
+    void read_at(const std::filesystem::path& path, std::uint64_t offset, std::span<std::uint8_t> dest) override {
+        const Node* node = walk(path, false);
+        if (!node || node->is_dir) throw std::runtime_error("cannot read " + path.string());
+        if (offset > node->visible_data.size() || dest.size() > node->visible_data.size() - static_cast<std::size_t>(offset)) {
+            throw std::runtime_error("short read " + path.string());
+        }
+        std::copy_n(node->visible_data.begin() + static_cast<std::ptrdiff_t>(offset), dest.size(), dest.begin());
+    }
+    void append(const std::filesystem::path& path, std::span<const std::uint8_t> data) override {
+        poke("append");
+        Node& parent = require_dir(path.parent_path());
+        const std::string name = path.filename().string();
+        Node* node = nullptr;
+        if (parent.visible_names.count(name)) {
+            node = parent.children[name].get();
+            if (!node || node->is_dir) throw std::runtime_error("cannot write " + path.string());
+        } else {
+            auto created = std::make_unique<Node>();
+            node = created.get();
+            parent.children[name] = std::move(created);
+            parent.visible_names.insert(name);
+        }
+        node->visible_data.insert(node->visible_data.end(), data.begin(), data.end());
+    }
+    void fsync_file(const std::filesystem::path& path) override {
+        poke("fsync_file");
+        if (crash_next_file_sync) {
+            crash_next_file_sync = false;
+            dead = true;
+            throw Crash("fsync_file");
+        }
+        Node* node = walk_mut(path, false);
+        if (!node || node->is_dir) throw std::runtime_error("cannot sync " + path.string());
+        node->durable_data = node->visible_data;
+        notes.push_back(Note{false, path.filename().string()});
+    }
+    void fsync_dir(const std::filesystem::path& path) override {
+        poke("fsync_dir");
+        Node* node = walk_mut(path, false);
+        if (!node || !node->is_dir) throw std::runtime_error("cannot sync " + path.string());
+        node->durable_names = node->visible_names;
+        notes.push_back(Note{true, path.filename().string()});
+    }
+    void truncate(const std::filesystem::path& path, std::uint64_t size) override {
+        poke("truncate");
+        Node* node = walk_mut(path, false);
+        if (!node || node->is_dir) throw std::runtime_error("cannot truncate " + path.string());
+        node->visible_data.resize(static_cast<std::size_t>(size));
+    }
+    void remove_file(const std::filesystem::path& path) override {
+        poke("unlink");
+        Node* parent = walk_mut(path.parent_path(), false);
+        if (!parent || !parent->is_dir) return;
+        parent->visible_names.erase(path.filename().string());
+    }
+    void write_atomic(const std::filesystem::path& path, std::span<const std::uint8_t> data) override {
+        poke("write_atomic");
+        Node& parent = require_dir(path.parent_path());
+        auto created = std::make_unique<Node>();
+        created->visible_data.assign(data.begin(), data.end());
+        created->durable_data = created->visible_data;
+        const std::string name = path.filename().string();
+        parent.children[name] = std::move(created);
+        parent.visible_names.insert(name);
+        parent.durable_names = parent.visible_names;
+        notes.push_back(Note{false, name});
+        notes.push_back(Note{true, path.parent_path().filename().string()});
+    }
+
+    std::optional<std::size_t> note_at(bool dir, const std::string& name) const {
+        for (std::size_t n = 0; n < notes.size(); ++n) {
+            if (notes[n].dir == dir && notes[n].name == name) return n;
+        }
+        return std::nullopt;
+    }
+
+private:
+    void poke(const char* what) {
+        if (dead) throw Crash(what);
+    }
+    void restore(Node& node) {
+        node.visible_data = node.durable_data;
+        node.visible_names = node.durable_names;
+        std::vector<std::string> drop;
+        for (const auto& [name, child] : node.children) {
+            if (!node.durable_names.count(name)) drop.push_back(name);
+        }
+        for (const std::string& name : drop) node.children.erase(name);
+        for (auto& [name, child] : node.children) restore(*child);
+    }
+    const Node* walk(const std::filesystem::path& path, bool durable) const {
+        return const_cast<CrashIo*>(this)->walk_mut(path, durable);
+    }
+    Node* walk_mut(const std::filesystem::path& path, bool durable) {
+        const auto normal = path.lexically_normal();
+        const auto base = root_path.lexically_normal();
+        if (normal == base) return &root;
+        const auto rel = normal.lexically_relative(base);
+        if (rel.empty() || rel.is_absolute() || *rel.begin() == "..") return nullptr;
+        Node* node = &root;
+        for (const std::filesystem::path& part : rel) {
+            const std::string name = part.string();
+            const std::set<std::string>& names = durable ? node->durable_names : node->visible_names;
+            if (!names.count(name)) return nullptr;
+            const auto it = node->children.find(name);
+            if (it == node->children.end() || !it->second) return nullptr;
+            node = it->second.get();
+        }
+        return node;
+    }
+    Node& require_dir(const std::filesystem::path& path) {
+        Node* node = walk_mut(path, false);
+        if (!node || !node->is_dir) throw std::runtime_error("missing directory " + path.string());
+        return *node;
+    }
+};
+
+void require_durable_before_manifest(const CrashIo& io, const std::string& segment) {
+    const std::optional<std::size_t> seg = io.note_at(false, segment);
+    const std::optional<std::size_t> manifest = io.note_at(false, "manifest.log");
+    const std::optional<std::size_t> events = io.note_at(true, "events");
+    const std::optional<std::size_t> room = io.note_at(true, "lab");
+    CHECK(seg && manifest && events && room);
+    CHECK(*seg < *manifest && *events < *manifest && *room < *manifest);
+}
 
 EventReplay live(const EventLog& log, std::uint64_t generation, std::uint64_t next_seq,
                  std::vector<msg::Bytes>& cache_bytes, std::vector<EventPiece> open = {}) {
@@ -714,6 +911,171 @@ TEST(corrupt_history_refuses_the_room) {
     data[static_cast<std::size_t>(offsets[0]) + 12 + 3] ^= 0x11;
     write_file(segment, data);
     CHECK_THROWS(std::runtime_error, RoomMemory(config, stamp(50), kGeneration + 1));
+}
+
+TEST(a_fitting_batch_is_one_segment_write) {
+    Room room;
+    TracingIo io;
+    EventLog log = EventLog::open(room.path, EventLogLimits{}, &io);
+    log.append(kGeneration, 0, 7, 1, bytes_of(1));
+    log.append(kGeneration, 1, 7, 2, bytes_of(2));
+    log.commit();
+    CHECK(io.appends == 2 && io.file_syncs == 2);
+    CHECK(std::filesystem::exists(room.path / "events" / "seg-000001.log"));
+    CHECK(!std::filesystem::exists(room.path / "events" / "seg-000002.log"));
+    const EventReplay replay = log.replay_archive(kGeneration, std::nullopt).value();
+    CHECK((replay.messages == std::vector<msg::Bytes>{bytes_of(1), bytes_of(2)}));
+}
+
+TEST(a_batch_over_the_total_cap_drops_a_prefix_and_reopens) {
+    std::uint64_t one = 0;
+    {
+        Room probe;
+        EventLog log = EventLog::open(probe.path, EventLogLimits{});
+        commit_one(log, kGeneration, 0, 1, bytes_of(1));
+        one = std::filesystem::file_size(only_segment(probe.path));
+    }
+    EventLogLimits limits;
+    limits.segment_bytes = 1;
+    limits.total_bytes = one * 2;
+    Room room;
+    EventLog log = EventLog::open(room.path, limits);
+    const msg::Bytes cdrs[4] = {bytes_of(1), bytes_of(2), bytes_of(3), bytes_of(4)};
+    for (int n = 0; n < 4; ++n) log.append(kGeneration, static_cast<std::uint64_t>(n), 7, n + 1, cdrs[n]);
+    log.commit();
+    CHECK(!std::filesystem::exists(room.path / "events" / "seg-000001.log"));
+    CHECK(!std::filesystem::exists(room.path / "events" / "seg-000002.log"));
+    CHECK(std::filesystem::exists(room.path / "events" / "seg-000003.log"));
+    CHECK(std::filesystem::exists(room.path / "events" / "seg-000004.log"));
+    const EventReplay replay = log.replay_archive(kGeneration, std::nullopt).value();
+    CHECK((replay.messages == std::vector<msg::Bytes>{cdrs[2], cdrs[3]}));
+    CHECK((replay.unavailable == Ranges{{0, 1}}) && replay.bound == 3);
+    EventLog again = EventLog::open(room.path, limits);
+    CHECK(again.replay_archive(kGeneration, std::nullopt)->messages == replay.messages);
+}
+
+TEST(maximum_records_in_one_commit_stay_under_the_recovery_ceiling) {
+    // Default limits make 34 maximum records one 35,651,992-byte segment, over the
+    // 34,607,116-byte recovery ceiling, and retention cannot unlink the only segment.
+    // The same inequality with total_bytes == 1 is two maximum records.
+    EventLogLimits limits;
+    limits.segment_bytes = 1;
+    limits.total_bytes = 1;
+    const std::uint64_t ceiling =
+        limits.total_bytes + static_cast<std::uint64_t>(kEventMaxPayload) + kEventHeaderBytes + 4096;
+    const std::uint64_t record = static_cast<std::uint64_t>(kEventHeaderBytes) + kEventMaxPayload;
+    CHECK(record * 2 > ceiling);
+    const std::size_t payload = static_cast<std::size_t>(kEventMaxPayload) - kEventFixedBytes;
+    const msg::Bytes first = bytes_of(1, payload);
+    const msg::Bytes second = bytes_of(2, payload);
+    Room room;
+    {
+        EventLog log = EventLog::open(room.path, limits);
+        log.append(kGeneration, 0, 7, 1, first);
+        log.append(kGeneration, 1, 7, 2, second);
+        log.commit();
+    }
+    const std::filesystem::path kept = room.path / "events" / "seg-000002.log";
+    CHECK(!std::filesystem::exists(room.path / "events" / "seg-000001.log"));
+    CHECK(std::filesystem::exists(kept));
+    CHECK(std::filesystem::file_size(kept) <= ceiling);
+    CHECK(std::filesystem::file_size(kept) == record);
+    EventLog again = EventLog::open(room.path, limits);
+    const EventReplay replay = again.replay_archive(kGeneration, std::nullopt).value();
+    CHECK((replay.messages == std::vector<msg::Bytes>{second}));
+    CHECK(replay.bound == 1 && (replay.unavailable == Ranges{{0, 0}}));
+}
+
+TEST(a_split_batch_retries_the_unfinished_suffix_without_duplicating) {
+    EventLogLimits limits;
+    limits.segment_bytes = 1;
+    Room room;
+    TracingIo io;
+    EventLog log = EventLog::open(room.path, limits, &io);
+    log.append(kGeneration, 0, 7, 1, bytes_of(1));
+    log.append(kGeneration, 1, 7, 2, bytes_of(2));
+    io.fail = "fsync_file";
+    CHECK_THROWS(IoFault, log.commit());
+    io.fail.clear();
+    io.fail_seen = 0;
+    log.commit();
+    const EventReplay replay = log.replay_archive(kGeneration, std::nullopt).value();
+    CHECK((replay.messages == std::vector<msg::Bytes>{bytes_of(1), bytes_of(2)}));
+    CHECK(replay.bound == 1 && replay.unavailable.empty());
+    EventLog again = EventLog::open(room.path, limits);
+    CHECK(again.replay_archive(kGeneration, std::nullopt)->messages == replay.messages);
+}
+
+TEST(recovery_fsyncs_unsynced_records_before_the_manifest) {
+    Room room;
+    CrashIo io(room.path);
+    const std::filesystem::path segment = room.path / "events" / "seg-000001.log";
+    const std::filesystem::path manifest = room.path / "events" / "manifest.log";
+    {
+        EventLog log = EventLog::open(room.path, EventLogLimits{}, &io);
+        log.append(kGeneration, 0, 7, 1, bytes_of(1));
+        log.append(kGeneration, 1, 7, 2, bytes_of(2));
+        io.crash_next_file_sync = true;
+        CHECK_THROWS(Crash, log.commit());
+    }
+    CHECK(!io.durable_bytes(segment));
+    CHECK(io.visible_bytes(segment).value_or(0) > kEventHeaderBytes);
+    io.dead = false;
+    io.crash_next_file_sync = false;
+    io.notes.clear();
+    {
+        EventLog log = EventLog::open(room.path, EventLogLimits{}, &io);
+        require_durable_before_manifest(io, "seg-000001.log");
+        const EventReplay replay = log.replay_archive(kGeneration, std::nullopt).value();
+        CHECK((replay.messages == std::vector<msg::Bytes>{bytes_of(1), bytes_of(2)}));
+    }
+    const auto durable = io.durable_bytes(segment);
+    const auto visible = io.visible_bytes(segment);
+    CHECK(durable && visible && *durable == *visible && *durable > 0);
+    CHECK(io.durable_bytes(manifest).value_or(0) > 0);
+    io.power_loss();
+    EventLog again = EventLog::open(room.path, EventLogLimits{}, &io);
+    const EventReplay replay = again.replay_archive(kGeneration, std::nullopt).value();
+    CHECK((replay.messages == std::vector<msg::Bytes>{bytes_of(1), bytes_of(2)}));
+    CHECK(replay.bound == 1 && replay.unavailable.empty());
+}
+
+TEST(recovery_fsyncs_a_new_segment_before_an_existing_manifest) {
+    EventLogLimits limits;
+    limits.segment_bytes = 1;
+    Room room;
+    CrashIo io(room.path);
+    {
+        EventLog log = EventLog::open(room.path, limits, &io);
+        commit_one(log, kGeneration, 0, 1, bytes_of(1));
+    }
+    io.power_loss();
+    {
+        EventLog log = EventLog::open(room.path, limits, &io);
+        CHECK(log.replay_archive(kGeneration, std::nullopt)->messages == std::vector<msg::Bytes>{bytes_of(1)});
+        log.append(kGeneration, 1, 7, 2, bytes_of(2));
+        io.crash_next_file_sync = true;
+        CHECK_THROWS(Crash, log.commit());
+    }
+    const std::filesystem::path segment = room.path / "events" / "seg-000002.log";
+    CHECK(!io.durable_bytes(segment));
+    CHECK(io.visible_bytes(segment).value_or(0) > kEventHeaderBytes);
+    io.dead = false;
+    io.crash_next_file_sync = false;
+    io.notes.clear();
+    {
+        EventLog log = EventLog::open(room.path, limits, &io);
+        require_durable_before_manifest(io, "seg-000002.log");
+        CHECK(log.replay_archive(kGeneration, std::nullopt)->messages.size() == 2);
+    }
+    const auto rolled = io.durable_bytes(segment);
+    const auto rolled_visible = io.visible_bytes(segment);
+    CHECK(rolled && rolled_visible && *rolled == *rolled_visible && *rolled > 0);
+    io.power_loss();
+    EventLog again = EventLog::open(room.path, limits, &io);
+    const EventReplay replay = again.replay_archive(kGeneration, std::nullopt).value();
+    CHECK((replay.messages == std::vector<msg::Bytes>{bytes_of(1), bytes_of(2)}));
+    CHECK(replay.bound == 1 && replay.unavailable.empty());
 }
 
 TEST(a_reused_generation_is_refused_before_it_is_written) {

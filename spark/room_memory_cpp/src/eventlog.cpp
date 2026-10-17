@@ -340,18 +340,49 @@ void EventLog::ensure_events() {
     events_ready_ = true;
 }
 
+std::uint64_t EventLog::segment_ceiling() const {
+    return limits_.total_bytes + static_cast<std::uint64_t>(kEventMaxPayload) + kEventHeaderBytes + 4096;
+}
+
+std::uint64_t EventLog::record_bytes(const Pending& pending) const {
+    return static_cast<std::uint64_t>(kEventHeaderBytes) + kEventFixedBytes + pending.cdr.size();
+}
+
+bool EventLog::segment_accepts(std::uint64_t used, std::uint64_t record) const {
+    // A record of its own may pass the segment target. It still fits under the ceiling:
+    // the payload cap is 1 MiB and the ceiling adds that on top of total_bytes.
+    if (used == 0) return true;
+    if (used >= limits_.segment_bytes) return false;
+    return used + record <= segment_ceiling();
+}
+
 void EventLog::roll_if_needed() {
-    if (!segments_.empty() && segments_.back().bytes < limits_.segment_bytes) return;
+    const std::uint64_t next = pending_.empty() ? 0 : record_bytes(pending_.front());
+    if (!segments_.empty() && segment_accepts(segments_.back().bytes, next)) return;
     const int number = segments_.empty() ? 1 : segments_.back().number + 1;
     segments_.push_back(Segment{number, 0});
     active_dir_synced_ = false;
 }
 
-std::vector<std::uint8_t> EventLog::encode_pending(std::int64_t retain_base, bool have_base) const {
+std::size_t EventLog::fit_in_segment(std::uint64_t used) const {
+    std::size_t count = 0;
+    std::uint64_t at = used;
+    for (const Pending& pending : pending_) {
+        const std::uint64_t record = record_bytes(pending);
+        if (count > 0 && !segment_accepts(at, record)) break;
+        at += record;
+        ++count;
+    }
+    return count;
+}
+
+std::vector<std::uint8_t> EventLog::encode_pending(std::size_t count, std::int64_t retain_base, bool have_base) const {
     std::vector<std::uint8_t> out;
     std::int64_t retain = retain_base;
     bool have = have_base;
-    for (const Pending& pending : pending_) {
+    const std::size_t end = std::min(count, pending_.size());
+    for (std::size_t n = 0; n < end; ++n) {
+        const Pending& pending = pending_[n];
         retain = have ? std::max(retain, pending.stamp_ns) : pending.stamp_ns;
         have = true;
         std::vector<std::uint8_t> payload;
@@ -408,31 +439,45 @@ void EventLog::write_pending() {
     if (pending_.empty() && !write_mark_) return;
     if (!pending_.empty()) require_next_seq();
     ensure_events();
-    if (!write_mark_) roll_if_needed();
-    const std::vector<std::uint8_t> encoded = encode_pending(retain_high_, have_retain_);
-    const std::filesystem::path path = segment_path(segments_.back().number);
-    if (!write_mark_) write_mark_ = io_->exists(path) ? io_->file_size(path) : std::uint64_t{0};
-    const std::uint64_t start = *write_mark_;
-    durable_append(*io_, path, encoded, write_mark_, active_dir_synced_, events_dir());
-    std::int64_t retain = retain_high_;
-    bool have = have_retain_;
-    std::uint64_t offset = start;
-    for (const Pending& pending : pending_) {
-        retain = have ? std::max(retain, pending.stamp_ns) : pending.stamp_ns;
-        have = true;
-        const auto payload_len = static_cast<std::uint32_t>(kEventFixedBytes + pending.cdr.size());
-        index_.push_back(Stored{pending.generation, pending.seq, pending.map_epoch, pending.stamp_ns, retain,
-                                segments_.back().number, offset, payload_len});
-        offset += kEventHeaderBytes + payload_len;
-        const auto known = generations_.find(pending.generation);
-        if (known == generations_.end() || known->second < pending.seq) generations_[pending.generation] = pending.seq;
-        const auto filed = manifest_at_.find(pending.generation);
-        if (filed == manifest_at_.end() || filed->second < generations_[pending.generation]) manifest_dirty_ = true;
+    // One chunk fills the active segment and is one write plus one fsync. The next chunk
+    // rolls. A retry (write_mark_ set) rewrites the same segment instead of rolling.
+    while (!pending_.empty() || write_mark_) {
+        if (!write_mark_) {
+            if (pending_.empty()) break;
+            roll_if_needed();
+        }
+        const std::uint64_t used = write_mark_ ? *write_mark_ : segments_.back().bytes;
+        const std::size_t count = fit_in_segment(used);
+        if (count == 0) {
+            if (!pending_.empty()) throw std::logic_error("event log could not place a record");
+            break;
+        }
+        const std::vector<std::uint8_t> encoded = encode_pending(count, retain_high_, have_retain_);
+        const std::filesystem::path path = segment_path(segments_.back().number);
+        if (!write_mark_) write_mark_ = io_->exists(path) ? io_->file_size(path) : std::uint64_t{0};
+        const std::uint64_t start = *write_mark_;
+        durable_append(*io_, path, encoded, write_mark_, active_dir_synced_, events_dir());
+        std::int64_t retain = retain_high_;
+        bool have = have_retain_;
+        std::uint64_t offset = start;
+        for (std::size_t n = 0; n < count; ++n) {
+            const Pending& pending = pending_[n];
+            retain = have ? std::max(retain, pending.stamp_ns) : pending.stamp_ns;
+            have = true;
+            const auto payload_len = static_cast<std::uint32_t>(kEventFixedBytes + pending.cdr.size());
+            index_.push_back(Stored{pending.generation, pending.seq, pending.map_epoch, pending.stamp_ns, retain,
+                                    segments_.back().number, offset, payload_len});
+            offset += kEventHeaderBytes + payload_len;
+            const auto known = generations_.find(pending.generation);
+            if (known == generations_.end() || known->second < pending.seq) generations_[pending.generation] = pending.seq;
+            const auto filed = manifest_at_.find(pending.generation);
+            if (filed == manifest_at_.end() || filed->second < generations_[pending.generation]) manifest_dirty_ = true;
+        }
+        retain_high_ = retain;
+        have_retain_ = have;
+        segments_.back().bytes = offset;
+        pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(count));
     }
-    retain_high_ = retain;
-    have_retain_ = have;
-    segments_.back().bytes = offset;
-    pending_.clear();
 }
 
 void EventLog::persist_manifest() {
@@ -572,8 +617,7 @@ void EventLog::recover() {
     for (std::size_t n = 1; n < numbers.size(); ++n) {
         if (numbers[n] == numbers[n - 1]) throw std::runtime_error("duplicate event segment in " + dir.string());
     }
-    const std::uint64_t ceiling =
-        limits_.total_bytes + static_cast<std::uint64_t>(kEventMaxPayload) + kEventHeaderBytes + 4096;
+    const std::uint64_t ceiling = segment_ceiling();
     std::optional<std::int64_t> previous_retain;
     for (std::size_t n = 0; n < numbers.size(); ++n) {
         const bool allow_tear = n + 1 == numbers.size();
@@ -656,9 +700,21 @@ void EventLog::recover() {
         const auto known = generations_.find(generation);
         if (known == generations_.end() || known->second < seq) generations_[generation] = seq;
     }
+    // A crash can leave a CRC-valid tail in the page cache and no fsync. The manifest
+    // must not name those bytes until the segment and its directory entry are durable.
+    sync_recovered();
     if (manifest_dirty_) persist_manifest();
     retain();
     require_suffix();
+}
+
+void EventLog::sync_recovered() {
+    if (segments_.empty()) return;
+    for (const Segment& segment : segments_) io_->fsync_file(segment_path(segment.number));
+    io_->fsync_dir(events_dir());
+    io_->fsync_dir(room_);
+    parent_synced_ = true;
+    active_dir_synced_ = true;
 }
 
 void EventLog::require_suffix() const {

@@ -89,20 +89,26 @@ public:
     EventLog(const EventLog&) = delete;
     EventLog& operator=(const EventLog&) = delete;
 
-    // Scans segments. A torn tail is truncated and fsynced; a bad record with a valid
-    // record after it throws std::runtime_error. Absent events/ is an empty log.
-    // `io` null uses POSIX and is owned here. Throws std::invalid_argument on bad limits.
+    // Scans segments. A torn tail is truncated and fsynced. Recovered segment bytes and
+    // the directory entries that name them are fsynced before the manifest high water
+    // advances, so a later power loss cannot keep the manifest ahead of its tail. A bad
+    // record with a valid record after it throws std::runtime_error. Absent events/ is
+    // an empty log. `io` null uses POSIX and is owned here. Throws std::invalid_argument
+    // on bad limits.
     static EventLog open(std::filesystem::path room, EventLogLimits limits, EventLogIo* io = nullptr);
 
     // Copies one original CDR into the commit buffer. Throws if the record would pass 1 MiB.
     void append(std::uint64_t generation, std::uint64_t seq, std::uint64_t map_epoch, std::int64_t stamp_ns,
                 msg::Bytes cdr);
 
-    // Writes, fsyncs, then drops a prefix for age and size. No I/O when nothing is buffered
-    // and nothing was left half-rotated. A seq that is not the next seq of a generation the
-    // log already knows throws before the write, so a second process cannot append seq 0
-    // onto a generation it does not own. Throws on I/O failure; a failed write leaves the
-    // buffer in place. Returns seqs removed from the retained index.
+    // Writes, fsyncs, then drops a prefix for age and size. Records that fit in the active
+    // segment are one write and one fsync of that segment, then the manifest. A batch that
+    // would pass the segment cap, or the recovery ceiling, is split across segments first,
+    // so retention can drop a prefix and a restart can reopen the log. No I/O when nothing
+    // is buffered and nothing was left half-rotated. A seq that is not the next seq of a
+    // generation the log already knows throws before the write, so a second process cannot
+    // append seq 0 onto a generation it does not own. Throws on I/O failure; a failed write
+    // leaves the uncommitted suffix in place. Returns seqs removed from the retained index.
     std::vector<EvictedEvent> commit();
 
     bool knows(std::uint64_t generation) const;
@@ -147,9 +153,17 @@ private:
     std::filesystem::path manifest_path() const;
     void ensure_events();
     void roll_if_needed();
-    std::vector<std::uint8_t> encode_pending(std::int64_t retain_base, bool have_base) const;
+    // total_bytes + one maximum record + 4 KiB. recover() rejects a segment above this.
+    std::uint64_t segment_ceiling() const;
+    std::uint64_t record_bytes(const Pending& pending) const;
+    // An empty segment accepts one record even when it passes the segment target.
+    bool segment_accepts(std::uint64_t used, std::uint64_t record) const;
+    std::size_t fit_in_segment(std::uint64_t used) const;
+    std::vector<std::uint8_t> encode_pending(std::size_t count, std::int64_t retain_base, bool have_base) const;
     void write_pending();
     void persist_manifest();
+    // Fsync recovered segment bytes and the directory entries that name them.
+    void sync_recovered();
     std::vector<EvictedEvent> retain();
     void unlink_segment(int number);
     msg::Bytes read_cdr(const Stored& stored) const;
