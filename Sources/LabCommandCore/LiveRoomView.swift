@@ -364,6 +364,8 @@ public struct LiveRoomScreen: Equatable, Sendable {
     public var banner: LiveRoomBanner?
     /// Why the socket is not up, when that is more specific than the banner. Nil while the link is up.
     public var connectionDetail: String?
+    /// The detail is the cleartext-off block. The Room page offers one control that opens that switch.
+    public var offersCleartextSettings: Bool
     public var statusLine: String
     /// Centered copy that replaces the voxels. Nil draws the map.
     public var canvasSentence: String?
@@ -400,6 +402,7 @@ public struct LiveRoomScreen: Equatable, Sendable {
             urlText: endpointURL,
             blocked: endpointBlock
         )
+        let offersCleartextSettings = endpointBlock.map(RoomMemoryEndpoint.offersCleartextSettings) ?? false
         if let endpointBlock, !endpointBlock.isEmpty, canvas == "Room memory unavailable" {
             canvas = nil
         }
@@ -426,6 +429,7 @@ public struct LiveRoomScreen: Equatable, Sendable {
             pip: roomPip(mirror: mirror, connection: connection),
             banner: banner,
             connectionDetail: connectionDetail,
+            offersCleartextSettings: offersCleartextSettings,
             statusLine: statusLine(mirror: mirror, connection: connection, now: now),
             canvasSentence: canvas,
             brickOpacity: roomBrickOpacity(mirror: mirror, drawingMap: canvas == nil),

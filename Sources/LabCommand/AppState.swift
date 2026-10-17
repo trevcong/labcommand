@@ -87,10 +87,13 @@ final class AppState: ObservableObject {
     /// Resolved once, from the environment and then saved defaults. Settings reads this.
     /// It does not resolve again on appear.
     private let roomEndpoint: RoomMemoryEndpointStore
-    /// The saved cleartext switch. Off until the operator turns it on.
+    /// Cleartext permission for this process. The saved switch, or `LABCOMMAND_ALLOW_CLEARTEXT=1`.
+    /// Off until one of those is set. The environment flag is not saved.
     @Published private(set) var allowCleartextRoomWebSocket: Bool
     /// Set when the current address must not be dialed. The Room screen shows this string.
     @Published private(set) var roomEndpointBlock: String?
+    /// The Room block asked to show the cleartext switch. Settings scrolls to it and clears this.
+    @Published var showCleartextToggle = false
     let room: LiveRoomClient?
     @Published private(set) var fixture: LiveRoomFixture? {
         didSet { recomputeStatusDots() }
@@ -170,6 +173,16 @@ final class AppState: ObservableObject {
         roomEndpoint.setAllowCleartext(allow)
         allowCleartextRoomWebSocket = allow
         applyRoomAdmission(startIfNeeded: true)
+    }
+
+    /// One step from the Room block to the cleartext switch. Does not turn the switch on.
+    func openCleartextSettings() {
+        dest = .settings
+        showCleartextToggle = true
+    }
+
+    func cleartextToggleWasShown() {
+        showCleartextToggle = false
     }
 
     /// Saves a valid endpoint and retargets the live socket. An invalid string, a disallowed

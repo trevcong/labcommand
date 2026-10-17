@@ -60,12 +60,15 @@ public enum RoomRedirectDecision: Equatable, Sendable {
 /// a fallback. A live screenshot that must show the IP sets `LABCOMMAND_ROOM_URL`.
 ///
 /// `ws://` is cleartext. It is dialed only for a private address, Tailscale CGNAT (`100.64.0.0/10`),
-/// or a `*.ts.net` host, and only when the saved switch is on. The switch defaults to off.
+/// or a `*.ts.net` host, and only when cleartext is permitted. The saved switch defaults to off.
+/// `LABCOMMAND_ALLOW_CLEARTEXT=1` permits it for this process and is not saved.
 /// `LABCOMMAND_ROOM_URL` chooses the address. It does not turn the switch on, on this launch or the next.
 public enum RoomMemoryEndpoint {
     public static let defaultsKey = "roomMemoryEndpoint"
     public static let cleartextDefaultsKey = "roomMemoryAllowCleartextWebSocket"
     public static let environmentKey = "LABCOMMAND_ROOM_URL"
+    /// Process-local opt-in. The only granting value is `1`. It is never written to the saved switch.
+    public static let allowCleartextEnvironmentKey = "LABCOMMAND_ALLOW_CLEARTEXT"
 
     public static let cleartextWarning = "Warning: cleartext WebSocket sends room memory without encryption. ws:// is limited to private addresses, Tailscale CGNAT (100.64.0.0/10), and .ts.net hosts."
     public static let cleartextOffNote = "Cleartext is off. A ws:// address is not used until you turn this on. wss:// is always allowed."
@@ -144,8 +147,24 @@ public enum RoomMemoryEndpoint {
         return allowsCleartextIPv4(name)
     }
 
+    public static let cleartextDisabledPrefix = "Cleartext WebSocket is off."
+
+    /// Why a fresh install does not connect, and what the operator can do. The default address is `ws://`
+    /// and the switch starts off.
     public static func cleartextDisabledMessage(url: URL) -> String {
-        "Cleartext WebSocket is off. Turn it on in Settings to connect to \(url.absoluteString), or enter a wss:// address."
+        "\(cleartextDisabledPrefix) \(url.absoluteString) is an unencrypted ws:// connection, so LabCommand will not connect. "
+            + "Turn on Allow cleartext WebSocket in Settings, or enter a wss:// address."
+    }
+
+    /// True when `message` is the cleartext-off block. The Room page then offers one control that opens that switch.
+    public static func offersCleartextSettings(_ message: String) -> Bool {
+        message.hasPrefix(cleartextDisabledPrefix)
+    }
+
+    /// `1` opts this process in. Any other value, including a missing key, does not.
+    /// This does not read `LABCOMMAND_ROOM_URL` and does not write the saved switch.
+    public static func environmentAllowsCleartext(_ environment: [String: String]) -> Bool {
+        environment[allowCleartextEnvironmentKey] == "1"
     }
 
     public static func cleartextHostMessage(host: String) -> String {
@@ -378,16 +397,20 @@ public struct RoomRedirectChain: Equatable, Sendable {
 @MainActor
 public final class RoomMemoryEndpointStore {
     public private(set) var current: URL
-    /// The saved switch. Off when the key is absent. This is the only cleartext grant.
+    /// The saved switch, or a process-local opt-in. Off when neither is set.
     public private(set) var allowCleartext: Bool
     private let defaults: UserDefaults
 
-    /// The saved switch. Absent and explicit false are both off. An environment URL never turns this on.
+    /// Absent and explicit false are both off. An environment URL never turns this on.
+    /// `LABCOMMAND_ALLOW_CLEARTEXT=1` permits this process only and is not written.
     public var cleartextPermitted: Bool { allowCleartext }
 
     public init(environment: [String: String], defaults: UserDefaults) {
         self.defaults = defaults
         allowCleartext = defaults.bool(forKey: RoomMemoryEndpoint.cleartextDefaultsKey)
+        if RoomMemoryEndpoint.environmentAllowsCleartext(environment) {
+            allowCleartext = true
+        }
         current = RoomMemoryEndpoint.resolve(environment: environment, defaults: defaults)
     }
 

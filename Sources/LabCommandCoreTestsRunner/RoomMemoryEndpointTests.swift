@@ -401,6 +401,10 @@ func testCleartextHostPolicy() {
         expect(message.contains("Cleartext WebSocket is off"), "the default is blocked while the switch is off, got \(message)")
         expect(message.contains(CaptureRecipe.tailscaleDNS), "the block names the MagicDNS host")
         expect(!message.contains(CaptureRecipe.tailscaleIP), "the block does not substitute the tailnet IP")
+        expect(message.contains("unencrypted ws://"), "the block says why: the address is cleartext, got \(message)")
+        expect(message.contains("Allow cleartext WebSocket"), "the block names the switch to turn on, got \(message)")
+        expect(message.contains("Settings"), "the block says where the switch is, got \(message)")
+        expect(RoomMemoryEndpoint.offersCleartextSettings(message), "the cleartext-off block can open Settings")
     case .allowed:
         expect(false, "the default ws:// must not dial while cleartext is off")
     }
@@ -446,8 +450,99 @@ func testCleartextHostPolicy() {
     let detail = blockedScreen.connectionDetail ?? ""
     expect(detail.contains("Cleartext WebSocket is off"), "the Room screen shows the cleartext block, got \(detail)")
     expect(detail.contains(CaptureRecipe.tailscaleDNS), "the Room screen names the address that was not dialed")
+    expect(detail.contains("Allow cleartext WebSocket"), "the Room screen names the switch, got \(detail)")
+    expect(blockedScreen.offersCleartextSettings, "the Room screen offers the Settings action")
     expect(blockedScreen.canvasSentence != "Room memory unavailable", "the block is not hidden behind the off sentence")
     expect(blockedScreen.banner == nil, "a socket that never started keeps an empty banner")
+
+    let refusedHost = LiveRoomScreen.make(
+        mirror: RoomMemoryMirror(),
+        connection: .off,
+        requestPathExists: false,
+        started: false,
+        now: 10,
+        endpointBlock: RoomMemoryEndpoint.cleartextHostMessage(host: "8.8.8.8")
+    )
+    expect(!refusedHost.offersCleartextSettings, "a public host does not offer the cleartext switch")
+    expect(!(refusedHost.connectionDetail ?? "").contains("Allow cleartext WebSocket"),
+           "a public host is not told to turn the switch on")
+}
+
+/// A fresh install has no saved switch. The default ws:// is blocked, and an explicit opt-in is not written.
+@MainActor
+func testFreshInstallCleartextBlock() {
+    let key = RoomMemoryEndpoint.cleartextDefaultsKey
+    let fresh = isolatedDefaults()
+    let store = RoomMemoryEndpointStore(environment: [:], defaults: fresh)
+    expect(endpointString(store.current) == endpointString(RoomMemoryEndpoint.defaultURL), "a fresh install uses the built-in ws:// address")
+    expect(!store.allowCleartext && !store.cleartextPermitted, "a fresh install does not permit cleartext")
+    expect(fresh.object(forKey: key) == nil, "a fresh install does not write the switch")
+    guard case .blocked(let message) = RoomMemoryEndpoint.admit(store.current, allowCleartext: store.cleartextPermitted) else {
+        expect(false, "a fresh install must not dial ws://")
+        return
+    }
+    expect(message.contains("Cleartext WebSocket is off"), "the fresh-install block says cleartext is off, got \(message)")
+    expect(message.contains("unencrypted ws://"), "the fresh-install block says why, got \(message)")
+    expect(message.contains("Allow cleartext WebSocket"), "the fresh-install block says what to turn on, got \(message)")
+    expect(RoomMemoryEndpoint.offersCleartextSettings(message), "the fresh-install block opens Settings")
+    let screen = LiveRoomScreen.make(
+        mirror: RoomMemoryMirror(),
+        connection: .off,
+        requestPathExists: false,
+        started: false,
+        now: 10,
+        endpointBlock: message
+    )
+    expect(screen.connectionDetail == message, "the Room view model shows the fresh-install block")
+    expect(screen.offersCleartextSettings, "the Room view model offers the Settings action")
+
+    let again = RoomMemoryEndpointStore(environment: [:], defaults: fresh)
+    expect(!again.cleartextPermitted, "opening the app again still does not permit cleartext")
+    expect(fresh.object(forKey: key) == nil, "the second launch still does not write the switch")
+
+    let opted = isolatedDefaults()
+    let flagged = RoomMemoryEndpointStore(
+        environment: [
+            "LABCOMMAND_ROOM_URL": "ws://100.118.187.99:8767",
+            RoomMemoryEndpoint.allowCleartextEnvironmentKey: "1",
+        ],
+        defaults: opted
+    )
+    expect(flagged.cleartextPermitted, "the explicit flag permits cleartext for this process")
+    expect(opted.object(forKey: key) == nil, "the flag does not save the switch")
+    expect(RoomMemoryEndpoint.admit(flagged.current, allowCleartext: flagged.cleartextPermitted) == .allowed,
+           "the flagged run may dial the pinned address")
+    let afterFlag = RoomMemoryEndpointStore(
+        environment: ["LABCOMMAND_ROOM_URL": "ws://100.118.187.99:8767"],
+        defaults: opted
+    )
+    expect(!afterFlag.cleartextPermitted, "the next process without the flag stays off")
+    expect(opted.object(forKey: key) == nil, "the next process still has no saved switch")
+
+    let pinnedOff = isolatedDefaults()
+    pinnedOff.set(false, forKey: key)
+    let overOff = RoomMemoryEndpointStore(
+        environment: [RoomMemoryEndpoint.allowCleartextEnvironmentKey: "1"],
+        defaults: pinnedOff
+    )
+    expect(overOff.cleartextPermitted, "the flag permits a process whose saved switch is off")
+    expect((pinnedOff.object(forKey: key) as? Bool) == false, "the flag does not erase a saved off")
+
+    for value in ["", "true", "yes", "0", "1 "] {
+        let defaults = isolatedDefaults()
+        let session = RoomMemoryEndpointStore(
+            environment: [RoomMemoryEndpoint.allowCleartextEnvironmentKey: value],
+            defaults: defaults
+        )
+        expect(!session.cleartextPermitted, "\(value.debugDescription) is not the opt-in")
+        expect(defaults.object(forKey: key) == nil, "\(value.debugDescription) does not write the switch")
+    }
+    let urlOnly = isolatedDefaults()
+    let fromURL = RoomMemoryEndpointStore(
+        environment: ["LABCOMMAND_ROOM_URL": "ws://10.1.2.3:8767", RoomMemoryEndpoint.allowCleartextEnvironmentKey: "true"],
+        defaults: urlOnly
+    )
+    expect(!fromURL.cleartextPermitted, "an environment URL still does not grant cleartext")
 }
 
 @MainActor
@@ -1061,10 +1156,26 @@ func testRoomMemorySettingsSourcesAndATS() {
     let room = text("Sources/LabCommand/LiveRoomView.swift")
     expect(room.contains("connectionDetail"), "the Room screen shows why the socket is not up")
     expect(room.contains("roomEndpointBlock"), "the Room screen receives the cleartext block")
+    expect(room.contains("offersCleartextSettings"), "the Room screen reads the cleartext action from the view model")
+    expect(room.contains("openCleartextSettings"), "the Room screen opens Settings from the block")
+    expect(room.contains("Open cleartext settings"), "the block has a one-click control")
+
+    expect(state.contains("func openCleartextSettings()"), "AppState opens Settings on the cleartext switch")
+    expect(state.contains("dest = .settings"), "the action selects Settings")
+    expect(state.contains("showCleartextToggle = true"), "Settings is asked to show the switch")
+    expect(settings.contains("cleartextToggle"), "Settings can scroll to the cleartext switch")
+    expect(settings.contains("showCleartextToggle"), "Settings reacts when the Room block asks for the switch")
+    expect(settings.contains("allowCleartextWebSocket"), "the switch has an identifier")
+    expect(settings.contains("cleartextToggleWasShown"), "showing the switch does not leave the request set")
 
     let script = text("scripts/live-room-shots.sh")
     expect(script.contains("export LABCOMMAND_ROOM_URL=\"ws://100.118.187.99:8767\""), "live shots pin the grep URL")
     expect(script.contains("if [[ \"$MODE\" == \"live\" ]]; then"), "the pin is the live mode only")
+    expect(script.contains("--allow-cleartext"), "live shots can opt in to cleartext for one run")
+    expect(script.contains("Does not save Allow cleartext WebSocket"), "the help says the flag is not saved")
+    expect(script.contains("export LABCOMMAND_ALLOW_CLEARTEXT=1"), "the flag permits cleartext for that process")
+    expect(script.contains("unset LABCOMMAND_ALLOW_CLEARTEXT"), "without the flag the script does not leave cleartext on")
+    expect(!script.contains("defaults write"), "the script does not save the switch")
 
     let plistURL = root.appendingPathComponent("Info.plist")
     guard let data = try? Data(contentsOf: plistURL),
@@ -1146,6 +1257,8 @@ func runRoomMemoryEndpointTests() {
         print("  room endpoint: cleartext switch, host allow-list, and wss to ws confirmation"); passed()
         testEnvironmentURLDoesNotGrantCleartext()
         print("  room endpoint: an environment ws:// does not grant cleartext across relaunch"); passed()
+        testFreshInstallCleartextBlock()
+        print("  room endpoint: a fresh install explains the cleartext block and does not save an opt-in"); passed()
         testLiveRoomRetarget()
         print("  room endpoint: retarget swaps bridges, publishes connecting, same URL keeps bricks"); passed()
         testLiveRoomRetargetDuringHandshakeBackoffAndRapidChanges()

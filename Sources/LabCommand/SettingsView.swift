@@ -10,7 +10,22 @@ struct SettingsView: View {
     @State private var pendingDowngrade = false
     @State private var rigDiagnosticsOpen = false
 
+    private static let cleartextToggleID = "cleartextToggle"
+
     var body: some View {
+        ScrollViewReader { proxy in
+            settingsBody
+                .onAppear {
+                    loadEndpointDraft()
+                    revealCleartextToggle(proxy)
+                }
+                .onChange(of: state.showCleartextToggle) { _, shown in
+                    if shown { revealCleartextToggle(proxy) }
+                }
+        }
+    }
+
+    private var settingsBody: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: LabTheme.sectionGap) {
                 Text("Settings")
@@ -87,6 +102,8 @@ struct SettingsView: View {
                     .toggleStyle(.switch)
                     .controlSize(.small)
                     .padding(.vertical, 10)
+                    .id(Self.cleartextToggleID)
+                    .accessibilityIdentifier("allowCleartextWebSocket")
                     Text(state.showsCleartextWarning
                          ? RoomMemoryEndpoint.cleartextWarning
                          : RoomMemoryEndpoint.cleartextOffNote)
@@ -203,7 +220,13 @@ struct SettingsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(LabTheme.bg)
-        .onAppear { loadEndpointDraft() }
+    }
+
+    /// The Room block opens this page on the switch. Showing it does not turn the switch on.
+    private func revealCleartextToggle(_ proxy: ScrollViewProxy) {
+        guard state.showCleartextToggle else { return }
+        proxy.scrollTo(Self.cleartextToggleID, anchor: .center)
+        state.cleartextToggleWasShown()
     }
 
     /// The draft is the process's current endpoint, not a fresh environment resolve.

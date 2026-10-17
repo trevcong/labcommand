@@ -90,11 +90,22 @@ private struct LiveRoomBody: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             if let detail = screen.connectionDetail {
-                Text(detail)
-                    .font(LabTheme.t(13))
-                    .foregroundStyle(LabTheme.bad)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(detail)
+                        .font(LabTheme.t(13))
+                        .foregroundStyle(LabTheme.bad)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if screen.offersCleartextSettings {
+                        Button("Open cleartext settings") {
+                            state.openCleartextSettings()
+                        }
+                        .font(LabTheme.t(13, .medium))
+                        .buttonStyle(QuietButton())
+                        .accessibilityLabel("Open cleartext settings")
+                        .accessibilityIdentifier("openCleartextSettings")
+                    }
+                }
             }
             if let restart = screen.restartBanner {
                 Text(restart.text)
