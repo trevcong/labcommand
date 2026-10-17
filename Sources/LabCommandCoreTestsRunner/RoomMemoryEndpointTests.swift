@@ -349,6 +349,34 @@ func testCleartextHostPolicy() {
     deny("1.2.3.4")
     deny("192.0.2.10")
     deny("2130706433")
+    // inet_aton reads a leading zero as octal. 010.0.0.1 is 8.0.0.1, not 10.0.0.1.
+    deny("010.0.0.1")
+    deny("0127.1.1.1")
+    deny("0100.0100.0.1")
+    deny("0x0a.0.0.1")
+    deny("10.1")
+    deny("167772161")
+    for host in ["010.0.0.1", "0127.1.1.1", "0100.0100.0.1", "0x0a.0.0.1", "10.1", "167772161"] {
+        if case .success(let url) = RoomMemoryEndpoint.parse("ws://\(host):8767") {
+            expect(false, "\(host) must not become a dial string, got \(url.absoluteString)")
+        }
+        let typed = URL(string: "ws://\(host):8767")!
+        if case .allowed = RoomMemoryEndpoint.admit(typed, allowCleartext: true) {
+            expect(false, "\(host) must not be admitted: the dial string is not the checked address")
+        }
+    }
+    switch RoomMemoryEndpoint.parse("ws://10.0.0.1:8767") {
+    case .success(let url):
+        expect(url.host == "10.0.0.1", "a strict address is dialed as the address that was checked, got \(url.host ?? "")")
+        expect(RoomMemoryEndpoint.allowsCleartextHost(url.host ?? ""), "the dial host is the classified host")
+    case .failure(let error):
+        expect(false, "a strict private address parses: \(error.message)")
+    }
+    if case .failure(let error) = RoomMemoryEndpoint.parse("ws://010.0.0.1:8767") {
+        expect(error == .ambiguousAddress, "a leading zero is refused before it can be saved, got \(error)")
+    } else {
+        expect(false, "010.0.0.1 must not parse")
+    }
     deny("localhost")
     deny("example.com")
     deny("notts.net")

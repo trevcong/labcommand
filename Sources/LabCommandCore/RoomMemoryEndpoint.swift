@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Why a typed room-memory address was not saved.
@@ -11,6 +12,7 @@ public enum RoomMemoryEndpointError: Error, Equatable, Sendable {
     case path
     case query
     case fragment
+    case ambiguousAddress
     case unparseable
 
     public var message: String {
@@ -24,6 +26,7 @@ public enum RoomMemoryEndpointError: Error, Equatable, Sendable {
         case .path: return "The endpoint has no path."
         case .query: return "The endpoint has no query."
         case .fragment: return "The endpoint has no fragment."
+        case .ambiguousAddress: return "Write the IPv4 address as four decimal numbers, without leading zeros."
         case .unparseable: return "That is not a WebSocket URL."
         }
     }
@@ -106,16 +109,24 @@ public enum RoomMemoryEndpoint {
         }
         if components.query != nil { return .failure(.query) }
         if components.fragment != nil { return .failure(.fragment) }
+        let storedHost: String
+        switch hostForDial(host) {
+        case .failure(let error):
+            return .failure(error)
+        case .success(let strict):
+            storedHost = strict
+        }
         var canonical = URLComponents()
         canonical.scheme = scheme
-        canonical.host = host
+        canonical.host = storedHost
         canonical.port = port
         guard let url = canonical.url else { return .failure(.unparseable) }
         return .success(url)
     }
 
     /// Private ranges (RFC1918, loopback, link-local), CGNAT `100.64.0.0/10`, or a `*.ts.net` name.
-    /// Public names and public addresses are false. `localhost` is false; use `127.0.0.1`.
+    /// An IPv4 host counts only as strict dotted decimal. Public names and public addresses are
+    /// false. `localhost` is false; use `127.0.0.1`.
     public static func allowsCleartextHost(_ host: String) -> Bool {
         var name = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if name.hasSuffix(".") { name.removeLast() }
@@ -123,11 +134,13 @@ public enum RoomMemoryEndpoint {
         if name.hasPrefix("[") && name.hasSuffix("]") {
             name = String(name.dropFirst().dropLast())
         }
-        if name.hasSuffix(".ts.net") {
-            let prefix = name.dropLast(".ts.net".count)
+        // A trailing dot is an absolute DNS name. It is not part of a dotted-decimal address.
+        let absolute = name.hasSuffix(".") ? String(name.dropLast()) : name
+        if absolute.hasSuffix(".ts.net") {
+            let prefix = absolute.dropLast(".ts.net".count)
             return !prefix.isEmpty && !prefix.hasSuffix(".")
         }
-        if name.contains(":") { return allowsCleartextIPv6(name) }
+        if name.contains(":") { return allowsCleartextIPv6(absolute) }
         return allowsCleartextIPv4(name)
     }
 
@@ -228,18 +241,51 @@ public enum RoomMemoryEndpoint {
         return parts.url ?? url
     }
 
-    private static func allowsCleartextIPv4(_ host: String) -> Bool {
-        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count == 4 else { return false }
-        var octets: [Int] = []
-        for part in parts {
-            guard part.count <= 3, part.allSatisfy({ $0.isASCII && $0.isNumber }), let value = Int(part), (0...255).contains(value) else {
-                return false
-            }
-            octets.append(value)
+    /// The host stored on a parsed URL. A strict IPv4 literal is its canonical dotted form,
+    /// which is the same string. A legacy literal is refused so nothing later dials it.
+    private static func hostForDial(_ host: String) -> Result<String, RoomMemoryEndpointError> {
+        if let strict = canonicalDottedIPv4(host) { return .success(strict) }
+        if isLegacyIPv4Literal(host) { return .failure(.ambiguousAddress) }
+        return .success(host)
+    }
+
+    /// `inet_pton(AF_INET)` accepts a leading zero as decimal on this OS (`010` → 10).
+    /// `inet_aton` reads that same text as octal (`010` → 8), and `getaddrinfo` accepts
+    /// hex, short forms, and a single integer. The only presentation those lookups share
+    /// is the text `inet_ntop` writes back. A later dial of `host` is then the address
+    /// that was checked.
+    static func canonicalDottedIPv4(_ host: String) -> String? {
+        var addr = in_addr()
+        guard host.withCString({ inet_pton(AF_INET, $0, &addr) }) == 1 else { return nil }
+        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        let written = buffer.withUnsafeMutableBufferPointer { raw -> UnsafePointer<CChar>? in
+            guard let base = raw.baseAddress else { return nil }
+            return inet_ntop(AF_INET, &addr, base, socklen_t(INET_ADDRSTRLEN))
         }
-        let a = octets[0]
-        let b = octets[1]
+        guard written != nil else { return nil }
+        let canonical = String(cString: buffer)
+        guard canonical == host else { return nil }
+        return canonical
+    }
+
+    /// Forms `inet_aton` would dial as a different address than the text: a leading zero,
+    /// a short form (`10.1`), hex (`0x0a.0.0.1`), or a single integer (`167772161`).
+    /// A strict dotted-decimal address is not legacy.
+    private static func isLegacyIPv4Literal(_ host: String) -> Bool {
+        if canonicalDottedIPv4(host) != nil { return false }
+        let parts = host.lowercased().split(separator: ".", omittingEmptySubsequences: false)
+        guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty }) else { return false }
+        return parts.allSatisfy { part in
+            if part.allSatisfy({ $0.isASCII && $0.isNumber }) { return true }
+            let digits = part.dropFirst(2)
+            return part.hasPrefix("0x") && !digits.isEmpty && digits.allSatisfy(\.isHexDigit)
+        }
+    }
+
+    private static func allowsCleartextIPv4(_ host: String) -> Bool {
+        guard let canonical = canonicalDottedIPv4(host) else { return false }
+        let parts = canonical.split(separator: ".")
+        guard parts.count == 4, let a = Int(parts[0]), let b = Int(parts[1]) else { return false }
         if a == 10 { return true }
         if a == 127 { return true }
         if a == 192 && b == 168 { return true }

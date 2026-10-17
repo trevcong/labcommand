@@ -167,11 +167,10 @@ public enum FoxgloveProtocol {
         SparkSSH.hopList(lastLAN: lastLAN).filter(isIPv4Literal)
     }
 
+    /// Strict dotted decimal only. A leading zero, a short form, or hex is not a socket host:
+    /// `inet_aton` would dial a different address than the text.
     public static func isIPv4Literal(_ host: String) -> Bool {
-        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
-        return parts.count == 4 && parts.allSatisfy { part in
-            part.count <= 3 && part.allSatisfy { $0.isASCII && $0.isNumber } && UInt8(part) != nil
-        }
+        RoomMemoryEndpoint.canonicalDottedIPv4(host) != nil
     }
 
     /// Reconnect backoff: 1 s, 2 s, 4 s … capped at 30 s. Zero failures means the
