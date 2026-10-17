@@ -1359,10 +1359,10 @@ def _overflow_cloud():
 
 
 def _overflow_samples(path, enable, points, count):
-    """Time overflowing windows, including the close that seals the minute.
+    """Time overflowing windows. The first closes fill the table and are not sampled.
 
-    The first windows fill the table and are not part of the sample. A cache that
-    dies on the overflow miss, or on the seal, shows up in the measured closes.
+    ``boundaries`` are the sampled closes that seal a minute. A cache that dies on
+    the overflow miss slows every close. A cache that dies on the seal slows those.
     """
     memory = RoomMemory(config(
         path, state_dir=None, rhythm_enable=enable, rhythm_dir="" if not enable else str(path),
@@ -1377,8 +1377,7 @@ def _overflow_samples(path, enable, points, count):
             memory.add_points("jt128", points)
             memory.close_window(stamp(warm))
             memory.enqueue_rhythm()
-        walls, cpus = [], []
-        boundary = None
+        walls, cpus, boundaries = [], [], []
         previous = None
         for index in range(count):
             second = 30 + index
@@ -1392,51 +1391,61 @@ def _overflow_samples(path, enable, points, count):
             cpus.append((time.process_time() - cpu) * 1000)
             minute = (START.sec + second) - (START.sec + second) % 60
             if previous is not None and minute != previous:
-                boundary = index
+                boundaries.append(index)
             previous = minute
-        assert boundary is not None
-        return walls, cpus, boundary
+        assert len(boundaries) >= 3
+        return walls, cpus, boundaries
     finally:
         memory.close()
 
 
-def test_overflowing_callback_stays_within_the_allowance(tmp_path):
-    """Two sensors, 4097 regions each, across a minute seal.
+def _without(values, indexes):
+    skip = set(indexes)
+    return [value for index, value in enumerate(values) if index not in skip]
 
-    The allowance is the same ``max(1 ms, 10% of the disabled median wall)``. The
-    seal window is its own sample: one slow close must not disappear into the median.
+
+def test_overflowing_callback_stays_within_the_allowance(tmp_path):
+    """Two sensors, 4097 regions each, across more than one minute seal.
+
+    Steady closes use the same allowance as the other callback test. The seal
+    closes are judged on their own median, against the disabled seal at the same
+    stamp, so one scheduler stall is not the logger and a seal that probes the
+    full table cannot hide in the steady median.
     """
     points = _overflow_cloud()
     seen = []
     for trial in range(5):
-        off_wall, off_cpu, off_at = _overflow_samples(tmp_path / f"off{trial}", False, points, 40)
-        on_wall, on_cpu, on_at = _overflow_samples(tmp_path / f"on{trial}", True, points, 40)
-        off_med = _percent(off_wall, 0.5)
-        off_tail = _percent(off_wall, 0.99)
-        off_cpu_med = _percent(off_cpu, 0.5)
-        off_cpu_tail = _percent(off_cpu, 0.99)
+        off_wall, off_cpu, off_at = _overflow_samples(tmp_path / f"off{trial}", False, points, 140)
+        on_wall, on_cpu, on_at = _overflow_samples(tmp_path / f"on{trial}", True, points, 140)
+        assert off_at == on_at
+        off_steady, on_steady = _without(off_wall, off_at), _without(on_wall, on_at)
+        off_cpu_steady, on_cpu_steady = _without(off_cpu, off_at), _without(on_cpu, on_at)
+        off_med = _percent(off_steady, 0.5)
+        off_tail = _percent(off_steady, 0.99)
+        off_cpu_med = _percent(off_cpu_steady, 0.5)
+        off_cpu_tail = _percent(off_cpu_steady, 0.99)
         allowance = max(1.0, 0.10 * off_med)
         quiet = (off_tail - off_med) <= allowance and (off_cpu_tail - off_cpu_med) <= allowance
         if quiet:
-            deltas = (
-                _percent(on_wall, 0.5) - off_med,
-                _percent(on_wall, 0.99) - off_med,
-                _percent(on_cpu, 0.99) - off_cpu_med,
-                on_wall[on_at] - off_med,
-            )
+            deltas = [
+                _percent(on_steady, 0.5) - off_med,
+                _percent(on_steady, 0.99) - off_med,
+                _percent(on_cpu_steady, 0.99) - off_cpu_med,
+            ]
         else:
-            deltas = (
-                _percent(on_wall, 0.5) - off_med,
-                _percent(on_wall, 0.99) - off_tail,
-                _percent(on_cpu, 0.99) - off_cpu_tail,
-                on_wall[on_at] - off_wall[off_at],
-            )
+            deltas = [
+                _percent(on_steady, 0.5) - off_med,
+                _percent(on_steady, 0.99) - off_tail,
+                _percent(on_cpu_steady, 0.99) - off_cpu_tail,
+            ]
+        seal = [on_wall[index] - off_wall[index] for index in on_at]
+        deltas.append(_percent(seal, 0.5))
         seen.append((tuple(round(delta, 3) for delta in deltas), round(allowance, 3), quiet))
         if all(delta <= allowance for delta in deltas):
             return
-    median, tail, cpu, boundary = seen[-1][0]
+    median, tail, cpu, seal = seen[-1][0]
     allowance = seen[-1][1]
-    assert median <= allowance and tail <= allowance and cpu <= allowance and boundary <= allowance, seen
+    assert median <= allowance and tail <= allowance and cpu <= allowance and seal <= allowance, seen
 
 
 @pytest.mark.skipif(
