@@ -10,7 +10,7 @@ enum Dest: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    static var navCases: [Dest] { [.workspace, .settings, .liveRoom] }
+    static var navCases: [Dest] { [.liveRoom, .settings, .workspace] }
 
     var label: String {
         switch self {
@@ -20,11 +20,13 @@ enum Dest: String, CaseIterable, Identifiable {
         }
     }
 
+    var windowTitle: String { "LabCommand - \(label)" }
+
     var shortcutKey: String {
         switch self {
-        case .workspace: return "1"
+        case .workspace: return "3"
         case .settings: return "2"
-        case .liveRoom: return "3"
+        case .liveRoom: return "1"
         }
     }
 }
@@ -33,7 +35,7 @@ enum Dest: String, CaseIterable, Identifiable {
 final class AppState: ObservableObject {
     @Published private(set) var snapshot: LabStatusSnapshot
     @Published private(set) var isRefreshing = false
-    @Published var dest: Dest = .workspace
+    @Published var dest: Dest = .liveRoom
 
     /// Fast rig poll (API GET over the tunnel). Cheap — not an SSH probe.
     @Published var rigPollSeconds: Double = 5
@@ -41,8 +43,17 @@ final class AppState: ObservableObject {
     @Published var probeIntervalSeconds: Double = 45
     @Published var autoRefreshEnabled: Bool = true
 
-    /// The rig as last honestly measured.
-    @Published private(set) var rig: RigSnapshot = RigSnapshot.offline(reason: "Not probed yet")
+    /// The rig as last honestly measured. Recording gates and the left column read this.
+    @Published private(set) var rig: RigSnapshot = RigSnapshot.offline(reason: "Not probed yet") {
+        didSet { recomputeStatusDots() }
+    }
+    /// Top-bar Spark / Mid-360 / JT128 chips. The room link wins while it is fresh.
+    @Published private(set) var statusDots = StatusDots.derive(
+        rig: RigSnapshot.offline(reason: "Not probed yet"),
+        connection: .off,
+        status: nil,
+        isStatusFresh: false
+    )
     @Published var session: CaptureSessionSpec = CaptureSessionSpec()
     @Published private(set) var missionEvents: [MissionEvent] = []
     @Published private(set) var isActing = false
@@ -76,7 +87,9 @@ final class AppState: ObservableObject {
     /// A snapshot launch isolates the network, so it leaves this nil too.
     let roomLaunch: LiveRoomLaunch
     let room: LiveRoomClient?
-    @Published private(set) var fixture: LiveRoomFixture?
+    @Published private(set) var fixture: LiveRoomFixture? {
+        didSet { recomputeStatusDots() }
+    }
     /// True after `start()` has opened the room socket. The Off screen is the other case.
     private(set) var roomDidStart = false
     private var fixtureTimer: Timer?
@@ -89,6 +102,8 @@ final class AppState: ObservableObject {
     /// Watchdog lines already forwarded into the mission log.
     private var seenWatchdogLines: Set<String> = []
     private var adoptedSensorColors = false
+    /// Room-client updates. Map bricks republish the client; the dots assign only when they change.
+    private var roomDotsWatch: AnyCancellable?
 
     init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -125,9 +140,13 @@ final class AppState: ObservableObject {
             pointCloudColorMode = .sensor
             autoRefreshEnabled = false
         }
-        if roomLaunch.opensRoom {
-            dest = .liveRoom
+        // Room is home. A snapshot pair stays on Rig unless this launch also asked
+        // for the room page. Do not open Room by setting `opensRoom`: that skips probes.
+        if launch.isolates && !roomLaunch.opensRoom {
+            dest = .workspace
         }
+        recomputeStatusDots()
+        watchRoomDots()
     }
 
     var roomMirror: RoomMemoryMirror {
@@ -138,6 +157,30 @@ final class AppState: ObservableObject {
     var roomConnection: LiveRoomConnection {
         if let room { return room.connection }
         return fixture?.connection ?? .off
+    }
+
+    /// `objectWillChange` is sent before the new mirror is stored. The hop reads the
+    /// value the client just published. Assigning only when the dots change keeps a
+    /// map-brick update from redrawing the whole window.
+    private func watchRoomDots() {
+        guard let room else { return }
+        roomDotsWatch = room.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.recomputeStatusDots()
+            }
+    }
+
+    private func recomputeStatusDots() {
+        let next = StatusDots.derive(
+            rig: rig,
+            connection: roomConnection,
+            status: roomMirror.status,
+            isStatusFresh: roomMirror.isStatusFresh
+        )
+        if next != statusDots {
+            statusDots = next
+        }
     }
 
     /// The bridge offers the request service or client publishing, or a relay sink is installed (D39).

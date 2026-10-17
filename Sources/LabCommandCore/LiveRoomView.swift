@@ -5,6 +5,8 @@ import simd
 /// Fixture mode never constructs a `LiveRoomClient`.
 public enum LiveRoomLaunch: Equatable, Sendable {
     /// A live socket. `opensRoom` is true only for the value `live` (the gate launch).
+    /// That flag skips probes and the lidar client. It is not the Room tab.
+    /// An unset variable stays `.live(opensRoom: false)`: probes and the lidar client stay on.
     case live(opensRoom: Bool)
     case fixture(LiveRoomFixture.Mode)
 
@@ -13,7 +15,7 @@ public enum LiveRoomLaunch: Equatable, Sendable {
         return false
     }
 
-    /// Room is the destination. An unset variable stays on Rig.
+    /// The gate launch and every fixture. Not the Room tab: setting this skips probes.
     public var opensRoom: Bool {
         switch self {
         case .live(let opensRoom): return opensRoom
@@ -376,7 +378,7 @@ public struct LiveRoomScreen: Equatable, Sendable {
     public var caption: String
     public var openRows: [LiveRoomEventRow]
     public var historyRows: [LiveRoomEventRow]
-    /// Open events of earlier runs: "earlier run · may be outdated", never on the map.
+    /// Open events of earlier runs. The row says the latest status is unknown. Never drawn on the map.
     public var earlierRows: [LiveRoomEventRow]
     /// The column prints `caption` in place of the event sections.
     public var columnIsUnavailable: Bool
@@ -388,7 +390,8 @@ public struct LiveRoomScreen: Equatable, Sendable {
         started: Bool,
         now: TimeInterval,
         kinds: Set<RoomMemory.ChangeEvent.Kind> = Set(RoomMemory.ChangeEvent.Kind.allCases),
-        selection: String? = nil
+        selection: String? = nil,
+        timeZone: TimeZone = .current
     ) -> LiveRoomScreen {
         let canvas = roomCanvasSentence(mirror: mirror, connection: connection, started: started)
         var banner = baseBanner(mirror: mirror, connection: connection, started: started, now: now)
@@ -404,11 +407,11 @@ public struct LiveRoomScreen: Equatable, Sendable {
         }
         let markers = LiveRoomMarkers.draw(mirror: mirror, kinds: kinds, selection: selection)
         let outdated = !mirror.eventHistory.caughtUp
-        let openRows = rows(from: sortedOpen(mirror.openEvents), mirror: mirror, history: false, outdated: outdated, kinds: kinds)
+        let openRows = rows(from: sortedOpen(mirror.openEvents), mirror: mirror, history: false, outdated: outdated, kinds: kinds, timeZone: timeZone)
         let historySource = Array(mirror.events.filter { isTerminal($0.event.state) }.reversed())
-        let historyRows = rows(from: historySource, mirror: mirror, history: true, outdated: false, kinds: kinds)
+        let historyRows = rows(from: historySource, mirror: mirror, history: true, outdated: false, kinds: kinds, timeZone: timeZone)
         let earlierRows = rows(from: sortedOpen(mirror.archivedOpenEvents.map(\.entry)), mirror: mirror, history: false,
-                               outdated: false, earlier: true, kinds: kinds)
+                               outdated: false, earlier: true, kinds: kinds, timeZone: timeZone)
         let unavailable = columnUnavailable(mirror: mirror, connection: connection)
         return LiveRoomScreen(
             pip: roomPip(mirror: mirror, connection: connection),
@@ -702,6 +705,26 @@ private func twoDecimals(_ value: Float) -> String {
     String(format: "%.2f", locale: posix, Double(value))
 }
 
+/// Fraction of the region's cells with evidence. Nil was not computed, which is not zero.
+private func boxSeen(_ evidence: Float?) -> String {
+    guard let evidence else { return "box not measured" }
+    let percent = Int((Double(evidence) * 100).rounded())
+    return "\(percent)% of the box was seen"
+}
+
+/// Calibrated false-alarm limit of the detector, not this event's chance of being wrong.
+/// Nil, exact zero, and a positive level under 1% stay distinct.
+private func falseAlarmLimit(_ alpha: Float?) -> String {
+    guard let alpha else { return "false-alarm limit not calibrated" }
+    if alpha == 0 { return "false-alarm limit 0%" }
+    if alpha > 0, alpha < 0.01 { return "false-alarm limit <1%" }
+    let percent = (Double(alpha) * 1000).rounded() / 10
+    let text = percent == percent.rounded()
+        ? String(Int(percent))
+        : String(format: "%.1f", locale: posix, percent)
+    return "false-alarm limit \(text)%"
+}
+
 private func isConnected(_ connection: LiveRoomConnection) -> Bool {
     if case .connected = connection { return true }
     return false
@@ -736,11 +759,11 @@ private func kindWord(_ kind: RoomMemory.ChangeEvent.Kind) -> String {
 
 private func stateName(_ state: RoomMemory.ChangeEvent.State) -> String {
     switch state {
-    case .candidate: return "candidate"
+    case .candidate: return "checking"
     case .confirmed: return "confirmed"
-    case .accepted: return "accepted"
-    case .reverted: return "reverted"
-    case .expired: return "expired"
+    case .accepted: return "saved"
+    case .reverted: return "change undone"
+    case .expired: return "no longer detected"
     }
 }
 
@@ -748,12 +771,11 @@ private func isTerminal(_ state: RoomMemory.ChangeEvent.State) -> Bool {
     state == .accepted || state == .reverted || state == .expired
 }
 
-/// `{sec: 0, nanosec: 0}` is `time —`. Anything else is `HH:mm:ss` UTC.
-func liveRoomClock(_ time: RoomMemory.Time) -> String {
+/// `{sec: 0, nanosec: 0}` is `time —` in every zone. Anything else is `HH:mm:ss` there.
+func liveRoomClock(_ time: RoomMemory.Time, timeZone: TimeZone = .current) -> String {
     if time.sec == 0, time.nanosec == 0 { return "time —" }
-    var day = Int(time.sec) % 86_400
-    if day < 0 { day += 86_400 }
-    return String(format: "%02d:%02d:%02d", day / 3600, (day % 3600) / 60, day % 60)
+    let seconds = TimeInterval(time.sec) + TimeInterval(time.nanosec) / 1_000_000_000
+    return LiveViewMode.clock(Date(timeIntervalSince1970: seconds), timeZone: timeZone)
 }
 
 private func roomPip(mirror: RoomMemoryMirror, connection: LiveRoomConnection) -> LiveRoomPip {
@@ -877,12 +899,12 @@ private func formatHistory(mirror: RoomMemoryMirror, requestPathExists: Bool) ->
     case .empty:
         return "no events this run"
     case .completeThrough(let top):
-        return "history complete through #\(top)"
+        return "all events through event \(top) are here"
     case .missing:
         let (missing, lost) = history.missingCounts
         var line = "history incomplete: \(missing) missing"
         if lost > 0 { line += " (\(lost) lost on the Spark)" }
-        if !requestPathExists, missing > lost { line += " · no request path" }
+        if !requestPathExists, missing > lost { line += " · can't ask the Spark for them" }
         return line
     }
 }
@@ -896,24 +918,24 @@ private func restartNotice(_ mirror: RoomMemoryMirror) -> LiveRoomBanner? {
     return LiveRoomBanner(text: "Spark node restarted · events from the earlier run may be missing", tone: .warn)
 }
 
-/// The map needs a resync no request path can carry, or requests went unsent. The history line
-/// says "no request path" for events itself.
+/// The map needs a resend the client cannot ask for, or a request never left the Mac.
+/// The history line says that for missing events itself.
 private func resyncPhrase(mirror: RoomMemoryMirror, requestPathExists: Bool) -> String? {
     let recovery = isStale(mirror.mapState) && !isLegacy(mirror)
     let unsent = mirror.activity.requestsUnsent
     guard (recovery && !requestPathExists) || unsent > 0 else { return nil }
-    if unsent > 0 { return "cannot request resync · \(unsent) unsent" }
-    return "cannot request resync"
+    if unsent > 0 { return "can't ask the Spark to resend the map · \(unsent) not sent" }
+    return "can't ask the Spark to resend the map"
 }
 
 private func roomCaption(mirror: RoomMemoryMirror, markers: [LiveRoomMarker], unavailable: Bool) -> String {
     if unavailable { return "Room memory unavailable" }
     let changes = markers.filter(\.countsAsChange).count
-    let candidates = markers.filter(\.countsAsCandidate).count
+    let checking = markers.filter(\.countsAsCandidate).count
     if mirror.isMapCurrent, mirror.openEvents.isEmpty {
         return "0 changes"
     }
-    return "\(countWord(changes, one: "change", many: "changes")) · \(countWord(candidates, one: "candidate", many: "candidates")) on map"
+    return "\(countWord(changes, one: "change", many: "changes")) · \(countWord(checking, one: "checking", many: "checking"))"
 }
 
 private func countWord(_ count: Int, one: String, many: String) -> String {
@@ -935,34 +957,24 @@ private func rows(
     history: Bool,
     outdated: Bool,
     earlier: Bool = false,
-    kinds: Set<RoomMemory.ChangeEvent.Kind>
+    kinds: Set<RoomMemory.ChangeEvent.Kind>,
+    timeZone: TimeZone
 ) -> [LiveRoomEventRow] {
     events.compactMap { entry in
         guard kinds.contains(entry.event.kind) else { return nil }
         let event = entry.event
         let id = earlier ? "earlier-\(entry.seq)-\(event.eventId)" : history ? "\(entry.seq)-\(event.eventId)" : String(event.eventId)
-        let voxels = event.voxelCount == 1 ? "1 voxel" : "\(event.voxelCount) voxels"
-        let line1 = "\(kindWord(event.kind)) · \(stateName(event.state)) · \(voxels) · \(liveRoomClock(event.header.stamp))"
-        var bits: [String] = []
-        if let evidence = event.evidence {
-            bits.append("evidence \(Int((Double(evidence) * 100).rounded()))%")
-        } else {
-            bits.append("evidence —")
-        }
-        if let alpha = event.alpha {
-            bits.append("α \(twoDecimals(alpha))")
-        } else {
-            bits.append("uncalibrated")
-        }
-        bits.append(sensorWords(event.sensors))
-        if event.mask == nil { bits.append("no mask") }
+        let cells = event.voxelCount == 1 ? "1 cell" : "\(event.voxelCount) cells"
+        let line1 = "\(kindWord(event.kind)) · \(stateName(event.state)) · \(cells) · \(liveRoomClock(event.header.stamp, timeZone: timeZone))"
+        var bits: [String] = [boxSeen(event.evidence), falseAlarmLimit(event.alpha), sensorWords(event.sensors)]
+        if event.mask == nil { bits.append("box only") }
         if history, LiveRoomMarkers.isWaiting(entry, mirror: mirror) {
-            bits.append("accepted · map updating")
+            bits.append("saved · map updating")
         }
         if earlier {
-            bits.append("earlier run · may be outdated")
+            bits.append("earlier run · latest status unknown")
         } else if !history, outdated {
-            bits.append("may be outdated")
+            bits.append("latest status unknown")
         }
         return LiveRoomEventRow(id: id, kind: event.kind, line1: line1, line2: bits.joined(separator: " · "), history: history)
     }

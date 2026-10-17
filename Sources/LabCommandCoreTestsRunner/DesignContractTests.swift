@@ -88,3 +88,60 @@ func testNoPlaceholderScaffolding() {
         expect(!body.contains("case product"), "Dest.product is gone from the enum")
     }
 }
+
+private func repoFile(_ relative: String) -> String {
+    let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(relative)
+    return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+}
+
+/// The window opens on Room, titles itself LabCommand - <tab>, and the event
+/// column does not print the wire vocabulary.
+func testRoomFirstShell() {
+    let app = repoFile("Sources/LabCommand/LabCommandApp.swift")
+    let desk = repoFile("Sources/LabCommandCore/RigDesk.swift")
+    let state = repoFile("Sources/LabCommand/AppState.swift")
+    let chrome = repoFile("Sources/LabCommand/CommandCenterView.swift")
+    let room = repoFile("Sources/LabCommandCore/LiveRoomView.swift")
+    expect(!app.isEmpty && !desk.isEmpty && !state.isEmpty && !chrome.isEmpty && !room.isEmpty,
+           "room-first sources are readable from the repo root")
+
+    expect(!app.contains("Rig command"), "the app does not title the window Rig command")
+    expect(app.contains("windowTitle"), "the app takes the window title from Dest")
+    expect(app.contains("win.title = appState.dest.windowTitle"), "the initial title is the current destination")
+    expect(app.contains("$dest"), "the title follows destination changes")
+    expect(!desk.contains("Rig command"), "the rig desk title is not Rig command")
+    expect(desk.contains("static let title = \"Rig\""), "the rig desk title is Rig")
+
+    expect(state.contains("var windowTitle: String { \"LabCommand - \\(label)\" }"),
+           "window titles are declared on Dest")
+    expect(state.contains("static var navCases: [Dest] { [.liveRoom, .settings, .workspace] }"),
+           "nav order is Room, Settings, Rig")
+    expect(state.contains("case .liveRoom: return \"1\""), "Room is ⌘1")
+    expect(state.contains("case .settings: return \"2\""), "Settings stays ⌘2")
+    expect(state.contains("case .workspace: return \"3\""), "Rig is ⌘3")
+    expect(state.contains("var dest: Dest = .liveRoom"), "a normal launch opens on Room")
+    expect(state.contains("launch.isolates && !roomLaunch.opensRoom"), "snapshot isolation is the Rig exception")
+    expect(state.contains("dest = .workspace"), "the snapshot tool still has a Rig assignment")
+
+    expect(chrome.contains("case .workspace") && chrome.contains("case .settings") && chrome.contains("case .liveRoom"),
+           "every destination still renders")
+    expect(!chrome.contains("dual-lidar rig"), "the top bar no longer says dual-lidar rig")
+    expect(chrome.contains("room memory"), "the top bar says room memory")
+
+    let banned = [
+        "\"candidate\"",
+        "\"candidates\"",
+        "uncalibrated",
+        "no request path",
+        "may be outdated",
+        "\"evidence ",
+        "\"α ",
+        " voxels\"",
+        "history complete through",
+        "cannot request resync",
+    ]
+    for phrase in banned {
+        expect(!room.contains(phrase), "room screen still prints \(phrase)")
+    }
+    expect(room.contains("case .candidate:"), "the wire state stays .candidate")
+}

@@ -349,7 +349,7 @@ private struct LiveRoomBody: View {
                 Text(row.line2)
                     .font(LabTheme.mono(11))
                     .foregroundStyle(LabTheme.dim)
-                    .lineLimit(2)
+                    .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }

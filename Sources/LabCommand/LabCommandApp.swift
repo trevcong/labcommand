@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let appState = AppState()
     private var statusItem: NSStatusItem?
     private var statusWatch: AnyCancellable?
+    private var titleWatch: AnyCancellable?
     private var visibilityObservers: [NSObjectProtocol] = []
     private var keyMonitor: Any?
 
@@ -36,7 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             backing: .buffered,
             defer: false
         )
-        win.title = "Rig command"
+        win.title = appState.dest.windowTitle
         win.contentView = hosting
         win.setContentSize(NSSize(width: 1180, height: 800))
         win.center()
@@ -46,6 +47,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         win.backgroundColor = NSColor(red: 0.043, green: 0.051, blue: 0.063, alpha: 1)
         win.makeKeyAndOrderFront(nil)
         window = win
+        titleWatch = appState.$dest.receive(on: DispatchQueue.main).sink { [weak self] dest in
+            self?.window?.title = dest.windowTitle
+        }
         watchVisibility(of: win)
 
         appState.start()
@@ -254,8 +258,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         guard let menu = statusItem?.menu else { return }
         menu.removeAllItems()
         let rig = appState.rig
-        menu.addItem(header("Mid-360  \(rig.mid360.state.displayLabel)"))
-        menu.addItem(header("JT128    \(rig.jt128.state.displayLabel)"))
+        let dots = appState.statusDots
+        menu.addItem(header("Mid-360  \(dots.mid360.state.displayLabel)"))
+        menu.addItem(header("JT128    \(dots.jt128.state.displayLabel)"))
         menu.addItem(header("Clocks   \(rig.clock.state.displayLabel)"))
         menu.addItem(header("Record   \(rig.recording.active ? "Live" : "Idle")"))
         if appState.isolatesNetwork {
@@ -263,14 +268,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             menu.addItem(header("Spark    local"))
         } else {
             menu.addItem(header("Health   \(appState.health.label)"))
-            if !rig.sparkReachable {
+            if !dots.sparkReachable {
                 menu.addItem(header("Spark    offline"))
             }
         }
-        if let hz = rig.mid360.pointRateHz, rig.mid360.state == .streaming {
+        if let hz = dots.mid360.pointRateHz, dots.mid360.state == .streaming {
             menu.addItem(header("Mid rate \(TelemetryFormat.hz(hz))"))
         }
-        if let hz = rig.jt128.pointRateHz, rig.jt128.state == .streaming {
+        if let hz = dots.jt128.pointRateHz, dots.jt128.state == .streaming {
             menu.addItem(header("JT rate  \(TelemetryFormat.hz(hz))"))
         }
         menu.addItem(.separator())
