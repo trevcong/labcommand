@@ -127,6 +127,17 @@ Region region_of(const Suppression& s) {
     return region;
 }
 
+// The channel's last window, on its own, supports `region` with the freshness thresholds. The
+// recent layer keeps a region matched for recent_windows windows after the object left or went
+// out of view, so a match alone does not show it is there now.
+bool seen_now(const Region& region, const CellSummary& last, const Config& change, const MemoryConfig& config,
+              const RayBackend* backend) {
+    const OccupancyMap window = occupancy_from(last, change);
+    const Keys& removed = region.kind == Region::Kind::disappeared ? region.keys : region.from_keys;
+    const Keys free = removed.empty() ? Keys{} : cast_rays(window, change, &removed, backend);
+    return region_fresh(region, window.occupied, free, config.fresh_min_voxels, config.fresh_min_fraction);
+}
+
 }  // namespace
 
 void set_write_fault(WriteFault fault) { write_fault() = std::move(fault); }
@@ -452,7 +463,9 @@ Outcome RoomMemory::event_action(const msg::OperatorAction& action, const msg::T
                                   config_.stable_min_fraction);
 
     if (action.action == OperatorActionKind::confirm) {
-        if (!fresh) return Outcome::target_changed;
+        if (!fresh || !seen_now(candidate->region, channel->recent.back(), change_, config_, backend_)) {
+            return Outcome::target_changed;
+        }
         candidate->confirmed = true;
         candidate->published = candidate->region;
         events.push_back(event(*channel, EventState::confirmed, shown(*candidate), stamp));
@@ -495,7 +508,9 @@ Outcome RoomMemory::event_action(const msg::OperatorAction& action, const msg::T
 
     // ACCEPT: compare-and-set on the published map, and only one accept waits for it at a time.
     if (!map_started_ || action.header.map_epoch != map_epoch_sent_ || !held_.empty()) return Outcome::stale_epoch;
-    if (!fresh) return Outcome::target_changed;
+    if (!fresh || !seen_now(candidate->published, channel->recent.back(), change_, config_, backend_)) {
+        return Outcome::target_changed;
+    }
     if (!channel->residual || *channel->residual > config_.learn_max_offset_m) return Outcome::rig_unsettled;
     VoxelLayer layer = absorbed(channel->reference, candidate->published);
     if (config_.state_dir) {

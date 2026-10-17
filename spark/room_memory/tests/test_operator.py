@@ -26,10 +26,11 @@ def stamp(second):
 
 
 def config(state_dir=None, sensors=("mid360",), **fields):
-    return MemoryConfig(sensors=sensors, max_range=None, reference_windows=3, recent_windows=1, occupied_min_hits=1,
-                        occupied_min_ratio=0.0, free_min_seen=1, candidate_windows=1, expire_windows=1,
-                        fresh_min_voxels=1, fresh_min_fraction=0.0, activity_radius_m=0.0, suppress_clear_windows=3,
-                        state_dir=None if state_dir is None else str(state_dir), **fields)
+    return MemoryConfig(**{**dict(sensors=sensors, max_range=None, reference_windows=3, recent_windows=1, occupied_min_hits=1,
+                                  occupied_min_ratio=0.0, free_min_seen=1, candidate_windows=1, expire_windows=1,
+                                  fresh_min_voxels=1, fresh_min_fraction=0.0, activity_radius_m=0.0,
+                                  suppress_clear_windows=3, state_dir=None if state_dir is None else str(state_dir)),
+                           **fields})
 
 
 def window(memory, cloud, second, sensor="mid360"):
@@ -221,6 +222,54 @@ def test_refusals_change_nothing(tmp_path):
     assert outcome(memory, act(OperatorActionKind.ACCEPT, event_id, EventState.CONFIRMED, n=19)) == OperatorOutcome.TARGET_CHANGED
     assert RoomMemory(config(), START, GENERATION).operate(
         act(OperatorActionKind.CONFIRM, 5, EventState.CANDIDATE, epoch=0, n=1), stamp(1))[0] == OperatorOutcome.NOT_TRACKING
+
+
+def test_confirm_and_accept_need_the_target_in_the_last_window_itself(tmp_path):
+    # Review round 2: the recent layer keeps a region matched (missed == 0) for recent_windows
+    # windows after the object left or went out of view. Only the last window's own evidence counts.
+    def confirmed(memory):
+        event_id = candidate(memory)
+        assert outcome(memory, act(OperatorActionKind.CONFIRM, event_id, EventState.CANDIDATE, n=1)) == OperatorOutcome.APPLIED
+        return event_id
+
+    still = RoomMemory(config(tmp_path / "still", recent_windows=3), START, GENERATION)
+    event_id = confirmed(still)
+    assert window(still, WITH_BOX, 5) == []
+    assert outcome(still, act(OperatorActionKind.ACCEPT, event_id, EventState.CONFIRMED, n=2), 5) == OperatorOutcome.APPLIED
+
+    for name, cloud in (("removed", ROOM), ("occluded", BEHIND)):
+        memory = RoomMemory(config(tmp_path / name, recent_windows=3), START, GENERATION)
+        event_id = confirmed(memory)
+        assert window(memory, cloud, 5) == []
+        assert memory.channels["mid360"].tracker.open[0].missed == 0, name
+        files = {path.name: path.read_bytes() for path in (tmp_path / name / "lab").iterdir()}
+        reference = memory.channels["mid360"].reference.occupied.copy()
+        result, events, _, _ = memory.operate(act(OperatorActionKind.ACCEPT, event_id, EventState.CONFIRMED, n=2), stamp(5))
+        assert (result, events) == (OperatorOutcome.TARGET_CHANGED, []), name
+        assert np.array_equal(memory.channels["mid360"].reference.occupied, reference), name
+        assert {path.name: path.read_bytes() for path in (tmp_path / name / "lab").iterdir()} == files, name
+        assert memory._held == [], name
+        # Seen again: the same action id may be sent afresh, since a refusal is not a failure.
+        assert window(memory, WITH_BOX, 6) == []
+        assert outcome(memory, act(OperatorActionKind.ACCEPT, event_id, EventState.CONFIRMED, n=3), 6) == OperatorOutcome.APPLIED
+
+    gone = RoomMemory(config(recent_windows=3), START, GENERATION)
+    event_id = candidate(gone)
+    assert window(gone, ROOM, 5) == [] and gone.channels["mid360"].tracker.open[0].missed == 0
+    assert outcome(gone, act(OperatorActionKind.CONFIRM, event_id, EventState.CANDIDATE, n=1)) == OperatorOutcome.TARGET_CHANGED
+    assert not gone.channels["mid360"].tracker.open[0].confirmed
+
+
+def test_a_disappearance_needs_its_voxels_seen_free_in_the_last_window():
+    memory = RoomMemory(config(recent_windows=3), START, GENERATION)
+    track(memory, WITH_BOX)
+    events = window(memory, ROOM, 4)
+    assert [(e.kind, e.state) for e in events] == [(EventKind.DISAPPEARED, EventState.CANDIDATE)]
+    event_id = events[0].event_id
+    assert window(memory, BEHIND, 5) == [] and memory.channels["mid360"].tracker.open[0].missed == 0
+    assert outcome(memory, act(OperatorActionKind.CONFIRM, event_id, EventState.CANDIDATE, n=1)) == OperatorOutcome.TARGET_CHANGED
+    assert window(memory, ROOM, 6) == []
+    assert outcome(memory, act(OperatorActionKind.CONFIRM, event_id, EventState.CANDIDATE, n=2), 6) == OperatorOutcome.APPLIED
 
 
 def test_a_moved_rig_refuses_accept():

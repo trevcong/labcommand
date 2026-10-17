@@ -586,6 +586,68 @@ TEST(a_moved_rig_refuses_accept) {
     CHECK(result.outcome == Outcome::rig_unsettled && result.events.empty());
 }
 
+// Review round 2: the recent layer keeps a region matched (missed 0) for recent_windows windows
+// after the object left or went out of view. Only the last window's own evidence counts.
+TEST(confirm_and_accept_need_the_target_in_the_last_window_itself) {
+    const auto three = [](const std::optional<std::string>& dir) {
+        MemoryConfig c = config(dir);
+        c.recent_windows = 3;
+        return c;
+    };
+    const auto confirmed = [](RoomMemory& memory) {
+        const std::uint64_t id = candidate(memory);
+        CHECK(memory.operate(act(OperatorActionKind::confirm, id, EventState::candidate, 1, 1), stamp(5)).outcome ==
+              Outcome::applied);
+        return id;
+    };
+    {
+        TempDir dir;
+        RoomMemory still(three(dir.path.string()), kStart, kGeneration);
+        const std::uint64_t id = confirmed(still);
+        CHECK(window(still, with(box()), 5).empty());
+        CHECK(still.operate(act(OperatorActionKind::accept, id, EventState::confirmed, 1, 2), stamp(5)).outcome ==
+              Outcome::applied);
+    }
+    const Cloud hidden = behind();
+    for (const Cloud* cloud : {&room(), &hidden}) {
+        TempDir dir;
+        RoomMemory memory(three(dir.path.string()), kStart, kGeneration);
+        const std::uint64_t id = confirmed(memory);
+        CHECK(window(memory, *cloud, 5).empty());
+        CHECK(memory.channel("mid360").tracker.open()[0].missed == 0);
+        const Snapshot before = snapshot(memory, dir.path);
+        const auto result = memory.operate(act(OperatorActionKind::accept, id, EventState::confirmed, 1, 2), stamp(5));
+        CHECK(result.outcome == Outcome::target_changed && result.events.empty());
+        CHECK(same(before, snapshot(memory, dir.path)));
+        // Seen again: a new action applies.
+        CHECK(window(memory, with(box()), 6).empty());
+        CHECK(memory.operate(act(OperatorActionKind::accept, id, EventState::confirmed, 1, 3), stamp(6)).outcome ==
+              Outcome::applied);
+    }
+    RoomMemory gone(three(std::nullopt), kStart, kGeneration);
+    const std::uint64_t id = candidate(gone);
+    CHECK(window(gone, room(), 5).empty() && gone.channel("mid360").tracker.open()[0].missed == 0);
+    CHECK(gone.operate(act(OperatorActionKind::confirm, id, EventState::candidate, 1, 1), stamp(5)).outcome ==
+          Outcome::target_changed);
+    CHECK(!gone.channel("mid360").tracker.open()[0].confirmed);
+}
+
+TEST(a_disappearance_needs_its_voxels_seen_free_in_the_last_window) {
+    MemoryConfig c = config(std::nullopt);
+    c.recent_windows = 3;
+    RoomMemory memory(c, kStart, kGeneration);
+    track(memory, with(box()));
+    const auto events = window(memory, room(), 4);
+    CHECK((transitions(events) == std::vector<std::pair<EventKind, EventState>>{{EventKind::disappeared, EventState::candidate}}));
+    const std::uint64_t id = events[0].event_id;
+    CHECK(window(memory, behind(), 5).empty() && memory.channel("mid360").tracker.open()[0].missed == 0);
+    CHECK(memory.operate(act(OperatorActionKind::confirm, id, EventState::candidate, 1, 1), stamp(5)).outcome ==
+          Outcome::target_changed);
+    CHECK(window(memory, room(), 6).empty());
+    CHECK(memory.operate(act(OperatorActionKind::confirm, id, EventState::candidate, 1, 2), stamp(6)).outcome ==
+          Outcome::applied);
+}
+
 TEST(a_reshaped_candidate_is_not_what_the_operator_saw) {
     RoomMemory memory(config(std::nullopt), kStart, kGeneration);
     const std::uint64_t id = candidate(memory);

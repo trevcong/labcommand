@@ -15,9 +15,9 @@ from typing import Optional
 
 import numpy as np
 
-from .core import cast_rays
+from .core import cast_rays, occupancy_map
 from .core.change_detection import contains
-from .memory import _EMPTY_KEYS, _room_dir, _same_shape, VoxelLayer, reference_path, region_keys
+from .memory import _EMPTY_KEYS, _room_dir, _same_shape, VoxelLayer, reference_path, region_fresh, region_keys
 from .messages import (
     Compression, EventKind, EventState, Header, MapBricks, MapKind, MemoryState, OperatorActionKind, OperatorOutcome,
 )
@@ -344,6 +344,16 @@ def restore_confirmed(memory, channel, window, stamp, events):
         memory._log_event(events[-1])
 
 
+def _seen_now(memory, channel, region):
+    """The channel's last window, on its own, supports ``region`` with the freshness thresholds.
+    The recent layer keeps a region matched for ``recent_windows`` windows after the object left
+    or went out of view, so a match alone does not show it is there now."""
+    window = occupancy_map(channel.recent[-1], memory.change)
+    removed = region.keys if region.kind == "disappeared" else _from_keys(region)
+    free = cast_rays(window, memory.change, removed) if len(removed) else _EMPTY_KEYS
+    return region_fresh(region, window.occupied, free, memory.config.fresh_min_voxels, memory.config.fresh_min_fraction)
+
+
 def _release(tracker, event_id):
     for index, candidate in enumerate(tracker.open):
         if candidate.event_id == event_id:
@@ -401,7 +411,7 @@ def _event_action(memory, action, stamp, events):
                              config.stable_min_fraction))
 
     if action.action == OperatorActionKind.CONFIRM:
-        if not fresh:
+        if not fresh or not _seen_now(memory, channel, candidate.region):
             return OperatorOutcome.TARGET_CHANGED
         candidate.confirmed = True
         candidate.published = candidate.region
@@ -430,7 +440,7 @@ def _event_action(memory, action, stamp, events):
     # ACCEPT: compare-and-set on the published map, and only one accept waits for it at a time.
     if not memory._map_started or action.header.map_epoch != memory._map_epoch_sent or memory._held:
         return OperatorOutcome.STALE_EPOCH
-    if not fresh:
+    if not fresh or not _seen_now(memory, channel, candidate.published):
         return OperatorOutcome.TARGET_CHANGED
     if channel.residual is None or channel.residual > config.learn_max_offset_m:
         return OperatorOutcome.RIG_UNSETTLED

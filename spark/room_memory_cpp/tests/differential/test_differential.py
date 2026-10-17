@@ -1076,3 +1076,19 @@ def test_operator_confirmed_lifecycle(tmp_path):
     events = [ChangeEvent.from_cdr(bytes.fromhex(line.split()[1])) for line in out.splitlines() if line.startswith("event ")]
     assert [(e.kind, e.state) for e in events] == [(EventKind.MOVED, EventState.CANDIDATE), (EventKind.MOVED, EventState.CONFIRMED),
                                                    (EventKind.MOVED, EventState.REVERTED)]
+
+
+def test_operator_needs_the_target_in_the_last_window(tmp_path):
+    # Review round 2: with recent_windows=3 the box stays matched after it left or went out of view;
+    # both engines refuse until a window of its own sees it again.
+    paths = operator_scene(tmp_path)
+    lines = operator_run(paths, "room", ["box",
+        operator_line(5, OperatorActionKind.CONFIRM, FIRST_EVENT, EventState.CANDIDATE, n=1), "room",
+        operator_line(6, OperatorActionKind.ACCEPT, FIRST_EVENT, EventState.CONFIRMED, n=2), "behind",
+        operator_line(7, OperatorActionKind.ACCEPT, FIRST_EVENT, EventState.CONFIRMED, n=3), "box",
+        operator_line(8, OperatorActionKind.ACCEPT, FIRST_EVENT, EventState.CONFIRMED, n=4), "map 1760400010 0"])
+    lines[0] += " recent_windows=3"
+    out = run_both(tmp_path, "\n".join(lines))
+    assert outcomes(out) == ["APPLIED", "TARGET_CHANGED", "TARGET_CHANGED", "APPLIED"]
+    states = [ChangeEvent.from_cdr(bytes.fromhex(line.split()[1])).state for line in out.splitlines() if line.startswith("event ")]
+    assert states == [EventState.CANDIDATE, EventState.CONFIRMED, EventState.ACCEPTED]
