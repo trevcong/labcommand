@@ -1,7 +1,8 @@
 // Thin rclcpp node around RoomMemory: raw CDR in, codec bytes out. The C++ twin of
 // spark/room_memory/room_memory/node.py, with the same topics, QoS and parameters: status and
 // activity at 1 Hz, events per transition, map_bricks after each window when RoomMemory::map_update has
-// one, and RequestSync answers on the two sync topics, each answer followed by its SyncEnd on
+// one, a latched persistence string when a saved room was quarantined or a save failed, and RequestSync
+// answers on the two sync topics, each answer followed by its SyncEnd on
 // /room_memory/sync/end (protocol sections 2 and 5). A RequestSync arrives on its topic or as the
 // /room_memory/sync/request service, which the :8767 bridge exposes to the Mac (D39). The publisher generation is allocated
 // (durably, under publisher.lock) before any publisher exists; without it the node refuses to
@@ -40,6 +41,7 @@ using room_memory::RoomMemory;
 namespace msg = room_memory::msg;
 
 constexpr const char* kStatusTopic = "/room_memory/status";
+constexpr const char* kPersistenceTopic = "/room_memory/persistence";
 constexpr const char* kActivityTopic = "/room_memory/activity";
 constexpr const char* kEventsTopic = "/room_memory/events";
 constexpr const char* kMapTopic = "/room_memory/map_bricks";
@@ -77,6 +79,20 @@ std::string names(const std::vector<std::string>& sensors) {
     std::string text = "[";
     for (std::size_t n = 0; n < sensors.size(); ++n) text += (n ? ", '" : "'") + sensors[n] + "'";
     return text + "]";
+}
+
+// std_msgs/msg/String in CDR little-endian. The length counts the trailing NUL. The generic
+// publisher loads std_msgs' type support at run time (ros-jazzy-sensor-msgs depends on it).
+msg::Bytes string_cdr(const std::string& text) {
+    const auto length = static_cast<std::uint32_t>(text.size() + 1);
+    msg::Bytes out;
+    out.reserve(8 + text.size() + 4);
+    out.insert(out.end(), {0x00, 0x01, 0x00, 0x00});
+    for (int byte = 0; byte < 4; ++byte) out.push_back(static_cast<std::uint8_t>(length >> (8 * byte)));
+    out.insert(out.end(), text.begin(), text.end());
+    out.push_back(0);
+    while ((out.size() - 4) % 4 != 0) out.push_back(0);
+    return out;
 }
 
 class RoomMemoryNode : public rclcpp::Node {
@@ -128,15 +144,16 @@ public:
         }
         memory_ = std::make_unique<RoomMemory>(config, stamp(), generation_->generation());
 
-        // Durability is declared on every topic (protocol §2, D24). Status and activity are full state at
-        // 1 Hz, so a late subscriber (the bridge, when the first Mac subscribes) gets the last one at once;
-        // a copy delivered again repeats its seq in its generation. Everything else is volatile: the Mac
-        // gets the map and recent events by RequestSync, and a restarted node never receives an old
-        // request. Same QoS as node.py.
+        // Durability is declared on every topic (protocol §2, D24). Status, activity, and the persistence
+        // diagnostic are latched, so a late subscriber gets the last one at once; a copy of status or
+        // activity delivered again repeats its seq in its generation. The map, events, and sync topics stay
+        // volatile: the Mac gets the map and recent events by RequestSync, and a restarted node never
+        // receives an old request. Same QoS as node.py, plus the persistence topic.
         const auto volatile_qos = [](std::size_t depth) { return rclcpp::QoS(depth).reliable().durability_volatile(); };
         const auto latched_qos = [] { return rclcpp::QoS(1).reliable().transient_local(); };
         events_ = create_generic_publisher(kEventsTopic, kEventType, volatile_qos(100));
         status_ = create_generic_publisher(kStatusTopic, "labcommand_msgs/msg/MemoryStatus", latched_qos());
+        persistence_ = create_generic_publisher(kPersistenceTopic, "std_msgs/msg/String", latched_qos());
         activity_ = create_generic_publisher(kActivityTopic, "labcommand_msgs/msg/Activity", latched_qos());
         map_ = create_generic_publisher(kMapTopic, kMapType, volatile_qos(10));
         sync_map_ = create_generic_publisher(kSyncMapTopic, kMapType, volatile_qos(10));
@@ -167,6 +184,17 @@ public:
                     config.room_id.c_str(), names(memory_->config().sensors).c_str(), msg::name(memory_->state()),
                     static_cast<unsigned long long>(memory_->map_epoch()),
                     static_cast<unsigned long long>(memory_->publisher_generation()));
+        if (!memory_->startup_note().empty()) {
+            RCLCPP_ERROR(get_logger(), "saved room quarantined: %s", memory_->startup_note().c_str());
+        }
+        if (const auto error = memory_->take_save_error()) {
+            RCLCPP_ERROR(get_logger(), "reference save failed: %s", error->c_str());
+        }
+        // Exactly zero. Any positive period with no frames yet is DEGRADED, and a measured
+        // "about zero" is still positive. The latched persistence text is what a late subscriber
+        // keeps; the next 1 Hz status replaces this sample.
+        if (!memory_->startup_note().empty() || !memory_->persistence_ok()) publish_status_period(0.0);
+        publish_persistence();
     }
 
 private:
@@ -186,29 +214,46 @@ private:
     }
 
     void close_window() {
-        const auto start = std::chrono::steady_clock::now();
-        const double cpu = cpu_ms();
-        const msg::Time now_stamp = stamp();
-        const std::vector<msg::ChangeEvent> events = memory_->close_window(now_stamp);
-        for (const msg::ChangeEvent& event : events) events_->publish(serialized(event.to_cdr()));
-        const std::optional<msg::Bytes> map = memory_->map_update(now_stamp);
-        if (map) map_->publish(serialized(*map));
-        const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        RCLCPP_INFO(get_logger(), "window %.1f ms wall, %.1f ms cpu, %zu event messages, map %zu B, state %s", elapsed,
-                    cpu_ms() - cpu, events.size(), map ? map->size() : std::size_t{0}, msg::name(memory_->state()));
-        if (elapsed > memory_->config().window_s * 1000) {
-            RCLCPP_WARN(get_logger(), "window took %.0f ms, longer than window_s", elapsed);
+        try {
+            const auto start = std::chrono::steady_clock::now();
+            const double cpu = cpu_ms();
+            const msg::Time now_stamp = stamp();
+            const std::vector<msg::ChangeEvent> events = memory_->close_window(now_stamp);
+            for (const msg::ChangeEvent& event : events) events_->publish(serialized(event.to_cdr()));
+            const std::optional<msg::Bytes> map = memory_->map_update(now_stamp);
+            if (map) map_->publish(serialized(*map));
+            if (const auto error = memory_->take_save_error()) {
+                RCLCPP_ERROR(get_logger(), "reference save failed: %s", error->c_str());
+            }
+            publish_persistence();
+            const double elapsed =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            RCLCPP_INFO(get_logger(), "window %.1f ms wall, %.1f ms cpu, %zu event messages, map %zu B, state %s",
+                        elapsed, cpu_ms() - cpu, events.size(), map ? map->size() : std::size_t{0},
+                        msg::name(memory_->state()));
+            if (elapsed > memory_->config().window_s * 1000) {
+                RCLCPP_WARN(get_logger(), "window took %.0f ms, longer than window_s", elapsed);
+            }
+        } catch (const std::exception& error) {
+            // Jazzy's executor does not catch a timer exception. An escape here abort-loops the container.
+            RCLCPP_ERROR(get_logger(), "window failed: %s", error.what());
         }
+    }
+
+    void publish_status_period(double period) {
+        const msg::Time now_stamp = stamp();
+        status_->publish(serialized(memory_->status(now_stamp, period).to_cdr()));
+        activity_->publish(serialized(memory_->activity(now_stamp).to_cdr()));
     }
 
     void publish_status() {
         const auto now_steady = std::chrono::steady_clock::now();
         const double period = std::chrono::duration<double>(now_steady - last_status_).count();
         last_status_ = now_steady;
-        const msg::Time now_stamp = stamp();
-        status_->publish(serialized(memory_->status(now_stamp, period).to_cdr()));
-        activity_->publish(serialized(memory_->activity(now_stamp).to_cdr()));
+        publish_status_period(period);
     }
+
+    void publish_persistence() { persistence_->publish(serialized(string_cdr(memory_->persistence_report()))); }
 
     /// Publishes the answer and its SyncEnd; false when the request was dropped.
     bool answer(const rclcpp::SerializedMessage& message) {
@@ -245,6 +290,7 @@ private:
     room_memory::RejectionLog rejections_;
     std::shared_ptr<rclcpp::GenericPublisher> events_;
     std::shared_ptr<rclcpp::GenericPublisher> status_;
+    std::shared_ptr<rclcpp::GenericPublisher> persistence_;
     std::shared_ptr<rclcpp::GenericPublisher> activity_;
     std::shared_ptr<rclcpp::GenericPublisher> map_;
     std::shared_ptr<rclcpp::GenericPublisher> sync_map_;
