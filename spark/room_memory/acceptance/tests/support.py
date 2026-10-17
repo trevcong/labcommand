@@ -108,11 +108,14 @@ def _hz(value):
 
 def stream(t_first, t_last, events=(), active=None, hz_at=None, stamp_offset_s=0.0, generation=4,
            generation_at=None, ready_s=None, session_end_s=None, session_reason="complete",
-           matched=True, status_seq_jump_at=(), latched=None, state="tracking", drop_ready=False):
+           matched=True, status_seq_jump_at=(), latched=None, state="tracking", drop_ready=False,
+           dropped_at=None):
     """One status and one activity at each integer second from ``t_first`` to ``t_last``.
 
     ``events`` are published in time order. ``omit`` keeps the seq in ``events_seq`` but
-    drops the line, which is a missed event. A caller who wants a scenario ``[t0, t1]``
+    drops the line, which is a missed event. ``dropped_at(t)`` is the status
+    ``dropped_windows`` counter (default 0); ``state`` may be a callable of ``t``.
+    A caller who wants a scenario ``[t0, t1]``
     covered passes a grid that starts at or before ``t0`` and ends at or after ``t1``.
     """
     published = [dict(item) for item in events]
@@ -155,11 +158,11 @@ def stream(t_first, t_last, events=(), active=None, hz_at=None, stamp_offset_s=0
             "publisher_generation": gen,
             "initial": False,
             "message": {
-                "state": state,
+                "state": state(t) if callable(state) else state,
                 "events_seq": events_seq,
                 "mid360_hz": _hz(hz[0]),
                 "jt128_hz": _hz(hz[1]),
-                "dropped_windows": 0,
+                "dropped_windows": 0 if dropped_at is None else dropped_at(t),
                 "n_open_events": 0,
                 "pose_residual_m": 0.01,
             },

@@ -36,6 +36,7 @@ IDLE_IDS = {"baseline_idle", "hour_idle"}
 CHANGE_IDS = ("box_placed", "box_removed", "box_moved")
 PERSON_IDS = ("person_walk", "person_sit")
 SENSOR_HZ = {1: "mid360_hz", 2: "jt128_hz"}
+LOST_WINDOW_REASONS = ("dropped_windows", "dropped_windows_regressed", "dropped_windows_unknown")
 
 CONFIRMED_NOTE = (
     "No CONFIRMED message was published. false_candidate_alarms_per_hour is not the "
@@ -125,9 +126,11 @@ def _fresh(messages):
 
 def _coverage(scenario, messages, fresh, meta, expected):
     if scenario.get("class") == "setup" or scenario.get("completion") in ("blocked", "skipped"):
-        return {"ok": False, "coverage": "not_applicable", "reasons": [scenario.get("completion") or "setup"], "gaps": 0}
+        return {"ok": False, "coverage": "not_applicable", "reasons": [scenario.get("completion") or "setup"], "gaps": 0,
+                "dropped": 0}
     reasons = []
     gaps = 0
+    dropped = 0
     t0 = scenario["t0_mono_ns"]
     t1 = scenario["t1_mono_ns"]
     if meta["end_ns"] is None:
@@ -171,6 +174,7 @@ def _coverage(scenario, messages, fresh, meta, expected):
             else:
                 continue
             break
+        dropped = _dropped_windows(status_chain, reasons)
         _event_coverage(messages, status_chain[0], status_chain[-1], t0, t1, reasons)
     if not status_chain and not any(reason.startswith("no_fresh") or reason == "stale_or_unfresh" for reason in reasons):
         reasons.append("stale_or_unfresh")
@@ -178,7 +182,34 @@ def _coverage(scenario, messages, fresh, meta, expected):
     for reason in reasons:
         if reason not in unique:
             unique.append(reason)
-    return {"ok": not unique, "coverage": "verifiable" if not unique else "unverifiable", "reasons": unique, "gaps": gaps}
+    return {"ok": not unique, "coverage": "verifiable" if not unique else "unverifiable", "reasons": unique, "gaps": gaps,
+            "dropped": dropped}
+
+
+def _dropped_windows(chain, reasons):
+    """Windows the node dropped across one status chain, from its counter deltas.
+
+    ``dropped_windows`` counts since node start, so only an increase inside the chain
+    is new. ``_chain`` keeps one publisher generation, so the first sample is the
+    baseline and a restart's reset to 0 between intervals never counts. Positive Hz
+    does not cover this: both publishers count rejected frames toward Hz.
+    """
+    total = 0
+    previous = None
+    for sample in chain:
+        value = (sample.get("message") or {}).get("dropped_windows")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            reasons.append("dropped_windows_unknown")
+            return total
+        if previous is not None:
+            if value < previous:
+                reasons.append("dropped_windows_regressed")
+            elif value > previous:
+                total += value - previous
+        previous = value
+    if total:
+        reasons.append("dropped_windows")
+    return total
 
 
 def _chain(messages, fresh, topic, label, t0, t1):
@@ -340,6 +371,7 @@ def _blank_row(scenario, cover):
         "actual_duration_s": scenario.get("actual_duration_s"),
         "coverage": cover["coverage"],
         "coverage_reasons": list(cover["reasons"]),
+        "dropped_windows": cover["dropped"],
         "detection": "none",
         "discrimination": "none",
         "receipt_delay_s": None,
@@ -655,8 +687,9 @@ def _finish(rows, events, assigned, messages, fresh, compatible, meta, ignored, 
     protocol = _protocol_complete(rows, compatible, meta)
     for row in rows:
         row.pop("_change_done", None)
+    lost = [row["id"] for row in rows if any(reason in LOST_WINDOW_REASONS for reason in row["coverage_reasons"])]
     result, exit_code, acceptance = _decide(
-        protocol, rows, misses, non_idle, rate_pass, activity_as_change, split_move,
+        protocol, rows, misses, non_idle, rate_pass, activity_as_change, split_move, lost,
     )
     product, product_note = _confirmed_bar(
         confirmed_count, exposure, protocol, threshold, messages, static_intervals,
@@ -688,6 +721,8 @@ def _finish(rows, events, assigned, messages, fresh, compatible, meta, ignored, 
         "candidate_during_activity": during,
         "person_unverified": unverified,
         "split_move": split_move,
+        "dropped_windows": sum(row["dropped_windows"] for row in rows),
+        "lost_window_scenarios": lost,
         "seq_gaps": sum(1 for row in rows for reason in row["coverage_reasons"] if reason.endswith("_seq_gap")),
         "detection_delay_basis": "receipt_mono",
         "receipt_delay_s": {
@@ -748,7 +783,7 @@ def _protocol_complete(rows, compatible, meta):
     return True
 
 
-def _decide(protocol, rows, misses, non_idle, rate_pass, activity_as_change, split_move):
+def _decide(protocol, rows, misses, non_idle, rate_pass, activity_as_change, split_move, lost):
     hard = bool(misses or non_idle or activity_as_change or split_move or rate_pass is False)
     if not protocol:
         return ("fail" if hard else "inconclusive"), 2, "denied"
@@ -767,7 +802,9 @@ def _decide(protocol, rows, misses, non_idle, rate_pass, activity_as_change, spl
                 unverified = True
     if failed:
         return "fail", 1, "denied"
-    if unverified or rate_pass is not True:
+    # A scenario outside the protocol set, such as restore_reference, still denies
+    # the session when the node dropped windows in it.
+    if unverified or lost or rate_pass is not True:
         return "inconclusive", 2, "denied"
     return "pass", 0, "full_candidate"
 

@@ -506,6 +506,81 @@ def test_not_tracking_is_inconclusive():
     assert report["idle_false_candidate_alarms_per_hour"] is None
 
 
+def test_dropped_windows_during_the_hour_are_not_exposure():
+    # Positive Hz and continuous status/activity, but every window of the hour is dropped.
+    messages, mark = _perfect(
+        state=lambda t: "degraded" if t >= 780 else "tracking",
+        dropped_at=lambda t: max(0, t - 779),
+    )
+    report = _score(messages, mark)
+    hour = _row(report, "hour_idle")
+    assert hour["coverage"] == "unverifiable"
+    assert hour["coverage_reasons"] == ["dropped_windows"]
+    assert hour["dropped_windows"] == 3600
+    assert report["dropped_windows"] == 3600
+    assert report["lost_window_scenarios"] == ["hour_idle"]
+    assert report["credited_idle_exposure_s"] == 60
+    assert report["protocol_complete"] is False
+    assert report["g5_acceptance"] == "denied"
+    assert report["exit_code"] == 2
+    assert "lost_window_scenarios: hour_idle" in report["markdown"]
+
+
+def test_dropped_windows_make_a_change_inconclusive_not_a_miss():
+    messages, mark = _perfect(drop_place=True, dropped_at=lambda t: 0 if t < 150 else 1)
+    report = _score(messages, mark)
+    placed = _row(report, "box_placed")
+    assert placed["detection"] == "inconclusive"
+    assert "dropped_windows" in placed["coverage_reasons"]
+    assert report["misses"] == 0
+    assert report["lost_window_scenarios"] == ["box_placed"]
+    assert report["g5_acceptance"] == "denied"
+    assert report["exit_code"] == 2
+
+
+def test_dropped_windows_outside_the_protocol_scenarios_still_deny():
+    messages, mark = _perfect(dropped_at=lambda t: 0 if t < 740 else 1)
+    report = _score(messages, mark)
+    assert _row(report, "restore_reference")["coverage_reasons"] == ["dropped_windows"]
+    assert _row(report, "hour_idle")["coverage"] == "verifiable"
+    assert report["protocol_complete"] is True
+    assert report["lost_window_scenarios"] == ["restore_reference"]
+    assert report["g5_acceptance"] == "denied"
+    assert report["exit_code"] == 2
+
+
+def test_an_unchanged_historical_dropped_count_keeps_coverage():
+    steady = _score(*_perfect(dropped_at=lambda t: 7))
+    assert steady["g5_acceptance"] == "full_candidate"
+    assert steady["credited_idle_exposure_s"] == 3660
+    assert steady["dropped_windows"] == 0
+    assert steady["lost_window_scenarios"] == []
+
+    # Drops between two intervals are in neither interval's status chain.
+    between = _score(*_perfect(dropped_at=lambda t: 0 if t < 75 else 3))
+    assert between["g5_acceptance"] == "full_candidate"
+    assert between["exit_code"] == 0
+
+    # A restart between intervals resets the counter in a new generation.
+    restarted = _score(*_perfect(
+        generation_at=lambda t: 4 if t < 775 else 5,
+        dropped_at=lambda t: 7 if t < 775 else 0,
+    ))
+    assert _row(restarted, "hour_idle")["coverage"] == "verifiable"
+    assert restarted["g5_acceptance"] == "full_candidate"
+    assert restarted["credited_idle_exposure_s"] == 3660
+
+
+def test_a_dropped_count_that_regresses_or_is_missing_is_unverifiable():
+    mark = marks([scenario("baseline_idle", "idle", 1, 29, protocol=60, actual=28, completion="shortened")])
+    regressed = _score(stream(0, 30, dropped_at=lambda t: 5 if t < 15 else 0), mark)
+    assert _row(regressed, "baseline_idle")["coverage_reasons"] == ["dropped_windows_regressed"]
+    assert regressed["credited_idle_exposure_s"] == 0
+    missing = _score(stream(0, 30, dropped_at=lambda t: None), mark)
+    assert _row(missing, "baseline_idle")["coverage_reasons"] == ["dropped_windows_unknown"]
+    assert missing["credited_idle_exposure_s"] == 0
+
+
 def test_static_confirmations_count_without_a_captured_candidate():
     outside = [
         event(131, "appeared", 1, PLACE, state="confirmed"),
@@ -622,7 +697,7 @@ def pytest_rate(count, exposure_s):
     return count * 3600 / exposure_s
 
 
-def _perfect(drop_place=False, extra_idle=(), extra_events=(), place_targets=None):
+def _perfect(drop_place=False, extra_idle=(), extra_events=(), place_targets=None, **stream_options):
     events = []
     if not drop_place:
         events.append(event(130, "appeared", 1, PLACE))
@@ -633,7 +708,7 @@ def _perfect(drop_place=False, extra_idle=(), extra_events=(), place_targets=Non
     def active(t):
         return (80 <= t < 90) or (470 <= t < 490) or (580 <= t <= 700)
 
-    messages = stream(8, 4381, events, active=active, ready_s=7, session_end_s=4382)
+    messages = stream(8, 4381, events, active=active, ready_s=7, session_end_s=4382, **stream_options)
     rows = [
         scenario("baseline_idle", "idle", 10, 70, protocol=60),
         scenario("box_placed", "change", 80, 200, kind="appeared", protocol=120, change_done=80, clear=90,

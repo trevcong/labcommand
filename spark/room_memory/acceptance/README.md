@@ -109,10 +109,24 @@ samples whose stamp delta matches the receipt delta, and it is not applied.
 A scenario is verifiable only when the subscription was matched before it
 started, fresh status and activity cover the interval with no header-seq gap
 and no gap over 2.5 s, expected sensors report nonzero Hz, the state is
-`tracking` or `degraded`, and every event seq through `MemoryStatus.events_seq`
-on the closing status is in the log, including that tail. `events_seq` is
-stored on every status line. Gaps, a missing tail, sensor dropout, a decode
-error, and a log that ends before the interval are unverifiable. That time is
+`tracking` or `degraded`, `MemoryStatus.dropped_windows` does not increase
+across the interval's status samples, and every event seq through
+`MemoryStatus.events_seq` on the closing status is in the log, including that
+tail. `events_seq` is stored on every status line. Gaps, a missing tail, sensor
+dropout, dropped windows, a decode error, and a log that ends before the
+interval are unverifiable.
+
+Nonzero Hz does not prove the detector ran: both nodes count every received
+frame toward Hz, rejected frames included, and drop a window whose frames were
+all rejected. An hour of `degraded` status at 10 Hz can hold no processed window. The counter is per node process and counts since its
+start, so the score uses only its increase within one interval, which is already
+one publisher generation. A steady nonzero count from earlier in the run, drops
+between two intervals, and a restart's reset to 0 between intervals do not
+count. An increase is `dropped_windows`; a decrease within a generation
+(`dropped_windows_regressed`) and a missing count (`dropped_windows_unknown`)
+are unverifiable too. The report lists the lost windows per scenario and in
+`dropped_windows`, and names the scenarios in `lost_window_scenarios`. Any
+such scenario denies full acceptance, `restore_reference` included. That time is
 not exposure and is not a zero-false-alarm pass. `session_end` is in the log
 so an offline score sees the same interruption.
 

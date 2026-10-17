@@ -26,6 +26,8 @@ def render_markdown(report):
         f"activity_as_change: {report['activity_as_change']}",
         f"person_unverified: {report['person_unverified']}",
         f"split_move: {report['split_move']}",
+        f"dropped_windows: {report['dropped_windows']}",
+        f"lost_window_scenarios: {', '.join(report['lost_window_scenarios']) or 'none'}",
         f"confirmed_count: {report['confirmed_count']}",
         f"detection_delay_basis: {report['detection_delay_basis']}",
         f"receipt_delay_p50_s: {report['receipt_delay_s']['p50']}",
