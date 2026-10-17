@@ -34,7 +34,7 @@ cmake_host_system_information(RESULT HOST_CORES QUERY NUMBER_OF_LOGICAL_CORES)
 set(THREAD_COUNTS 1 3 ${HOST_CORES})
 list(REMOVE_DUPLICATES THREAD_COUNTS)
 
-foreach(suite goldens core messages memory generation cli)
+foreach(suite goldens core messages memory generation cli operator)
   add_executable(test_${suite} test_${suite}.cpp)
   target_link_libraries(test_${suite} PRIVATE room_memory_test_support)
 endforeach()
@@ -53,6 +53,7 @@ if(ROOM_MEMORY_APPLE_LZFSE)
 endif()
 add_test(NAME cli COMMAND test_cli)
 add_test(NAME generation COMMAND test_generation)
+add_test(NAME operator COMMAND test_operator)
 
 # The installed binary itself, byte for byte, on both change-detection fixtures.
 foreach(sensor jt128 mid360)

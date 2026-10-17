@@ -83,6 +83,7 @@ class RoomMemoryNode(Node):
             "delta_period_s": defaults.delta_period_s,
             "keyframe_period_s": defaults.keyframe_period_s,
             "keyframe_delta_ratio": defaults.keyframe_delta_ratio,
+            "suppress_clear_windows": defaults.suppress_clear_windows,
         }
         values = {name: self.declare_parameter(name, value).value for name, value in params.items()}
         values["sensors"] = tuple(values["sensors"])

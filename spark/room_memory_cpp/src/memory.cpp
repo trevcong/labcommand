@@ -583,6 +583,7 @@ RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, std::uint64_
     if (config_.candidate_windows < 1 || config_.expire_windows < 1) {
         throw std::invalid_argument("candidate_windows and expire_windows must be >= 1");
     }
+    if (config_.suppress_clear_windows < 1) throw std::invalid_argument("suppress_clear_windows must be >= 1");
     if (!(config_.learn_max_offset_m >= 0 && config_.learn_max_offset_m < 1e9)) {
         throw std::invalid_argument("learn_max_offset_m must be in [0, 1e9) m");
     }
@@ -620,6 +621,8 @@ RoomMemory::RoomMemory(MemoryConfig config, const msg::Time& start, std::uint64_
     }
     const std::int64_t millis = start.sec * 1000 + start.nanosec / 1'000'000;
     next_event_id_ = static_cast<std::uint64_t>(millis) << 20;
+    suppressions_.assign(channels_.size(), {});
+    suppressions_dirty_.assign(channels_.size(), false);
     load(start);
 }
 
@@ -660,6 +663,7 @@ void RoomMemory::load(const msg::Time& start) {
     if (present == 0) {
         // BUILDING publishes no map or events; TRACKING takes the next epoch.
         map_epoch_ = room_epoch.value_or(0);
+        load_suppressions(false);
         return;
     }
     if (!missing.empty()) {
@@ -681,6 +685,7 @@ void RoomMemory::load(const msg::Time& start) {
         set_reference(channels_[n], std::move(layer));
         channels_[n].reference_windows = config_.reference_windows;
     }
+    load_suppressions(true);
     // seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
     // before it names a message after it. Saved at once, so the next restart moves on again.
     map_epoch_ = epoch + 1;
@@ -817,7 +822,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         options.before_known = &channel.reference.known;
         options.scope = scope_;
         options.backend = backend_;
-        const Report report = diff(channel.reference.as_occupancy(change_.voxel_size), recent, change_, options);
+        Report report = diff(channel.reference.as_occupancy(change_.voxel_size), recent, change_, options);
         // The recent layer carries a return and its ray for recent_windows windows, so only this
         // window's own evidence counts toward the persistence gate: an appeared or moved region
         // is fresh when this window occupies one of its (new-pose) voxels, a disappeared one
@@ -833,11 +838,13 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
             supported[n] = region_fresh(report.regions[n], window.occupied, free, config_.fresh_min_voxels,
                                         config_.fresh_min_fraction);
         }
+        screen_suppressed(channel, report.regions, supported, window);
         for (const auto& [state, candidate] :
              channel.tracker.update(report.regions, stamp, [this] { return next_id(); }, supported)) {
             events.push_back(event(channel, state, candidate, stamp));
             log_event(events.back());
         }
+        restore_confirmed(channel, window, stamp, events);
         for (const std::size_t n : channel.tracker.activity()) activity.push_back(Moving{channel.sensor.bit, report.regions[n]});
     }
     if (dropped) ++dropped_windows_;
@@ -883,6 +890,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         ++map_epoch_;
         save(stamp);
     }
+    persist_suppressions();
     return events;
 }
 
@@ -919,6 +927,9 @@ msg::Bytes RoomMemory::publish_map(const msg::MapBricks& message) {
     }
     last_map_ns_ = ns;
     map_epoch_sent_ = message.header.map_epoch;
+    for (HeldAccept& held : held_) {
+        if (!held.epoch) held.epoch = message.header.map_epoch;
+    }
     map_log_.push_back(Logged{map_seq_, message.header.map_epoch, bytes});
     if (map_log_.size() > kMapLogDepth) map_log_.pop_front();
     ++map_seq_;
@@ -953,6 +964,8 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
             settle_pending_ = false;
         }
     }
+    // An accept's absorbed reference goes out on the next due tick, retried until a map message carries it.
+    if (std::any_of(held_.begin(), held_.end(), [](const HeldAccept& held) { return !held.epoch; })) changed = true;
     if (!changed && !keyframe_due) return std::nullopt;
     if (changed) {
         ++map_epoch_;
@@ -1124,6 +1137,7 @@ msg::MemoryStatus RoomMemory::status(const msg::Time& stamp, double period_s) {
     message.state = last_window_dropped_ || silent ? msg::MemoryState::degraded : state_;
     message.n_bricks = channels_[map_channel_].reference.brick_count();
     for (const Channel& channel : channels_) message.n_open_events += static_cast<std::int64_t>(channel.tracker.open().size());
+    message.n_open_events += static_cast<std::int64_t>(held_.size());  // open until ACCEPTED is published
     message.coverage_known_frac = coverage_;
     if (state_ != msg::MemoryState::building) {
         std::optional<double> residual;

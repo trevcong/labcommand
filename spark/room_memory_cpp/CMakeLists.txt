@@ -66,6 +66,7 @@ add_library(room_memory_core
   src/pointcloud2.cpp
   src/messages.cpp
   src/memory.cpp
+  src/operator.cpp
   src/generation.cpp
   src/rejectlog.cpp
 )

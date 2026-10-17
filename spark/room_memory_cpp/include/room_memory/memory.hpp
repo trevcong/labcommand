@@ -140,6 +140,10 @@ struct Candidate {
     std::int64_t missed = 0;   // consecutive windows without a match
     Keys anchor;               // pending: its (new-pose) voxels when the run started
     Keys anchor_from;          // pending: its old-pose voxels then (empty unless moved)
+    // Open: an operator confirmed it (D46); it never expires, it is REVERTED only when its
+    // voxels are seen back at the reference state.
+    bool confirmed = false;
+    Region published{};        // open: the geometry of its last published transition
 };
 
 // Every voxel of a region, both poses for moved, sorted.
@@ -165,8 +169,9 @@ std::int64_t box_gap(const Box& a, const Box& b);
 // appeared or disappeared region that matches none but shares a voxel with the same side of an
 // open moved candidate (its new pose, its old pose) is a half of that move and starts nothing;
 // when a window has both halves, they are the move itself and count as its match. An open
-// candidate goes EXPIRED after `expire_windows` consecutive windows without a match. A matched
-// open candidate sends nothing.
+// candidate goes EXPIRED after `expire_windows` consecutive windows without a match, unless an
+// operator confirmed it (D46: RoomMemory reverts it once its voxels are seen back at the
+// reference state). A matched open candidate sends nothing.
 //
 // The rest are pending, in this order: a moved region matches the first pending move sharing a
 // voxel; a pending move with no such region matches an appeared region on its new-pose anchor plus
@@ -210,6 +215,10 @@ public:
         activity_.clear();
     }
     const std::vector<Candidate>& open() const { return open_; }
+    // The open candidate with this event id, or null.
+    Candidate* find_open(std::uint64_t event_id);
+    // Removes and returns the open candidate with this event id (an operator dismiss or accept).
+    std::optional<Candidate> release(std::uint64_t event_id);
     const std::vector<Candidate>& pending() const { return pending_; }
     // Indices into the last update's regions that were activity, ascending.
     const std::vector<std::size_t>& activity() const { return activity_; }
@@ -282,6 +291,9 @@ struct MemoryConfig {
     double delta_period_s = 5.0;
     double keyframe_period_s = 60.0;
     double keyframe_delta_ratio = 0.5;
+    // Operator dismiss (D46): windows in which the dismissed voxels are seen back at the
+    // reference state before the suppression lifts. Windows that do not observe them do not count.
+    std::int64_t suppress_clear_windows = 30;
 
     // The core config: evidence on, sensor origin (0, 0, 0) in each sensor's frame.
     Config change_config() const;
@@ -308,6 +320,25 @@ inline constexpr std::int64_t kPoseSearchVoxels = 4;
 // the result is the norm of the three per-axis shifts. Empty when no shift overlaps at all.
 // Binary64 like the Python oracle, so the learning gate decides alike; status rounds to float.
 std::optional<double> pose_offset(const Keys& recent, const Membership& reference, double voxel_size);
+
+// A dismissed change (D46): regions of its kind (and, for a move, its halves) of the same shape
+// over these voxels are dropped before the tracker sees them. `cleared` counts the windows that
+// observed the voxels back at the reference state since a matching region was last seen.
+struct Suppression {
+    std::uint64_t event_id = 0;
+    msg::EventKind kind = msg::EventKind::appeared;
+    Keys keys;       // the new pose for a move
+    Keys from_keys;  // the old pose; empty unless moved
+    std::int64_t cleared = 0;
+};
+
+// An operator accept waiting for the map message that carries it (D46, protocol 4.2): `epoch`
+// is set by the first map message published after the absorbed reference.
+struct HeldAccept {
+    std::size_t channel = 0;
+    Candidate candidate;
+    std::optional<std::uint64_t> epoch;
+};
 
 // Why add_cdr rejected a frame: the error's type name and message.
 struct RejectedFrame {
@@ -383,6 +414,23 @@ public:
     // legacy request included, as generation 0 with an all-zero token) the request is answered
     // as SINCE_NONE.
     SyncAnswer sync(const msg::RequestSync& request, const msg::Time& stamp);
+    // One operator action (protocol 3.6, D46): its outcome and the ChangeEvent messages to
+    // publish. Never throws; a refused action changes nothing. operator.cpp.
+    struct OperatorResult {
+        msg::OperatorOutcome outcome = msg::OperatorOutcome::invalid;
+        std::vector<msg::ChangeEvent> events;
+        // A repeated action_id: the stored outcome, nothing done; and whether its payload differs.
+        bool repeat = false;
+        bool repeat_differs = false;
+    };
+    OperatorResult operate(const msg::OperatorAction& action, const msg::Time& stamp);
+    // The ACCEPTED transitions whose map message map_update just published (call after each
+    // published map message), with that message's map_epoch.
+    std::vector<msg::ChangeEvent> accepted_after_map(const msg::Time& stamp);
+    // The last failed or uncertain durable write of an operator path, cleared by the next good
+    // one; for the node's log.
+    const std::optional<std::string>& storage_error() const { return storage_error_; }
+    const std::vector<Suppression>& suppressions(const std::string& sensor) const;
     // Writes every sensor's reference and the room's epoch file with the current map_epoch.
     // No-op without state_dir.
     void save(const msg::Time& stamp);
@@ -411,6 +459,20 @@ private:
     msg::MapBricks map_message(msg::MapKind kind, const msg::Time& stamp) const;
     msg::Bytes publish_map(const msg::MapBricks& message);
     void log_event(const msg::ChangeEvent& event);
+    // Operator hooks (operator.cpp). Before the tracker: drops suppressed regions (with their
+    // fresh flags) and counts or lifts suppressions. After it: confirmed candidates seen back at
+    // the reference state go REVERTED. At the end of the window: retries a failed suppressions write.
+    void screen_suppressed(Channel& channel, std::vector<Region>& regions, std::vector<bool>& supported,
+                           const OccupancyMap& window);
+    void restore_confirmed(Channel& channel, const OccupancyMap& window, const msg::Time& stamp,
+                           std::vector<msg::ChangeEvent>& events);
+    void persist_suppressions();
+    void load_suppressions(bool references);
+    msg::OperatorOutcome event_action(const msg::OperatorAction& action, const msg::Time& stamp,
+                                      std::vector<msg::ChangeEvent>& events);
+    bool agrees(const Region& region, const OccupancyMap& window) const;
+    bool supported_by(const Keys& evidence, const Keys& keys) const;
+    std::size_t index_of(const Channel& channel) const;
 
     MemoryConfig config_;
     std::uint64_t publisher_generation_;
@@ -449,7 +511,22 @@ private:
     std::deque<Logged> event_log_;
     std::map<std::uint64_t, Logged> open_latest_;  // event_id -> latest message, open events only
     std::optional<float> coverage_;
+    // Operator actions (D46): per-channel suppressions, whether the file lags them, accepts held
+    // for their map message, and the last kStoredActions action ids with their outcomes.
+    std::vector<std::vector<Suppression>> suppressions_;
+    std::vector<bool> suppressions_dirty_;
+    std::vector<HeldAccept> held_;
+    struct StoredAction {
+        msg::OperatorAction action;
+        msg::OperatorOutcome outcome;
+    };
+    std::deque<StoredAction> actions_;
+    std::optional<std::string> storage_error_;
 };
+
+// Repeated action ids answered from memory (D46). A restart forgets them; the generation fence
+// refuses a retry across it.
+inline constexpr std::size_t kStoredActions = 256;
 
 template <typename NextId>
 std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(const std::vector<Region>& regions,
@@ -714,6 +791,7 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
         step.promoted = true;
         Candidate c = *step.entry;
         c.event_id = next_id();
+        c.published = c.region;
         transitions.emplace_back(msg::EventState::candidate, c);
         promoted.push_back(std::move(c));
     }
@@ -730,7 +808,7 @@ std::vector<std::pair<msg::EventState, Candidate>> CandidateTracker::update(cons
     std::sort(by_id.begin(), by_id.end(), [&](std::size_t a, std::size_t b) { return open_[a].event_id < open_[b].event_id; });
     std::vector<bool> expired(open_.size(), false);
     for (const std::size_t n : by_id) {
-        if (!open_matched[n] && !absorbed[n] && ++open_[n].missed >= expire_windows_) {
+        if (!open_matched[n] && !absorbed[n] && ++open_[n].missed >= expire_windows_ && !open_[n].confirmed) {
             expired[n] = true;
             transitions.emplace_back(msg::EventState::expired, open_[n]);
         }

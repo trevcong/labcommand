@@ -22,8 +22,8 @@ import replay
 import scenes
 from room_memory import offline
 from room_memory.messages import (
-    Activity, ChangeEvent, EventKind, EventState, Header, MapBricks, MapKind, MemoryStatus, RequestSync, SyncEnd,
-    SyncTopic, Time, ZERO_TOKEN,
+    Activity, ChangeEvent, EventKind, EventState, Header, MapBricks, MapKind, MemoryStatus, OperatorAction,
+    OperatorActionKind, RequestSync, SyncEnd, SyncTopic, Time, ZERO_TOKEN,
 )
 
 OFFLINE = os.environ.get("ROOM_MEMORY_OFFLINE")
@@ -946,3 +946,133 @@ def test_sync_across_restarts_with_two_generations(tmp_path):
     assert maps_end[0][0] == [] and maps_end[0][1].delivered == ()
     for messages, end in maps_end[1:]:
         assert len(messages) == 1 and end.delivered == ((0, 0),) and MapBricks.from_cdr(messages[0]).publisher_generation == 9
+
+
+# MARK: Operator actions (D46)
+
+# The first event id of a run started at 1760400000 s: its start time in ms, shifted by 20.
+FIRST_EVENT = G << 20
+OPERATOR_CONFIG = (f"config {SINGLE_WINDOW} sensors=mid360 max_range=none reference_windows=3 suppress_clear_windows=3 "
+                   "state_dir={state}")
+
+
+def operator_line(second, kind, event, expected, epoch=1, n=0, generation=G, room_id="lab", text=""):
+    action = OperatorAction(Header(room_id, epoch, n, Time(1760400000 + second, 0)), kind, event, expected, generation,
+                            text, "trevor", f"00000000-0000-4000-8000-{n:012d}")
+    return f"operator {1760400000 + second} 0 {action.to_cdr().hex()}"
+
+
+def operator_scene(tmp_path):
+    room = scenes.room_shell()
+    box = scenes.box_shell((1.0, 0.5, 0.3))
+    a = scenes.box_shell((0.0, 0.5, 0.30))
+    return {name: floats(tmp_path, name, cloud) for name, cloud in (
+        ("room", room), ("box", np.concatenate([room, box])), ("behind", room[room[:, 0] < -0.5]),
+        ("a", np.concatenate([room, a])), ("b", np.concatenate([room, scenes.shifted(a, 1)])))}
+
+
+def operator_run(paths, reference, sequence, start=0):
+    """The reference at seconds 0..2 and its first snapshot at 3, then `sequence`: a scene name closes a
+    window, anything else is a script line. Returns the script lines."""
+    lines = [OPERATOR_CONFIG, "start 1760400000 0"]
+    for second in range(3):
+        lines += [f"points mid360 {paths[reference]}", f"close {1760400000 + second} 0"]
+    lines += ["map 1760400003 0"]
+    second = 4
+    for step in sequence:
+        if step in paths:
+            lines += [f"points mid360 {paths[step]}", f"close {1760400000 + second} 0"]
+            second += 1
+        else:
+            lines.append(step)
+    return lines
+
+
+def outcomes(out):
+    return [line.split()[1] for line in out.splitlines() if line.startswith("operator ")]
+
+
+def test_operator_confirm_then_accept(tmp_path):
+    paths = operator_scene(tmp_path)
+    lines = operator_run(paths, "room", ["box",
+        operator_line(5, OperatorActionKind.CONFIRM, FIRST_EVENT, EventState.CANDIDATE, n=1),
+        operator_line(5, OperatorActionKind.ACCEPT, FIRST_EVENT, EventState.CONFIRMED, n=2),
+        "status 1760400005 0 1.0", "box", "map 1760400006 0", "map 1760400008 0", "status 1760400008 0 1.0", "box"])
+    out = run_both(tmp_path, "\n".join(lines))
+    assert outcomes(out) == ["APPLIED", "APPLIED"]
+    accepted = [ChangeEvent.from_cdr(bytes.fromhex(line.split()[1])) for line in out.splitlines() if line.startswith("event ")]
+    assert [e.state for e in accepted] == [EventState.CANDIDATE, EventState.CONFIRMED, EventState.ACCEPTED]
+    assert accepted[-1].header.map_epoch == 2
+    # Restarted on the saved state: the box is the reference now.
+    reload = [OPERATOR_CONFIG, "start 1760400100 0", f"points mid360 {paths['box']}", "close 1760400101 0"]
+    assert "event " not in run_both(tmp_path, "\n".join(reload))
+
+
+def test_operator_dismiss_suppress_and_lift(tmp_path):
+    paths = operator_scene(tmp_path)
+    lines = operator_run(paths, "room", ["box",
+        operator_line(5, OperatorActionKind.DISMISS, FIRST_EVENT, EventState.CANDIDATE, n=1, text="left on purpose"),
+        "box", "box", "behind", "behind", "room", "room", "box", "room", "room", "room", "box"])
+    out = run_both(tmp_path, "\n".join(lines))
+    states = [ChangeEvent.from_cdr(bytes.fromhex(line.split()[1])).state for line in out.splitlines() if line.startswith("event ")]
+    assert outcomes(out) == ["APPLIED"] and states == [EventState.CANDIDATE, EventState.REVERTED, EventState.CANDIDATE]
+
+
+def test_operator_suppressions_survive_a_restart(tmp_path):
+    paths = operator_scene(tmp_path)
+    lines = operator_run(paths, "room", ["box",
+        operator_line(5, OperatorActionKind.DISMISS, FIRST_EVENT, EventState.CANDIDATE, n=1), "box"])
+    run_both(tmp_path, "\n".join(lines))
+    reload = [OPERATOR_CONFIG, "start 1760400100 0"] + [
+        line for second in range(101, 104) for line in (f"points mid360 {paths['box']}", f"close {1760400000 + second} 0")]
+    assert "event " not in run_both(tmp_path, "\n".join(reload))
+
+
+def test_operator_refusals(tmp_path):
+    paths = operator_scene(tmp_path)
+    confirm = operator_line(5, OperatorActionKind.CONFIRM, FIRST_EVENT, EventState.CANDIDATE, n=1)
+    lines = operator_run(paths, "room", ["box",
+        operator_line(5, OperatorActionKind.ACCEPT, FIRST_EVENT, EventState.CONFIRMED, n=9),
+        operator_line(5, OperatorActionKind.CONFIRM, FIRST_EVENT + 1, EventState.CANDIDATE, n=2),
+        operator_line(5, OperatorActionKind.CONFIRM, FIRST_EVENT, EventState.CANDIDATE, n=3, generation=G + 1),
+        operator_line(5, OperatorActionKind.CONFIRM, FIRST_EVENT, EventState.CANDIDATE, n=4, room_id="other"),
+        "operator 1760400005 0 0001000000",
+        confirm, confirm,
+        operator_line(5, OperatorActionKind.ACCEPT, FIRST_EVENT, EventState.CONFIRMED, epoch=0, n=5),
+        "behind",
+        operator_line(6, OperatorActionKind.ACCEPT, FIRST_EVENT, EventState.CONFIRMED, n=6),
+        operator_line(6, OperatorActionKind.ACKNOWLEDGE, FIRST_EVENT, EventState.CONFIRMED, n=7)])
+    out = run_both(tmp_path, "\n".join(lines))
+    assert outcomes(out) == ["STATE_MISMATCH", "UNKNOWN_EVENT", "STALE_GENERATION", "WRONG_ROOM", "INVALID", "APPLIED",
+                             "APPLIED", "STALE_EPOCH", "TARGET_CHANGED", "APPLIED"]
+
+
+def test_operator_accept_across_a_keyframe(tmp_path):
+    paths = operator_scene(tmp_path)
+    lines = operator_run(paths, "room", ["box",
+        operator_line(5, OperatorActionKind.CONFIRM, FIRST_EVENT, EventState.CANDIDATE, n=1),
+        operator_line(5, OperatorActionKind.ACCEPT, FIRST_EVENT, EventState.CONFIRMED, n=2), "map 1760400009 0"])
+    lines[0] += " keyframe_period_s=6"
+    out = run_both(tmp_path, "\n".join(lines))
+    maps = [MapBricks.from_cdr(bytes.fromhex(line.split()[1])) for line in out.splitlines()
+            if line.startswith("map ") and line != "map none"]
+    assert maps[-1].kind == MapKind.SNAPSHOT and maps[-1].header.map_epoch == 2
+    assert out.splitlines()[-1].startswith("event ")
+
+
+def test_operator_confirmed_lifecycle(tmp_path):
+    paths = operator_scene(tmp_path)
+    lines = operator_run(paths, "room", ["box",
+        operator_line(5, OperatorActionKind.CONFIRM, FIRST_EVENT, EventState.CANDIDATE, n=1),
+        "behind", "behind", "room", "status 1760400008 0 1.0"])
+    out = run_both(tmp_path, "\n".join(lines))
+    states = [ChangeEvent.from_cdr(bytes.fromhex(line.split()[1])).state for line in out.splitlines() if line.startswith("event ")]
+    assert states == [EventState.CANDIDATE, EventState.CONFIRMED, EventState.REVERTED]
+    moved = operator_run(paths, "a", ["b",
+        operator_line(5, OperatorActionKind.CONFIRM, FIRST_EVENT, EventState.CANDIDATE, n=1),
+        "room", "room", "a"])
+    (tmp_path / "moved").mkdir()
+    out = run_both(tmp_path / "moved", "\n".join(moved))
+    events = [ChangeEvent.from_cdr(bytes.fromhex(line.split()[1])) for line in out.splitlines() if line.startswith("event ")]
+    assert [(e.kind, e.state) for e in events] == [(EventKind.MOVED, EventState.CANDIDATE), (EventKind.MOVED, EventState.CONFIRMED),
+                                                   (EventKind.MOVED, EventState.REVERTED)]

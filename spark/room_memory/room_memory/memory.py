@@ -389,6 +389,10 @@ class Candidate:
     missed: int = 0  # consecutive windows without a match
     anchor: Optional[np.ndarray] = None  # pending: its (new-pose) voxels when the run started
     anchor_from: Optional[np.ndarray] = None  # pending: its old-pose voxels then (empty unless moved)
+    # Open: an operator confirmed it (D46); it never expires, it is REVERTED only when its voxels
+    # are seen back at the reference state.
+    confirmed: bool = False
+    published: object = None  # open: the geometry of its last published transition
 
 
 def region_keys(region):
@@ -485,15 +489,16 @@ def _gap(a, b):
 
 
 class CandidateTracker:
-    """Transition-only bookkeeping for one sensor's change regions (PR 2.3 adds CONFIRMED).
+    """Transition-only bookkeeping for one sensor's change regions.
 
     A region first matches the first open candidate of its kind sharing a voxel that no other
     region of this window matched. An appeared or disappeared region that matches none but shares
     a voxel with the same side of an open moved candidate (its new pose, its old pose) is a half of
     that move and starts nothing; when a window has both halves, they are the move itself and
     count as its match. An open candidate goes EXPIRED after ``expire_windows`` consecutive windows
-    without a match. A matched open candidate sends nothing: the protocol has one message per
-    transition.
+    without a match, unless an operator confirmed it (D46: ``RoomMemory`` reverts it once its voxels
+    are seen back at the reference state). A matched open candidate sends nothing: the protocol has
+    one message per transition.
 
     The rest are pending, in this order: a moved region matches the first pending move sharing a
     voxel; a pending move with no such region matches an appeared region on its new-pose anchor
@@ -701,7 +706,7 @@ class CandidateTracker:
         promoted = []
         for entry, indices, region, new, old, fragments in sorted(steps, key=lambda step: min(step[1])):
             if entry.windows >= self.candidate_windows:
-                candidate = replace(entry, event_id=next_id())
+                candidate = replace(entry, event_id=next_id(), published=entry.region)
                 transitions.append((EventState.CANDIDATE, candidate))
                 promoted.append(candidate)
         promoted_from = {id(step[0]) for step in steps if step[0].windows >= self.candidate_windows}
@@ -710,7 +715,7 @@ class CandidateTracker:
             if index in open_matched or index in absorbed:
                 continue
             self.open[index].missed += 1
-            if self.open[index].missed >= self.expire_windows:
+            if self.open[index].missed >= self.expire_windows and not self.open[index].confirmed:
                 expired.add(index)
                 transitions.append((EventState.EXPIRED, self.open[index]))
         self.open = [c for n, c in enumerate(self.open) if n not in expired] + promoted
@@ -780,6 +785,9 @@ class MemoryConfig:
     delta_period_s: float = 5.0
     keyframe_period_s: float = 60.0
     keyframe_delta_ratio: float = 0.5
+    # Operator dismiss (D46): windows in which the dismissed voxels are seen back at the reference
+    # state before the suppression lifts. Windows that do not observe them do not count.
+    suppress_clear_windows: int = 30
 
     def change_config(self):
         """The core config: evidence on, sensor origin (0, 0, 0) in each sensor's frame."""
@@ -844,6 +852,8 @@ class RoomMemory:
             raise ValueError("occupied_min_hits and free_min_seen must be >= 1, the ratios in [0, 1]")
         if config.candidate_windows < 1 or config.expire_windows < 1:
             raise ValueError("candidate_windows and expire_windows must be >= 1")
+        if config.suppress_clear_windows < 1:
+            raise ValueError("suppress_clear_windows must be >= 1")
         if not 0 <= config.learn_max_offset_m < 1e9:
             raise ValueError("learn_max_offset_m must be in [0, 1e9) m")
         if config.learn_windows < 0:
@@ -891,6 +901,14 @@ class RoomMemory:
         self._map_log = deque(maxlen=MAP_LOG_DEPTH)
         self._event_log = deque(maxlen=EVENT_LOG_DEPTH)
         self._open_latest = {}  # event_id -> latest Logged message, open events only
+        # Operator actions (D46): per-sensor suppressions, whether the file lags them, accepts held
+        # for their map message, the last STORED_ACTIONS (action, outcome), and the last failed or
+        # uncertain durable write (for the node's log).
+        self._suppressions = {name: [] for name in self.channels}
+        self._suppressions_dirty = {name: False for name in self.channels}
+        self._held = []
+        self._actions = deque(maxlen=_operator.STORED_ACTIONS)
+        self.storage_error = None
         self._load(start)
 
     def _paths(self):
@@ -907,6 +925,7 @@ class RoomMemory:
         if not present:
             # BUILDING publishes no map or events; TRACKING takes the next epoch.
             self.map_epoch = room_epoch or 0
+            _operator.load_suppressions(self, False)
             return
         if len(present) != len(paths):
             missing = sorted(set(paths) - set(present))
@@ -922,6 +941,7 @@ class RoomMemory:
             channel = self.channels[name]
             self._set_reference(channel, layer)
             channel.reference_windows = self.config.reference_windows
+        _operator.load_suppressions(self, True)
         # seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
         # before it names a message after it. Saved at once, so the next restart moves on again.
         self.map_epoch = epoch + 1
@@ -1037,10 +1057,12 @@ class RoomMemory:
             free = cast_rays(window, self.change, np.unique(np.concatenate(gone))) if gone else _EMPTY_KEYS
             fresh = [region_fresh(region, window.occupied, free, self.config.fresh_min_voxels,
                                   self.config.fresh_min_fraction) for region in report.regions]
-            for state, candidate in channel.tracker.update(report.regions, stamp, self._next_id, fresh):
+            regions, fresh = _operator.screen_suppressed(self, channel, report.regions, fresh, window)
+            for state, candidate in channel.tracker.update(regions, stamp, self._next_id, fresh):
                 events.append(self._event(channel, state, candidate, stamp))
                 self._log_event(events[-1])
-            activity.extend((channel.sensor.bit, report.regions[index]) for index in channel.tracker.activity)
+            _operator.restore_confirmed(self, channel, window, stamp, events)
+            activity.extend((channel.sensor.bit, regions[index]) for index in channel.tracker.activity)
         if dropped:
             self.dropped_windows += 1
         self.last_window_dropped = dropped
@@ -1064,6 +1086,7 @@ class RoomMemory:
                 self._settle_pending = True
             self.map_epoch += 1
             self.save(stamp)
+        _operator.persist_suppressions(self)
         return events
 
     def activity(self, stamp):
@@ -1104,6 +1127,9 @@ class RoomMemory:
             self._delta_bytes += len(data)
         self._last_map_ns = ns
         self._map_epoch_sent = message.header.map_epoch
+        for held in self._held:
+            if held.epoch is None:
+                held.epoch = message.header.map_epoch
         self._map_log.append(Logged(self._map_seq, message.header.map_epoch, data))
         self._map_seq += 1
         return data
@@ -1142,6 +1168,9 @@ class RoomMemory:
                 for channel in self.channels.values():
                     channel.stats = VoxelStats()
                 self._settle_pending = False
+        # An accept's absorbed reference goes out on the next due tick, retried until a map message carries it.
+        if any(held.epoch is None for held in self._held):
+            changed = True
         if not changed and not keyframe_due:
             return None
         if changed:
@@ -1213,6 +1242,19 @@ class RoomMemory:
         self.sync_end_seq += 1
         return messages, end
 
+    def operate(self, action, stamp):
+        """One operator action (protocol §3.6, D46): ``(outcome, events, repeat, repeat_differs)``,
+        the events to publish. Never raises; a refused action changes nothing."""
+        return _operator.operate(self, action, stamp)
+
+    def accepted_after_map(self, stamp):
+        """The ACCEPTED transitions whose map message ``map_update`` just published (call after each
+        published map message), with that message's ``map_epoch``."""
+        return _operator.accepted_after_map(self, stamp)
+
+    def suppressions(self, sensor):
+        return self._suppressions[sensor]
+
     def _event(self, channel, state, candidate, stamp):
         region = candidate.region
         header = Header(self.config.room_id, self.map_epoch, self.event_seq, stamp)
@@ -1265,7 +1307,8 @@ class RoomMemory:
             header=Header(self.config.room_id, self.map_epoch, self.status_seq, stamp),
             state=state,
             n_bricks=self.channels[self.map_sensor].reference.brick_count,
-            n_open_events=sum(len(channel.tracker.open) for channel in self.channels.values()),
+            # A held accept is open until its ACCEPTED is published.
+            n_open_events=sum(len(channel.tracker.open) for channel in self.channels.values()) + len(self._held),
             coverage_known_frac=self._coverage,
             pose_residual_m=residual,
             window_s=self.config.window_s,
@@ -1277,3 +1320,7 @@ class RoomMemory:
         )
         self.status_seq += 1
         return message
+
+
+# Last: operator.py imports from this module.
+from . import operator as _operator  # noqa: E402

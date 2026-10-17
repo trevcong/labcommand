@@ -57,6 +57,7 @@ ARGUMENTS = {
     "delta_period_s": ("5.0", float),
     "keyframe_period_s": ("60.0", float),
     "keyframe_delta_ratio": ("0.5", float),
+    "suppress_clear_windows": ("30", int),
 }
 
 # The node's RequestSync service, the only one the bridge exposes (D39).

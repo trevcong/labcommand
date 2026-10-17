@@ -113,6 +113,8 @@ public:
         config.delta_period_s = declare_parameter<double>("delta_period_s", defaults.delta_period_s);
         config.keyframe_period_s = declare_parameter<double>("keyframe_period_s", defaults.keyframe_period_s);
         config.keyframe_delta_ratio = declare_parameter<double>("keyframe_delta_ratio", defaults.keyframe_delta_ratio);
+        config.suppress_clear_windows =
+            declare_parameter<std::int64_t>("suppress_clear_windows", defaults.suppress_clear_windows);
         // Before any publisher: every message this process sends carries the generation. The
         // allocation holds publisher.lock until the process exits. The wall clock, not now(),
         // which may be sim time.
