@@ -145,3 +145,38 @@ func testRoomFirstShell() {
     }
     expect(room.contains("case .candidate:"), "the wire state stays .candidate")
 }
+
+/// The Dock, menus, and window wordmark say LabCommand. The binary and the
+/// ~/Applications install path stay LabCommand.app.
+func testVisibleAppName() {
+    let plist = repoFile("Info.plist")
+    let app = repoFile("Sources/LabCommand/LabCommandApp.swift")
+    let chrome = repoFile("Sources/LabCommand/CommandCenterView.swift")
+    let build = repoFile("build.sh")
+    expect(!plist.isEmpty && !app.isEmpty && !chrome.isEmpty && !build.isEmpty,
+           "name sources are readable from the repo root")
+
+    expect(plist.contains("<key>CFBundleDisplayName</key>\n\t<string>LabCommand</string>"),
+           "the Dock and Finder name is LabCommand")
+    expect(plist.contains("<key>CFBundleName</key>\n\t<string>LabCommand</string>"),
+           "the app menu title is LabCommand")
+    expect(plist.contains("<key>CFBundleExecutable</key>\n\t<string>LabCommand</string>"),
+           "the binary stays LabCommand")
+    expect(!plist.contains("<string>Lab</string>"), "the bundle does not name itself Lab")
+    expect(plist.contains("LabCommand reads Desktop/lidar-sessions"),
+           "the Desktop prompt names LabCommand")
+
+    expect(app.contains("\"About LabCommand\""), "About names LabCommand")
+    expect(app.contains("\"Quit LabCommand\""), "Quit names LabCommand")
+    expect(app.contains("\"Show LabCommand\""), "the status menu names LabCommand")
+    expect(app.contains("button?.title = \"LabCommand\""), "the status item names LabCommand")
+    expect(!app.contains("\"About Lab\"") && !app.contains("\"Quit Lab\"") && !app.contains("\"Show Lab\""),
+           "menus do not say Lab")
+
+    expect(chrome.contains("Text(\"LabCommand\")"), "the window wordmark is LabCommand")
+    expect(chrome.contains(".accessibilityLabel(\"LabCommand\")"), "the wordmark label is LabCommand")
+    expect(!chrome.contains("Text(\"Lab\")"), "the window does not say Lab")
+
+    expect(build.contains("APP_NAME=\"LabCommand\""), "the .app filename and binary stay LabCommand")
+    expect(build.contains("INSTALL_DIR=\"${HOME}/Applications\""), "install stays ~/Applications")
+}

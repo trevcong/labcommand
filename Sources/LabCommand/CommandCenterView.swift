@@ -23,10 +23,10 @@ struct CommandCenterView: View {
 
     private var topBar: some View {
         HStack(spacing: 20) {
-            Text("Lab")
+            Text("LabCommand")
                 .font(LabTheme.t(13, .semibold))
                 .foregroundStyle(LabTheme.text)
-                .accessibilityLabel("Lab")
+                .accessibilityLabel("LabCommand")
             Text("room memory")
                 .font(LabTheme.t(12))
                 .foregroundStyle(LabTheme.faint)
