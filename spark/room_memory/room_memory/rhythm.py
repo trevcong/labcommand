@@ -383,7 +383,8 @@ class _Table:
         self.sums = np.zeros(slots, dtype=np.uint64)
         self.count = 0
         # Slot cache for a repeated cell list. Probing from Python is the callback cost;
-        # a steady room presents the same cells every window. Cleared with the table.
+        # a steady room presents the same cells every window. ``clear`` keeps it when
+        # it lists every occupied slot, so the next minute does not probe again.
         self._cached = 0
         self._cix = np.empty(slots, dtype=np.int16)
         self._ciy = np.empty(slots, dtype=np.int16)
