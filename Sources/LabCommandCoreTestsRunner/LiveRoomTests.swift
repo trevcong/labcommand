@@ -810,6 +810,70 @@ func testLiveRoomActivityAndEpoch() {
     expect(bad.activity.rejected == 1 && bad.mapState == .current, "a truncated activity is rejected; the map stays current")
 }
 
+/// Archive retrieval (D45): a retired generation's answer is stored and is not a live install.
+func testLiveRoomArchiveRetrieval() {
+    var early = Mirror(tokenSeed: 8)
+    _ = early.connectionOpened(at: 0, canRequest: true)
+    expect(early.requestArchive(generation: g1, since: nil, at: 1).isEmpty, "no archive request before a generation is observed")
+    _ = early.receive(topic: .syncEnd, payload: LRWire.syncEnd(g1, topic: .eventArchive, token: .zero, bound: 1, delivered: [0...1]), at: 1)
+    expect(early.activeGeneration == nil && early.highestGeneration == nil && early.activity.olderGeneration == 0,
+           "an archive SyncEnd does not install its generation")
+    expect(early.continuity == .unknown, "an archive SyncEnd is not a continuity witness")
+
+    var mirror = currentMirror()
+    for seq in UInt64(0)...2 {
+        _ = mirror.receive(topic: .events, payload: event(id: 1, seq: seq, state: seq == 2 ? .confirmed : .candidate), at: 101)
+    }
+    _ = mirror.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 2), at: 102)
+    let restarted = mirror.receive(topic: .status, payload: status(epoch: 6, seq: 0, eventsSeq: nil, g: g2), at: 110)
+    expect(mirror.activeGeneration == g2 && mirror.continuity == .broken(sinceGeneration: g1), "g2 installed, continuity broken since g1")
+    expect(request(restarted, .events, "g2 empty") == nil, "g2 published nothing: no live events request")
+    expect(mirror.archivedOpenEvents.contains { $0.generation == g1 && $0.entry.seq == 2 && $0.entry.event.state == .confirmed },
+           "g1's open event is in the display archive")
+    let g2Coverage = mirror.eventHistory.coverage
+
+    let since = R.RequestSync.Position(epoch: 5, seq: 0)
+    let asked = request(mirror.requestArchive(generation: g1, since: since, at: 111), .eventArchive, "archive g1")
+    expect(asked?.topic == .eventArchive && asked?.expectedGeneration == g1 && asked?.since == since,
+           "archive request names g1 and keeps since")
+    expect(request(mirror.tick(at: 112), .eventArchive, "before timeout") == nil, "an outstanding archive request waits out its timeout")
+    let retry = request(mirror.tick(at: 116), .eventArchive, "timeout")
+    expect(retry?.token != asked?.token && retry?.since == since && retry?.expectedGeneration == g1,
+           "a timeout resends the same since with a fresh token")
+
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 1, seq: 4, state: .expired, g: g1), at: 117)
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 1, seq: 2, state: .confirmed, g: g1), at: 117)
+    _ = mirror.receive(topic: .syncEvents, payload: event(id: 1, seq: 2, state: .accepted, g: g1), at: 117)
+    expect(mirror.activity.contractViolations == 1, "the same archived seq with another payload is a contract violation; the first is kept")
+    expect(mirror.activity.olderGeneration == 0 && mirror.activeGeneration == g2, "archive events of g1 are not olderGeneration and do not install g1")
+    let history = mirror.archivedHistory(g1)
+    expect(history.map(\.header.seq) == [2, 4] && history.map(\.state) == [.confirmed, .expired],
+           "archive history is the original seqs, first payload kept")
+    expect(mirror.archivedOpenEvents.filter { $0.generation == g1 }.isEmpty, "a newer terminal archive message closes the display event and an older one does not reopen it")
+    _ = mirror.receive(topic: .syncEnd, payload: LRWire.syncEnd(
+        g1, topic: .eventArchive, token: retry?.token ?? .zero, bound: 4, delivered: [2...2, 4...4], unavailable: [0...1, 3...3]
+    ), at: 118)
+    expect(mirror.eventHistory.coverage == g2Coverage && mirror.eventsById.isEmpty, "g2 coverage is unchanged")
+    expect(mirror.continuity == .broken(sinceGeneration: g1), "an archive manifest does not heal continuity")
+    expect(mirror.retrievalStatus(.events) == .idle, "the archive SyncEnd does not start a live events retrieval")
+    expect(request(mirror.tick(at: 119), .eventArchive, "complete") == nil, "every delivered seq is held: the archive request completes")
+
+    _ = mirror.receive(topic: .events, payload: event(id: 1, seq: 5, state: .expired, g: g1), at: 120)
+    expect(mirror.activity.olderGeneration == 1 && mirror.archivedHistory(g1).map(\.header.seq) == [2, 4],
+           "a stray g1 event with no archive request still counts, and is not filed")
+
+    var live = currentMirror()
+    let gap = live.receive(topic: .status, payload: status(epoch: 5, seq: 2, eventsSeq: 4), at: 101)
+    expect(request(gap, .events, "gap") != nil && live.retrievalStatus(.events) == .waiting, "a live events request is outstanding")
+    let selfArchive = request(live.requestArchive(generation: g1, since: nil, at: 102), .eventArchive, "archive self")
+    _ = live.receive(topic: .syncEnd, payload: LRWire.syncEnd(
+        g1, topic: .eventArchive, token: selfArchive?.token ?? .zero, bound: 4, unavailable: [0...4]
+    ), at: 103)
+    expect(live.eventHistory.coverage == .missing(pending: [0...4], lost: []) && live.retrievalStatus(.events) == .waiting,
+           "an archive SyncEnd of the active generation does not merge unavailable or complete the live retrieval")
+    expect(live.activeGeneration == g1 && live.continuity == .verified, "the active generation stays put")
+}
+
 func runLiveRoomTests() {
     testLiveRoomFoxgloveClientFrames()
     print("  LiveRoom: serverInfo capabilities, client advertise + message data, topic/schema match (sync/end in, events_fallback out)"); passed()
@@ -837,6 +901,8 @@ func runLiveRoomTests() {
     print("  LiveRoom: an empty-map answer yields to a later status or reconnect; eviction never reopens a closed event"); passed()
     testLiveRoomActivityAndEpoch()
     print("  LiveRoom: Activity/Epoch per generation (a restart's seq 0 applies), seq duplicates, freshness; never decide the wire"); passed()
+    testLiveRoomArchiveRetrieval()
+    print("  LiveRoom: an archive answer is stored for its generation and does not install it, merge into the live witness, or heal continuity"); passed()
     runLiveRoomTraceTests()
 }
 

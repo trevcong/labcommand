@@ -500,6 +500,8 @@ public enum RoomMemory {
             case mapBricks = 0
             /// `/room_memory/events`.
             case events = 1
+            /// One generation's durable event log (`TOPIC_EVENT_ARCHIVE`). Not requested on its own.
+            case eventArchive = 2
         }
 
         /// The last message the Mac applied on the topic.

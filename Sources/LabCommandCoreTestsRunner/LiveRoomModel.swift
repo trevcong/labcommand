@@ -372,6 +372,9 @@ struct LRPublisher {
                     }
                 }
             }
+        case .eventArchive:
+            // The trace oracle has no durable log. An archive request is not a live answer.
+            return []
         }
         let seq = syncEndSeq
         syncEndSeq += 1
