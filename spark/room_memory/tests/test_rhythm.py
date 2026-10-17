@@ -1167,23 +1167,38 @@ def _close_samples(path, enable, points, count):
 
 
 def _assert_within_allowance(root, points, trials=5):
-    """Enabled median wall, p99 wall, and p99 CPU against the disabled median wall.
+    """Enabled median wall, p99 wall, and p99 CPU stay within the allowance.
 
-    A scheduler stall is larger than the allowance and shows up in the disabled run too.
-    The first quiet trial is enough. An overrun that is actually the logger fails every trial.
+    The allowance is ``max(1 ms, 10% of the disabled median wall)``. On a quiet trial the
+    disabled p99 sits within that of the disabled median, and the enabled median, p99, and
+    CPU p99 are judged against the disabled median. A scheduler stall is larger than the
+    allowance and shows up with rhythm off; that trial is judged against the same percentile
+    of the disabled run, so the stall is not charged to the logger. The first passing trial
+    is enough. An overrun that is actually the logger fails every trial.
     """
     seen = []
     for trial in range(trials):
         off_wall, off_cpu = _close_samples(root / f"off{trial}", False, points, 100)
         on_wall, on_cpu = _close_samples(root / f"on{trial}", True, points, 100)
         off_med = _percent(off_wall, 0.5)
+        off_tail = _percent(off_wall, 0.99)
+        off_cpu_med = _percent(off_cpu, 0.5)
+        off_cpu_tail = _percent(off_cpu, 0.99)
         allowance = max(1.0, 0.10 * off_med)
-        deltas = (
-            _percent(on_wall, 0.5) - off_med,
-            _percent(on_wall, 0.99) - off_med,
-            _percent(on_cpu, 0.99) - _percent(off_cpu, 0.5),
-        )
-        seen.append((tuple(round(delta, 3) for delta in deltas), round(allowance, 3)))
+        quiet = (off_tail - off_med) <= allowance and (off_cpu_tail - off_cpu_med) <= allowance
+        if quiet:
+            deltas = (
+                _percent(on_wall, 0.5) - off_med,
+                _percent(on_wall, 0.99) - off_med,
+                _percent(on_cpu, 0.99) - off_cpu_med,
+            )
+        else:
+            deltas = (
+                _percent(on_wall, 0.5) - off_med,
+                _percent(on_wall, 0.99) - off_tail,
+                _percent(on_cpu, 0.99) - off_cpu_tail,
+            )
+        seen.append((tuple(round(delta, 3) for delta in deltas), round(allowance, 3), quiet))
         if all(delta <= allowance for delta in deltas):
             return
     median, tail, cpu = seen[-1][0]
