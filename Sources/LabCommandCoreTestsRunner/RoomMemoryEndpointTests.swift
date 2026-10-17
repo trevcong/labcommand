@@ -298,6 +298,61 @@ func testLiveRoomRetargetDuringHandshakeBackoffAndRapidChanges() {
     a.stop(); b.stop(); c.stop()
 }
 
+func testRoomMemorySettingsSourcesAndATS() {
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    func text(_ path: String) -> String {
+        let url = root.appendingPathComponent(path)
+        guard let body = try? String(contentsOf: url, encoding: .utf8) else {
+            expect(false, "missing \(path)")
+            return ""
+        }
+        return body
+    }
+
+    let client = text("Sources/LabCommandCore/LiveRoom/LiveRoomClient.swift")
+    expect(!client.contains("100.118.187.99"), "LiveRoomClient has no tailnet IP")
+    expect(!client.contains("defaultURL"), "LiveRoomClient does not own a default URL")
+    expect(client.contains("func retarget"), "retarget lives on the client")
+
+    let endpoint = text("Sources/LabCommandCore/RoomMemoryEndpoint.swift")
+    expect(!endpoint.contains("100.118.187.99"), "the endpoint type has no tailnet IP")
+    expect(endpoint.contains("CaptureRecipe.tailscaleDNS"), "the default host is the MagicDNS name")
+
+    let settings = text("Sources/LabCommand/SettingsView.swift")
+    expect(settings.contains("Rig diagnostics"), "recorder rows sit under Rig diagnostics")
+    expect(settings.contains("Room memory"), "the endpoint group is Room memory")
+    expect(settings.contains("Room memory endpoint"), "the field has its accessibility label")
+    expect(settings.contains("commitRoomEndpoint"), "the field commits through AppState")
+    expect(settings.contains("roomEndpointURL"), "the draft is the current endpoint")
+    expect(!settings.contains("RoomMemoryEndpoint.resolve"), "appearing does not re-resolve the environment")
+    expect(!settings.contains("100.118.187.99"), "Settings does not hardcode the room IP")
+
+    let state = text("Sources/LabCommand/AppState.swift")
+    expect(state.contains("LiveRoomClient(url:"), "AppState passes an explicit URL")
+    expect(state.contains("RoomMemoryEndpointStore"), "one store owns the current endpoint")
+    expect(state.contains("commitRoomEndpoint"), "one commit method")
+    expect(state.contains("retargeting: room"), "commit retargets the live client")
+    expect(!state.contains("100.118.187.99"), "AppState does not hardcode the room IP")
+
+    let script = text("scripts/live-room-shots.sh")
+    expect(script.contains("export LABCOMMAND_ROOM_URL=\"ws://100.118.187.99:8767\""), "live shots pin the grep URL")
+    expect(script.contains("if [[ \"$MODE\" == \"live\" ]]; then"), "the pin is the live mode only")
+
+    let plistURL = root.appendingPathComponent("Info.plist")
+    guard let data = try? Data(contentsOf: plistURL),
+          let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+          let ats = plist["NSAppTransportSecurity"] as? [String: Any] else {
+        expect(false, "Info.plist ATS dictionary")
+        return
+    }
+    expect(ats["NSAllowsArbitraryLoads"] as? Bool == true, "arbitrary loads is on")
+    expect(ats["NSAllowsLocalNetworking"] == nil, "NSAllowsLocalNetworking would mask arbitrary loads")
+    expect(ats["NSAllowsArbitraryLoadsForMedia"] == nil, "the media exception would mask arbitrary loads")
+    expect(ats["NSAllowsArbitraryLoadsInWebContent"] == nil, "the web-content exception would mask arbitrary loads")
+    let domains = ats["NSExceptionDomains"] as? [String: Any]
+    expect(domains?["100.118.187.99"] != nil && domains?["192.168.68.65"] != nil, "the existing exception domains stay")
+}
+
 func runRoomMemoryEndpointTests() {
     MainActor.assumeIsolated {
         testRoomMemoryEndpointParsesAndResolves()
@@ -309,4 +364,6 @@ func runRoomMemoryEndpointTests() {
         testLiveRoomRetargetDuringHandshakeBackoffAndRapidChanges()
         print("  room endpoint: retarget during handshake and backoff; A→B→C ignores the old bridges"); passed()
     }
+    testRoomMemorySettingsSourcesAndATS()
+    print("  room endpoint: Settings, AppState, live-shot pin, and ATS keys"); passed()
 }

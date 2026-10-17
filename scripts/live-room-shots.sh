@@ -29,6 +29,10 @@ rm -f "$PNG" "$SIDECAR"
 
 export LABCOMMAND_LIVE_ROOM="$MODE"
 export LABCOMMAND_ROOM_SIDECAR="$SIDECAR"
+# The sidecar grep is this IP. A saved preference must not change what live mode dials.
+if [[ "$MODE" == "live" ]]; then
+  export LABCOMMAND_ROOM_URL="ws://100.118.187.99:8767"
+fi
 "$BIN" >/tmp/lc-liveroom-shot-${MODE}.log 2>&1 &
 PID=$!
 echo "pid ${PID}"
