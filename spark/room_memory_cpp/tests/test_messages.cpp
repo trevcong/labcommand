@@ -185,6 +185,18 @@ RequestSync request_events_none() {
     return RequestSync{head("lab-a", kSinceNone, 0, Time{1760400000, 500000000}), std::nullopt, SyncTopic::events};
 }
 
+Epoch epoch_v2() {
+    Epoch e = epoch();
+    e.publisher_generation = kG;
+    return e;
+}
+
+Activity activity_v2() {
+    Activity a = activity();
+    a.publisher_generation = kG;
+    return a;
+}
+
 MemoryStatus memory_status_v2() {
     MemoryStatus s = memory_status();
     s.publisher_generation = kG;
@@ -263,8 +275,6 @@ std::optional<std::uint64_t> generation_of(const T& value) {
         return value.expected_generation;
     } else if constexpr (std::is_same_v<T, SyncEnd>) {
         return value.publisher_generation;
-    } else if constexpr (std::is_same_v<T, Epoch> || std::is_same_v<T, Activity>) {
-        return std::nullopt;
     } else {
         return value.publisher_generation;
     }
@@ -318,6 +328,9 @@ const std::map<std::string, Golden>& goldens() {
         {"sync_end_events_empty_le.hex", golden<SyncEnd>(sync_end_events_empty, true)},
         {"sync_end_events_fallback_le.hex", golden<SyncEnd>(sync_end_events_fallback, true)},
         {"sync_end_map_replay_be.hex", golden<SyncEnd>(sync_end_map_replay, false)},
+        {"epoch_v2_le.hex", golden<Epoch>(epoch_v2, true)},
+        {"epoch_v2_be.hex", golden<Epoch>(epoch_v2, false)},
+        {"activity_v2_le.hex", golden<Activity>(activity_v2, true)},
     };
     return table;
 }
@@ -330,9 +343,6 @@ Bytes u64le(std::uint64_t value) {
     for (int b = 0; b < 8; ++b) out[static_cast<std::size_t>(b)] = static_cast<std::uint8_t>(value >> (8 * b));
     return out;
 }
-
-// Derived on this branch; the Swift suite does not decode Activity yet (PROVENANCE.md).
-bool in_swift(const std::string& name) { return name != "activity_le.hex" && name != "activity_idle_le.hex"; }
 
 Bytes inflate_all(const Bytes& data) {
     z_stream stream{};
@@ -387,7 +397,7 @@ TEST(every_hand_golden_is_covered) {
         CHECK(goldens().count(entry.path().filename().string()) == 1);
     }
     CHECK_EQ(files, goldens().size());
-    CHECK_EQ(files, std::size_t{24});
+    CHECK_EQ(files, std::size_t{27});
 }
 
 TEST(hand_goldens_match_the_swift_copies) {
@@ -396,12 +406,9 @@ TEST(hand_goldens_match_the_swift_copies) {
     for (const auto& entry : std::filesystem::directory_iterator(kSwiftHand)) {
         if (entry.path().extension() == ".hex") copies.insert(entry.path().filename().string());
     }
-    for (const auto& [name, g] : goldens()) {
-        if (in_swift(name)) expected.insert(name);
-    }
+    for (const auto& [name, g] : goldens()) expected.insert(name);
     CHECK(copies == expected);
     for (const auto& [name, g] : goldens()) {
-        if (!in_swift(name)) continue;
         if (hexfile(name, kSwiftHand) != hexfile(name)) throw harness::Failure("Swift copy differs: " + name);
     }
     CHECK(memory_status().to_cdr() == hexfile("memory_status_le.hex", kSwiftHand));
@@ -707,6 +714,16 @@ TEST(layout_detection_from_trailing_bytes) {
     CHECK(!RequestSync::from_cdr(request).token);
     CHECK_THROWS(Invalid, RequestSync::from_cdr(join(request, Bytes(7 + 8, 0))));
     CHECK_THROWS_MATCH(Invalid, "all-zero", RequestSync::from_cdr(join(request, Bytes(7 + 24, 0))));
+    // Epoch ends on a uint8 (7 pad bytes before the generation), Activity on a float32 (4).
+    const Bytes epoch_legacy = hexfile("epoch_le.hex");
+    CHECK(slice(hexfile("epoch_v2_le.hex"), 0, epoch_legacy.size()) == epoch_legacy);
+    CHECK(join(join(epoch_legacy, Bytes(7, 0)), u64le(kG)) == hexfile("epoch_v2_le.hex"));
+    CHECK_THROWS_MATCH(Invalid, "GENERATION_UNKNOWN", Epoch::from_cdr(join(epoch_legacy, Bytes(7 + 8, 0))));
+    CHECK_THROWS_MATCH(Invalid, "neither padding", Epoch::from_cdr(join(join(epoch_legacy, Bytes(3, 0)), u64le(kG))));
+    const Bytes activity_legacy = hexfile("activity_le.hex");
+    CHECK(join(join(activity_legacy, Bytes(4, 0)), u64le(kG)) == hexfile("activity_v2_le.hex"));
+    CHECK_THROWS_MATCH(Invalid, "GENERATION_UNKNOWN", Activity::from_cdr(join(activity_legacy, Bytes(4 + 8, 0))));
+    CHECK_THROWS(Invalid, Activity::from_cdr(join(hexfile("activity_v2_le.hex"), Bytes(4, 0))));
 }
 
 TEST(v2_mask_follows_the_parent) {

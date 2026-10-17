@@ -9,8 +9,8 @@ encoders write little endian. Validation is symmetric (protocol D16): ``to_cdr``
 exactly what ``from_cdr`` rejects. Float fields hold binary32 values; a missing float
 measurement is ``None`` here and NaN on the wire.
 
-Protocol v2 appends fields at the end of ``MemoryStatus``, ``MapBricks``, ``ChangeEvent`` and
-``RequestSync`` (protocol §1.4, §3). The layout comes from the bytes after the last legacy field:
+Protocol v2 appends fields at the end of ``MemoryStatus``, ``MapBricks``, ``ChangeEvent``,
+``Epoch``, ``Activity`` and ``RequestSync`` (protocol §1.4, §3, D38). The layout comes from the bytes after the last legacy field:
 at most 3 is a legacy message, padding to 8 then exactly the v2 fields (then at most 3) is v2, and
 anything else is invalid. ``publisher_generation`` (and the ``RequestSync`` v2 fields) are
 ``None`` for the legacy layout; the encoders write it only when they hold one.
@@ -810,12 +810,14 @@ class Epoch:
     n_moved: int
     coverage_known_frac: Optional[float]
     state: MemoryState
+    publisher_generation: Optional[int] = None  # None: the legacy layout
 
     def __post_init__(self):
         _f32_fields(self, ("coverage_known_frac",))
 
     def validate(self):
         self.header.validate("Epoch")
+        _require_generation(self.publisher_generation, "Epoch: publisher_generation")
         for name in ("n_appeared", "n_disappeared", "n_moved"):
             _require_int(getattr(self, name), 0, (1 << 32) - 1, f"Epoch: {name}")
         _require_fraction(self.coverage_known_frac, "Epoch: coverage_known_frac")
@@ -831,6 +833,8 @@ class Epoch:
         writer.u32(self.n_moved)
         writer.f32(self.coverage_known_frac)
         writer.u8(self.state)
+        if self.publisher_generation is not None:
+            writer.u64(self.publisher_generation)
         return bytes(writer.data)
 
     @classmethod
@@ -841,7 +845,8 @@ class Epoch:
             counts = [reader.u32(name) for name in ("n_appeared", "n_disappeared", "n_moved")]
             coverage = reader.f32("coverage_known_frac")
             state = _enum(MemoryState, reader.u8("state"), "Epoch: state")
-            epoch = cls(header, *counts, None if math.isnan(coverage) else coverage, state)
+            generation = reader.u64("publisher_generation") if reader.is_v2(8, "state") else None
+            epoch = cls(header, *counts, None if math.isnan(coverage) else coverage, state, generation)
             epoch.validate()
             return epoch
         return _decode(data, "Epoch", body)
@@ -865,6 +870,7 @@ class Activity:
     aabb_min: Optional[Tuple[float, float, float]]
     aabb_max: Optional[Tuple[float, float, float]]
     since_s: Optional[float]
+    publisher_generation: Optional[int] = None  # None: the legacy layout
 
     def __post_init__(self):
         _f32_fields(self, ("centroid", "aabb_min", "aabb_max", "since_s"))
@@ -872,6 +878,7 @@ class Activity:
     def validate(self):
         context = "Activity"
         self.header.validate(context)
+        _require_generation(self.publisher_generation, f"{context}: publisher_generation")
         if not isinstance(self.active, bool):
             raise Invalid(f"{context}: active {self.active!r} is not a bool")
         _require_int(self.sensors, 0, 0xFF, f"{context}: sensors")
@@ -916,6 +923,8 @@ class Activity:
         writer.floats(self.aabb_min or (None, None, None))
         writer.floats(self.aabb_max or (None, None, None))
         writer.f32(self.since_s)
+        if self.publisher_generation is not None:
+            writer.u64(self.publisher_generation)
         return bytes(writer.data)
 
     @classmethod
@@ -938,8 +947,9 @@ class Activity:
                     raise Invalid(f"Activity: {what} {values} is partly NaN")
                 geometry.append(None if all(nans) else values)
             since = reader.f32("since_s")
+            generation = reader.u64("publisher_generation") if reader.is_v2(8, "since_s") else None
             activity = cls(header, bool(active), sensors, largest_sensor, n_regions, voxel_count, *geometry,
-                           None if math.isnan(since) else since)
+                           None if math.isnan(since) else since, generation)
             activity.validate()
             return activity
         return _decode(data, "Activity", body)

@@ -137,8 +137,13 @@ func testLiveRoomGoldensDecode() {
         ("change_event_appeared_le", .events),
         ("change_event_moved_mask_le", .events),
         ("memory_status_le", .status),
-        ("epoch_le", nil),
-        ("epoch_be", nil),
+        ("epoch_le", .epoch),
+        ("epoch_be", .epoch),
+        ("epoch_v2_le", .epoch),
+        ("epoch_v2_be", .epoch),
+        ("activity_le", .activity),
+        ("activity_idle_le", .activity),
+        ("activity_v2_le", .activity),
         ("request_sync_map_le", nil),
         ("request_sync_map_be", nil),
         ("request_sync_events_none_le", nil),
@@ -165,7 +170,10 @@ func testLiveRoomGoldensDecode() {
             case let n where n.hasPrefix("memory_status"):
                 let decoded = try R.MemoryStatus.decode(cdr: payload)
                 expect(decoded.eventsSeq == 12 && (decoded.publisherGeneration == g1) == v2, "\(name): events_seq 12, generation")
-            case let n where n.hasPrefix("epoch"): _ = try R.Epoch.decode(cdr: payload)
+            case let n where n.hasPrefix("epoch"):
+                expect((try R.Epoch.decode(cdr: payload).publisherGeneration == g1) == v2, "\(name): generation")
+            case let n where n.hasPrefix("activity"):
+                expect((try R.Activity.decode(cdr: payload).publisherGeneration == g1) == v2, "\(name): generation")
             case let n where n.hasPrefix("sync_end"):
                 expect(try R.SyncEnd.decode(cdr: payload).publisherGeneration == g1, "\(name): generation")
             default:
@@ -178,8 +186,14 @@ func testLiveRoomGoldensDecode() {
         if let topic {
             var mirror = Mirror(tokenSeed: 1)
             _ = mirror.connectionOpened(at: 0, canRequest: false)
+            if topic == .activity || topic == .epoch {
+                // These never fix the wire: a status of the same layout comes first.
+                _ = mirror.receive(topic: .status, payload: status(epoch: 1, seq: 0, g: v2 ? g1 : nil), at: 0)
+            }
             _ = mirror.receive(topic: topic, payload: payload, at: 0)
-            expect(mirror.activity.rejected == 0, "mirror accepts golden \(name)")
+            expect(mirror.activity.rejected == 0 && mirror.activity.sideTopicLayout == 0, "mirror accepts golden \(name)")
+            if topic == .activity { expect(mirror.roomActivity != nil && mirror.isActivityFresh, "golden \(name) is the room activity") }
+            if topic == .epoch { expect(mirror.epochTick != nil && mirror.isEpochFresh, "golden \(name) is the epoch tick") }
             expect(mirror.wire == (v2 ? .v2 : .legacy), "golden \(name) fixes the wire as \(v2 ? "v2" : "legacy")")
             expect(mirror.activity.topics[topic.rawValue]?.count == 1, "activity counts golden \(name) on \(topic.rawValue)")
         }
@@ -729,6 +743,73 @@ func testLiveRoomEmptyMapAndEviction() {
     expect(evicting.openEvents.map(\.event.eventId) == [3], "a newer event still enters latest")
 }
 
+/// `Activity` and `Epoch`: full state per generation, applied by seq, and never the layout's decider.
+func testLiveRoomActivityAndEpoch() {
+    // The reported bug: after a restart the new generation's seq starts at 0 again. It applies; the
+    // old generation's higher seq does not hide it.
+    var mirror = currentMirror()
+    _ = mirror.receive(topic: .activity, payload: LRWire.activity(g1, seq: 50, active: true), at: 100.5)
+    _ = mirror.receive(topic: .epoch, payload: LRWire.epochTick(g1, seq: 9), at: 100.5)
+    expect(mirror.roomActivity?.message.header.seq == 50 && mirror.roomActivity?.message.active == true, "g1 activity 50 held")
+    _ = mirror.receive(topic: .activity, payload: LRWire.activity(g1, seq: 50, active: true), at: 100.6)
+    _ = mirror.receive(topic: .activity, payload: LRWire.activity(g1, seq: 49), at: 100.7)
+    expect(mirror.activity.duplicates == 2 && mirror.roomActivity?.message.header.seq == 50, "a repeated or older seq is a duplicate")
+    _ = mirror.receive(topic: .activity, payload: LRWire.activity(g2, seq: 0), at: 101)
+    expect(mirror.activeGeneration == g2 && mirror.roomActivity?.message.header.seq == 0 && mirror.roomActivity?.message.active == false,
+           "g2 activity seq 0 installs g2 and applies")
+    expect(mirror.epochTick == nil && !mirror.isEpochFresh, "g1's epoch tick does not cross into g2")
+    _ = mirror.receive(topic: .epoch, payload: LRWire.epochTick(g2, seq: 0), at: 101)
+    expect(mirror.epochTick?.message.header.seq == 0 && mirror.isEpochFresh, "g2 epoch seq 0 applies")
+    _ = mirror.receive(topic: .activity, payload: LRWire.activity(g1, seq: 51), at: 101.2)
+    expect(mirror.activity.olderGeneration == 1 && mirror.roomActivity?.message.publisherGeneration == g2, "a late g1 activity is ignored")
+    // Freshness: 3 s for activity, 15 s for epoch, on this connection only.
+    _ = mirror.tick(at: 104.1)
+    expect(!mirror.isActivityFresh && mirror.isEpochFresh, "activity stale after 3 s, epoch still fresh")
+    _ = mirror.tick(at: 116.1)
+    expect(!mirror.isEpochFresh, "epoch stale after 15 s")
+    _ = mirror.receive(topic: .epoch, payload: LRWire.epochTick(g2, seq: 1), at: 116.5)
+    mirror.connectionClosed(at: 117)
+    _ = mirror.connectionOpened(at: 117, canRequest: false)
+    expect(mirror.epochTick != nil && !mirror.isEpochFresh, "a tick from the last connection is kept, not fresh")
+
+    // A node from before the Activity v2 tail (PR #18): v2 status, legacy transient_local Activity
+    // that arrives first. It neither fixes the wire nor archives anything.
+    var rollout = Mirror(tokenSeed: 5)
+    _ = rollout.connectionOpened(at: 0, canRequest: true)
+    _ = rollout.receive(topic: .activity, payload: LRWire.activity(nil, seq: 7), at: 0)
+    expect(rollout.wire == .undetermined && rollout.activity.sideTopicLayout == 1 && rollout.roomActivity == nil,
+           "a first legacy activity is dropped and leaves the wire undecided")
+    _ = rollout.receive(topic: .mapBricks, payload: snapshot(epoch: 5, seq: 10, [brick(0)]), at: 0.1)
+    _ = rollout.receive(topic: .status, payload: status(epoch: 5, seq: 1), at: 0.2)
+    _ = rollout.receive(topic: .activity, payload: LRWire.activity(nil, seq: 8), at: 1)
+    expect(rollout.wire == .v2 && rollout.mapState == .current && rollout.archive.isEmpty && rollout.activity.wireMismatch == 0,
+           "the stateful topics decide v2; the map is current and nothing was archived")
+    expect(rollout.activity.sideTopicLayout == 2 && rollout.roomActivity == nil && rollout.continuity == .verified,
+           "legacy activity on a v2 wire is dropped and counted, continuity untouched")
+
+    // A v2 activity before anything else waits for the wire too; a legacy node is all legacy.
+    var early = Mirror(tokenSeed: 6)
+    _ = early.connectionOpened(at: 0, canRequest: false)
+    _ = early.receive(topic: .activity, payload: LRWire.activity(g1, seq: 0), at: 0)
+    expect(early.wire == .undetermined && early.activeGeneration == nil && early.activity.sideTopicLayout == 1,
+           "a first v2 activity is dropped, installs nothing")
+    var legacy = Mirror(tokenSeed: 7)
+    _ = legacy.connectionOpened(at: 0, canRequest: false)
+    _ = legacy.receive(topic: .status, payload: status(epoch: 5, seq: 1, g: nil), at: 0)
+    _ = legacy.receive(topic: .activity, payload: LRWire.activity(nil, seq: 3), at: 0.5)
+    _ = legacy.receive(topic: .activity, payload: LRWire.activity(nil, seq: 3), at: 0.6)
+    _ = legacy.receive(topic: .activity, payload: LRWire.activity(nil, seq: 0), at: 1.5)
+    expect(legacy.wire == .legacy && legacy.roomActivity?.message.header.seq == 0 && legacy.activity.duplicates == 1,
+           "legacy wire: only an exact copy is a duplicate; a lower seq (a restart) applies")
+    _ = legacy.receive(topic: .activity, payload: LRWire.activity(g1, seq: 4), at: 2)
+    expect(legacy.activity.sideTopicLayout == 1 && legacy.activity.wireMismatch == 0, "v2 activity on a legacy wire: dropped, side-topic counter")
+
+    // Undecodable activity is rejected like any message, without touching the map.
+    var bad = currentMirror()
+    _ = bad.receive(topic: .activity, payload: Data(LRWire.activity(g1, seq: 1).dropLast(2)), at: 100)
+    expect(bad.activity.rejected == 1 && bad.mapState == .current, "a truncated activity is rejected; the map stays current")
+}
+
 func runLiveRoomTests() {
     testLiveRoomFoxgloveClientFrames()
     print("  LiveRoom: serverInfo capabilities, client advertise + message data, topic/schema match (sync/end in, events_fallback out)"); passed()
@@ -754,6 +835,8 @@ func runLiveRoomTests() {
     print("  LiveRoom: generations install on the first message, archive the old run, ignore older ones; unreadable map → resync"); passed()
     testLiveRoomEmptyMapAndEviction()
     print("  LiveRoom: an empty-map answer yields to a later status or reconnect; eviction never reopens a closed event"); passed()
+    testLiveRoomActivityAndEpoch()
+    print("  LiveRoom: Activity/Epoch per generation (a restart's seq 0 applies), seq duplicates, freshness; never decide the wire"); passed()
     runLiveRoomTraceTests()
 }
 

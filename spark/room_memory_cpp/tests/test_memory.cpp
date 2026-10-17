@@ -1538,6 +1538,8 @@ TEST(activity_reports_the_newest_window_with_motion) {
     RoomMemory memory(config, kStart, kGeneration);
     const msg::Activity idle = memory.activity(stamp(0));
     CHECK(!idle.active && !idle.since_s && idle.header.seq == 0);
+    // Like every stateful message, Activity carries the process's generation (seq restarts at 0 per generation).
+    CHECK(idle.publisher_generation == kGeneration);
     const std::int64_t second = build_reference(memory, room);
     for (int n = 0; n < 4; ++n) {
         const Cloud box = scenes::box_shell({0.3 + 0.3 * (n % 2), 1.2, 0.3});

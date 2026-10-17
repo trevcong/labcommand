@@ -46,6 +46,26 @@ enum LRWire {
         return cdr(message.encodedCDR, "status g\(String(describing: generation)) s\(seq)")
     }
 
+    /// An inactive `Activity` (nothing moving), or an active one with one JT128 region.
+    static func activity(_ generation: UInt64?, seq: UInt64, epoch: UInt64 = 5, active: Bool = false, room: String = room) -> Data {
+        let message = RM.Activity(
+            header: RM.Header(roomId: room, mapEpoch: epoch, seq: seq, stamp: stamp(seq)), active: active,
+            sensors: active ? .jt128 : [], largestSensor: active ? .jt128 : [], regionCount: active ? 1 : 0,
+            voxelCount: active ? 12 : 0, centroid: active ? SIMD3(1, 1, 0.5) : nil,
+            aabb: active ? RM.ChangeEvent.Box(min: SIMD3(0.9, 0.9, 0.4), max: SIMD3(1.1, 1.1, 0.6)) : nil,
+            sinceS: active ? 0 : nil, publisherGeneration: generation
+        )
+        return cdr(message.encodedCDR, "activity g\(String(describing: generation)) s\(seq)")
+    }
+
+    static func epochTick(_ generation: UInt64?, seq: UInt64, epoch: UInt64 = 5, room: String = room) -> Data {
+        let message = RM.Epoch(
+            header: RM.Header(roomId: room, mapEpoch: epoch, seq: seq, stamp: stamp(seq)), appearedCount: 0,
+            disappearedCount: 0, movedCount: 0, coverageKnownFraction: 0.5, state: .tracking, publisherGeneration: generation
+        )
+        return cdr(message.encodedCDR, "epoch g\(String(describing: generation)) s\(seq)")
+    }
+
     static func snapshot(_ generation: UInt64?, epoch: UInt64, seq: UInt64, _ bricks: [RM.Brick], room: String = room) -> Data {
         let message = RM.MapBricks(header: RM.Header(roomId: room, mapEpoch: epoch, seq: seq, stamp: stamp(seq)), kind: .snapshot,
                                    baseEpoch: 0, voxelSize: 0.05, bricks: bricks, publisherGeneration: generation)

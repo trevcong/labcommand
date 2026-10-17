@@ -1,6 +1,6 @@
 # Room memory protocol, v1 (Spark `room_memory` → LabCommand Mac)
 
-Status: draft for PR 0.1. Codex has not signed it off. Trevor decided D5, D9 and D19 on 2026-10-14 (§8); he has not answered Q1–Q5 (end of this doc). PR #13 added D23–D24 (the `seq` rule and durability), D25 (`OperatorAction`), D26 (the events high-water mark, `MemoryStatus.events_seq`) and D27 (the events fallback header, `EventsFallback`) as proposals. PR #14 (the Spark node, merged before it) added D28–D33 and §3.7 (`Activity`). `pubgen` (PLAN-PUBGEN, approved by Astra) adds protocol v2: D34 (publisher generations), D35 (`RequestSync` token and expected generation), D36 (`SyncEnd`, which supersedes D27 and D26's request mark) and D37 (the generation-scoped mirror, which supersedes D23's restart cases). §5 is the single normative statement of the resync rules. Sources: `RESEARCH_BRIEF.md` §2.2–§2.5 (2026-10-14). The `.msg` files are in `ros/labcommand_msgs/msg/`. The Swift codecs are `Sources/LabCommandCore/RoomMemoryMessages.swift` and `RoomMemoryCDR.swift`.
+Status: draft for PR 0.1. Codex has not signed it off. Trevor decided D5, D9 and D19 on 2026-10-14 (§8); he has not answered Q1–Q5 (end of this doc). PR #13 added D23–D24 (the `seq` rule and durability), D25 (`OperatorAction`), D26 (the events high-water mark, `MemoryStatus.events_seq`) and D27 (the events fallback header, `EventsFallback`) as proposals. PR #14 (the Spark node, merged before it) added D28–D33 and §3.7 (`Activity`). `pubgen` (PLAN-PUBGEN, approved by Astra) adds protocol v2: D34 (publisher generations), D35 (`RequestSync` token and expected generation), D36 (`SyncEnd`, which supersedes D27 and D26's request mark) and D37 (the generation-scoped mirror, which supersedes D23's restart cases); its follow-up adds D38 (the generation on `Activity` and `Epoch`). §5 is the single normative statement of the resync rules. Sources: `RESEARCH_BRIEF.md` §2.2–§2.5 (2026-10-14). The `.msg` files are in `ros/labcommand_msgs/msg/`. The Swift codecs are `Sources/LabCommandCore/RoomMemoryMessages.swift` and `RoomMemoryCDR.swift`.
 
 The Spark does all perception and keeps the memory. The Mac mirrors the reference map, the event list and the timeline, and renders them. It never infers a change itself. Five Spark → Mac topics carry the state, three sync topics carry answers to the Mac's resync requests, and two Mac → Spark topics carry those requests and the operator's actions. How they travel between the Spark and the Mac is open (§2, D28, Q5): a dedicated foxglove_bridge on :8767 in the room-memory container, or the existing foxglove_bridge on :8765 with the requests relayed over the ssh-authenticated command-center API on :8766.
 
@@ -18,7 +18,7 @@ The Spark does all perception and keeps the memory. The Mac mirrors the referenc
 - **One exception to the byte order.** `MapBricks.payload` is a `uint8[]` whose contents are packed little endian in either CDR byte order (§3.1).
 - **Protocol v2 fields and layout detection (D34).** The v2 fields sit at the end of each message, after its last legacy field, so every legacy byte offset is unchanged. A decoder decides the layout from what is left there, never from a schema:
   - at most 3 unread bytes: the **legacy** layout;
-  - padding to 8, then exactly the v2 fields (8 bytes for `MemoryStatus` and `MapBricks`, 16 for a `ChangeEvent` with a mask, 8 without, 24 for `RequestSync`), then at most 3: **v2**;
+  - padding to 8, then exactly the v2 fields (8 bytes for `MemoryStatus`, `MapBricks`, `Epoch` and `Activity`, 16 for a `ChangeEvent` with a mask, 8 without, 24 for `RequestSync`), then at most 3: **v2**;
   - anything else: *invalid*. Pad bytes are not checked, as with every alignment.
   - A `ChangeEvent` with a mask: the nested `MapBricks` is not at the end, so the outer decoder decides once, after the nested payload, for both messages (16 bytes: the mask's generation, then the parent's). A legacy event has a legacy mask and a v2 event a v2 mask; nothing else can be encoded.
   - A v2 message cut inside its v2 fields can read as a valid legacy message. The Mac fixes the layout per connection (§5), so such a message is a wire mismatch there, and a map one marks the map stale like a rejected one.
@@ -62,7 +62,7 @@ Every message starts with these four fields, in the order the brief lists them:
 
 A message whose `room_id` differs from the room being viewed is ignored.
 
-**Publisher generation (D34).** Every stateful Spark → Mac message (`MemoryStatus`, `MapBricks` including the `ChangeEvent.mask`, `ChangeEvent`, `SyncEnd`) ends with `uint64 publisher_generation`: the generation of the node process that published it. It is durable and increasing per room (§5), the same for every message of one process, and never `GENERATION_UNKNOWN` (0). `seq` orders messages only within one (generation, topic). A replay resends the original bytes, so it carries the original generation, which is the answering process's: the logs live in memory for one process. `map_epoch` stays a map revision, independent of the generation. "Publisher generation" is not Phase 3's `room_id` generation (P9, `lab` → `lab~2`); this doc always says "publisher generation" in full. `Activity` and `Epoch` carry none (unchanged); saved reference files are `MapBricks` in the legacy layout (§5).
+**Publisher generation (D34).** Every Spark → Mac message (`MemoryStatus`, `MapBricks` including the `ChangeEvent.mask`, `ChangeEvent`, `SyncEnd`, `Activity`, `Epoch`) ends with `uint64 publisher_generation`: the generation of the node process that published it. It is durable and increasing per room (§5), the same for every message of one process, and never `GENERATION_UNKNOWN` (0). `seq` orders messages only within one (generation, topic). A replay resends the original bytes, so it carries the original generation, which is the answering process's: the logs live in memory for one process. `map_epoch` stays a map revision, independent of the generation. "Publisher generation" is not Phase 3's `room_id` generation (P9, `lab` → `lab~2`); this doc always says "publisher generation" in full. `Activity` and `Epoch` carry it too (D38): they are transient_local and their `seq` restarts at 0 with each process, so without it a Mac holding the old run's higher `seq` would take the new run's messages for stored copies. They are full state, so the generation only scopes them; they never decide a connection's layout (§5.3). Saved reference files are `MapBricks` in the legacy layout (§5).
 
 ### 1.5 Missing values
 
@@ -105,7 +105,7 @@ Topic names are a proposal for PR 2.4 (D18):
   - `map_bricks` and `events`: the Mac gets the map and the recent events by `RequestSync` (§5).
   - The sync topics, `sync/end` included: an answer is for the requests outstanding when it is sent, not for a later subscriber.
   - `request_sync` and `operator`: a restarted node must not receive a stored request or action again. A replayed `OperatorAction` would act twice.
-- **The nodes match this only for `activity`.** The Python node (`spark/room_memory`) and the C++ node (`spark/room_memory_cpp`) declare `activity` transient_local (PR #14). They publish `status` volatile, leave every other topic at the ROS 2 default (volatile) without declaring it, and have no `epoch` topic. The change is planned in `docs/phase3-live-integration.md` §2.5.
+- **The nodes match this.** The Python node (`spark/room_memory`) and the C++ node (`spark/room_memory_cpp`) declare every topic's durability: `status` and `activity` transient_local with depth 1, the others volatile (`docs/phase3-live-integration.md` §2.5). Neither publishes `epoch` yet: its counts are of CONFIRMED events (D13), nothing reaches CONFIRMED before PR 2.3, and cumulative counts "since the room was created" also need saving across restarts. The topic's QoS above is the rule for when it is published.
 - In ROS 2 a volatile subscriber still receives from a transient_local publisher. A transient_local subscriber receives nothing from a volatile one.
 
 **Transport (D28, open: Q5).** Two options are on the table, and Trevor has not chosen. Both carry the same CDR bytes, and the node answers whatever arrives on `/room_memory/request_sync`, so the protocol does not depend on the choice.
@@ -119,7 +119,7 @@ The :8767 option as implemented: the room-memory container starts its own foxglo
 
 ## 3. Messages
 
-The `.msg` text below is the legal ROS 2 version of §2.4. §8 (D1) lists every syntax change. Field names, types and order are as §2.4 gives them, except for `MapBricks`, whose brick arrays moved into a compressed payload (D9). §3.5 adds `RequestSync` (D19, D35), §3.6 adds `OperatorAction` (D25), §3.7 adds `Activity` (D33), and §3.8 adds `SyncEnd` and `SeqRange` (D36). Protocol v2 appends `publisher_generation` (D34) to §3.1–§3.3. The *missing* column says how "not available" travels on the wire, and the *rendering* column says what the Mac shows then. "Stale" is the message-level rendering of §5.
+The `.msg` text below is the legal ROS 2 version of §2.4. §8 (D1) lists every syntax change. Field names, types and order are as §2.4 gives them, except for `MapBricks`, whose brick arrays moved into a compressed payload (D9). §3.5 adds `RequestSync` (D19, D35), §3.6 adds `OperatorAction` (D25), §3.7 adds `Activity` (D33), and §3.8 adds `SyncEnd` and `SeqRange` (D36). Protocol v2 appends `publisher_generation` (D34) to §3.1–§3.4 and §3.7 (D38). The *missing* column says how "not available" travels on the wire, and the *rendering* column says what the Mac shows then. "Stale" is the message-level rendering of §5.
 
 ### 3.1 `MapBricks`: snapshot or delta
 
@@ -320,9 +320,10 @@ uint32 n_disappeared
 uint32 n_moved
 float32 coverage_known_frac
 uint8 state
+uint64 publisher_generation
 ```
 
-§2.4 gives Epoch as prose: "epoch id, stamp, counts of appeared/disappeared/moved, coverage_known_frac, state". The epoch id is `map_epoch` (D2).
+§2.4 gives Epoch as prose: "epoch id, stamp, counts of appeared/disappeared/moved, coverage_known_frac, state". The epoch id is `map_epoch` (D2). No node publishes `Epoch` yet (§2): its counts are of CONFIRMED events, and nothing reaches CONFIRMED before PR 2.3.
 
 | field | type | unit | valid | missing on the wire | rendering when missing / invalid |
 |---|---|---|---|---|---|
@@ -331,8 +332,9 @@ uint8 state
 | `n_moved` | `uint32` | events | same, MOVED | cannot be missing | stale: "—" |
 | `coverage_known_frac` | `float32` | fraction 0–1 | as in MemoryStatus | NaN | "coverage —" |
 | `state` | `uint8` | enum | MemoryStatus `STATE_*` at this tick | cannot be missing | other value: message rejected |
+| `publisher_generation` | `uint64` | generation | §1.4; ≠ 0; after `state`, 7 pad bytes to 8 (D38) | absent: the legacy layout (§1.1) | 0: *invalid* |
 
-**Wire size.** `4 + C + 17` bytes: 53 B for "lab".
+**Wire size.** `4 + C + 32` bytes: 68 B for "lab" (legacy `4 + C + 17`, 53 B).
 
 ### 3.5 `RequestSync`: resync request, Mac → Spark
 
@@ -371,6 +373,11 @@ Trevor's D19 gives `RequestSync{room_id, since_epoch, since_seq, stamp}`. The co
 ### 3.6 `OperatorAction`: one operator action, Mac → Spark
 
 Proposed in PR #13 (D25). It is published on `/room_memory/operator` (§2), and the room-memory node is its only subscriber.
+
+**Out of scope for protocol v2.** This section and `OperatorAction.msg` are a proposal. Protocol v2 (D34–D38) defines no codec, golden or handler for it, in any language, and its tests do not cover it. Codecs and goldens are Phase 3 stage S5, written together with the node's handler, for three reasons:
+- **Nothing would use them.** No node subscribes to `/room_memory/operator`, and the Mac has no operator UI that sends an action.
+- **No transport.** How a Mac → Spark message reaches the node is open (D28, Q5), and the deployed bridge offers no `clientPublish` (§5.3).
+- **The layout is not final.** An action is compare-and-set on `map_epoch` and `expected_state`, but not on the publisher generation. A REREFERENCE, PAUSE or RESUME sent just before a restart could act on the new process, whose `map_epoch` can equal the old one when no references were saved (§1.4). S5 decides whether the message gets an `expected_generation` (as `RequestSync` has, D35) before any bytes are frozen in a golden. The wire size below was computed by hand from §1.1, not encoded.
 
 ```
 uint8 ACTION_ACKNOWLEDGE=0
@@ -443,13 +450,14 @@ uint32 voxel_count
 float32[3] centroid
 float32[6] aabb
 float32 since_s
+uint64 publisher_generation
 ```
 
 Activity is never a change: nothing in it becomes a `ChangeEvent`, and `MemoryStatus` and `ChangeEvent` are unchanged (D33). An *activity region* is a change region of one sensor's tracking window that the window's own evidence supports and that either appeared new in that window or lost its shape (§4.2). Regions matched to an open event are not activity. `active` false means no such region, not a motionless room: still people, motion below `min_voxels` and motion inside an open event do not show.
 
 | field | type | unit | valid | missing on the wire | rendering when missing / invalid |
 |---|---|---|---|---|---|
-| `seq` | `uint64` | count | per-topic counter, +1 per message | cannot be missing | — |
+| `seq` | `uint64` | count | per-topic counter, +1 per message, from 0 per publisher generation | cannot be missing | — |
 | `active` | `bool` | — | a tracking window since the previous `Activity` had activity | cannot be missing | other value than 0/1: message rejected |
 | `sensors` | `uint8` | bitmask | `SENSOR_*` with activity in the newest such window; 0 when inactive | cannot be missing | undefined bit: message rejected |
 | `largest_sensor` | `uint8` | enum | the `SENSOR_*` bit whose frame `centroid` and `aabb` are in (D30); one bit of `sensors`; 0 when inactive | cannot be missing | otherwise rejected |
@@ -457,8 +465,9 @@ Activity is never a change: nothing in it becomes a `ChangeEvent`, and `MemorySt
 | `voxel_count` | `uint32` | voxels | their voxels (a move counts its new pose); 0 when inactive | cannot be missing | — |
 | `centroid`, `aabb` | `float32[3]`, `float32[6]` | m | the largest activity region (most voxels; ties to the lower sensor bit), as a `ChangeEvent` would carry it | NaN ×3, NaN ×6 when inactive | partly NaN: rejected |
 | `since_s` | `float32` | s | from the newest window with activity to `stamp`, ≥ 0 | NaN = none since the node started | negative: rejected |
+| `publisher_generation` | `uint64` | generation | §1.4; ≠ 0; after `since_s`, 4 pad bytes to 8 (D38) | absent: the legacy layout (§1.1) | 0: *invalid* |
 
-**Wire size.** `4 + C + 52` bytes: 88 B for "lab".
+**Wire size.** `4 + C + 64` bytes: 100 B for "lab" (legacy `4 + C + 52`, 88 B).
 
 ### 3.8 `SyncEnd` and `SeqRange`: the end-of-answer manifest, Spark → Mac
 
@@ -591,7 +600,7 @@ Let `g` be the node's generation. `since` is honoured only when `expected_genera
 
 `RoomMemoryMirror` (`Sources/LabCommandCore/LiveRoom/`) holds one **active** generation state, the only state that renders as current, an archive of the newest 2 retired generations (display only), the highest generation ever installed, and one retrieval per topic. Validation (decode, `room_id`, the D16 rules) comes first; a rejected message changes nothing except the counters and, for a map message, the map's STALE state.
 
-**Wire.** The layout (§1.1) of the first room-memory message decoded on a connection fixes it. A later message of the other layout on that connection is dropped and counted (`wireMismatch`); a map one also marks the map stale. Every reconnect re-decides.
+**Wire.** The layout (§1.1) of the first stateful message (`map_bricks`, `events`, `status`, a sync topic) decoded on a connection fixes it. A later message of the other layout on that connection is dropped and counted (`wireMismatch`); a map one also marks the map stale. Every reconnect re-decides. `Activity` and `Epoch` never fix it (D38): one that arrives before the layout is fixed, or in the other layout, is dropped and counted (`sideTopicLayout`), and changes nothing else. A node from before D38 publishes v2 status, map and events next to legacy `Activity`, and its transient_local `Activity` copy usually arrives first; letting it decide would run the Mac in legacy mode against a v2 node.
 
 **Generations.**
 - A v2 message of a generation above the highest installed **installs** it: the active state is archived (its tail is unknown: a retired generation has no final bound on the wire), a fresh empty state is created, and every retrieval goes idle. The message is then handled in it. Generations are durable and wall-clock floored, so a newer value always belongs to a later process; installing on the first validated message loses nothing and needs no buffer, and coverage cannot be complete or empty without a witness of that generation.
@@ -621,7 +630,7 @@ Let `g` be the node's generation. `since` is honoured only when `expected_genera
 
 **No request path.** Without client publishing or a relay, retrieval cannot run: coverage typically reads `missing(pending: …)` after a mid-stream connect, the map becomes current from the next keyframe, and the UI says "no request path" instead of retrying.
 
-**`status`, `activity`, `epoch`.** These are full-state messages, so a gap is only counted, and the message is applied. All three are transient_local (§2, D24); a stored copy delivered again repeats its `seq` and is ignored. Each is stale when its newest message is older than 3 periods: 3 s for `status` and `activity`, and 15 s for `epoch`.
+**`status`, `activity`, `epoch`.** These are full-state messages, so a gap is not a resync, and the message is applied. All three are transient_local (§2, D24); within a generation a stored copy delivered again repeats its `seq` and is ignored, and a `seq` not above the held one is never applied. Each is scoped to its generation: a newer generation starts empty, so a restarted node's `seq` 0 applies (D38), and an older generation's message is ignored. On a legacy wire only an exact copy (`seq` and `stamp`) is a duplicate. Each is stale when its newest message on this connection is older than 3 periods: 3 s for `status` and `activity`, and 15 s for `epoch`.
 
 ## 6. Honest-state rendering rules
 
@@ -645,8 +654,8 @@ These extend the app's existing contract (missing ≠ zero, a running container 
 | stream | rate | message size ("lab", default zlib) | steady state |
 |---|---|---|---|
 | MemoryStatus | 1 Hz | 84 B (exact; legacy 76 B) | 0.08 KB/s |
-| Activity | 1 Hz | 88 B (exact) | 0.09 KB/s |
-| Epoch | 0.2 Hz | 53 B (exact) | 0.01 KB/s |
+| Activity | 1 Hz | 100 B (exact; legacy 88 B) | 0.10 KB/s |
+| Epoch | 0.2 Hz | 68 B (exact; legacy 53 B), not published yet | 0.01 KB/s |
 | ChangeEvent, no mask | per transition, < 1/min | 148 B (exact; legacy 136 B) | < 0.01 KB/s |
 | ChangeEvent with a 25 cm box mask | per transition | 276 B (v2, from the measured 253 B legacy size) | < 0.01 KB/s |
 | MapBricks delta, 25 cm box added | ≤ 0.2 Hz, on reference change | 380 B (v2, from the measured 367 B legacy size) | < 0.1 KB/s |
@@ -655,7 +664,7 @@ These extend the app's existing contract (missing ≠ zero, a running container 
 | OperatorAction (Mac → Spark) | per operator action | 117 B (exact, for the §3.6 example) | — |
 | SyncEnd | one per answered request | 84 B with no ranges, + 16 B per range (+ 4 B padding per non-empty list; §3.8) | — |
 
-**Measured on the real 5-minute static recording** `static5m` (`spark/room_memory_cpp/PLAN.md`), both lidars, node defaults, the JT128's reference as the map, before protocol v2 (v2 adds 8 B per status and up to 15 B per map message): 0.89 KB/s mean over all room-memory topics. Tracking teaches the reference nothing (`learn_windows` 0), so there are no deltas, and Trevor's motion next to the rig is activity, not events.
+**Measured on the real 5-minute static recording** `static5m` (`spark/room_memory_cpp/PLAN.md`), both lidars, node defaults, the JT128's reference as the map, before protocol v2 (v2 adds 8 B per status, 12 B per activity and up to 15 B per map message): 0.89 KB/s mean over all room-memory topics. Tracking teaches the reference nothing (`learn_windows` 0), so there are no deltas, and Trevor's motion next to the rig is activity, not events.
 
 | stream | messages | bytes | mean |
 |---|---|---|---|
@@ -784,13 +793,15 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **D24. Durability** (PR #13; Phase 3's P2). It needs Trevor's and Codex's review.
   - `status`, `activity` and `epoch` are transient_local with depth 1, so a Mac shows the memory state as soon as it subscribes. Without it, the Mac would wait up to 1 s for `status` and `activity` and 5 s for `epoch`.
   - Every other topic is volatile, and says so explicitly (§2).
-  - The nodes match it only for `activity` (PR #14): both publish `status` volatile. `docs/phase3-live-integration.md` §2.5 plans the change.
+  - **The nodes now match it** (protocol-v2 follow-up; PR #14 had done `activity` only). The code was changed, not this decision, because nothing argued for volatile `status` any more: a stored copy is safe now that `status` carries the publisher generation (D34), the mirror already treats a `seq` not above the held one as a transient_local copy (§5.3), and `activity` had used the same QoS through the same bridge since PR #14. A Mac that subscribes gets the memory state at once instead of up to 1 s later.
+  - `epoch` is the exception: no node publishes it yet (§2), so it has no durability to get wrong. Its row in §2 stands for when PR 2.4 adds it.
 - **D25. `OperatorAction`** (PR #13; Phase 3's P6). It needs Trevor's and Codex's review. §3.6 defines it, with `ros/labcommand_msgs/msg/OperatorAction.msg`.
   - The actions asked for (acknowledge, dismiss, re-baseline, label) and Phase 3's earlier list map onto the existing transitions. Acknowledge and label are log-only. Dismiss is §4.2's "operator revert". Re-baseline is §4.1's "operator re-references the room". Pause and resume are §4.1's operator pause and resume. Accept is §4.2's "operator accept". Mark ground truth is for PR 3.2's scoring.
   - The common fields serve as the header, not `std_msgs/Header` (D2).
   - `operator_id` is self-asserted. Neither the bridge's client-publish path nor Phase 3's ssh relay can tell which person sent an action.
   - **ACCEPTED follows its map message** (§4.2). If ACCEPTED went out first, every Mac would remove the overlay while its map still lacked the change. A delta can wait 5 s for the 0.2 Hz slot (§2), and longer behind Phase 3's byte bucket (`docs/phase3-live-integration.md` §3.3). So the node publishes ACCEPTED right after the message that carries the change. The Mac also removes the overlay only once its mirror's epoch is ≥ the event's `map_epoch`. `expected_state` is compared with the node's own state, so an accept still waiting for its map message cannot also be dismissed.
   - Open: re-referencing outside RIG_MOVED, and showing labels and acknowledgements on other Macs. Both would change §4.1 or `ChangeEvent`.
+  - **Out of scope for protocol v2** (§3.6): no codec, golden or handler in any language until Phase 3 S5, which also decides whether an action is fenced to the publisher generation (an `expected_generation`, as D35 gives `RequestSync`).
 - **D26. Events high-water mark** (PR #13; Phase 3's P16). **Partly superseded by D36:** `events_seq` stays (scoped to the generation by D34) as a witness of H, but the request "mark" no longer decides completion; the `SyncEnd` manifest does. §5 defines it, and §3.3 adds `uint64 events_seq` to `MemoryStatus`. That changes `MemoryStatus` bytes: 8 more per message.
   - **`events_seq` is the newest events `seq`.** Before this, a replay was complete once it reached the highest live `seq` the Mac had seen. A Mac that missed the last events before a quiet period has seen none of them on the live topic, so its request was done at once and the history stayed wrongly complete. The map already had its high-water mark in `map_epoch`.
   - **Not an in-band end marker.** An earlier draft ended every answer with its last message sent again. Sync topics are shared, and the repeat was an ordinary `ChangeEvent`. So after a lost marker, another answer starting at the same `seq` read as the marker, and the request closed before the missed events arrived (Codex, PR #13). `events_seq` is not part of any answer. A lost message only delays completion.
@@ -808,18 +819,19 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **D30. One published map.** There is no JT128↔Mid-360 extrinsic yet (brief R1), so the references stay per sensor and `map_bricks` carries one of them, `map_sensor` (default: the JT128 when configured; its repeating pattern gives the denser map). `n_bricks` and `coverage_known_frac` describe that map. Events of the other sensor are in that sensor's own frame.
 - **D31. A persistence gate before CANDIDATE (strengthened by D33).** On the static recording the node sent ~120 CANDIDATE/EXPIRED messages per minute. Most of them came from a reference built as the union of 5 windows of the Mid-360's sparse non-repetitive pattern; per-voxel window counts fix that (`spark/room_memory_cpp/PLAN.md`). As a second line, a region now has to persist `candidate_windows` windows before its CANDIDATE is sent. An open candidate expires only after `expire_windows` unmatched windows, so an intermittently seen change does not flicker. T_commit (CANDIDATE → CONFIRMED) is unchanged and still PR 2.3.
 - **D32. No events in the near field (superseded by D33: removed).** The rig stands about 1.3 m from where someone works. Live and in both static recordings, something low there (z up to ~0.8 m in the sensor frames) shifts every few seconds to minutes, seen by both lidars at once, and it was 100 % of the remaining events (live 2–18 per minute). A change region with a voxel center within `near_range_m` (2.0 m) of its sensor is not reported, whichever pose of a move it is. With it, the diff's `tolerance` 2 and `min_voxels` 8 remove the far fragments of the same motion. This is a blind zone, not noise removal: a real change within 2 m of either lidar is not reported. 0.3 m cubes from 2.2 m out are still detected at the same latency (`spark/room_memory_cpp/PLAN.md`, "False change events"). *Removed:* the "something low" was Trevor working at a desk (he confirmed it), real transient motion, and a blind zone also hid real changes next to the rig. `near_range_m` is gone; `tolerance` and `min_voxels` are back at 1 and 6. D33 replaces it.
-- **D33. Activity is not change.** Motion next to the rig (a person working) is reported on `/room_memory/activity` (§3.7), never as a `ChangeEvent`. A region becomes a CANDIDATE only after it has stayed settled for `candidate_windows` windows (§4.2): fresh, the same shape, and no activity within `activity_radius_m`; so a change made by a person is reported that long after they stop moving next to it. `candidate_windows` is 40 (40 s at `window_s` 1): on both static recordings, looped for 30 minutes, the longest settled run of anything Trevor left is 24 windows (the part of his BUILDING-time pose he moved away from). 0.3 m boxes 1.0–4.6 m from either lidar are CANDIDATEs 40–43 s after they appear, disappear or move. Tracking teaches the reference nothing (`learn_windows` 0): learning while he worked wrote his surroundings into the reference and produced a 45-window still residue. Limits: a person who stays perfectly still for longer than the gate after shifting is reported, and so is a reference built while someone sat in it once they leave; without the JT128↔Mid-360 extrinsic (D30) one sensor's activity cannot hold the other's regions. The Mac does not decode `Activity` yet.
+- **D33. Activity is not change.** Motion next to the rig (a person working) is reported on `/room_memory/activity` (§3.7), never as a `ChangeEvent`. A region becomes a CANDIDATE only after it has stayed settled for `candidate_windows` windows (§4.2): fresh, the same shape, and no activity within `activity_radius_m`; so a change made by a person is reported that long after they stop moving next to it. `candidate_windows` is 40 (40 s at `window_s` 1): on both static recordings, looped for 30 minutes, the longest settled run of anything Trevor left is 24 windows (the part of his BUILDING-time pose he moved away from). 0.3 m boxes 1.0–4.6 m from either lidar are CANDIDATEs 40–43 s after they appear, disappear or move. Tracking teaches the reference nothing (`learn_windows` 0): learning while he worked wrote his surroundings into the reference and produced a 45-window still residue. Limits: a person who stays perfectly still for longer than the gate after shifting is reported, and so is a reference built while someone sat in it once they leave; without the JT128↔Mid-360 extrinsic (D30) one sensor's activity cannot hold the other's regions. The Mac decodes `Activity` into its mirror (§5.3, D38); the view does not show it yet.
 
-- **D34. Publisher generations** (`pubgen`, PLAN-PUBGEN §2–§3). Every stateful Spark → Mac message ends with `uint64 publisher_generation`, durable and increasing per room (`max(stored + 1, now_ms)`, written and fsynced before the first publish, under a per-room `flock`, fail closed), the same for every message of one process. `seq` is ordered per (generation, topic). The v2 fields are appended after each message's last legacy field, so every legacy offset and golden prefix is unchanged, and the layout is detected from the trailing bytes (§1.1): the Mac needs no schema text, and `FoxgloveProtocol.Channel` carries none. Generation 0 is reserved (`GENERATION_UNKNOWN`). Saved references stay legacy. Rollout: the Mac app first (it reads both layouts and runs an old node in legacy mode), then the room-memory container; rolling back is safe both ways (PLAN-PUBGEN §8).
+- **D34. Publisher generations** (`pubgen`, PLAN-PUBGEN §2–§3). Every stateful Spark → Mac message ends with `uint64 publisher_generation`, durable and increasing per room (`max(stored + 1, now_ms)`, written and fsynced before the first publish, under a per-room `flock`, fail closed), the same for every message of one process. `seq` is ordered per (generation, topic). The v2 fields are appended after each message's last legacy field, so every legacy offset and golden prefix is unchanged, and the layout is detected from the trailing bytes (§1.1): the Mac needs no schema text, and `FoxgloveProtocol.Channel` carries none. Generation 0 is reserved (`GENERATION_UNKNOWN`). Saved references stay legacy. Rollout: the Mac app first (it reads both layouts and runs an old node in legacy mode), then the room-memory container; rolling back is safe both ways (PLAN-PUBGEN §8). D38 extends the field to `Activity` and `Epoch`.
 - **D35. `RequestSync` token and expected generation.** A v2 request appends `expected_generation` (the generation its `since` belongs to) and a random 16-byte token, new for every send. The node honours `since` only in its own generation, and copies the token into the `SyncEnd`. A legacy request is answered as generation 0 with an all-zero token. A legacy node rejects a v2 request, so the Mac sends none on a legacy wire.
 - **D36. `SyncEnd`, the end-of-answer manifest** (supersedes D27 and D26's request mark). One per answered request, on `/room_memory/sync/end`, after the answer: the generation, the token, the topic's bound, and the `seq`s delivered and (events fallback) unavailable (§3.8). It states what was sent, never what a Mac received. Every Mac may record its bound and unavailable `seq`s; only the requester's token moves a retrieval, and only receipt of what it names completes it.
 - **D37. The generation-scoped mirror** (supersedes D23's restart cases and its residual). One active generation state, installed on the first validated message of a higher generation (a deviation from Astra's table, which quarantined messages until the generation's status: installing early loses nothing, PLAN-PUBGEN §4.5), retrieval by token and manifest, and the `EventHistory` projection (coverage, freshness, continuity, caughtUp). Legacy wire: shown, unverified, never current, no requests. PLAN-PUBGEN §4.4 lists the invariants; the Swift runner checks them after every input of 2,000 seeded traces against an independent reference model, with the ten Codex findings and Astra's pair as regression seeds (PLAN-PUBGEN §6).
+- **D38. `Activity` and `Epoch` carry the publisher generation** (the PR #18 follow-up to D34). Both are transient_local, and their `seq` restarts at 0 with each process. So `seq` alone cannot tell a restarted node's message from a stored copy: a Mac holding `Activity` seq 50 of the old run would drop the new run's 0, 1, … as copies until they passed 50. Like every Spark → Mac message, they now end with `uint64 publisher_generation` (padding to 8, then 8 bytes; layout from the trailing bytes, §1.1), and the Mac scopes them to the generation (§5.3). They never fix a connection's layout: a PR #18 node publishes v2 status, map and events next to legacy `Activity`, whose stored transient_local copy usually arrives first, and letting it decide would run the Mac in legacy mode against a v2 node. Rollout as D34, the Mac first: against a PR #18 node it drops the legacy `Activity` and counts it, which costs nothing it showed before. `Epoch` gets the field before any node publishes it, so it is never deployed without it.
 
 ## 9. Verification status
 
-- **Hand goldens.** `Tests/Fixtures/room/golden/hand/*.hex` were written byte by byte from these rules, with every span annotated. There are 22: the 12 legacy ones (9 little endian and 3 big endian, covering the five messages of §3.1–§3.5), and 10 protocol v2 ones (7 little endian, 3 big endian: `MemoryStatus`, `MapBricks` LE/BE, `ChangeEvent` with and without a mask, `RequestSync` LE/BE, and three `SyncEnd`s), each v2 one repeating its legacy twin's values with the new fields appended and one publisher generation throughout. `OperatorAction` has none yet. `scripts/check-shared-goldens.sh` requires every shared file to be identical in both fixture directories. `spark/room_memory/tests/fixtures/hand` adds two `Activity` goldens (active, and idle with NaN geometry), checked by the Python and C++ codecs only; the Swift suite does not decode `Activity` yet. The tests check:
-  - The Swift decoder reads all 12 to the expected values. The big-endian `MapBricks` golden has a little-endian payload inside a big-endian message.
-  - The encoder reproduces the 7 uncompressed little-endian goldens exactly.
+- **Hand goldens.** `Tests/Fixtures/room/golden/hand/*.hex` were written byte by byte from these rules, with every span annotated. There are 27, the same files in `spark/room_memory/tests/fixtures/hand`: the 14 legacy ones (11 little endian and 3 big endian, covering §3.1–§3.5 and two `Activity`s, active and idle with NaN geometry), and 13 protocol v2 ones (9 little endian, 4 big endian: `MemoryStatus`, `MapBricks` LE/BE, `ChangeEvent` with and without a mask, `RequestSync` LE/BE, three `SyncEnd`s, `Epoch` LE/BE and `Activity`), each v2 one repeating its legacy twin's values with the new fields appended and one publisher generation throughout. `OperatorAction` has none: it is out of scope for protocol v2 (§3.6). `scripts/check-shared-goldens.sh` requires every shared file to be identical in both fixture directories. Swift, Python and C++ decode all 27. The tests check:
+  - The Swift decoder reads the 14 legacy goldens to the expected values. The big-endian `MapBricks` golden has a little-endian payload inside a big-endian message.
+  - The encoder reproduces the 9 uncompressed little-endian legacy goldens exactly, and every little-endian v2 one.
   - For the zlib and LZFSE goldens, which hold a hand-built stored block and an uncompressed LZFSE block:
     - the encoder matches the bytes up to the payload length;
     - its own compressed stream, inflated through Foundation rather than the codec, equals the hand payload;
@@ -830,11 +842,11 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
   - Apple inflates Python's `zlib.compressobj(6, zlib.DEFLATED, -15)` output of the same payload.
   - The packing helpers in `scripts/spark/make_room_memory_goldens.py` reproduce the payload bytes of all 5 hand goldens that have one.
 - **No independent CDR cross-check yet.** No offline ROS 2 CDR library (`rosbags`, `mcap_ros2`) is installed on this Mac, and none was installed for this PR. So the hand goldens have only been checked against the Swift codec, which follows the same rules.
-- **Spark goldens: not produced.** `scripts/spark/make_room_memory_goldens.py` serializes the 9 little-endian values with `rclpy` after a `colcon build` of `labcommand_msgs` in the Jazzy container. Running it is a Spark task. The follow-up test then requires each Spark file to decode to the same value as its hand golden, which confirms D4.
+- **Spark goldens: not produced.** `scripts/spark/make_room_memory_goldens.py` serializes the 9 little-endian v2 values with `rclpy` after a `colcon build` of `labcommand_msgs` in the Jazzy container. Running it is a Spark task. The follow-up test then requires each Spark file to decode to the same value as its hand golden, which confirms D4.
 - **`colcon build` of `labcommand_msgs`: not run.** There is no ROS 2 on the Mac.
-- **`OperatorAction` (§3.6, D25): the `.msg` only.** There is no Swift codec and no hand golden yet. The 117 B wire size was computed by hand from §1.1, not encoded. Codecs and goldens are Phase 3 stage S5.
-- **Protocol v2 (D34–D37): implemented** in the Python oracle, the C++ node and the Swift codec and mirror. The Python, C++ and Swift codecs decode every v2 golden and reproduce the little-endian ones. The differential tests compare Python and C++ byte for byte, `SyncEnd`s included, on every §5.2 answer case, a session across two generations, and the legacy `RequestSync` answer. The ROS node wiring (`node.py`, `room_memory_node.cpp`) needs ROS 2 and was not run on the Mac.
-- **The Spark side of §5 is implemented** in `spark/room_memory_cpp` (the node) and in the Python oracle `spark/room_memory`. Not implemented: `status` and `epoch` as transient_local (D24); `docs/phase3-live-integration.md` plans it. The bridge's client-publish path has not been tried against a live bridge, and the Mac has no request path in the deployed setup (§5.3).
+- **`OperatorAction` (§3.6, D25): out of scope for protocol v2, the `.msg` only.** There is no codec in Swift, Python or C++, no hand golden and no node handler, by decision (§3.6): they are Phase 3 stage S5, together with the generation question. The 117 B wire size was computed by hand from §1.1, not encoded.
+- **Protocol v2 (D34–D38): implemented** in the Python oracle, the C++ node and the Swift codec and mirror. The Python, C++ and Swift codecs decode every v2 golden and reproduce the little-endian ones. The differential tests compare Python and C++ byte for byte, `SyncEnd`s included, on every §5.2 answer case, a session across two generations, and the legacy `RequestSync` answer. The ROS node wiring (`node.py`, `room_memory_node.cpp`) needs ROS 2 and was not run on the Mac.
+- **The Spark side of §5 is implemented** in `spark/room_memory_cpp` (the node) and in the Python oracle `spark/room_memory`. Both nodes declare D24's durability on every topic; the rclpy test for it (`test_node.py`) and the C++ node need ROS 2 and were not run on the Mac. Not implemented: the `epoch` topic (§2). The bridge's client-publish path has not been tried against a live bridge, and the Mac has no request path in the deployed setup (§5.3).
 
 ## 10. Open questions for Trevor (brief §5, Q1–Q4, and Q5)
 

@@ -44,7 +44,7 @@ No Spark, rig or app was touched to write this.
   - Across the tailnet the hop is one TCP stream. Messages are lost in only two places: the bridge's per-client backlog, which drops the oldest message on overflow ([F1]), and disconnects.
   - Either loss shows up as a `seq` gap or an epoch mismatch, which protocol §5 already turns into STALE and a resync.
   - `map_bricks` and `events` therefore stay volatile. A latched copy replayed by the bridge would make each connect pay for the map twice, and the request is the one connect mechanism (§4.3). (Under D23 it would also have looked like a node restart to every connected Mac; under D37 a lower `seq` is never a restart signal.)
-  - `status` and `epoch` become transient_local (protocol §2, D24), so a Mac shows the memory state on connect. The nodes need a small change for that (§2.5).
+  - `status` and `epoch` become transient_local (protocol §2, D24), so a Mac shows the memory state on connect. Both nodes now publish `status` that way; `epoch` waits for PR 2.4 (§2.5).
 - **The governing invariant: the mirror is never shown as current while it is wrong.** It may be stale, incomplete or empty, and it says so. Every test in §7 checks this under faults.
 - **The Spark side is not ready for live integration yet.**
   - Both nodes (Python oracle, C++ production, PR #14) publish `map_bricks` with 60 s keyframes, `events`, `status`, `activity` and the sync topics, and answer `RequestSync`.
@@ -58,8 +58,8 @@ No Spark, rig or app was touched to write this.
 |---|---|---|
 | Wire contract (protocol §1–§8) | merged in #10; Swift codecs and hand goldens; Spark-produced goldens not yet made (protocol §9) | Spark goldens (confirm D4's `uint64` alignment) before stage S3 |
 | Mac `RoomMemoryStore` (PR 1.1) | not built | the mirror's data model; §5 adds the connection layer around it |
-| Python node `spark/room_memory` | reference oracle (main, PR #11; extended by PR #14): `map_bricks` (keyframes and deltas, protocol D29), `events`, `status` with `events_seq`, `activity`, the two sync topics and the `RequestSync` handler with the bounded fallback; all reliable, only `activity` declares durability (transient_local); states BUILDING, TRACKING, DEGRADED | stays the oracle; not deployed; `epoch` and the durability change (§2.5). P17's manifest is done as `SyncEnd` (D36), with the publisher generation (D34) |
-| C++ node `spark/room_memory_cpp` | PR #14: byte-identical to Python (differential tests); 6.4–16.5 ms per 1 s window on an M5 Max (target < 200 ms); same topics, same QoS; its launch file also starts the :8767 bridge (protocol D28, still open) | production node; must add `epoch` (PR 2.4; P17's manifest is done as `SyncEnd`, D36, with the publisher generation, D34), CONFIRMED, moved supersession and RIG_MOVED (PR 2.3), the room-frame transform (P14), the durability change (§2.5) and an `OperatorAction` handler (S5) |
+| Python node `spark/room_memory` | reference oracle (main, PR #11; extended by PR #14): `map_bricks` (keyframes and deltas, protocol D29), `events`, `status` with `events_seq`, `activity`, the two sync topics and the `RequestSync` handler with the bounded fallback; all reliable, every topic's durability declared (`status` and `activity` transient_local, §2.5); states BUILDING, TRACKING, DEGRADED | stays the oracle; not deployed; `epoch` (§2.5). P17's manifest is done as `SyncEnd` (D36), with the publisher generation (D34) |
+| C++ node `spark/room_memory_cpp` | PR #14: byte-identical to Python (differential tests); 6.4–16.5 ms per 1 s window on an M5 Max (target < 200 ms); same topics, same QoS; its launch file also starts the :8767 bridge (protocol D28, still open) | production node; must add `epoch` (PR 2.4; P17's manifest is done as `SyncEnd`, D36, with the publisher generation, D34), CONFIRMED, moved supersession and RIG_MOVED (PR 2.3), the room-frame transform (P14) and an `OperatorAction` handler (S5); the durability change (§2.5) is done |
 | foxglove_bridge on `:8765` | built on foxglove-sdk-cpp v0.25.1 (`FoxgloveProtocol.swift`), which is bridge release 3.4.1, inferred from the changelog's SDK pin ([F3]); ROS 2 Jazzy; subprotocol `foxglove.sdk.v1`; its parameters and container are not known from the Mac | unchanged (P12) |
 | Mac live client | per-sensor sockets, direct `ws://<tailnet IP>:8765`, ATS exception for the 100.x IP, backoff 1 s … 30 s | a memory socket with its own state machine (§5); advertise parsing that keeps `schemaEncoding` and `schema`, which `Channel` drops today |
 | Command-center API on `:8766` | polled every 5 s over the ssh tunnel, ~0.4 KB/s measured | a `room_memory` block (§2.4) and a request relay (P11); both are changes to Trevor's `command_center.py` |
@@ -129,8 +129,8 @@ The topic set, QoS and durability are protocol §2 (D18, D24), including the ope
 |---|---|---|---|---|---|
 | `/room_memory/map_bricks` | S→M | `MapBricks` | snapshot when TRACKING starts and every `keyframe_period_s` (protocol D29); deltas ≤ 0.2 Hz, only on a reference change | reliable, volatile, keep-last 10 | volatile is required (§4.3) |
 | `/room_memory/events` | S→M | `ChangeEvent` | per transition | reliable, volatile, keep-last 100 | volatile is required (§4.3) |
-| `/room_memory/status` | S→M | `MemoryStatus` | 1 Hz | reliable, transient_local, keep-last 1 | nodes publish volatile today (§2.5) |
-| `/room_memory/activity` | S→M | `Activity` (protocol §3.7) | 1 Hz, with each status | reliable, transient_local, keep-last 1 | as specified in both nodes (PR #14); the Mac does not decode it yet |
+| `/room_memory/status` | S→M | `MemoryStatus` | 1 Hz | reliable, transient_local, keep-last 1 | as specified in both nodes (§2.5) |
+| `/room_memory/activity` | S→M | `Activity` (protocol §3.7) | 1 Hz, with each status | reliable, transient_local, keep-last 1 | as specified in both nodes (PR #14); the Mac mirror decodes it (protocol D38), the view does not show it yet |
 | `/room_memory/epoch` | S→M | `Epoch` | 0.2 Hz | reliable, transient_local, keep-last 1 | not published yet (PR 2.4, §2.5) |
 | `/room_memory/sync/map_bricks` | S→M | `MapBricks` | answers | reliable, volatile, keep-last 10 | — |
 | `/room_memory/sync/events` | S→M | `ChangeEvent` | answers | reliable, volatile, keep-last 200 | — |
@@ -179,15 +179,15 @@ This is the out-of-band identity and health channel. It is already polled every 
 
 ### 2.5 Node durability change
 
-Protocol §2 (D24) makes `status`, `activity` and `epoch` transient_local. Both nodes already publish `activity` that way (PR #14). They publish `status` volatile, leave the other topics at the ROS 2 default (volatile) without declaring it, and do not publish `epoch`. This is the plan for the rest of the change. Nothing in the nodes is changed by this PR.
+Protocol §2 (D24) makes `status`, `activity` and `epoch` transient_local. Both nodes published `activity` that way since PR #14. **Done** on `protocol-v2-followups` for `status` and the explicit volatile topics, as planned below; `epoch` waits for PR 2.4 (no node publishes it). The rclpy late-joiner test and the C++ node need ROS 2 and were not run on the Mac.
 
 **Topics.**
 
 | topic | durability | depth | what a late-joining subscriber gets |
 |---|---|---|---|
-| `status` | transient_local | 1 | the last `MemoryStatus` published, then the live stream |
+| `status` | transient_local (done) | 1 | the last `MemoryStatus` published, then the live stream |
 | `activity` | transient_local (done) | 1 | the last `Activity` published, then the live stream |
-| `epoch` | transient_local | 1 | the last `Epoch` published, then the live stream |
+| `epoch` | transient_local (PR 2.4) | 1 | the last `Epoch` published, then the live stream |
 | `map_bricks`, `events`, the three sync topics | volatile, declared explicitly | 10, 100, 10, 200, 10 | nothing published before it subscribed; the Mac gets the map and recent events by `RequestSync` |
 | `request_sync`, `operator` (node subscriptions) | volatile | 10 | nothing stored; a restarted node never sees an old request or action again |
 

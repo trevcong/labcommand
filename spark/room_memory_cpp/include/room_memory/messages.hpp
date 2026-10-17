@@ -10,7 +10,7 @@
 // codec range-checks them, so the same values are representable and rejected. A missing
 // float measurement is an empty optional here and NaN on the wire.
 //
-// Protocol v2 appends fields at the end of MemoryStatus, MapBricks, ChangeEvent and RequestSync
+// Protocol v2 appends fields at the end of MemoryStatus, MapBricks, ChangeEvent, Epoch, Activity and RequestSync
 // (protocol 1.4, 3). The layout comes from the bytes after the last legacy field: at most 3 is a
 // legacy message, padding to 8 then exactly the v2 fields (then at most 3) is v2, and anything else
 // is invalid. publisher_generation (and the RequestSync v2 fields) are empty for the legacy layout;
@@ -190,6 +190,7 @@ struct Epoch {
     std::int64_t n_moved = 0;
     std::optional<float> coverage_known_frac;
     MemoryState state = MemoryState::building;
+    std::optional<std::uint64_t> publisher_generation;  // empty: the legacy layout
     friend bool operator==(const Epoch&, const Epoch&) = default;
 
     void validate() const;
@@ -212,6 +213,7 @@ struct Activity {
     std::optional<std::array<float, 3>> aabb_min;
     std::optional<std::array<float, 3>> aabb_max;
     std::optional<float> since_s;
+    std::optional<std::uint64_t> publisher_generation;  // empty: the legacy layout
     friend bool operator==(const Activity&, const Activity&) = default;
 
     void validate() const;

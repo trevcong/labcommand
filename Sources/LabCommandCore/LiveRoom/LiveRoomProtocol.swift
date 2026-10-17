@@ -6,6 +6,10 @@ public enum LiveRoomTopic: String, Sendable, CaseIterable {
     case mapBricks = "/room_memory/map_bricks"
     case events = "/room_memory/events"
     case status = "/room_memory/status"
+    /// Transient motion next to the rig (`Activity`), 1 Hz.
+    case activity = "/room_memory/activity"
+    /// The timeline tick (`Epoch`), 0.2 Hz. No node publishes it yet (protocol §2).
+    case epoch = "/room_memory/epoch"
     case syncMapBricks = "/room_memory/sync/map_bricks"
     case syncEvents = "/room_memory/sync/events"
     /// The end-of-answer manifest of every `RequestSync` answer (`SyncEnd`).
@@ -17,6 +21,8 @@ public enum LiveRoomTopic: String, Sendable, CaseIterable {
         case .mapBricks, .syncMapBricks: return "labcommand_msgs/msg/MapBricks"
         case .events, .syncEvents: return "labcommand_msgs/msg/ChangeEvent"
         case .status: return "labcommand_msgs/msg/MemoryStatus"
+        case .activity: return "labcommand_msgs/msg/Activity"
+        case .epoch: return "labcommand_msgs/msg/Epoch"
         case .syncEnd: return "labcommand_msgs/msg/SyncEnd"
         }
     }

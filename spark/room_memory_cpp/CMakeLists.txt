@@ -31,7 +31,7 @@ else()
   set(ROOM_MEMORY_PYTHON_DEFAULT "")
 endif()
 set(ROOM_MEMORY_PYTHON "${ROOM_MEMORY_PYTHON_DEFAULT}" CACHE FILEPATH
-    "Python with numpy and pytest for the differential tests (empty: skip them)")
+    "Python with numpy and pytest for the differential and recording tests (empty: they report skipped)")
 
 find_package(ZLIB REQUIRED)
 

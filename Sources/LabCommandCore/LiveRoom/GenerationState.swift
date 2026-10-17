@@ -61,6 +61,10 @@ struct GenerationState: Sendable, Equatable {
     /// The connection the status arrived on.
     var statusConnection: Int?
 
+    // Activity and Epoch: full state, the newest by seq.
+    var activity: LiveRoomLatest<RoomMemory.Activity>?
+    var epoch: LiveRoomLatest<RoomMemory.Epoch>?
+
     // Map
     var chain: Chain?
     /// The newest map seq this generation is known to have published: every map message of it

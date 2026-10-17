@@ -11,11 +11,16 @@ import sys
 import numpy as np
 import pytest
 
-TOOLS = pathlib.Path(__file__).resolve().parents[2] / "tools"
+HERE = pathlib.Path(__file__).resolve().parent
+TOOLS = HERE.parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
 import bag_stream  # noqa: E402
 
 BAG = os.environ.get("ROOM_MEMORY_BAG")
+# What CTest's static_recording runs (CMake sets it from the same variable), else that file here.
+STATIC_RECORDING = os.environ.get("ROOM_MEMORY_STATIC_RECORDING_TEST", str(HERE / "test_static_recording.py"))
+# Set in the pytest runs below, so this file's own run-pytest tests do not run inside them.
+PROBE = "ROOM_MEMORY_RECORDING_PROBE"
 
 
 def test_bag_stream_finds_the_oracle_outside_the_repository(tmp_path):
@@ -101,3 +106,70 @@ def test_statuses_tick_every_second_independently_of_the_window():
     # Window and status lines come in time order.
     times = [t for t, _, _ in timed]
     assert times == sorted(times)
+
+
+def run_pytest(tmp_path, *args, environment=()):
+    """pytest as CTest runs it, with neither recording present."""
+    nowhere = tmp_path / "no-recording"
+    nowhere.mkdir(exist_ok=True)
+    env = {**os.environ, "ROOM_MEMORY_RECORDING": str(nowhere), "ROOM_MEMORY_RECORDING_B": str(nowhere), PROBE: "1",
+           **dict(environment)}
+    result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", "-p", "no:cacheprovider", *args],
+                            env=env, cwd=tmp_path, capture_output=True)
+    return result.returncode, result.stdout.decode() + result.stderr.decode()
+
+
+@pytest.mark.skipif(PROBE in os.environ, reason="inside a run_pytest run")
+def test_static_recording_reports_skipped_without_a_recording(tmp_path):
+    """Codex P2: static_recording ran this whole directory, and this file's tests need no
+    recording, so without one it passed ("3 passed, 32 skipped"). It runs test_static_recording.py
+    alone, and a run in which every test skipped exits 77, CTest's SKIP_RETURN_CODE for it."""
+    code, out = run_pytest(tmp_path, STATIC_RECORDING)
+    assert code == 77, out
+    assert " passed" not in out, out
+
+
+@pytest.mark.skipif(PROBE in os.environ, reason="inside a run_pytest run")
+def test_a_run_that_passed_anything_is_not_reported_skipped(tmp_path):
+    """The other side of exit 77: one pass among skips and deselections still exits 0."""
+    code, out = run_pytest(tmp_path, str(HERE / "test_tools.py"), "-k", "split_bags or statuses_tick",
+                           environment={"ROOM_MEMORY_BAG": ""})
+    assert code == 0, out
+    assert "1 passed, 1 skipped" in out, out
+
+
+def without_mcap(tmp_path, error):
+    """The environment of a run in which `import mcap` raises `error` (a statement)."""
+    shadow = tmp_path / "shadow"
+    shadow.mkdir(exist_ok=True)
+    (shadow / "mcap.py").write_text(error + "\n")
+    path = os.pathsep.join(p for p in (str(shadow), os.environ.get("PYTHONPATH")) if p)
+    return {"PYTHONPATH": path, "ROOM_MEMORY_BAG": BAG or "room_memory_bag"}
+
+
+@pytest.mark.skipif(PROBE in os.environ, reason="inside a run_pytest run")
+def test_static_recording_reports_skipped_without_the_mcap_package(tmp_path):
+    """Codex P2: without mcap (the image has none) test_static_recording.py skips at collection,
+    nothing is collected and pytest exits 5, not 0, so CTest reported static_recording failed.
+    A run that collected nothing and skipped something exits 77 too."""
+    code, out = run_pytest(tmp_path, STATIC_RECORDING,
+                           environment=without_mcap(tmp_path, "raise ModuleNotFoundError(\"No module named 'mcap'\", name='mcap')"))
+    assert code == 77, out
+    assert "the mcap package reads the recording" in out, out
+
+
+@pytest.mark.skipif(PROBE in os.environ, reason="inside a run_pytest run")
+def test_static_recording_fails_when_mcap_is_broken(tmp_path):
+    """The other side: an mcap that is there but fails to import is a collection error, not a skip."""
+    code, out = run_pytest(tmp_path, STATIC_RECORDING,
+                           environment=without_mcap(tmp_path, "raise RuntimeError('mcap is broken')"))
+    assert code not in (0, 77), out
+    assert "mcap is broken" in out, out
+
+
+@pytest.mark.skipif(PROBE in os.environ, reason="inside a run_pytest run")
+def test_a_run_that_collected_and_skipped_nothing_still_fails(tmp_path):
+    """Exit 5 alone (every test deselected, none skipped) is not reported skipped. On this file:
+    test_static_recording.py skips at collection where mcap is missing, before -k deselects."""
+    code, out = run_pytest(tmp_path, str(HERE / "test_tools.py"), "-k", "no_such_test")
+    assert code == 5, out

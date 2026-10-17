@@ -1,17 +1,20 @@
 # Hand CDR goldens: provenance
 
-Copied byte for byte from `Tests/Fixtures/room/golden/hand/` on the Phase 0 branch (`labcommand-memory` worktree), commit `95f49f2` ("Apply D5/D9/D19: keep all-free bricks, header compression (zlib default), RequestSync message"). They were derived by hand from `ros/labcommand_msgs/msg/*.msg` and `docs/ROOM-MEMORY-PROTOCOL.md` §1; every span is annotated. `memory_status_le.hex` was refreshed from `phase3-design` (PR #13) commit `d751db6` for `events_seq`. `activity_le.hex` and `activity_idle_le.hex` are not copies: they were derived by hand on `room-memory-cpp` from `ros/labcommand_msgs/msg/Activity.msg` (protocol §3.7) in the same annotated format, and the Swift suite has no copy yet (it does not decode `Activity`). The protocol v2 goldens (`*_v2_*.hex`, `sync_end_*.hex`) were derived by hand on `pubgen` from the v2 `.msg` files and `PLAN-PUBGEN.md` §2.2, in the same annotated format, and copied to `Tests/Fixtures/room/golden/hand/`; each v2 golden that extends a legacy one repeats its values and appends the new fields, and every v2 golden uses the one publisher generation 1760400000000. Format: whitespace-separated hex bytes, `#` starts a comment.
+Copied byte for byte from `Tests/Fixtures/room/golden/hand/` on the Phase 0 branch (`labcommand-memory` worktree), commit `95f49f2` ("Apply D5/D9/D19: keep all-free bricks, header compression (zlib default), RequestSync message"). They were derived by hand from `ros/labcommand_msgs/msg/*.msg` and `docs/ROOM-MEMORY-PROTOCOL.md` §1; every span is annotated. `memory_status_le.hex` was refreshed from `phase3-design` (PR #13) commit `d751db6` for `events_seq`. `activity_le.hex` and `activity_idle_le.hex` are not copies: they were derived by hand on `room-memory-cpp` from `ros/labcommand_msgs/msg/Activity.msg` (protocol §3.7) in the same annotated format, and copied to `Tests/Fixtures/room/golden/hand/` on `protocol-v2-followups`, when the Swift suite began decoding `Activity`. The protocol v2 goldens (`*_v2_*.hex`, `sync_end_*.hex`) were derived by hand on `pubgen` from the v2 `.msg` files and `PLAN-PUBGEN.md` §2.2 (`activity_v2_le.hex`, `epoch_v2_le.hex` and `epoch_v2_be.hex` on `protocol-v2-followups`, protocol D38), in the same annotated format, and copied to `Tests/Fixtures/room/golden/hand/`; each v2 golden that extends a legacy one repeats its values and appends the new fields, and every v2 golden uses the one publisher generation 1760400000000. Format: whitespace-separated hex bytes, `#` starts a comment.
 
 | file | sha256 |
 |---|---|
 | `activity_idle_le.hex` | `e389eb520462842584988251bef696f1388f94814e5326a2e6ff344d09171db1` |
 | `activity_le.hex` | `1e26a83b70b21a831c34a9e2cc5b8e21bf9e157df6f1b75ab5ea836bc2190d79` |
+| `activity_v2_le.hex` | `47d460c031c6b2c6c20f5b52b1c03f470dac7b93a8da25a3290346c0601f4fed` |
 | `change_event_appeared_le.hex` | `3b102fc7bff4788d702d456ec60a168a10a23b9b92559f8a27df50b7463f0491` |
 | `change_event_appeared_v2_le.hex` | `68fd743260fb137355e5da6685fe5ab5558b82fc63f7b6981801f18ca6e6e93a` |
 | `change_event_moved_mask_le.hex` | `f486818b3d6df538ea17e95de3bc23db59934241c37c850d160604ca130f9905` |
 | `change_event_moved_mask_v2_le.hex` | `600c2d39487a7173c6f39bca00830c2c28d27c1adc165b61679c42695c951f71` |
 | `epoch_be.hex` | `c2b121f7156c09f1126bb94c352b826ec1bd01e71f01f081e52ead257c3599c6` |
 | `epoch_le.hex` | `5eb7544d8e8cbc2a6e92f770e1dcdbbde74b7af3359e71febcac03ebf303dd8b` |
+| `epoch_v2_be.hex` | `5e837b817325d0700747bb2e8a9e714d839b3db876c2d28eadce7457ecd1d2ef` |
+| `epoch_v2_le.hex` | `ac7d6e31b97a52585093f1b0a2895a50894e1e14b407623e62535995994e4bef` |
 | `map_bricks_delta_be.hex` | `3ea657d2000708eb5dae81456ad802584544e1980ffbb40b462050e54a256054` |
 | `map_bricks_delta_le.hex` | `1b48dafbd91316e4a0386fe9202d3f80fd2721177ba3635edd191034e7c6eb3a` |
 | `map_bricks_delta_lzfse_le.hex` | `ddceca55f37a2c65263f44496138e5a062be4c5a04f3dbad4356799d63839280` |

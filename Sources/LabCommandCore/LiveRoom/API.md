@@ -37,7 +37,8 @@ room.mirror.mapRevision // bumps on every brick change: re-upload bricks only wh
 `LiveRoomClient` is `@MainActor final class: ObservableObject`. Every `@Published` property
 changes on the main actor. It republishes `mirror` on each applied message and on a 1 s tick,
 so time-based staleness re-renders without help from the view. It subscribes to every
-`LiveRoomTopic` the bridge advertises with a matching schema, `sync/end` included, stamps each
+`LiveRoomTopic` the bridge advertises with a matching schema, `sync/end` included (and `activity` and
+`epoch` when advertised: the node publishes `activity`, and no node publishes `epoch` yet), stamps each
 `Action.requestSync` with the wall clock, and sends it.
 
 ### `LiveRoomClient`
@@ -62,7 +63,8 @@ so time-based staleness re-renders without help from the view. It subscribes to 
 
 ### `LiveRoomTopic` (enum)
 
-`.mapBricks`, `.events`, `.status`, `.syncMapBricks`, `.syncEvents`, `.syncEnd`
+`.mapBricks`, `.events`, `.status`, `.activity` (`/room_memory/activity`, `labcommand_msgs/msg/Activity`),
+`.epoch` (`/room_memory/epoch`, `labcommand_msgs/msg/Epoch`), `.syncMapBricks`, `.syncEvents`, `.syncEnd`
 (`/room_memory/sync/end`, `labcommand_msgs/msg/SyncEnd`). `isSync` is true for the three answer topics.
 
 ### `RoomMemoryMirror` (pure `struct`, `Sendable`, `Equatable`)
@@ -155,6 +157,20 @@ diagnostics only, and `isOpen` is CANDIDATE or CONFIRMED. Only `.confirmed` rend
 `jt128Hz: UInt16?`, `droppedWindows`, `eventsSeq: UInt64?`, `publisherGeneration: UInt64?`,
 `receivedAt`. Nil means not measured (or, for the generation, a legacy node). Never render a nil as 0.
 
+**Activity and Epoch** (active generation only; full state, the newest `seq` wins)
+
+| property | type | meaning |
+|---|---|---|
+| `roomActivity` | `LiveRoomLatest<RoomMemory.Activity>?` | newest `Activity` (motion next to the rig, never a change) |
+| `isActivityFresh` | `Bool` | it arrived on this connection less than 3 s ago |
+| `epochTick` | `LiveRoomLatest<RoomMemory.Epoch>?` | newest `Epoch` timeline tick |
+| `isEpochFresh` | `Bool` | it arrived on this connection less than 15 s ago |
+
+`LiveRoomLatest { message, receivedAt, connection }`. A newer generation starts both empty, so a
+restarted node's `seq` 0 applies. They never decide the connection's layout: one that arrives
+before a stateful message, or in the other layout (a node from before their v2 tail sends them
+legacy next to a v2 status), is dropped and counted in `activity.sideTopicLayout`.
+
 **Activity**: `activity: LiveRoomActivity`
 
 - `topics: [String: TopicActivity]`, with `TopicActivity { count: Int, lastAt: TimeInterval }` per topic
@@ -164,6 +180,7 @@ diagnostics only, and `isOpen` is CANDIDATE or CONFIRMED. Only `.confirmed` rend
 - `olderGeneration`: messages below the highest generation, ignored
 - `contractViolations`: a seq received twice with different payloads (the first is kept)
 - `wireMismatch`: a message in the other layout than the connection's first one, dropped
+- `sideTopicLayout`: `Activity`/`Epoch` dropped because the connection's layout was not decided yet or is the other one
 - `requestsSent`, `requestsUnsent`: unsent means no request path carried it
 - `lastRequest: RoomMemory.RequestSync?`
 

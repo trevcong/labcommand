@@ -44,6 +44,29 @@ public struct LiveRoomStatus: Sendable, Equatable {
     }
 }
 
+/// The newest message of a full-state topic (`Activity`, `Epoch`), as received.
+public struct LiveRoomLatest<Message: Sendable & Equatable>: Sendable, Equatable {
+    public var message: Message
+    /// When the Mac received it, on the mirror's clock.
+    public var receivedAt: TimeInterval
+    /// The connection it arrived on.
+    public var connection: Int
+
+    public init(message: Message, receivedAt: TimeInterval, connection: Int) {
+        self.message = message
+        self.receivedAt = receivedAt
+        self.connection = connection
+    }
+}
+
+/// `Activity` and `Epoch`: each message replaces the last; only the common fields order them.
+protocol FullStateMessage: Sendable, Equatable {
+    var header: RoomMemory.Header { get }
+}
+
+extension RoomMemory.Activity: FullStateMessage {}
+extension RoomMemory.Epoch: FullStateMessage {}
+
 /// One applied `ChangeEvent` message.
 public struct LiveRoomEvent: Sendable, Equatable {
     /// `header.seq` on the events topic.
@@ -83,6 +106,10 @@ public struct LiveRoomActivity: Sendable, Equatable {
     public var contractViolations = 0
     /// A message in the other layout (legacy or v2) than the connection's first one, dropped.
     public var wireMismatch = 0
+    /// `Activity` or `Epoch` messages dropped because the connection's layout was not decided yet
+    /// or is the other one. They never decide it: a node from before their v2 tail sends them
+    /// legacy next to a v2 status.
+    public var sideTopicLayout = 0
     /// Messages for another `room_id`, ignored.
     public var foreignRoom = 0
     public var requestsSent = 0
@@ -127,6 +154,9 @@ public struct RoomMemoryMirror: Sendable, Equatable {
     public static let eventIdCapacity = 10_000
     /// `status` is fresh for 3 periods (protocol §5).
     public static let statusFreshFor: TimeInterval = 3
+    /// `activity` is fresh for 3 periods of 1 s, `epoch` for 3 of 5 s (protocol §5).
+    public static let activityFreshFor: TimeInterval = 3
+    public static let epochFreshFor: TimeInterval = 15
     /// Retrieval timeout by attempt: 5, 10, 20, then 30 s (Phase 3 P3).
     public static let requestRetry: [TimeInterval] = [5, 10, 20, 30]
     /// At most one request per topic per this long (protocol §2).
@@ -241,6 +271,23 @@ public struct RoomMemoryMirror: Sendable, Equatable {
 
     /// The newest status of the active generation (legacy: of the legacy run).
     public var status: LiveRoomStatus? { active?.status }
+
+    /// The newest `Activity` of the active generation (legacy: of the legacy run).
+    public var roomActivity: LiveRoomLatest<RoomMemory.Activity>? { active?.activity }
+
+    /// The newest `Epoch` of the active generation (legacy: of the legacy run).
+    public var epochTick: LiveRoomLatest<RoomMemory.Epoch>? { active?.epoch }
+
+    /// `roomActivity` arrived on this connection less than 3 s ago.
+    public var isActivityFresh: Bool { isFresh(active?.activity, for: Self.activityFreshFor) }
+
+    /// `epochTick` arrived on this connection less than 15 s ago.
+    public var isEpochFresh: Bool { isFresh(active?.epoch, for: Self.epochFreshFor) }
+
+    private func isFresh<Message>(_ latest: LiveRoomLatest<Message>?, for period: TimeInterval) -> Bool {
+        guard let latest, let id = connectionID, latest.connection == id else { return false }
+        return clock - latest.receivedAt < period
+    }
 
     public var activeGeneration: UInt64? { active?.generation }
 
@@ -381,6 +428,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         case event(RoomMemory.ChangeEvent)
         case status(RoomMemory.MemoryStatus)
         case syncEnd(RoomMemory.SyncEnd)
+        case activity(RoomMemory.Activity)
+        case epoch(RoomMemory.Epoch)
 
         var roomId: String {
             switch self {
@@ -388,6 +437,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             case .event(let m): return m.header.roomId
             case .status(let m): return m.header.roomId
             case .syncEnd(let m): return m.header.roomId
+            case .activity(let m): return m.header.roomId
+            case .epoch(let m): return m.header.roomId
             }
         }
 
@@ -397,6 +448,16 @@ public struct RoomMemoryMirror: Sendable, Equatable {
             case .event(let m): return m.publisherGeneration
             case .status(let m): return m.publisherGeneration
             case .syncEnd(let m): return m.publisherGeneration
+            case .activity(let m): return m.publisherGeneration
+            case .epoch(let m): return m.publisherGeneration
+            }
+        }
+
+        /// Only the stateful topics decide a connection's layout (protocol §5.3).
+        var decidesWire: Bool {
+            switch self {
+            case .map, .event, .status, .syncEnd: return true
+            case .activity, .epoch: return false
             }
         }
     }
@@ -407,6 +468,8 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         case .events, .syncEvents: return .event(try RoomMemory.ChangeEvent.decode(cdr: payload))
         case .status: return .status(try RoomMemory.MemoryStatus.decode(cdr: payload))
         case .syncEnd: return .syncEnd(try RoomMemory.SyncEnd.decode(cdr: payload))
+        case .activity: return .activity(try RoomMemory.Activity.decode(cdr: payload))
+        case .epoch: return .epoch(try RoomMemory.Epoch.decode(cdr: payload))
         }
     }
 
@@ -429,8 +492,15 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         }
         guard adopt(room: message.roomId) else { return [] }
 
-        // The connection's first message fixes its layout; SyncEnd exists only in v2.
+        // The connection's first stateful message fixes its layout; SyncEnd exists only in v2.
+        // Activity and Epoch follow it and never fix it.
         let layout: Wire = message.generation == nil ? .legacy : .v2
+        if !message.decidesWire {
+            guard wire == layout else {
+                activity.sideTopicLayout += 1
+                return settleAndFlush()
+            }
+        }
         switch wire {
         case .undetermined:
             wire = layout
@@ -459,6 +529,10 @@ public struct RoomMemoryMirror: Sendable, Equatable {
         case .event(let event): receiveEvent(event, at: now, fromSync: topic.isSync)
         case .status(let status): receiveStatus(status, at: now, connection: id)
         case .syncEnd(let end): receiveSyncEnd(end, matched: matched)
+        case .activity(let message):
+            receiveLatest(message, at: now, connection: id, in: \.activity)
+        case .epoch(let message):
+            receiveLatest(message, at: now, connection: id, in: \.epoch)
         }
         // Any validated message of the generation counts: archiving it now breaks continuity.
         active?.observed = true
@@ -650,6 +724,32 @@ public struct RoomMemoryMirror: Sendable, Equatable {
                 state.mismatchRetrieved = false
             }
         }
+        active = state
+    }
+
+    // MARK: Activity, Epoch
+
+    /// Full-state messages: a gap is not counted, and the newer `seq` replaces the held one. v2: a
+    /// `seq` not above the held one is a duplicate or a delayed transient_local copy. Legacy: only
+    /// an exact copy is known to be one. A restart is a new generation with an empty state, so its
+    /// `seq` 0 applies.
+    private mutating func receiveLatest<Message: FullStateMessage>(
+        _ message: Message,
+        at now: TimeInterval,
+        connection id: Int,
+        in path: WritableKeyPath<GenerationState, LiveRoomLatest<Message>?>
+    ) {
+        guard var state = active else { return }
+        if let held = state[keyPath: path]?.message.header {
+            let duplicate = state.generation != nil
+                ? message.header.seq <= held.seq
+                : message.header.seq == held.seq && message.header.stamp == held.stamp
+            if duplicate {
+                activity.duplicates += 1
+                return
+            }
+        }
+        state[keyPath: path] = LiveRoomLatest(message: message, receivedAt: now, connection: id)
         active = state
     }
 

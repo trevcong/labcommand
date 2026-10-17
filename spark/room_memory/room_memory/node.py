@@ -93,22 +93,26 @@ class RoomMemoryNode(Node):
             raise
         self.memory = RoomMemory(self.config, _time(self), self.generation.generation)
 
-        reliable = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE)
-        self.events = self.create_publisher(ChangeEventMsg, EVENTS_TOPIC, reliable)
-        self.status = self.create_publisher(MemoryStatusMsg, STATUS_TOPIC, QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
-        # Activity is full state at 1 Hz, so a late subscriber gets the last one at once; a copy delivered
-        # again repeats its seq (protocol §2). Same QoS as the C++ node.
-        self.activity = self.create_publisher(ActivityMsg, ACTIVITY_TOPIC, QoSProfile(
-            depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        # Durability is declared on every topic (protocol §2, D24). Status and activity are full state at
+        # 1 Hz, so a late subscriber (the bridge, when the first Mac subscribes) gets the last one at once;
+        # a copy delivered again repeats its seq in its generation. Everything else is volatile: the Mac
+        # gets the map and recent events by RequestSync, and a restarted node never receives an old
+        # request. Same QoS as the C++ node.
+        def volatile(depth):
+            return QoSProfile(depth=depth, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
+
+        def latched():
+            return QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+
+        self.events = self.create_publisher(ChangeEventMsg, EVENTS_TOPIC, volatile(100))
+        self.status = self.create_publisher(MemoryStatusMsg, STATUS_TOPIC, latched())
+        self.activity = self.create_publisher(ActivityMsg, ACTIVITY_TOPIC, latched())
         self._rejections = RejectionLog()
-        maps = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
-        self.map = self.create_publisher(MapBricksMsg, MAP_TOPIC, maps)
-        self.sync_map = self.create_publisher(MapBricksMsg, SYNC_MAP_TOPIC, maps)
-        self.sync_events = self.create_publisher(
-            ChangeEventMsg, SYNC_EVENTS_TOPIC, QoSProfile(depth=200, reliability=ReliabilityPolicy.RELIABLE))
-        self.sync_end = self.create_publisher(
-            SyncEndMsg, SYNC_END_TOPIC, QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE))
-        self.create_subscription(RequestSyncMsg, REQUEST_TOPIC, self._answer, maps, raw=True)
+        self.map = self.create_publisher(MapBricksMsg, MAP_TOPIC, volatile(10))
+        self.sync_map = self.create_publisher(MapBricksMsg, SYNC_MAP_TOPIC, volatile(10))
+        self.sync_events = self.create_publisher(ChangeEventMsg, SYNC_EVENTS_TOPIC, volatile(200))
+        self.sync_end = self.create_publisher(SyncEndMsg, SYNC_END_TOPIC, volatile(10))
+        self.create_subscription(RequestSyncMsg, REQUEST_TOPIC, self._answer, volatile(10), raw=True)
         for name in self.config.sensors:
             sensor = SENSORS[name]
             self.create_subscription(

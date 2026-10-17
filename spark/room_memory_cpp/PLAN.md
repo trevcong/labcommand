@@ -30,7 +30,7 @@ The core is plain C++20 with no ROS dependency. `CMakeLists.txt` builds core, CL
 # Mac (brew install cmake libomp; CXX=g++-16 for the GCC/libgomp build)
 cmake -S spark/room_memory_cpp -B build/room_memory_cpp -DCMAKE_BUILD_TYPE=Release
 cmake --build build/room_memory_cpp
-ctest --test-dir build/room_memory_cpp          # 16 entries; the differential ones use spark/.venv-local
+ctest --test-dir build/room_memory_cpp          # 20 entries at 18 cores; the Python ones use spark/.venv-local
 CHANGE_DETECT=$PWD/.build/release/change-detect ctest --test-dir build/room_memory_cpp -R differential  # + Swift
 spark/.venv-local/bin/python spark/room_memory_cpp/bench/dump_frames.py /tmp/frames
 OMP_NUM_THREADS=1 build/room_memory_cpp/bench_memory /tmp/frames [--full-diff]
@@ -40,7 +40,7 @@ spark/.venv-local/bin/python spark/room_memory_cpp/tools/bag_stream.py ~/Develop
     [--inject mid360:appear:180:-2.2,1.4,0.0:0.3] | build/room_memory_cpp/room_memory_bag [key=value ...]
 ```
 
-`-DROOM_MEMORY_PYTHON=` (empty) skips the differential tests, `-DROOM_MEMORY_SIMD=OFF` builds the portable lane code, `-DROOM_MEMORY_APPLE_LZFSE=OFF` drops the Apple LZFSE decoder. On the Spark: `docker build -f spark/room_memory_cpp/Dockerfile .` from the repository root.
+`-DROOM_MEMORY_PYTHON=<python>` picks the Python for the two differential runs, `recording_tools` and `static_recording` (default `spark/.venv-local/bin/python` when it exists; a git worktree has none, so pass it). Empty, the four stay registered and report *Skipped* with the reason. `static_recording` runs `tests/recording/test_static_recording.py` alone and also reports *Skipped* when every test in it skipped (no recording on this machine, or no `mcap` package, as in the image; `tests/recording/conftest.py` then exits 77); `recording_tools` runs `test_tools.py`, which needs no recording, and checks that. `-DROOM_MEMORY_SIMD=OFF` builds the portable lane code, `-DROOM_MEMORY_APPLE_LZFSE=OFF` drops the Apple LZFSE decoder. On the Spark: `docker build -f spark/room_memory_cpp/Dockerfile .` from the repository root.
 
 ## Parity rules (what makes the bytes identical)
 
@@ -234,7 +234,7 @@ The regression test (`tests/recording/test_static_recording.py`) now runs on bot
 4. A window without usable points drops every pending region of its sensor. A pending move is matched by one MOVED region or by its two halves; a MOVED region takes over a pending APPEARED plus DISAPPEARED on its poses (run = the shorter of theirs).
 5. CANDIDATE when the run reaches `candidate_windows` (40). Open events are unchanged.
 
-`Activity` (1 Hz, with each status): whether a tracking window since the last message had activity, the newest such window's region count, voxels and sensor bits, the largest region's centroid and box in its sensor's frame, and the seconds since the newest activity window. `MemoryStatus`, `ChangeEvent` and every golden are unchanged; the two new hand goldens are `activity_le.hex` and `activity_idle_le.hex`. The Mac (Swift) does not decode `Activity` yet: a follow-up adds the decoder, copies the two goldens to `Tests/Fixtures/room/golden/hand` and shows the activity state.
+`Activity` (1 Hz, with each status): whether a tracking window since the last message had activity, the newest such window's region count, voxels and sensor bits, the largest region's centroid and box in its sensor's frame, and the seconds since the newest activity window. `MemoryStatus`, `ChangeEvent` and every golden are unchanged; the two new hand goldens are `activity_le.hex` and `activity_idle_le.hex`. The Mac (Swift) decodes `Activity` into its mirror, per publisher generation (protocol D38, which also appends `publisher_generation`, golden `activity_v2_le.hex`); the goldens are shared with `Tests/Fixtures/room/golden/hand`. Showing the activity state is still to do.
 
 **Learning off (`learn_windows` 0).** grok1's budget (tracking windows that may still add to unsettled voxels, then the map freezes; cherry-picked as `learn_windows`) was ablated at 0, 30 and 1,000,000 (the old always-learn). All give 0 events, but the longest settled run on `static5m-b` is 15 windows without learning and 45 with it: a pending MOVED of 140 voxels at the desk, still from 253 to 298 s, ended by his next motion. Learning made it: the 30-window budget added 1,900 known voxels to the JT128 reference, 475 of them within 1 m of that move (128 of the 179 within 0.5 m learned as free), so his coming back there became an appearance in known space. Coverage barely changes (1,838 bricks with or without the budget on `static5m`, 1,852 vs 1,848 on `static5m-b`), the map stops changing after the tracking snapshot (no deltas, `map_epoch` steady), and a change in space the reference never saw stays unknown until a restart rebuilds it (no accept / re-reference yet).
 
@@ -376,7 +376,7 @@ On the Spark itself the GB10's cores differ from the M5's; the code has no Apple
 
 ## Tests and gate
 
-- **CTest (16 entries)**: `goldens`, `core` and `memory` at 1, 3 and 18 threads; `messages`; `cli`; the installed `room_memory_offline` binary byte-compared on both change-detection fixtures; `differential` (pytest) at 1 and 18 threads; `static_recording` (pytest, gated). 85 C++ test cases in total:
+- **CTest (20 entries at 18 cores)**: `goldens`, `core` and `memory` at 1, 3 and 18 threads; `messages`; `cli`; `generation`; the installed `room_memory_offline` binary byte-compared on both change-detection fixtures; `static_longrun` and `static_longrun_b` (skipped without the recordings); `differential` (pytest) at 1 and 18 threads; `recording_tools` (pytest, synthetic); `static_recording` (pytest, skipped without the recordings). 85 C++ test cases in total:
   - **goldens** (8): all 37 Swift goldens (27 scenes generated by the C++ port of `scenes.py`, 10 Phase 0 pairs, required when the Phase 0 fixtures exist at configure time) and both `Tests/Fixtures/change-detection` records on the shared `Tests/Fixtures/room/snapshots/{a,b}` pairs. Every one again with the sparse paths forced (no dense grids, hashed aggregation). Plus the spec clear-line literal, shuffled input, and the CLI;
   - **messages** (19): all 12 hand CDR goldens decode to their values, and the 7 exact ones re-encode byte for byte; zlib header/payload; every truncation; trailing padding; the 16 MiB limit before inflating; stream checks; all of Python's rejection tables; LZFSE;
   - **core** (25): the Python unit tests (quantizer, drops, representatives, `min_points`, invalid configs, synthetic scenes, occluded back face, octant sweep, long-ray stride table, extent gate, tie rules), plus SIMD-vs-scalar quantizer lanes, thread-count determinism, regions-vs-full scope, summary merging, and key sort/membership;
@@ -409,14 +409,14 @@ On the Spark itself the GB10's cores differ from the M5's; the code has no Apple
 - learning: `learn_max_offset_m` 0.02, `learn_windows` 0 (tracking windows that may still teach the reference);
 - the map stream: `map_sensor` (empty: the JT128 when configured), `delta_period_s` 5, `keyframe_period_s` 60, `keyframe_delta_ratio` 0.5.
 
-It subscribes to `/livox/lidar` and `/lidar_points` as generic (serialized) subscriptions with the sensor-data QoS, so the raw CDR goes through `decode_pointcloud2`. It publishes the codec bytes with generic publishers, volatile unless stated:
+It subscribes to `/livox/lidar` and `/lidar_points` as generic (serialized) subscriptions with the sensor-data QoS, so the raw CDR goes through `decode_pointcloud2`. It publishes the codec bytes with generic publishers, each declaring its durability (protocol §2, D24), volatile unless stated:
 - `/room_memory/events`: reliable, depth 100;
-- `/room_memory/status`: reliable, depth 1, 1 Hz;
+- `/room_memory/status`: reliable, transient_local, depth 1, 1 Hz;
 - `/room_memory/activity` (`labcommand_msgs/msg/Activity`): reliable, transient_local, depth 1, 1 Hz with each status;
 - `/room_memory/map_bricks`: reliable, depth 10, after each window when `map_update` returns a message;
-- `/room_memory/sync/map_bricks` and `/room_memory/sync/events`: reliable, depth 10 and 200.
+- `/room_memory/sync/map_bricks`, `/room_memory/sync/events` and `/room_memory/sync/end`: reliable, depth 10, 200 and 10.
 
-It answers each `/room_memory/request_sync` (reliable, depth 10) on the sync topic of its `topic`, and logs and drops requests that do not decode. Windows and status run on node-clock timers and log wall/CPU time per window and the map bytes. The type support for `sensor_msgs` and `labcommand_msgs` is needed only at run time. `Epoch` (0.2 Hz) is not published yet: with no CONFIRMED state its counts would always be 0.
+It answers each `/room_memory/request_sync` (reliable, volatile, depth 10) on the sync topic of its `topic`, and logs and drops requests that do not decode. Windows and status run on node-clock timers and log wall/CPU time per window and the map bytes. The type support for `sensor_msgs` and `labcommand_msgs` is needed only at run time. `Epoch` (0.2 Hz) is not published yet: with no CONFIRMED state its counts would always be 0.
 
 **Sidecar.** Whether the Mac uses this bridge or the existing :8765 with requests relayed over :8766 is open (protocol D28, Q5); the sidecar is the :8767 option, and `foxglove_bridge:=false` leaves it out. The launch file also starts `foxglove_bridge` (`ros-jazzy-foxglove-bridge`, added to the image) as node `room_memory_bridge`. Its launch arguments are `foxglove_bridge` (default `true`), `foxglove_port` (8767), `foxglove_address` (`0.0.0.0`) and `foxglove_client_publish` (`false`). Its parameters:
 - `topic_whitelist` `['^/room_memory/.*']`: the raw clouds are never relayed;

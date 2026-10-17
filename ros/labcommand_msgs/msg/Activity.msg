@@ -9,7 +9,7 @@ uint8 SENSOR_JT128=2              # bit 1 of sensors
 # Common fields, first in every labcommand_msgs message.
 string room_id
 uint64 map_epoch
-uint64 seq                        # per-topic counter, +1 per message
+uint64 seq                        # per-topic counter, +1 per message, starts at 0 per publisher generation
 builtin_interfaces/Time stamp
 
 bool active                       # some tracking window since the previous Activity message had activity
@@ -20,3 +20,4 @@ uint32 voxel_count                # their voxels; 0 when inactive
 float32[3] centroid               # m, the largest activity region, frame of largest_sensor; NaN x3 when inactive
 float32[6] aabb                   # m, its box: min_x, min_y, min_z, max_x, max_y, max_z; NaN x6 when inactive
 float32 since_s                   # s since the newest window with activity; NaN = none since the node started
+uint64 publisher_generation       # the publishing process's generation (section 1.4), never 0
