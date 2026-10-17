@@ -256,6 +256,38 @@ func testMissionClockIncludesTheDate() {
     expect(rendered.hasPrefix(clock + "  "), "renderLine leads with the dated clock, got \(rendered)")
 }
 
+func testMissionClockFollowsTimeZoneChanges() {
+    let date = Date(timeIntervalSince1970: 1_760_400_010)
+    func format(_ zone: TimeZone) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = zone
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter.string(from: date)
+    }
+
+    let system = format(.autoupdatingCurrent)
+    let candidates = [
+        TimeZone(secondsFromGMT: 0)!,
+        TimeZone(secondsFromGMT: 14 * 3600)!,
+        TimeZone(identifier: "Pacific/Kiritimati")!,
+    ]
+    guard let other = candidates.first(where: { format($0) != system }) else {
+        expect(false, "need a zone whose clock differs from the system zone")
+        return
+    }
+
+    MissionLog.refreshClock(timeZone: other)
+    let pinned = MissionLog.clock.string(from: date)
+    expect(pinned == format(other), "a refresh pins the clock to that zone, got \(pinned)")
+    expect(pinned != system, "the pinned zone is not the system zone, got \(pinned)")
+
+    NotificationCenter.default.post(name: .NSSystemTimeZoneDidChange, object: nil)
+    let followed = MissionLog.clock.string(from: date)
+    expect(followed == system, "NSSystemTimeZoneDidChange rebuilds the clock in the live zone, got \(followed)")
+    expect(followed != pinned, "the clock left the pinned zone, got \(followed)")
+}
+
 func testMissionLogAppendAndCap() {
     var events: [MissionEvent] = []
     events = MissionLog.append(events, kind: .start, text: "start rig…")

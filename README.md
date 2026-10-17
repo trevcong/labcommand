@@ -41,7 +41,7 @@ From the repository root:
 open ./build/LabCommand.app
 ```
 
-Menu bar extra: **LAB**. Capture menu: ⌘↩ start/restart rig, ⌘⇧R record,
+Menu bar extra: **LAB** (tooltip and menu say LabCommand). Capture menu: ⌘↩ start/restart rig, ⌘⇧R record,
 ⌘. stop, ⌘⇧D diagnose. View: ⌘⇧F focus, ⌘R refresh.
 
 ## Map

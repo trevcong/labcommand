@@ -1,6 +1,6 @@
 # Room memory protocol, v1 (Spark `room_memory` → LabCommand Mac)
 
-Status: draft for PR 0.1. Codex has not signed it off. Trevor decided D5, D9 and D19 on 2026-10-14 (§8); he has not answered Q1–Q5 (end of this doc). PR #13 added D23–D24 (the `seq` rule and durability), D25 (`OperatorAction`), D26 (the events high-water mark, `MemoryStatus.events_seq`) and D27 (the events fallback header, `EventsFallback`) as proposals. PR #14 (the Spark node, merged before it) added D28–D33 and §3.7 (`Activity`). `pubgen` (PLAN-PUBGEN, approved by Astra) adds protocol v2: D34 (publisher generations), D35 (`RequestSync` token and expected generation), D36 (`SyncEnd`, which supersedes D27 and D26's request mark) and D37 (the generation-scoped mirror, which supersedes D23's restart cases); its follow-up adds D38 (the generation on `Activity` and `Epoch`). Issue #21 adds D39 (`RequestSync` as a service through the :8767 bridge). `rig-guard` (PR #19, PLAN-RIGGUARD.md) adds D40–D44 and §3.9 (`RigPose`, the rig-pose guard), numbered after issue #21's. §5 is the single normative statement of the resync rules. Sources: `RESEARCH_BRIEF.md` §2.2–§2.5 (2026-10-14). The `.msg` files are in `ros/labcommand_msgs/msg/`. The Swift codecs are `Sources/LabCommandCore/RoomMemoryMessages.swift` and `RoomMemoryCDR.swift`.
+Status: draft for PR 0.1. Codex has not signed it off. Trevor decided D5, D9 and D19 on 2026-10-14 (§8); he has not answered Q1–Q5 (end of this doc). PR #13 added D23–D24 (the `seq` rule and durability), D25 (`OperatorAction`), D26 (the events high-water mark, `MemoryStatus.events_seq`) and D27 (the events fallback header, `EventsFallback`) as proposals. PR #14 (the Spark node, merged before it) added D28–D33 and §3.7 (`Activity`). `pubgen` (PLAN-PUBGEN, approved by Astra) adds protocol v2: D34 (publisher generations), D35 (`RequestSync` token and expected generation), D36 (`SyncEnd`, which supersedes D27 and D26's request mark) and D37 (the generation-scoped mirror, which supersedes D23's restart cases); its follow-up adds D38 (the generation on `Activity` and `Epoch`). Issue #21 adds D39 (`RequestSync` as a service through the :8767 bridge). `rig-guard` (PR #19, PLAN-RIGGUARD.md) adds D40–D44 and §3.9 (`RigPose`, the rig-pose guard), numbered after issue #21's. Legacy cleanup batch 1 adds D50 and §3.14 (retired Mac capture path: no new message). §5 is the single normative statement of the resync rules. Sources: `RESEARCH_BRIEF.md` §2.2–§2.5 (2026-10-14). The `.msg` files are in `ros/labcommand_msgs/msg/`. The Swift codecs are `Sources/LabCommandCore/RoomMemoryMessages.swift` and `RoomMemoryCDR.swift`.
 
 The Spark does all perception and keeps the memory. The Mac mirrors the reference map, the event list and the timeline, and renders them. It never infers a change itself. Five Spark → Mac topics carry the state, three sync topics carry answers to the Mac's resync requests, and two Mac → Spark topics carry those requests and the operator's actions. How they travel between the Spark and the Mac is open (§2, D28, Q5): a dedicated foxglove_bridge on :8767 in the room-memory container, or the existing foxglove_bridge on :8765 with the requests relayed over the ssh-authenticated command-center API on :8766.
 
@@ -583,6 +583,19 @@ uint64 publisher_generation
 
 **Wire size.** `4 + C + 144` bytes: 180 B for "lab" (legacy `4 + C + 132`: 168 B). `moved_at` ends 4 bytes short of 8-alignment, so 4 pad bytes precede `publisher_generation`.
 
+### 3.14 Retired Mac capture path
+
+Added by D50. This is not a new message. `spark-capture.sh`, `CaptureManifest`, and the `CaptureTelemetry` struct were Mac-side leftovers from the v0 single-lidar script. They are not a topic, a service, or a field on any message in §3. Removing them changes no byte on the wire.
+
+The Mac still decodes lidar in the two ways it already did:
+
+- Live frames from foxglove_bridge are CDR `sensor_msgs/PointCloud2`, decoded by `PointCloud2CDR`.
+- `.pcd` files go through `PointCloudDecoder.loadPCD`. `AppState` uses that for the sample cloud. `change-detect` uses it for `.pcd` and `PointCloud2CDR` for `.bin`.
+
+`PointCloudDecoder.decodeROS2PointCloud2` stays. `PointCloud2CDRTests.testCDRRealFixture` compares `fixtures/pointclouds/ros2-pointcloud2.bin` against it. `decodeROS1PointCloud2` is gone. Nothing in this tree reads a ROS 1 PointCloud2. `TelemetryFormat` stays in `CaptureTelemetry.swift`. The rig desk, the menu bar, and `RigTests` print rates through it. `PointCloud2Layout.FieldType` stays. `PointCloud2CDR` uses those datatype numbers.
+
+§3.10–§3.13 are reserved by other branches and are not in this tree. This section is numbered 3.14 so those sections can land in between.
+
 ## 4. State machines
 
 The Spark owns both machines. The Mac renders them. Event transitions are judged in `seq` order within one publisher generation: each event shows its highest-`seq` transition received, whatever the arrival order or transport (§5.3). An older one, filled in later by a replay, goes to the event's history only, and is not a violation.
@@ -908,6 +921,7 @@ Each item is a place where §2.4 was not legal ROS 2, was underspecified, or con
 - **D42. `RigPose` on `/room_memory/rig`** (§3.9). Reliable, transient_local, keep-last 1, like `Activity`, so a late Mac gets the current pose at once; published on every outcome or decision change and every 10 s. It is a new message on a new topic because the old ones cannot carry it: D3 makes a Mac reject an unknown enum value (a `ChangeEvent` `KIND_RIG_MOVED` would drop every such message on deployed Macs), and §1.1 allows no new trailing fields beyond the v2 ones. A Mac that does not subscribe ignores it. The :8767 bridge's `^/room_memory/.*` whitelist already covers the topic.
 - **D43. State precedence, two transitions, per-sensor expiry.** RIG_MOVED outranks DEGRADED: a silent sensor does not hide a move. §4.1 gains DEGRADED → RIG_MOVED and RIG_MOVED → DEGRADED; a Mac must accept both. RIG_MOVED expires the open CANDIDATEs of each sensor the guard finds moved; a sensor found in place keeps its candidates (amends D17).
 - **D44. CHECKING and INCONCLUSIVE are not memory states.** They exist only as `RigPose.outcome`. While a check runs (at most `check_max_s`, 10 s) CANDIDATE promotion and learning are held, and `MemoryStatus.state` stays TRACKING.
+- **D50. The v0 Mac capture script is not on this protocol** (§3.14). `scripts/spark-capture.sh`, `CaptureManifest`, and the `CaptureTelemetry` struct have no callers and are deleted. The app talks to the command-center API, not that script. No topic or message changes. `PointCloudDecoder.loadPCD` stays for `.pcd` (`AppState`, `change-detect`). Live clouds stay on `PointCloud2CDR`. `decodeROS2PointCloud2` stays as the offline oracle for `testCDRRealFixture`. `decodeROS1PointCloud2` is removed. `TelemetryFormat` and `PointCloud2Layout.FieldType` stay. Both still have callers.
 
 ## 9. Verification status
 
