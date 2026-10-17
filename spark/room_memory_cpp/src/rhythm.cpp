@@ -234,27 +234,45 @@ struct Table {
         cslot.assign(static_cast<std::size_t>(slots), 0);
     }
     void clear() {
+        // A minute seal. Keep a cache that lists the whole table so the next identical
+        // window writes those slots back. A partial cache is not a valid empty-table
+        // layout: a key stored past a neighbor would sit behind an empty slot.
+        if (cached != count) cached = 0;
         std::fill(used.begin(), used.end(), 0);
+        std::fill(hits.begin(), hits.end(), 0);
+        std::fill(sums.begin(), sums.end(), 0);
         count = 0;
-        cached = 0;
     }
     int insert_window(std::span<const Cell> cells) {
         const int total = static_cast<int>(cells.size());
         if (total == 0) return 0;
-        if (total == cached && same_cache(cells)) {
-            for (int n = 0; n < total; ++n) {
-                const int slot = cslot[static_cast<std::size_t>(n)];
-                const std::uint32_t updated = hits[static_cast<std::size_t>(slot)] + 1;
-                hits[static_cast<std::size_t>(slot)] = std::min(kU16Max, updated);
-                sums[static_cast<std::size_t>(slot)] += cells[static_cast<std::size_t>(n)].count;
+        int begin = 0;
+        if (cached > 0 && total >= cached && same_cache(cells)) {
+            if (count == 0) {
+                reoccupy(cells);
+            } else if (count == cached) {
+                bump(cells);
+            } else {
+                cached = 0;
             }
-            return 0;
+            if (cached > 0) {
+                if (total == cached) return 0;
+                // The prefix is the entire table and it is full. Every later cell misses.
+                if (count >= slots) return total - cached;
+                begin = cached;
+            }
         }
-        for (int n = 0; n < total; ++n) {
+        for (int n = begin; n < total; ++n) {
+            // Unique cells, and every occupied slot is one of this window's first n.
+            // The next cell is absent. Searching for it would scan the whole table.
+            if (count >= slots && n == count) {
+                remember(cells, n);
+                return total - n;
+            }
             const Cell& cell = cells[static_cast<std::size_t>(n)];
             const int slot = probe(cell.ix, cell.iy, cell.iz, rhythm_hash_slot(cell.ix, cell.iy, cell.iz, slots));
             if (slot < 0) {
-                cached = 0;
+                if (n > 0) remember(cells, n);
                 return total - n;
             }
             if (n < slots) cslot[static_cast<std::size_t>(n)] = slot;
@@ -262,16 +280,8 @@ struct Table {
             hits[static_cast<std::size_t>(slot)] = std::min(kU16Max, updated);
             sums[static_cast<std::size_t>(slot)] += cell.count;
         }
-        if (total <= slots) {
-            for (int n = 0; n < total; ++n) {
-                cix[static_cast<std::size_t>(n)] = cells[static_cast<std::size_t>(n)].ix;
-                ciy[static_cast<std::size_t>(n)] = cells[static_cast<std::size_t>(n)].iy;
-                ciz[static_cast<std::size_t>(n)] = cells[static_cast<std::size_t>(n)].iz;
-            }
-            cached = total;
-        } else {
-            cached = 0;
-        }
+        if (total <= slots) remember(cells, total);
+        else cached = 0;
         return 0;
     }
     bool holds(int slot, std::int16_t x, std::int16_t y, std::int16_t z) const {
@@ -323,6 +333,41 @@ private:
             }
         }
         return true;
+    }
+    void reoccupy(std::span<const Cell> cells) {
+        for (int n = 0; n < cached; ++n) {
+            const std::size_t index = static_cast<std::size_t>(n);
+            const std::size_t slot = static_cast<std::size_t>(cslot[index]);
+            used[slot] = 1;
+            ix[slot] = cix[index];
+            iy[slot] = ciy[index];
+            iz[slot] = ciz[index];
+            hits[slot] = 1;
+            sums[slot] = cells[index].count;
+        }
+        count = cached;
+    }
+    void bump(std::span<const Cell> cells) {
+        for (int n = 0; n < cached; ++n) {
+            const std::size_t index = static_cast<std::size_t>(n);
+            const std::size_t slot = static_cast<std::size_t>(cslot[index]);
+            const std::uint32_t updated = hits[slot] + 1;
+            hits[slot] = std::min(kU16Max, updated);
+            sums[slot] += cells[index].count;
+        }
+    }
+    void remember(std::span<const Cell> cells, int ncells) {
+        if (ncells <= 0 || ncells > slots) {
+            cached = 0;
+            return;
+        }
+        for (int n = 0; n < ncells; ++n) {
+            const std::size_t index = static_cast<std::size_t>(n);
+            cix[index] = cells[index].ix;
+            ciy[index] = cells[index].iy;
+            ciz[index] = cells[index].iz;
+        }
+        cached = ncells;
     }
     int probe(std::int16_t x, std::int16_t y, std::int16_t z, int start) {
         for (int step = 0; step < slots; ++step) {

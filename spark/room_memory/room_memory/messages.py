@@ -1,7 +1,7 @@
 """CDR codecs for the ``labcommand_msgs`` room-memory messages, with no ROS imports.
 
 The contract is ``docs/ROOM-MEMORY-PROTOCOL.md`` (Phase 0 branch). ``RhythmMinute`` is the
-rhythm-log record in ``PLAN-RHYTHM.md`` (protocol §3.9, D45). It skips the common header:
+rhythm-log record in ``PLAN-RHYTHM.md`` (protocol §3.10, D45). ``RigPose`` is the rig-pose guard (protocol §3.9, D42). It skips the common header:
 ``sensor`` (1 Mid-360, 2 JT128) is the field after ``room_id``, then ``map_epoch``, ``seq``
 and ``stamp``. Classic CDR (XCDR1):
 4-byte encapsulation header (``00 01`` little endian, ``00 00`` big endian), every primitive
@@ -13,7 +13,7 @@ exactly what ``from_cdr`` rejects. Float fields hold binary32 values; a missing 
 measurement is ``None`` here and NaN on the wire.
 
 Protocol v2 appends fields at the end of ``MemoryStatus``, ``MapBricks``, ``ChangeEvent``,
-``Epoch``, ``Activity``, ``RequestSync`` and ``RhythmMinute`` (protocol §1.4, §3.9, D38, D45). The layout comes from the bytes after the last legacy field:
+``Epoch``, ``Activity``, ``RequestSync``, ``RhythmMinute`` and ``RigPose`` (protocol §1.4, §3.9, §3.10, D38, D42, D45). The layout comes from the bytes after the last legacy field:
 at most 3 is a legacy message, padding to 8 then exactly the v2 fields (then at most 3) is v2, and
 anything else is invalid. ``publisher_generation`` (and the ``RequestSync`` v2 fields) are
 ``None`` for the legacy layout; the encoders write it only when they hold one.
@@ -112,6 +112,36 @@ class SyncTopic(IntEnum):
 
     MAP_BRICKS = 0
     EVENTS = 1
+
+
+class RigOutcome(IntEnum):
+    """``RigPose.outcome``: the rig-pose guard's last decision (protocol §3.9)."""
+
+    IN_PLACE = 0
+    CHECKING = 1
+    MOVED = 2
+    REALIGNED = 3
+    RELEARNING = 4
+    INCONCLUSIVE = 5
+
+
+class RigChannel(IntEnum):
+    """``RigPose.channel``: one sensor's result in the decision a ``RigPose`` reports."""
+
+    NONE = 0
+    IN_PLACE = 1
+    MOVED = 2
+    REJECTED = 3
+    UNAVAILABLE = 4
+
+
+CAUSE_IMU_SHOCK = 1
+CAUSE_IMU_TILT = 2
+CAUSE_POSE_OFFSET = 4
+CAUSE_PERIODIC = 8
+CAUSE_STARTUP = 16
+CAUSE_SENSOR_RESUMED = 32
+CAUSES_ALL = 63
 
 
 def f32(value):
@@ -236,6 +266,9 @@ class _Writer:
     def f32(self, value):
         self.u32(_NAN_BITS if value is None or math.isnan(value) else struct.unpack("<I", struct.pack("<f", value))[0])
 
+    def f64(self, value):
+        self._put("<d", 8, value)
+
     def floats(self, values):
         for value in values:
             self.f32(value)
@@ -317,6 +350,9 @@ class _Reader:
 
     def f32(self, what):
         return self._get("f", 4, what)
+
+    def f64(self, what):
+        return self._get("d", 8, what)
 
     def floats(self, what, count):
         return tuple(self.f32(f"{what}[{index}]") for index in range(count))
@@ -1118,7 +1154,7 @@ _RHYTHM_REGIONS = 65535
 
 @dataclass(frozen=True)
 class RhythmMinute:
-    """One minute of per-lidar region occupancy on ``/room_memory/rhythm`` (protocol §3.9, D45).
+    """One minute of per-lidar region occupancy on ``/room_memory/rhythm`` (protocol §3.10, D45).
 
     It skips the common header. ``sensor`` is the file-header code (1 Mid-360, 2 JT128) and is
     the field after ``room_id``, then ``map_epoch``, ``seq`` and ``stamp``. Region arrays are
@@ -1257,3 +1293,193 @@ class RhythmMinute:
             message.validate()
             return message
         return _decode(data, "RhythmMinute", body)
+
+def _f32_optional(values):
+    return tuple(None if value is None else f32(value) for value in values)
+
+
+@dataclass(frozen=True)
+class RigPose:
+    """The rig-pose guard (protocol §3.9): its outcome, what started the check, each sensor's
+    result and absolute pose (``tx ty tz qx qy qz qw``, current sensor frame → its reference
+    frame), and the last check's metrics. ``None`` is NaN on the wire (a pose: NaN × 7).
+    ``publisher_generation`` is the v2 tail (protocol §1.4); the engine always stamps it."""
+
+    header: Header
+    outcome: RigOutcome
+    causes: int
+    sensors: int
+    channel: Tuple[int, int]  # RigChannel per sensor, [0] Mid-360 [1] JT128
+    frame_epoch: int
+    n_realigned: int
+    mid360_pose: Optional[Tuple[float, ...]]
+    jt128_pose: Optional[Tuple[float, ...]]
+    delta_m: Tuple[Optional[float], Optional[float]]
+    delta_deg: Tuple[Optional[float], Optional[float]]
+    inlier_frac: Tuple[Optional[float], Optional[float]]
+    rms_m: Tuple[Optional[float], Optional[float]]
+    observe: Tuple[Optional[float], Optional[float]]
+    tilt_deg: Optional[float]
+    imu_ok: bool
+    moved_at: Time
+    publisher_generation: Optional[int] = None  # None: the legacy layout
+
+    _PAIRS = ("delta_m", "delta_deg", "inlier_frac", "rms_m", "observe")
+
+    def __post_init__(self):
+        _f32_fields(self, ("mid360_pose", "jt128_pose", "tilt_deg"))
+        for name in self._PAIRS:
+            object.__setattr__(self, name, _f32_optional(getattr(self, name)))
+        object.__setattr__(self, "channel", tuple(self.channel))
+
+    def validate(self):
+        context = "RigPose"
+        self.header.validate(context)
+        _require_generation(self.publisher_generation, f"{context}: publisher_generation")
+        _enum(RigOutcome, self.outcome, f"{context}: outcome")
+        _require_int(self.causes, 0, 0xFF, f"{context}: causes")
+        if self.causes & ~CAUSES_ALL:
+            raise Invalid(f"{context}: causes 0x{self.causes:x} sets an undefined bit")
+        _require_int(self.sensors, 0, 0xFF, f"{context}: sensors")
+        if self.sensors & ~SENSORS_ALL:
+            raise Invalid(f"{context}: sensors 0x{self.sensors:x} sets an undefined bit")
+        if len(self.channel) != 2:
+            raise Invalid(f"{context}: channel holds {len(self.channel)} entries, not 2")
+        for index, (value, bit) in enumerate(zip(self.channel, (SENSOR_MID360, SENSOR_JT128))):
+            result = _enum(RigChannel, value, f"{context}: channel[{index}]")
+            if not self.sensors & bit and result not in (RigChannel.NONE, RigChannel.UNAVAILABLE):
+                raise Invalid(f"{context}: channel[{index}] {result.name} for a sensor outside sensors")
+        _require_int(self.frame_epoch, 0, SINCE_NONE, f"{context}: frame_epoch")
+        _require_int(self.n_realigned, 0, (1 << 32) - 1, f"{context}: n_realigned")
+        for name in ("mid360_pose", "jt128_pose"):
+            pose = getattr(self, name)
+            if pose is None:
+                continue
+            if len(pose) != 7:
+                raise Invalid(f"{context}: {name} holds {len(pose)} values, not 7")
+            _require_finite(pose, f"{context}: {name}")
+            norm = math.sqrt(sum(value * value for value in pose[3:]))
+            if abs(norm - 1.0) > 1e-3:
+                raise Invalid(f"{context}: {name} quaternion norm {norm} is not 1")
+        limits = {"delta_m": None, "delta_deg": 180.0, "inlier_frac": 1.0, "rms_m": None, "observe": None}
+        for name, high in limits.items():
+            values = getattr(self, name)
+            if len(values) != 2:
+                raise Invalid(f"{context}: {name} holds {len(values)} values, not 2")
+            for value in values:
+                if value is not None and not (math.isfinite(value) and value >= 0 and (high is None or value <= high)):
+                    raise Invalid(f"{context}: {name} {value} must be finite and in [0, {high or 'inf'}], or NaN")
+        if self.tilt_deg is not None and not (math.isfinite(self.tilt_deg) and 0 <= self.tilt_deg <= 180):
+            raise Invalid(f"{context}: tilt_deg {self.tilt_deg} must be finite and in [0, 180], or NaN")
+        if not isinstance(self.imu_ok, bool):
+            raise Invalid(f"{context}: imu_ok {self.imu_ok!r} is not a bool")
+        self.moved_at.validate(f"{context}: moved_at")
+
+    def to_cdr(self):
+        """CDR little endian, encapsulation header included. Raises ``Invalid``."""
+        self.validate()
+        writer = _Writer()
+        writer.header(self.header)
+        writer.u8(self.outcome)
+        writer.u8(self.causes)
+        writer.u8(self.sensors)
+        for value in self.channel:
+            writer.u8(value)
+        writer.u64(self.frame_epoch)
+        writer.u32(self.n_realigned)
+        writer.floats(self.mid360_pose or (None,) * 7)
+        writer.floats(self.jt128_pose or (None,) * 7)
+        for name in self._PAIRS:
+            writer.floats(getattr(self, name))
+        writer.f32(self.tilt_deg)
+        writer.u8(1 if self.imu_ok else 0)
+        writer.time(self.moved_at)
+        if self.publisher_generation is not None:
+            writer.u64(self.publisher_generation)
+        return bytes(writer.data)
+
+    @classmethod
+    def from_cdr(cls, data):
+        """Decodes either byte order. Raises ``Truncated`` or ``Invalid``."""
+        def body(reader):
+            header = reader.header("")
+            outcome = _enum(RigOutcome, reader.u8("outcome"), "RigPose: outcome")
+            causes = reader.u8("causes")
+            sensors = reader.u8("sensors")
+            channel = (reader.u8("channel[0]"), reader.u8("channel[1]"))
+            frame_epoch = reader.u64("frame_epoch")
+            n_realigned = reader.u32("n_realigned")
+            poses = []
+            for name in ("mid360_pose", "jt128_pose"):
+                values = reader.floats(name, 7)
+                nans = [math.isnan(value) for value in values]
+                if any(nans) and not all(nans):
+                    raise Invalid(f"RigPose: {name} {values} is partly NaN")
+                poses.append(None if all(nans) else values)
+            pairs = [tuple(None if math.isnan(value) else value for value in reader.floats(name, 2))
+                     for name in cls._PAIRS]
+            tilt = reader.f32("tilt_deg")
+            imu_ok = reader.u8("imu_ok")
+            if imu_ok > 1:
+                raise Invalid(f"RigPose: imu_ok {imu_ok} is not a bool")
+            moved_at = reader.time("moved_at")
+            generation = reader.u64("publisher_generation") if reader.is_v2(8, "moved_at") else None
+            pose = cls(header, outcome, causes, sensors, channel, frame_epoch, n_realigned, *poses, *pairs,
+                       None if math.isnan(tilt) else tilt, bool(imu_ok), moved_at, generation)
+            pose.validate()
+            return pose
+        return _decode(data, "RigPose", body)
+
+
+# MARK: sensor_msgs/Imu
+
+
+@dataclass(frozen=True)
+class ImuSample:
+    """The fields of one ``sensor_msgs/Imu`` the rig guard reads: the header stamp, angular
+    velocity (rad/s) and linear acceleration (the driver's unit: g or m/s²), binary64."""
+
+    stamp: Time
+    frame_id: str
+    angular_velocity: Tuple[float, float, float]
+    linear_acceleration: Tuple[float, float, float]
+
+    def validate(self):
+        self.stamp.validate("Imu: stamp")
+        _require_finite(self.angular_velocity, "Imu: angular_velocity")
+        _require_finite(self.linear_acceleration, "Imu: linear_acceleration")
+
+    def to_cdr(self):
+        """CDR little endian: identity orientation, every covariance 0 (tests and replay tools)."""
+        self.validate()
+        writer = _Writer()
+        writer.u32(self.stamp.sec & 0xFFFFFFFF)
+        writer.u32(self.stamp.nanosec)
+        writer.string(self.frame_id)
+        for value in (0.0, 0.0, 0.0, 1.0):
+            writer.f64(value)
+        for vector in (None, self.angular_velocity, None, self.linear_acceleration, None):
+            for value in vector or (0.0,) * 9:
+                writer.f64(value)
+        return bytes(writer.data)
+
+
+def decode_imu(data):
+    """Decodes one CDR ``sensor_msgs/Imu`` (std_msgs/Header, orientation and its covariance,
+    angular velocity and its covariance, linear acceleration and its covariance). Raises
+    ``Truncated`` or ``Invalid`` (non-finite rates or accelerations)."""
+    def body(reader):
+        stamp = reader.time("header.stamp")
+        frame_id = reader.string("header.frame_id")
+        for index in range(4 + 9):
+            reader.f64(f"orientation[{index}]")
+        angular = tuple(reader.f64(f"angular_velocity[{index}]") for index in range(3))
+        for index in range(9):
+            reader.f64(f"angular_velocity_covariance[{index}]")
+        linear = tuple(reader.f64(f"linear_acceleration[{index}]") for index in range(3))
+        for index in range(9):
+            reader.f64(f"linear_acceleration_covariance[{index}]")
+        sample = ImuSample(stamp, frame_id, angular, linear)
+        sample.validate()
+        return sample
+    return _decode(data, "Imu", body)

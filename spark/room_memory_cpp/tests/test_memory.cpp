@@ -9,12 +9,14 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <numbers>
 #include <random>
 
 #include "harness.hpp"
 #include "room_memory/memory.hpp"
 #include "room_memory/pointcloud2.hpp"
 #include "room_memory/rejectlog.hpp"
+#include "rooms.hpp"
 #include "scenes.hpp"
 
 using namespace room_memory;
@@ -1569,5 +1571,856 @@ TEST(gate_config_rejections) {
         CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart, kGeneration));
     }
 }
+
+namespace {
+// MARK: The engine with the guard on (test_guard.py, "The engine with the guard on")
+
+constexpr std::int64_t kGuardReferenceWindows = 10;
+const rooms::Box kCube{{2.0, -0.4, -1.2}, {2.4, 0.0, -0.8}};
+
+MemoryConfig guarded_config(const std::optional<std::string>& state_dir = std::nullopt) {
+    MemoryConfig config;
+    config.sensors = {"mid360"};
+    config.state_dir = state_dir;
+    config.reference_windows = kGuardReferenceWindows;
+    config.rig_guard = true;
+    return config;
+}
+
+struct Window {
+    std::int64_t second;
+    std::vector<msg::ChangeEvent> events;
+    MemoryState state;
+    std::optional<msg::RigPose> rig;
+};
+
+using ImuSource = std::function<std::vector<msg::ImuSample>(std::int64_t second)>;
+
+// One window per pose, at seconds first, first + 1, ..., of `frames` scans each; imu(second) gives
+// the samples received during the second before that window closes. Stamps start at 0, as in
+// test_guard.py.
+std::vector<Window> drive(RoomMemory& memory, const std::vector<rig::Pose>& poses, std::int64_t first,
+                          const std::vector<rooms::Box>& boxes = rooms::kFurniture, const ImuSource& imu = {},
+                          int frames = 1, const rooms::Box& room = rooms::kRoom) {
+    std::vector<Window> trace;
+    for (std::size_t n = 0; n < poses.size(); ++n) {
+        const std::int64_t second = first + static_cast<std::int64_t>(n);
+        if (imu) {
+            for (const msg::ImuSample& sample : imu(second)) memory.add_imu(sample.to_cdr(), sample.stamp);
+        }
+        for (int frame = 0; frame < frames; ++frame) {
+            memory.add_points("mid360", rooms::scan(poses[n], room, boxes, 0.01,
+                                                    static_cast<std::uint64_t>(second * frames + frame)));
+        }
+        const msg::Time t{second, 0};
+        std::vector<msg::ChangeEvent> events = memory.close_window(t);
+        std::optional<msg::RigPose> rig = memory.rig_pose(t);
+        // Every RigPose carries the process's publisher generation (protocol 1.4).
+        CHECK(!rig || rig->publisher_generation == memory.publisher_generation());
+        trace.push_back(Window{second, std::move(events), memory.status(t, 1.0).state, std::move(rig)});
+    }
+    return trace;
+}
+
+std::vector<rig::Pose> repeat(const rig::Pose& pose, std::int64_t count) {
+    return std::vector<rig::Pose>(static_cast<std::size_t>(count), pose);
+}
+
+void append(std::vector<Window>& trace, std::vector<Window> more) {
+    for (Window& window : more) trace.push_back(std::move(window));
+}
+
+// The RigPose outcomes in order, repeats collapsed.
+std::vector<msg::RigOutcome> outcomes(const std::vector<Window>& trace) {
+    std::vector<msg::RigOutcome> out;
+    for (const Window& window : trace) {
+        if (window.rig && (out.empty() || out.back() != window.rig->outcome)) out.push_back(window.rig->outcome);
+    }
+    return out;
+}
+
+std::vector<msg::RigOutcome> last(const std::vector<msg::RigOutcome>& list, std::size_t count) {
+    return std::vector<msg::RigOutcome>(list.end() - static_cast<std::ptrdiff_t>(std::min(count, list.size())), list.end());
+}
+
+// The outcomes from the first MOVED on. This scan noise is not numpy's, so the static room's few
+// centimetres of pose_offset start checks at other windows than in the Python tests; what follows a
+// re-alignment is checks that stay in place, never a second move.
+std::vector<msg::RigOutcome> from_moved(const std::vector<msg::RigOutcome>& list) {
+    return std::vector<msg::RigOutcome>(std::find(list.begin(), list.end(), msg::RigOutcome::moved), list.end());
+}
+
+bool realigned_once(const std::vector<msg::RigOutcome>& list) {
+    const std::vector<msg::RigOutcome> after = from_moved(list);
+    return after.size() >= 2 && after[1] == msg::RigOutcome::realigned &&
+           std::all_of(after.begin() + 2, after.end(), [](msg::RigOutcome o) {
+               return o == msg::RigOutcome::checking || o == msg::RigOutcome::in_place || o == msg::RigOutcome::realigned;
+           });
+}
+
+std::vector<msg::ChangeEvent> all_events(const std::vector<Window>& trace) {
+    std::vector<msg::ChangeEvent> out;
+    for (const Window& window : trace) out.insert(out.end(), window.events.begin(), window.events.end());
+    return out;
+}
+
+std::vector<msg::ChangeEvent> candidates(const std::vector<Window>& trace) {
+    std::vector<msg::ChangeEvent> out;
+    for (const msg::ChangeEvent& event : all_events(trace)) {
+        if (event.state == EventState::candidate) out.push_back(event);
+    }
+    return out;
+}
+
+bool has_state(const std::vector<Window>& trace, MemoryState state) {
+    return std::any_of(trace.begin(), trace.end(), [&](const Window& w) { return w.state == state; });
+}
+
+void check_pose(const rig::Pose& estimate, const rig::Pose& truth) {
+    const auto [error_m, error_deg] = rooms::pose_error(estimate, truth);
+    if (!(error_m <= 0.005 && error_deg <= 0.05)) {
+        throw harness::Failure("pose error " + std::to_string(error_m) + " m, " + std::to_string(error_deg) + " deg");
+    }
+}
+
+using O = msg::RigOutcome;
+using Channel = RoomMemory::Channel;
+
+TEST(a_hold_defers_promotion_to_the_first_window_without_it) {
+    CandidateTracker tracker(3, 1, 1, 20, 0.9);
+    Region box;
+    box.kind = Region::Kind::appeared;
+    for (std::int64_t i = 0; i < 3; ++i) {
+        for (std::int64_t j = 0; j < 3; ++j) {
+            for (std::int64_t k = 0; k < 3; ++k) box.keys.push_back(pack(i, j, k));
+        }
+    }
+    sort_unique(box.keys);
+    box.voxel_count = static_cast<std::int64_t>(box.keys.size());
+    std::uint64_t id = 100;
+    for (std::int64_t n = 0; n < 5; ++n) CHECK(tracker.update({box}, stamp(n), [&] { return id++; }, {}, true).empty());
+    CHECK_EQ(tracker.pending()[0].windows, 5);
+    const auto out = tracker.update({box}, stamp(5), [&] { return id++; });
+    CHECK(out.size() == 1 && out[0].first == EventState::candidate && out[0].second.event_id == 100);
+}
+
+TEST(a_pushed_rig_realigns_without_false_events_and_finds_a_cube) {
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
+    const rig::Pose truth = rooms::rig(0.10, 0.0, 0.0, 2.0);
+    std::vector<Window> trace = drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 2), 1);
+    append(trace, drive(memory, repeat(truth, 20), static_cast<std::int64_t>(trace.size()) + 1));
+    CHECK(all_events(trace).empty());
+    CHECK(has_state(trace, MemoryState::rig_moved));
+    const std::vector<O> seen = outcomes(trace);
+    const auto first_moved = std::find(seen.begin(), seen.end(), O::moved);
+    CHECK(first_moved != seen.begin() && first_moved != seen.end() && *(first_moved - 1) == O::in_place);
+    CHECK(realigned_once(seen));
+    const auto moved = std::find_if(trace.begin(), trace.end(), [](const Window& w) { return w.rig && w.rig->outcome == O::moved; });
+    CHECK((moved->rig->causes & msg::kCausePoseOffset) && moved->rig->channel[0] == msg::RigChannel::moved);
+    check_pose(memory.channel("mid360").pose, truth);
+    CHECK_EQ(memory.map_epoch(), 1u);  // re-alignment sends no map
+    // A few frames per window, as a 10 Hz lidar gives: one sparse fan makes the cube flicker past the shape gate.
+    std::vector<rooms::Box> boxes = rooms::kFurniture;
+    boxes.push_back(kCube);
+    const std::vector<Window> later = drive(memory, repeat(truth, 50), static_cast<std::int64_t>(trace.size()) + 1, boxes, {}, 4);
+    const std::vector<msg::ChangeEvent> found = candidates(later);
+    CHECK_EQ(found.size(), 1u);
+    CHECK(found[0].kind == EventKind::appeared);
+    double squared = 0.0;
+    for (std::size_t a = 0; a < 3; ++a) {
+        const double center = (kCube.first[a] + kCube.second[a]) / 2;
+        squared += (found[0].centroid[a] - center) * (found[0].centroid[a] - center);
+    }
+    CHECK(std::sqrt(squared) <= 0.25);
+}
+
+TEST(without_the_guard_the_push_floods_candidates) {
+    MemoryConfig config = guarded_config();
+    config.rig_guard = false;
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+    drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 2), 1);
+    const std::vector<Window> trace = drive(memory, repeat(rooms::rig(0.10, 0.0, 0.0, 2.0), 45), kGuardReferenceWindows + 3);
+    CHECK(!candidates(trace).empty());
+    CHECK(std::none_of(trace.begin(), trace.end(), [](const Window& w) { return w.rig.has_value(); }));
+}
+
+TEST(a_yaw_alone_realigns_before_the_candidate_gate) {
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
+    const rig::Pose truth = rooms::rig(0.0, 0.0, 0.0, 3.0);
+    drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 2), 1);
+    const std::vector<Window> trace = drive(memory, repeat(truth, 45), kGuardReferenceWindows + 3);
+    CHECK(candidates(trace).empty());
+    const std::vector<O> seen = outcomes(trace);
+    CHECK(std::find(seen.begin(), seen.end(), O::realigned) != seen.end());
+    check_pose(memory.channel("mid360").pose, truth);
+}
+
+TEST(a_static_rig_checks_periodically_and_stays_in_place) {
+    // Without the pose_offset trigger: its checks on this noise come often enough to keep resetting
+    // the periodic timer (a_pushed_rig_realigns_without_false_events_and_finds_a_cube covers it).
+    MemoryConfig config = guarded_config();
+    config.pose_trigger_m = 1.0;
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+    const std::vector<Window> trace = drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 70), 1);
+    CHECK(all_events(trace).empty());
+    for (const Window& window : trace) CHECK(window.state == MemoryState::building || window.state == MemoryState::tracking);
+    for (const O outcome : outcomes(trace)) CHECK(outcome == O::in_place || outcome == O::checking);
+    CHECK(std::any_of(trace.begin(), trace.end(), [](const Window& w) {
+        return w.rig && w.rig->outcome == O::checking && (w.rig->causes & msg::kCausePeriodic);
+    }));
+    CHECK(memory.channel("mid360").pose.is_identity());
+}
+
+// Quiet samples at `rate` Hz, and with `shock_at` a 0.2 s jolt that turns the sensor by yaw_deg about z,
+// or rolls it by roll_deg about x so gravity reads tilted after it.
+ImuSource imu_stream(std::optional<double> shock_at = std::nullopt, double yaw_deg = 0.0, int rate = 50,
+                     double roll_deg = 0.0) {
+    const double yaw_rate = yaw_deg * (std::numbers::pi / 180.0) / 0.2;
+    const double roll = roll_deg * (std::numbers::pi / 180.0);
+    return [=](std::int64_t second) {
+        std::vector<msg::ImuSample> out;
+        for (int n = 0; n < rate; ++n) {
+            const double t = static_cast<double>(second - 1) + static_cast<double>(n) / rate;
+            msg::ImuSample sample;
+            sample.frame_id = "livox_frame";
+            sample.linear_acceleration = {0.0, 0.0, -1.0};
+            if (shock_at && *shock_at <= t && t < *shock_at + 0.2) {
+                sample.linear_acceleration = {0.3, 0.0, -1.2};
+                sample.angular_velocity = {roll / 0.2, 0.0, yaw_rate};
+            } else if (shock_at && t >= *shock_at + 0.2) {
+                sample.linear_acceleration = {0.0, -std::sin(roll), -std::cos(roll)};
+            }
+            const auto ns = static_cast<std::int64_t>(std::llround(t * 1e9));
+            sample.stamp = msg::Time{ns / 1'000'000'000, ns % 1'000'000'000};
+            out.push_back(sample);
+        }
+        return out;
+    };
+}
+
+TEST(an_imu_shock_with_a_move_realigns_from_the_gyro_prior) {
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
+    const rig::Pose truth = rooms::rig(0.05, 0.0, 0.0, 2.0);
+    std::vector<rig::Pose> poses = repeat(rig::Pose{}, kGuardReferenceWindows + 3);
+    const std::vector<rig::Pose> after = repeat(truth, 20);
+    poses.insert(poses.end(), after.begin(), after.end());
+    const std::vector<Window> trace =
+        drive(memory, poses, 1, rooms::kFurniture, imu_stream(static_cast<double>(kGuardReferenceWindows) + 2.5, 2.0));
+    CHECK(all_events(trace).empty());
+    const std::vector<O> seen = outcomes(trace);
+    const auto first_moved = std::find(seen.begin(), seen.end(), O::moved);
+    CHECK(first_moved != seen.begin() && first_moved != seen.end() && *(first_moved - 1) == O::checking);
+    CHECK(realigned_once(seen));
+    const auto checking = std::find_if(trace.begin(), trace.end(), [](const Window& w) { return w.rig && w.rig->outcome == O::checking; });
+    CHECK((checking->rig->causes & msg::kCauseImuShock) && checking->rig->imu_ok);
+    check_pose(memory.channel("mid360").pose, truth);
+}
+
+TEST(an_imu_shock_alone_checks_and_stays_in_place) {
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
+    const std::vector<Window> trace = drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 15), 1, rooms::kFurniture,
+                                            imu_stream(static_cast<double>(kGuardReferenceWindows) + 2.5));
+    CHECK((last(outcomes(trace), 2) == std::vector<O>{O::checking, O::in_place}));
+    CHECK(!has_state(trace, MemoryState::rig_moved));
+    CHECK(memory.channel("mid360").pose.is_identity());
+}
+
+RigState saved_rig_state(const std::filesystem::path& room) {
+    return parse_rig_state(harness::read_bytes(room / "rig_state"), "rig_state");
+}
+
+TEST(the_gravity_baseline_is_set_while_building) {
+    // The IMU streams through BUILDING, so the new frame starts with a gravity baseline.
+    TempDir dir;
+    RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
+    drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows), 1, rooms::kFurniture, imu_stream());
+    CHECK(memory.state() == MemoryState::tracking);
+    const RigState state = saved_rig_state(dir.path / "lab");
+    CHECK(state.g_base && std::fabs((*state.g_base)[2] + 1.0) <= 1e-9);
+}
+
+TEST(an_imu_tilt_is_move_evidence_where_icp_cannot_register) {
+    // Codex's repro: a planar reference with the IMU streaming throughout, then a 3 degree roll with
+    // a gyro shock. ICP rejects the floor, so the tilt alone must give RIG_MOVED, not INCONCLUSIVE.
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
+    std::vector<rig::Pose> poses = repeat(rig::Pose{}, kGuardReferenceWindows + 3);
+    const std::vector<rig::Pose> after = repeat(rooms::rig(0.0, 0.0, 0.0, 0.0, 3.0), 20);
+    poses.insert(poses.end(), after.begin(), after.end());
+    const std::vector<Window> trace = drive(memory, poses, 1, {},
+                                            imu_stream(static_cast<double>(kGuardReferenceWindows) + 2.5, 0.0, 50, 3.0),
+                                            1, rooms::kFloorOnly);
+    CHECK(has_state(trace, MemoryState::rig_moved));
+    const std::vector<O> seen = outcomes(trace);
+    CHECK(std::find(seen.begin(), seen.end(), O::moved) != seen.end());
+    CHECK(std::find(seen.begin(), seen.end(), O::inconclusive) == seen.end());
+    CHECK(std::any_of(trace.begin(), trace.end(), [](const Window& w) {
+        return w.rig && w.rig->outcome == O::moved && (w.rig->causes & msg::kCauseImuTilt);
+    }));
+}
+
+TEST(an_imu_that_comes_up_after_the_build_starts_the_gravity_baseline) {
+    // The IMU is silent through BUILDING, so the frame starts without a baseline: quiet gravity in
+    // place starts it (and saves it), and a tilt on a floor ICP cannot register still gives RIG_MOVED.
+    TempDir dir;
+    RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
+    const ImuSource stream = imu_stream(static_cast<double>(kGuardReferenceWindows) + 6.5, 0.0, 50, 3.0);
+    const ImuSource late = [&](std::int64_t second) {
+        return second > kGuardReferenceWindows ? stream(second) : std::vector<msg::ImuSample>{};
+    };
+    drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows), 1, {}, late, 1, rooms::kFloorOnly);
+    CHECK(memory.state() == MemoryState::tracking);
+    CHECK(!saved_rig_state(dir.path / "lab").g_base);
+    std::vector<Window> trace = drive(memory, repeat(rig::Pose{}, 6), kGuardReferenceWindows + 1, {}, late, 1,
+                                      rooms::kFloorOnly);
+    const RigState state = saved_rig_state(dir.path / "lab");
+    CHECK(state.g_base && std::fabs((*state.g_base)[2] + 1.0) <= 1e-9);
+    const std::vector<Window> tilted = drive(memory, repeat(rooms::rig(0.0, 0.0, 0.0, 0.0, 3.0), 20),
+                                             kGuardReferenceWindows + 7, {}, late, 1, rooms::kFloorOnly);
+    trace.insert(trace.end(), tilted.begin(), tilted.end());
+    CHECK(has_state(trace, MemoryState::rig_moved));
+    const std::vector<O> seen = outcomes(trace);
+    CHECK(std::find(seen.begin(), seen.end(), O::moved) != seen.end());
+    CHECK(std::find(seen.begin(), seen.end(), O::inconclusive) == seen.end());
+    CHECK(std::any_of(trace.begin(), trace.end(), [](const Window& w) {
+        return w.rig && w.rig->outcome == O::moved && (w.rig->causes & msg::kCauseImuTilt);
+    }));
+}
+
+TEST(a_shock_while_building_does_not_start_a_check) {
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
+    const std::vector<Window> trace = drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 5), 1, rooms::kFurniture,
+                                            imu_stream(static_cast<double>(kGuardReferenceWindows) / 2));
+    CHECK(std::none_of(trace.begin(), trace.end(), [](const Window& w) { return w.rig && (w.rig->causes & msg::kCauseImuShock); }));
+}
+
+TEST(a_sensor_lost_after_a_move_does_not_block_the_relearn) {
+    // Codex's repro: both sensors see a move outside the envelope, then the JT128 drops. The Mid-360
+    // relearns on its own at relearn_after_s and tracks again; the JT128 builds its reference when it
+    // returns, and only then is the new frame committed. The move rolls the rig 3 degrees under a
+    // streaming IMU, so the tilt confirms it whatever ICP makes of a pose it cannot reach.
+    TempDir dir;
+    const std::filesystem::path room = dir.path / "lab";
+    MemoryConfig config = guarded_config(dir.path.string());
+    config.sensors = {"mid360", "jt128"};
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+    const rig::Pose far = rooms::rig(0.5, 0.0, 0.0, 20.0, 3.0);
+    ImuSource imu = imu_stream();
+    std::vector<rooms::Box> with_cube = rooms::kFurniture;
+    with_cube.push_back(kCube);
+    const std::vector<std::string> both{"mid360", "jt128"};
+    const std::vector<std::string> mid{"mid360"};
+    std::vector<Window> trace;
+    std::int64_t second = 1;
+    const auto step = [&](const rig::Pose& pose, const std::vector<std::string>& sensors,
+                          const std::vector<rooms::Box>& boxes, int frames) {
+        for (const msg::ImuSample& sample : imu(second)) memory.add_imu(sample.to_cdr(), sample.stamp);
+        for (const std::string& name : sensors) {
+            for (int frame = 0; frame < frames; ++frame) {
+                memory.add_points(name, rooms::scan(pose, rooms::kRoom, boxes, 0.01,
+                                                    static_cast<std::uint64_t>(second * frames + frame)));
+            }
+        }
+        const msg::Time t{second++, 0};
+        std::vector<msg::ChangeEvent> events = memory.close_window(t);
+        memory.map_update(t);
+        std::optional<msg::RigPose> rig = memory.rig_pose(t);
+        trace.push_back(Window{t.sec, std::move(events), memory.status(t, 1.0).state, std::move(rig)});
+    };
+    const Channel& jt128 = memory.channel("jt128");
+    // Until an accepted check gives both an inlier baseline: without one, gross mismatch is no evidence.
+    while (!memory.channel("mid360").baseline || !jt128.baseline) {
+        step(rig::Pose{}, both, rooms::kFurniture, 1);
+        CHECK(second < kGuardReferenceWindows + 60);
+    }
+    const std::int64_t moving = second;
+    imu = imu_stream(static_cast<double>(moving) - 0.5, 0.0, 50, 3.0);
+    const std::uint64_t old_epoch = memory.map_epoch();
+    const std::uint64_t old_frame = saved_rig_state(room).frame_epoch;
+    while (memory.channel("mid360").mode != Channel::Mode::moved || jt128.mode != Channel::Mode::moved) {
+        step(far, both, rooms::kFurniture, 1);
+        CHECK(second < moving + 20);
+    }
+    const std::int64_t moved_at = second;
+    while (memory.rig_outcome() != O::relearning) {
+        step(far, mid, rooms::kFurniture, 1);
+        CHECK(second <= moved_at + 62);  // the silent JT128 blocked the relearn
+    }
+    // The room rebuilds on the Mid-360 alone and tracks again; the JT128 waits unbuilt.
+    const std::int64_t relearned_at = second;
+    while (memory.state() != MemoryState::tracking) {
+        CHECK(memory.rig_outcome() == O::relearning);
+        step(far, mid, rooms::kFurniture, 1);
+        CHECK(second <= relearned_at + kGuardReferenceWindows + 1);
+    }
+    CHECK(memory.channel("mid360").cloud && !jt128.cloud);
+    CHECK(memory.map_epoch() > old_epoch);
+    // Nothing commits a frame without the JT128: the files on disk are still the old frame's, and a
+    // restart loads that frame whole and checks it.
+    CHECK_EQ(saved_rig_state(room).frame_epoch, old_frame);
+    {
+        TempDir copy;
+        std::filesystem::copy(room, copy.path / "lab", std::filesystem::copy_options::recursive);
+        MemoryConfig again = config;
+        again.state_dir = copy.path.string();
+        RoomMemory restarted(again, msg::Time{0, 0}, kGeneration);
+        CHECK(restarted.state() == MemoryState::tracking && restarted.rig_outcome() == O::checking);
+        CHECK(restarted.channel("jt128").cloud);
+    }
+    const std::size_t start = trace.size();
+    for (int n = 0; n < 40; ++n) step(far, mid, with_cube, 4);
+    const std::vector<Window> after(trace.begin() + static_cast<std::ptrdiff_t>(start), trace.end());
+    CHECK(std::all_of(after.begin(), after.end(), [](const Window& w) { return w.state == MemoryState::degraded; }));
+    const std::vector<msg::ChangeEvent> found = candidates(after);
+    CHECK_EQ(found.size(), 1u);
+    CHECK_EQ(found[0].sensors, msg::kSensorMid360);
+    const rig::Vec3d center{(kCube.first[0] + kCube.second[0]) / 2, (kCube.first[1] + kCube.second[1]) / 2,
+                            (kCube.first[2] + kCube.second[2]) / 2};
+    const rig::Vec3d expected = far.inverse().apply(center);
+    double squared = 0.0;
+    for (std::size_t a = 0; a < 3; ++a) squared += (found[0].centroid[a] - expected[a]) * (found[0].centroid[a] - expected[a]);
+    CHECK(std::sqrt(squared) <= 0.25);
+    CHECK(std::none_of(after.begin(), after.end(), [](const Window& w) { return w.rig && (w.rig->sensors & msg::kSensorJT128); }));
+    // The JT128 returns: it builds its reference in the new frame, which is then committed.
+    for (std::int64_t n = 0; n < kGuardReferenceWindows; ++n) {
+        CHECK(!jt128.cloud);
+        step(far, both, with_cube, 1);
+    }
+    CHECK(jt128.cloud);
+    step(far, both, with_cube, 1);
+    CHECK(trace.back().state == MemoryState::tracking);
+    CHECK(jt128.available && jt128.mode == Channel::Mode::normal && jt128.pose.is_identity());
+    const RigState state = saved_rig_state(room);
+    CHECK(state.frame_epoch > old_frame);
+    const std::size_t cloud = jt128.cloud->size();
+    RoomMemory restarted(config, msg::Time{0, 0}, kGeneration);
+    CHECK(restarted.state() == MemoryState::tracking);
+    CHECK_EQ(restarted.channel("jt128").cloud->size(), cloud);
+}
+
+TEST(a_sensor_still_building_when_the_rig_moves_starts_its_build_over) {
+    // The JT128 is silent through the build and returns to build its reference while the room
+    // tracks. The rig moves two windows into that build: the JT128 starts over in the new pose, so
+    // it joins with a reference of one pose and reports nothing on the unchanged room.
+    MemoryConfig config = guarded_config();
+    config.sensors = {"mid360", "jt128"};
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+    const rig::Pose truth = rooms::rig(0.10, 0.0, 0.0, 2.0);
+    const Channel& jt128 = memory.channel("jt128");
+    std::vector<Window> trace;
+    std::vector<std::int64_t> built;
+    std::int64_t second = 1;
+    const auto step = [&](const rig::Pose& pose, const std::vector<std::string>& sensors) {
+        for (const std::string& name : sensors) {
+            memory.add_points(name, rooms::scan(pose, rooms::kRoom, rooms::kFurniture, 0.01, static_cast<std::uint64_t>(second)));
+        }
+        const msg::Time t{second++, 0};
+        std::vector<msg::ChangeEvent> events = memory.close_window(t);
+        std::optional<msg::RigPose> rig = memory.rig_pose(t);
+        trace.push_back(Window{t.sec, std::move(events), memory.status(t, 1.0).state, std::move(rig)});
+        built.push_back(static_cast<std::int64_t>(jt128.reference_windows));
+    };
+    const std::vector<std::string> both{"mid360", "jt128"};
+    // Until an accepted check gives the Mid-360 an inlier baseline, so a fit can say MOVED.
+    while (memory.state() != MemoryState::tracking || !memory.channel("mid360").baseline) {
+        step(rig::Pose{}, {"mid360"});
+        CHECK(second < kGuardReferenceWindows + 60);
+    }
+    CHECK(jt128.builder && jt128.reference_windows == 0);
+    for (int n = 0; n < 2; ++n) step(rig::Pose{}, both);
+    CHECK(jt128.reference_windows == 2);
+    const std::size_t moving = trace.size();
+    while (!jt128.cloud) {
+        step(truth, both);
+        CHECK(second < kGuardReferenceWindows + 100);
+    }
+    const std::vector<Window> moved(trace.begin() + static_cast<std::ptrdiff_t>(moving), trace.end());
+    CHECK(has_state(moved, MemoryState::rig_moved));
+    // The move restarted the build: the count fell back instead of running on from 2.
+    CHECK(*std::min_element(built.begin() + static_cast<std::ptrdiff_t>(moving), built.end()) < 2);
+    check_pose(memory.channel("mid360").pose, truth);
+    const std::size_t joined = trace.size();
+    for (int n = 0; n < 45; ++n) step(truth, both);
+    CHECK(std::all_of(trace.begin() + static_cast<std::ptrdiff_t>(joined), trace.end(),
+                      [](const Window& w) { return w.state == MemoryState::tracking; }));
+    CHECK(jt128.mode == Channel::Mode::normal && jt128.pose.is_identity());
+    CHECK(std::all_of(trace.begin() + static_cast<std::ptrdiff_t>(moving), trace.end(),
+                      [](const Window& w) { return w.events.empty(); }));
+}
+
+TEST(a_moved_sensor_gone_silent_keeps_the_move) {
+    // Codex's repro: a window without points right after a detected 10 cm + 2 degree push takes the
+    // sensor off line (stale), never the move: RIG_MOVED and MOVED until it realigns, and no check
+    // (here a periodic one falls due) starts over the unresolved move.
+    MemoryConfig config = guarded_config();
+    config.guard_check_period_s = 1.0;
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+    const rig::Pose truth = rooms::rig(0.10, 0.0, 0.0, 2.0);
+    drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 2), 1);
+    std::int64_t second = kGuardReferenceWindows + 3;
+    while (memory.channel("mid360").mode != Channel::Mode::moved) {
+        drive(memory, repeat(truth, 1), second++);
+        CHECK(second < kGuardReferenceWindows + 20);
+    }
+    std::vector<MemoryState> states;
+    std::vector<std::optional<msg::RigPose>> rigs;
+    for (int n = 0; n < 3; ++n, ++second) {
+        const msg::Time t{second, 0};
+        memory.close_window(t);
+        states.push_back(memory.status(t, 1.0).state);
+        rigs.push_back(memory.rig_pose(t));
+    }
+    CHECK(memory.channel("mid360").mode == Channel::Mode::stale);
+    CHECK(states == std::vector<MemoryState>(3, MemoryState::rig_moved) && memory.rig_outcome() == O::moved);
+    CHECK(rigs[0] && rigs[0]->outcome == O::moved);
+    const std::vector<Window> trace = drive(memory, repeat(truth, 20), second);
+    const std::vector<O> seen = outcomes(trace);
+    CHECK(std::find(seen.begin(), seen.end(), O::realigned) != seen.end() && trace.back().state == MemoryState::tracking);
+    check_pose(memory.channel("mid360").pose, truth);
+}
+
+TEST(the_rig_state_round_trips_and_a_restart_checks_the_pose) {
+    TempDir dir;
+    const rig::Pose truth = rooms::rig(0.10, 0.0, 0.0, 2.0);
+    rig::Pose pose;
+    std::size_t cloud = 0;
+    {
+        RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
+        drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 2), 1);
+        drive(memory, repeat(truth, 10), kGuardReferenceWindows + 3);
+        pose = memory.channel("mid360").pose;
+        cloud = memory.channel("mid360").cloud->size();
+    }
+    CHECK(!pose.is_identity());
+    CHECK(std::filesystem::exists(dir.path / "lab" / "rig_state"));
+    CHECK(std::filesystem::exists(dir.path / "lab" / "registration-mid360.bin"));
+    RoomMemory restarted(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
+    CHECK(restarted.channel("mid360").pose == pose);
+    CHECK_EQ(restarted.channel("mid360").cloud->size(), cloud);
+    CHECK(restarted.rig_outcome() == O::checking);
+    const std::vector<Window> trace = drive(restarted, repeat(truth, 5), 1);
+    CHECK(outcomes(trace).back() == O::in_place && candidates(trace).empty());
+    CHECK_EQ(trace[0].rig->causes, msg::kCauseStartup);
+}
+
+TEST(close_window_times_the_guard_icp) {
+    // window_estimates and window_estimate_ms cover the guard's ICP in the last window only: none
+    // while building or between checks, and time in each window that checks.
+    MemoryConfig config = guarded_config();
+    config.guard_check_period_s = 5.0;
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+    std::vector<std::pair<std::int64_t, double>> counts;
+    for (std::int64_t second = 1; second < kGuardReferenceWindows + 13; ++second) {
+        drive(memory, repeat(rig::Pose{}, 1), second);
+        counts.emplace_back(memory.window_estimates(), memory.window_estimate_ms());
+    }
+    for (std::int64_t n = 0; n + 1 < kGuardReferenceWindows; ++n) {
+        CHECK(counts[static_cast<std::size_t>(n)].first == 0 && counts[static_cast<std::size_t>(n)].second == 0.0);
+    }
+    bool checked = false, between = false;
+    for (std::size_t n = static_cast<std::size_t>(kGuardReferenceWindows); n < counts.size(); ++n) {
+        if (counts[n].first > 0) {
+            checked = true;
+            CHECK(counts[n].second > 0.0);
+        } else {
+            between = between || counts[n].second == 0.0;
+        }
+    }
+    CHECK(checked && between);
+}
+
+TEST(a_frame_add_imu_cannot_decode_is_counted_never_thrown) {
+    // add_imu rejects what decode_imu cannot read and counts it; with the guard off it reads nothing.
+    RoomMemory memory(guarded_config(), msg::Time{0, 0}, kGeneration);
+    const msg::Bytes good = msg::ImuSample{msg::Time{1, 0}, "livox_frame", {0.0, 0.0, 0.0}, {0.0, 0.0, -1.0}}.to_cdr();
+    CHECK(memory.add_imu(good, msg::Time{1, 0}) && memory.imu_failed() == 0);
+    const msg::Bytes truncated(good.begin(), good.begin() + 40);
+    CHECK(!memory.add_imu(truncated, msg::Time{1, 0}) && memory.imu_failed() == 1);
+    MemoryConfig off = guarded_config();
+    off.rig_guard = false;
+    RoomMemory unguarded(off, msg::Time{0, 0}, kGeneration);
+    CHECK(!unguarded.add_imu(good, msg::Time{1, 0}) && unguarded.imu_failed() == 0);
+}
+
+TEST(a_failed_rig_save_never_leaves_close_window_and_retries) {
+    // A rig_state write that fails (a directory where its temp file goes, as a full disk or a
+    // permission error would) is caught: the guard runs on from memory, the failure is counted, every
+    // window retries, and once a save goes through the state loads back.
+    TempDir dir;
+    const std::filesystem::path room = dir.path / "lab";
+    const std::filesystem::path blocker = room / "rig_state.tmp";
+    std::filesystem::create_directories(blocker);
+    RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
+    drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows + 3), 1);
+    CHECK(memory.state() == MemoryState::tracking && memory.rig_save_pending());
+    CHECK(memory.rig_save_failed() >= 4);  // the build, then a retry per window
+    CHECK(memory.rig_save_error().find("rig_state.tmp") != std::string::npos);
+    CHECK(std::filesystem::exists(room / "registration-mid360.bin") && !std::filesystem::exists(room / "rig_state"));
+    const std::int64_t failed = memory.rig_save_failed();
+    std::filesystem::remove(blocker);
+    drive(memory, repeat(rig::Pose{}, 1), kGuardReferenceWindows + 4);
+    CHECK(!memory.rig_save_pending() && memory.rig_save_failed() == failed);
+    RoomMemory restarted(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
+    CHECK_EQ(restarted.channel("mid360").cloud->size(), memory.channel("mid360").cloud->size());
+    CHECK(restarted.rig_outcome() == O::checking);
+}
+
+// A guarded engine with an inlier baseline, moved out of reach until it relearns; `blocked` names
+// files placed in the room just before the move. Keeps the old frame and its files on disk at the
+// relearn (map_epoch aside: it only moves on).
+struct Relearned {
+    TempDir dir;
+    std::filesystem::path room = dir.path / "lab";
+    std::unique_ptr<RoomMemory> memory;
+    ImuSource imu = imu_stream();
+    std::int64_t second = 1;
+    std::uint64_t old_frame = 0;
+    std::map<std::string, std::vector<std::uint8_t>> old_files;
+
+    explicit Relearned(const std::vector<std::string>& blocked) {
+        MemoryConfig config = guarded_config(dir.path.string());
+        config.relearn_after_s = 5.0;
+        memory = std::make_unique<RoomMemory>(config, msg::Time{0, 0}, kGeneration);
+        // Until an accepted check gives the Mid-360 an inlier baseline.
+        while (!memory->channel("mid360").baseline) {
+            step(rig::Pose{});
+            CHECK(second < kGuardReferenceWindows + 60);
+        }
+        for (const std::string& name : blocked) std::ofstream(room / name).close();
+        old_frame = saved_rig_state(room).frame_epoch;
+        imu = imu_stream(static_cast<double>(second) - 0.5, 0.0, 50, 3.0);  // the roll confirms the move
+        while (memory->rig_outcome() != O::relearning) {
+            step();
+            CHECK(second < kGuardReferenceWindows + 100);
+        }
+        old_files = files();
+    }
+    void step(const rig::Pose& pose = rooms::rig(0.5, 0.0, 0.0, 20.0, 3.0)) {
+        drive(*memory, repeat(pose, 1), second++, rooms::kFurniture, imu);
+    }
+    void rebuild() {
+        for (int n = 0; n < 3 * kGuardReferenceWindows && memory->state() != MemoryState::tracking; ++n) step();
+        CHECK(memory->state() == MemoryState::tracking);
+    }
+    std::map<std::string, std::vector<std::uint8_t>> files(const std::filesystem::path& from = {}) const {
+        std::map<std::string, std::vector<std::uint8_t>> out;
+        for (const char* name : {"rig_state", "reference-mid360.cdr", "registration-mid360.bin"}) {
+            out[name] = harness::read_bytes((from.empty() ? room : from) / name);
+        }
+        return out;
+    }
+};
+
+TEST(a_failed_relearn_archive_holds_the_old_frame_until_it_goes_through) {
+    // The relearn archives the old frame under prev/ (D41); when that fails (here prev is a file)
+    // the relearn goes on, but the old frame's files stay as they are: the new frame commits only
+    // once the archive, retried every window, goes through.
+    Relearned run({"prev"});
+    RoomMemory& memory = *run.memory;
+    CHECK(memory.rig_save_pending() && memory.rig_save_error().find("prev") != std::string::npos);
+    run.rebuild();
+    const std::int64_t failed = memory.rig_save_failed();
+    run.step();
+    CHECK(memory.rig_save_pending() && memory.rig_save_failed() > failed);
+    CHECK(run.files() == run.old_files);
+    std::filesystem::remove(run.room / "prev");
+    run.step();
+    CHECK(!memory.rig_save_pending());
+    std::vector<std::filesystem::path> archives;
+    for (const auto& entry : std::filesystem::directory_iterator(run.room / "prev")) archives.push_back(entry.path());
+    CHECK_EQ(archives.size(), 1u);
+    const std::string name = archives[0].filename().string();
+    const std::string suffix = "-frame-" + std::to_string(run.old_frame);
+    CHECK(name.size() > suffix.size() && name.substr(name.size() - suffix.size()) == suffix);
+    CHECK(run.files(archives[0]) == run.old_files);
+    CHECK(saved_rig_state(run.room).frame_epoch > run.old_frame);
+}
+
+TEST(a_failed_epoch_write_holds_the_rebuild_until_it_goes_through) {
+    // The rebuild's new epoch goes into the epoch file before anything carries it: when that write
+    // fails (here a directory where its temp file goes, as a full disk would) the build's end is held,
+    // so every window stays BUILDING under an epoch the file holds, nothing of the new frame reaches
+    // disk, and the next window retries. A start that cannot record its epoch stops: nothing carries
+    // that epoch yet.
+    Relearned run({});
+    RoomMemory& memory = *run.memory;
+    CHECK(!memory.rig_save_pending());  // the archive went through
+    const std::filesystem::path epoch_file = run.room / "map_epoch";
+    std::filesystem::create_directory(run.room / "map_epoch.tmp");
+    for (int n = 0; n < 3 * kGuardReferenceWindows; ++n) {
+        run.step();
+        CHECK(memory.state() == MemoryState::building && !memory.map_update(msg::Time{1000, 0}));
+        CHECK(load_epoch(epoch_file) && memory.map_epoch() <= *load_epoch(epoch_file));
+    }
+    CHECK(memory.epoch_held() && !memory.rig_save_pending());  // no save is pending: the node reports it from epoch_held
+    CHECK(memory.rig_save_failed() >= 2 * kGuardReferenceWindows);
+    CHECK(memory.rig_save_error().find("map_epoch.tmp") != std::string::npos);
+    CHECK(run.files() == run.old_files);
+    std::string refused;
+    try {
+        RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
+    } catch (const std::runtime_error& error) {
+        refused = error.what();
+    }
+    CHECK(refused.find("map_epoch.tmp") != std::string::npos);
+    std::filesystem::remove(run.room / "map_epoch.tmp");
+    run.step();
+    CHECK(memory.state() == MemoryState::tracking && !memory.rig_save_pending() && !memory.epoch_held());
+    CHECK(load_epoch(epoch_file) == std::optional<std::uint64_t>{memory.map_epoch()});
+    CHECK(saved_rig_state(run.room).frame_epoch > run.old_frame);
+    RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
+    CHECK_EQ(restarted.map_epoch(), memory.map_epoch() + 1);
+}
+
+TEST(a_failed_epoch_write_holds_a_settle_until_it_goes_through) {
+    // While tracking, voxels that settle take the next map_epoch. When the epoch file cannot record it
+    // the settle is held: the counts, the reference and map_epoch stay, no delta goes out, and the next
+    // window retries; once the write goes through the delta carries the epoch the file holds.
+    TempDir dir;
+    const std::filesystem::path room = dir.path / "lab";
+    MemoryConfig config = guarded_config(dir.path.string());
+    config.learn_windows = 30;
+    config.delta_period_s = 2.0;
+    config.keyframe_period_s = 1000.0;
+    config.keyframe_delta_ratio = 100.0;
+    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+    // The reference sees only what is within 4 m; the far walls are new coverage once tracking.
+    const auto window = [&](std::int64_t second, double max_range_m) {
+        const Cloud cloud = rooms::scan({}, rooms::kRoom, rooms::kFurniture, 0.01, static_cast<std::uint64_t>(second),
+                                        max_range_m);
+        return feed(memory, &cloud, second);
+    };
+    std::int64_t second = 1;
+    std::optional<msg::MapBricks> opening;
+    while (!opening) {
+        opening = window(second++, 4.0);
+        CHECK(second < 3 * kGuardReferenceWindows);
+    }
+    CHECK(opening->kind == msg::MapKind::snapshot && opening->header.map_epoch == memory.map_epoch());
+    const std::uint64_t epoch = memory.map_epoch();
+    const std::vector<msg::Brick> bricks = memory.channel("mid360").reference.to_bricks();
+    std::filesystem::create_directory(room / "map_epoch.tmp");
+    for (const std::int64_t last = second + 7; second < last; ++second) {
+        CHECK(!window(second, 30.0));
+        CHECK(memory.map_epoch() == epoch && load_epoch(room / "map_epoch") == std::optional<std::uint64_t>{epoch});
+        CHECK(memory.channel("mid360").reference.to_bricks() == bricks);
+    }
+    CHECK(!memory.channel("mid360").stats.keys.empty());
+    CHECK(memory.rig_save_error().find("map_epoch.tmp") != std::string::npos);
+    CHECK(memory.epoch_held() && !memory.rig_save_pending());  // no save is pending: the node reports it from epoch_held
+    const std::int64_t failed = memory.rig_save_failed();
+    CHECK(failed >= 2);
+    std::filesystem::remove(room / "map_epoch.tmp");
+    const std::optional<msg::MapBricks> delta = window(second, 30.0);
+    CHECK(delta && delta->kind == msg::MapKind::delta && delta->header.map_epoch == epoch + 1);
+    CHECK(load_epoch(room / "map_epoch") == std::optional<std::uint64_t>{epoch + 1});
+    CHECK(memory.rig_save_failed() == failed && !memory.rig_save_pending() && !memory.epoch_held());
+    CHECK(memory.channel("mid360").reference.to_bricks().size() > bricks.size());
+}
+
+TEST(a_new_frame_cut_short_never_loads_with_the_old_frames_poses) {
+    // Codex's repro: the rebuilt frame's commit fails part way. With its registration cloud
+    // unwritable a restart loads the old frame whole; with rig_state unwritable it refuses the set.
+    // Never the new references with the old frame's cloud and pose. Once the writes go through, the
+    // new frame loads.
+    Relearned run({});
+    RoomMemory& memory = *run.memory;
+    const std::filesystem::path blocker = run.room / "registration-mid360.bin.tmp";
+    std::filesystem::create_directory(blocker);
+    run.rebuild();
+    CHECK(memory.rig_save_pending() && memory.rig_save_error().find("registration-mid360.bin.tmp") != std::string::npos);
+    CHECK(run.files() == run.old_files);
+    const Keys old_reference = load_reference(run.room / "reference-mid360.cdr").second.occupied;
+    CHECK(old_reference != memory.channel("mid360").reference.occupied);
+    const RigState old_state = parse_rig_state(run.old_files["rig_state"], "rig_state");
+    {
+        RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
+        CHECK_EQ(restarted.rig_pose(msg::Time{0, 0})->frame_epoch, run.old_frame);
+        CHECK(restarted.channel("mid360").pose == old_state.sensors[0].second.pose);
+        CHECK(restarted.channel("mid360").reference.occupied == old_reference);
+    }
+    std::filesystem::remove(blocker);
+    std::filesystem::create_directory(run.room / "rig_state.tmp");
+    run.step();
+    CHECK(memory.rig_save_pending() && memory.rig_save_error().find("rig_state.tmp") != std::string::npos);
+    try {
+        RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
+        throw harness::Failure("a new frame's clouds loaded with the old rig_state");
+    } catch (const std::invalid_argument& error) {
+        if (std::string(error.what()).find("does not match") == std::string::npos) throw harness::Failure(error.what());
+    }
+    std::filesystem::remove(run.room / "rig_state.tmp");
+    run.step();
+    CHECK(!memory.rig_save_pending());
+    RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
+    const std::uint64_t frame = restarted.rig_pose(msg::Time{0, 0})->frame_epoch;
+    CHECK(frame == saved_rig_state(run.room).frame_epoch && frame > run.old_frame);
+    CHECK_EQ(restarted.channel("mid360").cloud->size(), memory.channel("mid360").cloud->size());
+}
+
+TEST(a_rig_state_that_does_not_match_its_files_is_refused) {
+    TempDir dir;
+    {
+        RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
+        drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows), 1);
+    }
+    const std::filesystem::path cloud = dir.path / "lab" / "registration-mid360.bin";
+    std::vector<std::uint8_t> data = harness::read_bytes(cloud);
+    data[data.size() - 5] ^= 1;
+    std::ofstream(cloud, std::ios::binary).write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    const auto refused = [&](const MemoryConfig& config, const std::string& reason) {
+        try {
+            RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
+        } catch (const std::invalid_argument& error) {
+            if (std::string(error.what()).find(reason) == std::string::npos) throw harness::Failure(error.what());
+            return;
+        }
+        throw harness::Failure("no error mentioning " + reason);
+    };
+    refused(guarded_config(dir.path.string()), "does not match");
+    std::filesystem::remove(cloud);
+    refused(guarded_config(dir.path.string()), "does not match");
+    MemoryConfig off = guarded_config(dir.path.string());
+    off.rig_guard = false;
+    refused(off, "rig_guard");
+}
+
+TEST(legacy_state_is_archived_and_rebuilt) {
+    TempDir dir;
+    {
+        MemoryConfig off = guarded_config(dir.path.string());
+        off.rig_guard = false;
+        RoomMemory memory(off, msg::Time{0, 0}, kGeneration);
+        drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows), 1);
+    }
+    RoomMemory memory(guarded_config(dir.path.string()), msg::Time{0, 0}, kGeneration);
+    CHECK(memory.state() == MemoryState::building && memory.rig_outcome() == O::relearning);
+    std::vector<std::filesystem::path> archives;
+    for (const auto& entry : std::filesystem::directory_iterator(dir.path / "lab" / "prev")) archives.push_back(entry.path());
+    CHECK_EQ(archives.size(), 1u);
+    std::vector<std::string> names;
+    for (const auto& entry : std::filesystem::directory_iterator(archives[0])) names.push_back(entry.path().filename().string());
+    std::sort(names.begin(), names.end());
+    CHECK((names == std::vector<std::string>{"map_epoch", "reference-mid360.cdr"}));
+    CHECK(!std::filesystem::exists(dir.path / "lab" / "reference-mid360.cdr"));
+    drive(memory, repeat(rig::Pose{}, kGuardReferenceWindows), 1);
+    CHECK(memory.state() == MemoryState::tracking && std::filesystem::exists(dir.path / "lab" / "rig_state"));
+    CHECK(memory.map_epoch() > 1u);
+}
+
+TEST(guard_config_rejections) {
+    for (const auto& edit : std::initializer_list<void (*)(MemoryConfig&)>{
+             [](MemoryConfig& c) { c.align_inlier_ratio = 1.5; }, [](MemoryConfig& c) { c.align_stable_windows = 0; },
+             [](MemoryConfig& c) { c.align_max_deg = 91.0; }, [](MemoryConfig& c) { c.check_max_s = 0.0; },
+             [](MemoryConfig& c) { c.guard_check_period_s = -1.0; }, [](MemoryConfig& c) { c.guard_check_period_s = 34.0; },
+             [](MemoryConfig& c) { c.imu_quiet_s = NAN; }}) {
+        MemoryConfig config = guarded_config();
+        edit(config);
+        CHECK_THROWS(std::invalid_argument, RoomMemory(config, kStart, kGeneration));
+        config.rig_guard = false;
+        RoomMemory unchecked(config, kStart, kGeneration);  // only checked with the guard on
+    }
+}
+
+}  // namespace
 
 TEST_MAIN

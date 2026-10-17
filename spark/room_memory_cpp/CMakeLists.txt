@@ -68,6 +68,9 @@ add_library(room_memory_core
   src/messages.cpp
   src/memory.cpp
   src/generation.cpp
+  src/guard.cpp
+  src/imu.cpp
+  src/state.cpp
   src/rejectlog.cpp
   src/rhythm.cpp
 )

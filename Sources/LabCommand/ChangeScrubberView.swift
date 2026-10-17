@@ -12,7 +12,7 @@ struct ChangeScrubberView: View {
                 Text(state.scrubberBefore)
                     .font(LabTheme.mono(11))
                     .foregroundStyle(LabTheme.dim)
-                    .frame(width: 64, alignment: .leading)
+                    .frame(width: 136, alignment: .leading)
                 Slider(
                     value: Binding(
                         get: { Double(state.scrubberSlider.value) },
@@ -27,7 +27,7 @@ struct ChangeScrubberView: View {
                 Text(state.scrubberAfter)
                     .font(LabTheme.mono(11))
                     .foregroundStyle(LabTheme.dim)
-                    .frame(width: 64, alignment: .trailing)
+                    .frame(width: 136, alignment: .trailing)
             }
             if !state.scrubberChips.isEmpty {
                 HStack(spacing: 6) {

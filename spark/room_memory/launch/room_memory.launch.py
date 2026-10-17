@@ -5,7 +5,8 @@
 ``max_range`` <= 0 disables the range clip; ``state_dir`` must already exist (it holds the
 references, ``map_epoch`` and the publisher generation), and an empty or missing one stops the node;
 an empty ``map_sensor`` publishes the JT128's reference when it is configured, else the first
-sensor's. The defaults are ``MemoryConfig``'s, measured on the static recording.
+sensor's; ``rig_guard:=true`` turns on the rig-pose guard (``RigPose`` on ``/room_memory/rig``),
+fed by ``imu_topic`` (empty: ICP only). The defaults are ``MemoryConfig``'s, measured on the static recording.
 """
 
 from launch import LaunchDescription
@@ -52,6 +53,31 @@ ARGUMENTS = {
     "rhythm_max_bytes": ("536870912", int),
     "rhythm_max_file_bytes": ("33554432", int),
     "rhythm_fsync_s": ("600", int),
+    "rig_guard": ("false", bool),
+    "imu_topic": ("/livox/imu", str),
+    "imu_shock_frac": ("0.05", float),
+    "imu_gyro_dps": ("2.0", float),
+    "imu_quiet_s": ("2.0", float),
+    "tilt_trigger_deg": ("0.2", float),
+    "pose_trigger_m": ("0.015", float),
+    "guard_check_period_s": ("30.0", float),
+    "check_max_s": ("10.0", float),
+    "move_min_m": ("0.015", float),
+    "move_min_deg": ("0.25", float),
+    "align_max_m": ("0.3", float),
+    "align_max_deg": ("10.0", float),
+    "align_inlier_ratio": ("0.9", float),
+    "align_max_rms_m": ("0.02", float),
+    "align_stable_windows": ("3", int),
+    "observe_min_eig": ("0.02", float),
+    "gross_inlier_ratio": ("0.5", float),
+    "relearn_after_s": ("60.0", float),
+    "auto_relearn": ("true", bool),
+    "reg_voxel_m": ("0.02", float),
+    "reg_max_points": ("300000", int),
+    "src_voxel_m": ("0.1", float),
+    "src_max_points": ("50000", int),
+    "icp_max_range_m": ("30.0", float),
 }
 
 

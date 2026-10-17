@@ -171,13 +171,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let appMenu = NSMenu()
         appMenuItem.submenu = appMenu
         appMenu.addItem(
-            withTitle: "About Lab",
+            withTitle: "About LabCommand",
             action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
             keyEquivalent: ""
         )
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(
-            withTitle: "Quit Lab",
+            withTitle: "Quit LabCommand",
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )
@@ -194,6 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let viewMenu = NSMenu(title: "View")
         viewItem.submenu = viewMenu
 
+        // ⌘1 is the first tab in navCases. The buttons do not register these keys too.
         for (idx, d) in Dest.navCases.enumerated() {
             let item = NSMenuItem(
                 title: d.label,
@@ -241,7 +242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func installStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "LAB"
+        item.button?.title = "LabCommand"
         item.button?.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
         item.menu = makeStatusMenu()
         statusItem = item
@@ -286,7 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         addStatusAction(menu, title: "Diagnose", action: #selector(menuDiagnose), enabled: true)
         addStatusAction(menu, title: appState.focusMode ? "Exit Focus" : "Focus Mode", action: #selector(menuFocus), enabled: true)
         menu.addItem(.separator())
-        addStatusAction(menu, title: "Show Lab", action: #selector(showWindow), enabled: true)
+        addStatusAction(menu, title: "Show LabCommand", action: #selector(showWindow), enabled: true)
     }
 
     private func header(_ title: String) -> NSMenuItem {

@@ -38,6 +38,7 @@ from room_memory.rhythm import (
     RhythmAccumulator,
     _Table,
     encode_header,
+    encode_record,
     header_identity,
     history_depth,
     parse_record,
@@ -590,6 +591,114 @@ def test_sixty_sixtyone_fiftynine_stay_one_fragment_and_gaps_write_no_filler():
     skipped = RhythmAccumulator(["mid360"], 10, 2, 60, 60)
     skipped.add("mid360", -1, key(0, 0, 0), 1)
     assert skipped.flush() == []
+
+
+def _cells(indexes):
+    count = len(indexes)
+    return (
+        np.asarray(indexes, dtype=np.int16),
+        np.zeros(count, dtype=np.int16),
+        np.zeros(count, dtype=np.int16),
+        np.ones(count, dtype=np.int64),
+    )
+
+
+def test_an_overflowing_window_reuses_slots_and_does_not_probe():
+    """The stored prefix stays cached, including across the clear a minute seal does.
+
+    A second copy must not probe: the miss on a full table walks every slot, and the
+    cells ahead of it do too. A leading cell that is not the prefix still stops the
+    window, and a cache that is not the whole table is not restored.
+    """
+    table = _Table(4)
+    stored = _cells([0, 1, 2, 3])
+    overflow = _cells([0, 1, 2, 3, 4, 5])
+    assert table.insert_window(*overflow) == 2
+    assert table._cached == 4 and table.count == 4
+    packed = table.pack_regions(1)
+    assert encode_record(10, 1, 1, 1, 0, 0, 2, 0, FLAG_OVERFLOW, packed_regions=packed) == encode_record(
+        10, 1, 1, 1, 0, 0, 2, 0, FLAG_OVERFLOW, table.regions(1),
+    )
+    signed = _Table(4)
+    signed.insert_window(
+        np.array([0, -2, 1], dtype=np.int16),
+        np.array([0, 1, -1], dtype=np.int16),
+        np.zeros(3, dtype=np.int16),
+        np.array([1, 4, 2], dtype=np.int64),
+    )
+    assert encode_record(1, 1, 1, 1, 0, 0, 0, 0, 0, packed_regions=signed.pack_regions(1)) == encode_record(
+        1, 1, 1, 1, 0, 0, 0, 0, 0, signed.regions(1),
+    )
+
+    def refuse_probe(*_args):
+        raise AssertionError("cached window probed the table")
+
+    table._slot = refuse_probe
+    assert table.insert_window(*overflow) == 2
+    for index in range(4):
+        slot = _slot_of(table, index, 0, 0)
+        assert int(table.hits[slot]) == 2 and int(table.sums[slot]) == 2
+    assert int(((table.used == 1) & (table.ix == 4)).sum()) == 0
+
+    # A different leading cell misses and does not update the cell behind it.
+    del table._slot
+    before = int(table.hits[_slot_of(table, 0, 0, 0)])
+    assert table.insert_window(*_cells([-5, 0])) == 2
+    assert table._cached == 4
+    assert int(table.hits[_slot_of(table, 0, 0, 0)]) == before
+
+    table._slot = refuse_probe
+    assert table.insert_window(*overflow) == 2
+    assert int(table.hits[_slot_of(table, 0, 0, 0)]) == before + 1
+
+    # The seal clears occupancy. The same window reoccupies the cached slots.
+    table.clear()
+    assert table.count == 0 and table._cached == 4 and int(table.used.sum()) == 0
+    assert table.insert_window(*overflow) == 2
+    assert table.count == 4 and int(table.hits[_slot_of(table, 3, 0, 0)]) == 1
+    assert int(table.sums[_slot_of(table, 3, 0, 0)]) == 1
+
+    # A prefix that does not fill the table still takes the new cells after it.
+    growing = _Table(8)
+    growing.insert_window(*_cells([0, 1]))
+    assert growing.insert_window(*_cells([0, 1, 2])) == 0
+    assert growing.count == 3 and int(growing.hits[_slot_of(growing, 0, 0, 0)]) == 2
+    assert int(growing.hits[_slot_of(growing, 2, 0, 0)]) == 1
+    growing._slot = refuse_probe
+    assert growing.insert_window(*_cells([0, 1, 2])) == 0
+    assert int(growing.hits[_slot_of(growing, 2, 0, 0)]) == 2
+
+    # The next window does not share the prefix, so the cache is not the whole table.
+    # Restoring it after a clear would leave a key behind an empty slot.
+    other = _Table(8)
+    other.insert_window(*stored)
+    other.insert_window(*_cells([10, 11]))
+    assert other.count == 6 and other._cached == 2
+    other.clear()
+    assert other._cached == 0 and other.count == 0 and int(other.used.sum()) == 0
+
+
+def test_a_sealed_overflow_minute_keeps_counts_and_the_next_minute_starts_over():
+    keys = pack(np.arange(4100), np.zeros(4100, dtype=np.int64), np.zeros(4100, dtype=np.int64))
+    acc = RhythmAccumulator(["mid360"], 1, 2, 60, 60)
+    acc.add("mid360", 10, keys, 1)
+    table = acc._sensors["mid360"]["table"]
+
+    def refuse_probe(*_args):
+        raise AssertionError("cached window probed the table")
+
+    table._slot = refuse_probe
+    acc.add("mid360", 11, keys, 1)
+    acc.add("mid360", 70, keys, 1)
+    assert len(acc.finished) == 1
+    record = parse_record(acc.finished[0].data)
+    assert record["regions_dropped"] == 8 and len(record["regions"]) == 4096
+    assert record["flags"] & FLAG_OVERFLOW
+    assert record["regions"][0] == (0, 0, 0, 2, 1) and record["regions"][-1][0] == 4095
+    assert all(region[0] != 4096 for region in record["regions"])
+    opened = acc._sensors["mid360"]["bin"]
+    assert opened.minute == 60 and opened.with_points == 1 and opened.regions_dropped == 4
+    assert int(table.hits[_slot_of(table, 0, 0, 0)]) == 1
 
 
 def test_the_first_miss_sets_overflow_and_stops_the_window():
@@ -1227,6 +1336,107 @@ def _assert_within_allowance(root, points, trials=5):
 
 def test_enabled_callback_stays_within_the_allowance(tmp_path):
     _assert_within_allowance(tmp_path, scenes.room_shell())
+
+
+def _overflow_cloud():
+    """64×64 voxels plus one, inside the default 15 m range.
+
+    Positions are voxel centers in the same binary32 quantizer ``close_window`` uses.
+    ``rhythm_cell_m`` 0.05 makes each occupied voxel its own region, so the window
+    is 4097 regions and the table overflows by one.
+    """
+    inverse = np.float32(1.0) / np.float32(0.05)
+    half = np.float32(0.5)
+    axis = np.arange(64, dtype=np.float32)
+    ii, jj = np.meshgrid(axis, axis, indexing="ij")
+    grid = np.column_stack([
+        (ii.ravel() + half) / inverse,
+        (jj.ravel() + half) / inverse,
+        np.full(4096, half / inverse, dtype=np.float32),
+    ]).astype(np.float32)
+    extra = np.array([[(np.float32(64) + half) / inverse, half / inverse, half / inverse]], dtype=np.float32)
+    return np.vstack([grid, extra])
+
+
+def _overflow_samples(path, enable, points, count):
+    """Time overflowing windows, including the close that seals the minute.
+
+    The first windows fill the table and are not part of the sample. A cache that
+    dies on the overflow miss, or on the seal, shows up in the measured closes.
+    """
+    memory = RoomMemory(config(
+        path, state_dir=None, rhythm_enable=enable, rhythm_dir="" if not enable else str(path),
+        rhythm_publish=False, rhythm_cell_m=0.05, rhythm_period_s=60, reference_windows=1,
+        max_range=15.0, sensors=("mid360", "jt128"),
+    ), START, GENERATION)
+    try:
+        occupied = occupancy_map(points, memory.change)
+        assert len(occupied.occupied) == 4097
+        for warm in range(3):
+            memory.add_points("mid360", points)
+            memory.add_points("jt128", points)
+            memory.close_window(stamp(warm))
+            memory.enqueue_rhythm()
+        walls, cpus = [], []
+        boundary = None
+        previous = None
+        for index in range(count):
+            second = 30 + index
+            memory.add_points("mid360", points)
+            memory.add_points("jt128", points)
+            started = time.perf_counter()
+            cpu = time.process_time()
+            memory.close_window(stamp(second))
+            memory.enqueue_rhythm()
+            walls.append((time.perf_counter() - started) * 1000)
+            cpus.append((time.process_time() - cpu) * 1000)
+            minute = (START.sec + second) - (START.sec + second) % 60
+            if previous is not None and minute != previous:
+                boundary = index
+            previous = minute
+        assert boundary is not None
+        return walls, cpus, boundary
+    finally:
+        memory.close()
+
+
+def test_overflowing_callback_stays_within_the_allowance(tmp_path):
+    """Two sensors, 4097 regions each, across a minute seal.
+
+    The allowance is the same ``max(1 ms, 10% of the disabled median wall)``. The
+    seal window is its own sample: one slow close must not disappear into the median.
+    """
+    points = _overflow_cloud()
+    seen = []
+    for trial in range(5):
+        off_wall, off_cpu, off_at = _overflow_samples(tmp_path / f"off{trial}", False, points, 40)
+        on_wall, on_cpu, on_at = _overflow_samples(tmp_path / f"on{trial}", True, points, 40)
+        off_med = _percent(off_wall, 0.5)
+        off_tail = _percent(off_wall, 0.99)
+        off_cpu_med = _percent(off_cpu, 0.5)
+        off_cpu_tail = _percent(off_cpu, 0.99)
+        allowance = max(1.0, 0.10 * off_med)
+        quiet = (off_tail - off_med) <= allowance and (off_cpu_tail - off_cpu_med) <= allowance
+        if quiet:
+            deltas = (
+                _percent(on_wall, 0.5) - off_med,
+                _percent(on_wall, 0.99) - off_med,
+                _percent(on_cpu, 0.99) - off_cpu_med,
+                on_wall[on_at] - off_med,
+            )
+        else:
+            deltas = (
+                _percent(on_wall, 0.5) - off_med,
+                _percent(on_wall, 0.99) - off_tail,
+                _percent(on_cpu, 0.99) - off_cpu_tail,
+                on_wall[on_at] - off_wall[off_at],
+            )
+        seen.append((tuple(round(delta, 3) for delta in deltas), round(allowance, 3), quiet))
+        if all(delta <= allowance for delta in deltas):
+            return
+    median, tail, cpu, boundary = seen[-1][0]
+    allowance = seen[-1][1]
+    assert median <= allowance and tail <= allowance and cpu <= allowance and boundary <= allowance, seen
 
 
 @pytest.mark.skipif(

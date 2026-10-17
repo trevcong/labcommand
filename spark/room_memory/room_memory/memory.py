@@ -11,19 +11,29 @@ node publishes as ``MapBricks`` snapshots and deltas.
 import functools
 import math
 import operator
-import os
 import pathlib
 import re
+import time
+import zlib
 from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple
 
 import numpy as np
 
+from . import guard as rig
+from . import state as rig_files
 from .core import Config, OccupancyMap, Region, cast_rays, decode_pointcloud2, diff, occupancy_map
 from .core.change_detection import contains, in_range, pack, unpack, validate
 from .rhythm import Rhythm, rhythm_active, validate_rhythm
+from .imu import ImuDetector
 from .messages import (
+    CAUSE_IMU_SHOCK,
+    CAUSE_IMU_TILT,
+    CAUSE_PERIODIC,
+    CAUSE_POSE_OFFSET,
+    CAUSE_SENSOR_RESUMED,
+    CAUSE_STARTUP,
     Activity,
     BRICK_DIM,
     Brick,
@@ -40,11 +50,15 @@ from .messages import (
     MapKind,
     MemoryState,
     MemoryStatus,
+    RigChannel,
+    RigOutcome,
+    RigPose,
     SENSOR_JT128,
     SENSOR_MID360,
     SyncEnd,
     SyncTopic,
     Time,
+    decode_imu,
 )
 
 _INT16 = (-(1 << 15), (1 << 15) - 1)
@@ -59,6 +73,16 @@ MAP_LOG_DEPTH = 10
 EVENT_LOG_DEPTH = 100
 # pose_residual_m: the registration search reaches this many voxels along each axis.
 POSE_SEARCH_VOXELS = 4
+# Rig guard: a sensor silent this long and back triggers a check; RigPose goes out at least this
+# often; an ICP source needs this many points; re-alignment needs consecutive estimates this close.
+RESUME_SILENCE_NS = 5_000_000_000
+RIG_POSE_PERIOD_NS = 10_000_000_000
+MIN_SOURCE_POINTS = 30
+STABLE_M = 0.005
+STABLE_DEG = 0.1
+# The nominal Mid-360 mount in the JT128 frame (RigTransforms.livoxToWorld: yaw -86.5 deg, roll pi),
+# used only to carry a rotation prior from one sensor's frame to the other's, never as an extrinsic.
+MOUNT = rig.Pose(rig.rotation_about((0.0, 0.0, 1.0), -86.5)).compose(rig.Pose(rig.rotation_about((1.0, 0.0, 0.0), 180.0))).R
 
 
 @dataclass(frozen=True)
@@ -238,15 +262,15 @@ def _coverage(reference):
     return int(np.count_nonzero(inside)) / cells
 
 
-def pose_offset(recent, reference_occupied, voxel_size):
-    """The translation (meters) that best registers ``recent`` (occupied keys) onto the reference
-    occupancy, as one number: per axis, the shift of -POSE_SEARCH_VOXELS .. POSE_SEARCH_VOXELS
-    voxels that maximizes the count of recent voxels landing on reference-occupied ones, refined
-    by the parabola through that count and its two neighbours (not at the ends of the range);
-    the norm of the three per-axis shifts. None when no shift overlaps at all."""
+def pose_shift(recent, reference_occupied, voxel_size):
+    """The translation (meters, per axis) that best registers ``recent`` (occupied keys) onto the
+    reference occupancy: per axis, the shift of -POSE_SEARCH_VOXELS .. POSE_SEARCH_VOXELS voxels that
+    maximizes the count of recent voxels landing on reference-occupied ones, refined by the parabola
+    through that count and its two neighbours (not at the ends of the range). Adding it to the
+    recent points moves them onto the reference. None when no shift overlaps at all."""
     r = POSE_SEARCH_VOXELS
     lanes = unpack(recent)
-    squared = 0.0
+    shifts = []
     for axis in range(3):
         counts = []
         for shift in range(-r, r + 1):
@@ -267,9 +291,23 @@ def pose_offset(recent, reference_occupied, voxel_size):
             curvature = low - 2.0 * mid + high
             if curvature < 0.0:
                 shift += (low - high) / (2.0 * curvature)
-        meters = shift * voxel_size
+        shifts.append(shift * voxel_size)
+    return tuple(shifts)
+
+
+def shift_norm(shift):
+    """The norm of a ``pose_shift`` in binary64, summed in axis order (``pose_residual_m``)."""
+    squared = 0.0
+    for meters in shift:
         squared += meters * meters
     return math.sqrt(squared)
+
+
+def pose_offset(recent, reference_occupied, voxel_size):
+    """``pose_shift`` as one number: the norm of the three per-axis shifts. None when no shift
+    overlaps at all."""
+    shift = pose_shift(recent, reference_occupied, voxel_size)
+    return None if shift is None else shift_norm(shift)
 
 
 # MARK: Persistence
@@ -317,22 +355,7 @@ def load_epoch(path):
     return int(data)
 
 
-def _write_atomic(path, data, make_parents=True):
-    """Temp file, fsync, rename, then fsync the directory, so the rename survives a crash."""
-    path = pathlib.Path(path)
-    if make_parents:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    scratch = path.with_suffix(path.suffix + ".tmp")
-    with open(scratch, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(scratch, path)
-    directory = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+_write_atomic = rig_files.write_atomic  # one implementation, in state.py (C++: state.cpp)
 
 
 def load_reference(path):
@@ -516,7 +539,9 @@ class CandidateTracker:
     its own within ``radius`` voxels (box gap, either pose) sets its run to 0: a change next to
     motion only counts once the motion has settled. ``tolerance`` None skips the shape check,
     ``radius`` None the activity check. Last, every entry whose run reached ``candidate_windows``
-    becomes a CANDIDATE (and gets its event id), in region order.
+    becomes a CANDIDATE (and gets its event id), in region order, unless ``hold`` is set (a rig
+    guard check): then nothing promotes, and an entry whose run reached the gate promotes on the
+    first window without the hold.
     """
 
     def __init__(self, candidate_windows=1, expire_windows=1, tolerance=None, radius=None, stable_fraction=1.0,
@@ -536,7 +561,7 @@ class CandidateTracker:
         self.pending = []
         self.activity = []
 
-    def update(self, regions, stamp, next_id, fresh=None):
+    def update(self, regions, stamp, next_id, fresh=None, hold=False):
         """Returns ``[(state, candidate)]``: new candidates in region order, then expiries by id.
 
         ``fresh`` holds one flag per region, None when every region is fresh.
@@ -701,11 +726,11 @@ class CandidateTracker:
         # Promotion, in region order.
         promoted = []
         for entry, indices, region, new, old, fragments in sorted(steps, key=lambda step: min(step[1])):
-            if entry.windows >= self.candidate_windows:
+            if not hold and entry.windows >= self.candidate_windows:
                 candidate = replace(entry, event_id=next_id())
                 transitions.append((EventState.CANDIDATE, candidate))
                 promoted.append(candidate)
-        promoted_from = {id(step[0]) for step in steps if step[0].windows >= self.candidate_windows}
+        promoted_from = {id(step[0]) for step in steps if not hold and step[0].windows >= self.candidate_windows}
         expired = set()
         for index in sorted(range(len(self.open)), key=lambda n: self.open[n].event_id):
             if index in open_matched or index in absorbed:
@@ -795,6 +820,44 @@ class MemoryConfig:
     rhythm_max_bytes: int = 536870912
     rhythm_max_file_bytes: int = 33554432
     rhythm_fsync_s: int = 600
+    # The rig-pose guard (PLAN-RIGGUARD.md; defaults not yet measured on the Spark). Off: no
+    # check, transform, IMU or extra file, so outputs and files are today's exactly. On: triggers (an
+    # IMU shock or tilt past tilt_trigger_deg, pose_offset above pose_trigger_m on 2 windows, every
+    # guard_check_period_s, a saved-state start, a sensor back after 5 s) start a check that holds
+    # promotion and learning for up to check_max_s and aligns each sensor against its registration
+    # cloud (reg_voxel_m points of the BUILDING windows, at most reg_max_points; the window's first
+    # point per src_voxel_m, at most src_max_points, within max_range or icp_max_range_m). An estimate
+    # is fit with inlier_frac >= align_inlier_ratio x its baseline, RMS <= align_max_rms_m and
+    # λ_min / Σw >= observe_min_eig; it moved when its increment reaches move_min_m or move_min_deg.
+    # Move evidence (a fit move; IMU tilt; every channel below gross_inlier_ratio x baseline on 2
+    # windows unwatched by a quiet IMU) gives RIG_MOVED; align_stable_windows agreeing estimates
+    # within align_max_m / align_max_deg of the frame re-align; none for relearn_after_s relearns
+    # (auto_relearn). imu_topic is the node's subscription ("": none).
+    rig_guard: bool = False
+    imu_topic: str = "/livox/imu"
+    imu_shock_frac: float = 0.05
+    imu_gyro_dps: float = 2.0
+    imu_quiet_s: float = 2.0
+    tilt_trigger_deg: float = 0.2
+    pose_trigger_m: float = 0.015
+    guard_check_period_s: float = 30.0
+    check_max_s: float = 10.0
+    move_min_m: float = 0.015
+    move_min_deg: float = 0.25
+    align_max_m: float = 0.3
+    align_max_deg: float = 10.0
+    align_inlier_ratio: float = 0.9
+    align_max_rms_m: float = 0.02
+    align_stable_windows: int = 3
+    observe_min_eig: float = 0.02
+    gross_inlier_ratio: float = 0.5
+    relearn_after_s: float = 60.0
+    auto_relearn: bool = True
+    reg_voxel_m: float = 0.02
+    reg_max_points: int = 300000
+    src_voxel_m: float = 0.1
+    src_max_points: int = 50000
+    icp_max_range_m: float = 30.0
 
     def change_config(self):
         """The core config: evidence on, sensor origin (0, 0, 0) in each sensor's frame."""
@@ -805,6 +868,31 @@ class MemoryConfig:
 
     def settle_rule(self):
         return SettleRule(self.occupied_min_hits, self.occupied_min_ratio, self.free_min_seen, self.free_max_ratio)
+
+
+def _validate_guard(config):
+    """The rig guard's parameters (only checked with ``rig_guard`` on)."""
+    def positive(*names):
+        for name in names:
+            value = getattr(config, name)
+            if not (math.isfinite(value) and 0 < value < 1e9):
+                raise ValueError(f"{name} must be a finite number > 0")
+    positive("imu_shock_frac", "imu_gyro_dps", "imu_quiet_s", "tilt_trigger_deg", "pose_trigger_m", "check_max_s",
+             "move_min_m", "move_min_deg", "align_max_m", "align_max_deg", "align_max_rms_m", "observe_min_eig",
+             "relearn_after_s", "reg_voxel_m", "src_voxel_m", "icp_max_range_m")
+    if not (math.isfinite(config.guard_check_period_s) and 0 <= config.guard_check_period_s < 1e9):
+        raise ValueError("guard_check_period_s must be in [0, 1e9) s (0: no periodic check)")
+    for name in ("align_inlier_ratio", "gross_inlier_ratio"):
+        if not 0 <= getattr(config, name) <= 1:
+            raise ValueError(f"{name} must be in [0, 1]")
+    if config.align_stable_windows < 1 or config.reg_max_points < 1 or config.src_max_points < 1:
+        raise ValueError("align_stable_windows, reg_max_points and src_max_points must be >= 1")
+    if config.align_max_deg > 90:
+        raise ValueError("align_max_deg must be at most 90")
+    # A yaw only the periodic check sees must be decided before a false region's run reaches the gate.
+    if config.guard_check_period_s > 0 and (config.guard_check_period_s + 2 * config.window_s
+                                           > config.candidate_windows * config.window_s - 5):
+        raise ValueError("guard_check_period_s + 2 window_s must be at most candidate_windows window_s - 5 s")
 
 
 @dataclass
@@ -832,6 +920,26 @@ class _Channel:
                                         config.stable_min_fraction, config.voxel_size)
         self.hz = None
         self.residual = None  # pose_offset of the last tracking window with points
+        # Rig guard. pose maps this window's points into the reference frame; config is the change
+        # config for them (origin at the pose, no range clip: the transform pass clipped).
+        self.pose = rig.Pose()
+        self.config = None
+        self.window = None  # this window's points, sensor frame
+        self.shift = None  # pose_shift of the last window with points
+        self.builder = rig.RegistrationBuilder(config.reg_voxel_m) if config.rig_guard else None
+        self.cloud = None  # RegistrationCloud once the reference is built
+        self.registration = None  # (file, size, crc) as last written or loaded
+        self.mode = "normal"  # normal, moved (no diff until re-aligned) or stale (moved while silent)
+        self.baseline = None  # inlier_frac at the last accepted decision
+        self.results = []  # RigChannel results of the current check, in order
+        self.estimates = []  # fit estimates while moved, the newest last
+        self.last_estimate = None
+        self.last_fit = False
+        self.delta = None  # (m, deg) of the last applied increment
+        self.pose_over = 0  # consecutive windows with pose_offset above pose_trigger_m
+        self.silent_since = None
+        self.learn_off = False  # rejected by an inconclusive check, until a check finds it in place
+        self.available = False
 
 
 class RoomMemory:
@@ -874,6 +982,8 @@ class RoomMemory:
         names = list(dict.fromkeys(config.sensors))
         if config.map_sensor and config.map_sensor not in names:
             raise ValueError(f"map_sensor '{config.map_sensor}' is not one of the sensors {list(config.sensors)}")
+        if config.rig_guard:
+            _validate_guard(config)
         self.config = config
         self.publisher_generation = publisher_generation
         self.change = config.change_config()
@@ -908,6 +1018,46 @@ class RoomMemory:
         self._event_log = deque(maxlen=EVENT_LOG_DEPTH)
         self._open_latest = {}  # event_id -> latest Logged message, open events only
         validate_rhythm(config)
+        for channel in self.channels.values():
+            channel.config = self.change
+        # Rig guard, room level.
+        self._detector = (ImuDetector(config.imu_shock_frac, config.imu_gyro_dps, config.imu_quiet_s)
+                          if config.rig_guard else None)
+        self.imu_failed = 0
+        # The rig files on disk lag the guard: a write or the relearn's archive failed (disk full,
+        # permissions). The guard runs on from memory and close_window retries every window; until
+        # the archive goes through, the old frame's files stay as they are. rig_save_failed counts
+        # the failed attempts, a held epoch write (_record_epoch) included, and rig_save_error is
+        # the last one's message. epoch_held: the last epoch write failed, so the build's end or a
+        # settle waits for it (no save is pending for that).
+        # Measurement only, in no output: the guard's ICP estimates in the last close_window and their
+        # wall time in ms (source cloud, seed with its yaw sweep, alignment).
+        self.window_estimates = 0
+        self.window_estimate_ms = 0.0
+        self.rig_save_pending = False
+        self.rig_save_failed = 0
+        self.rig_save_error = None
+        self.epoch_held = False
+        self._references_due = None  # a save's references header, not yet written (_save_rig)
+        self._archive_due = None  # the relearned frame's prev/ name, not yet archived
+        self._gravity = None  # the newest window's gravity
+        self._g_base = None  # gravity at the last accepted decision
+        self._gyro = None  # the gyro rotation of the last shock, until the check or move uses it
+        self._watched = False  # a quiet IMU streamed since the last accepted decision
+        self._check = None  # [start ns, causes, decision windows]
+        self._outcome = RigOutcome.IN_PLACE
+        self._causes = 0
+        self._next_check = None
+        self._moved_since = None
+        self._moved_at = Time(0, 0)
+        self._n_realigned = 0
+        self._frame_epoch = 0
+        self._tilt_run = 0
+        self._gross_run = 0
+        self._decision = {}  # sensor -> RigChannel of the last decision window
+        self._rig_seq = 0
+        self._rig_sent = None  # (outcome, ns) of the last RigPose
+        self._rig_dirty = True
         self._load(start)
         if rhythm_active(config):
             self._rhythm = Rhythm(config, publisher_generation=self.publisher_generation)
@@ -942,6 +1092,10 @@ class RoomMemory:
     def _load(self, start):
         if self.config.state_dir is None:
             return
+        room = _room_dir(self.config.state_dir, self.config.room_id)
+        rig_state = room / "rig_state"
+        if not self.config.rig_guard and rig_state.exists():
+            raise ValueError(f"{rig_state}: this state was written with rig_guard; enable it, or move the state aside")
         # The room's last epoch, whichever sensors that run had: a subset run moves it on and saves
         # only its own references, so the others' saved epochs may lag behind it.
         room_epoch = load_epoch(epoch_path(self.config.state_dir, self.config.room_id))
@@ -955,6 +1109,7 @@ class RoomMemory:
             missing = sorted(set(paths) - set(present))
             raise ValueError(f"saved references are incomplete for room '{self.config.room_id}': missing {missing}")
         epoch = room_epoch or 0
+        layers = {}
         for name, path in present.items():
             message, layer = load_reference(path)
             if message.header.room_id != self.config.room_id:
@@ -962,25 +1117,141 @@ class RoomMemory:
             if message.voxel_size != float(np.float32(self.config.voxel_size)):
                 raise ValueError(f"{path} uses voxel_size {message.voxel_size} m, not {self.config.voxel_size} m")
             epoch = max(epoch, message.header.map_epoch)
+            layers[name] = layer
+        if self.config.rig_guard and not rig_state.exists():
+            # Legacy references: no registration cloud and no pose, so a rig moved while the node was off
+            # could not be found (pose_offset is translation-only). Archived and rebuilt: a new frame.
+            save_epoch(epoch_path(self.config.state_dir, self.config.room_id), epoch)
+            files = ["map_epoch"] + [path.name for path in present.values()]
+            rig_files.archive(room, f"legacy-{epoch}", files, remove=[path.name for path in present.values()])
+            self.map_epoch = epoch
+            self._outcome = RigOutcome.RELEARNING
+            self._causes = CAUSE_STARTUP
+            return
+        for name, layer in layers.items():
             channel = self.channels[name]
             self._set_reference(channel, layer)
             channel.reference_windows = self.config.reference_windows
+        if self.config.rig_guard:
+            self._load_rig(room, rig_state)
         # seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
         # before it names a message after it. Saved at once, so the next restart moves on again.
+        if not self._record_epoch(epoch + 1):  # nothing carries the new epoch yet: a start that cannot record it stops
+            raise RuntimeError(self.rig_save_error)
         self.map_epoch = epoch + 1
         self.save(start)
         self.state = MemoryState.TRACKING
+        if self.config.rig_guard:
+            # The rig may have moved while the node was off.
+            self._start_check(_nanoseconds(start), CAUSE_STARTUP)
+
+    def _load_rig(self, room, path):
+        state = rig_files.parse_rig_state(path.read_bytes(), str(path))
+        if state.room_id != self.config.room_id or state.voxel_size != self.config.voxel_size:
+            raise ValueError(f"{path} holds room '{state.room_id}' at voxel_size {state.voxel_size}, not "
+                             f"'{self.config.room_id}' at {self.config.voxel_size}")
+        if sorted(state.sensors) != sorted(self.channels):
+            raise ValueError(f"{path} holds sensors {sorted(state.sensors)}, not {sorted(self.channels)}")
+        for name, saved in state.sensors.items():
+            file, size, crc = saved.registration
+            if file != rig_files.registration_name(name):
+                raise ValueError(f"{path}: {name} names registration file {file!r}")
+            data = (room / file).read_bytes() if (room / file).exists() else None
+            if data is None or len(data) != size or zlib.crc32(data) != crc:
+                raise ValueError(f"{room / file} does not match {path} (missing, or another size or CRC)")
+            sensor, frame_epoch, points = rig_files.parse_registration(data, str(room / file))
+            if sensor != name or frame_epoch != state.frame_epoch:
+                raise ValueError(f"{room / file} is {sensor}'s cloud of frame {frame_epoch}, not {name}'s of "
+                                 f"frame {state.frame_epoch}")
+            channel = self.channels[name]
+            channel.cloud = rig.RegistrationCloud(points, self.config.reg_voxel_m)
+            channel.registration = saved.registration
+            channel.builder = None
+            channel.baseline = saved.baseline
+            self._set_pose(channel, saved.pose)
+        self._frame_epoch = state.frame_epoch
+        self._n_realigned = state.n_realigned
+        self._g_base = state.g_base
 
     def save(self, stamp):
-        """Writes every sensor's reference and the room's epoch file with the current ``map_epoch``.
+        """Writes every sensor's reference and the room's epoch file with the current ``map_epoch``,
+        and with the rig guard its registration clouds and ``rig_state`` (``_save_rig``: one ordered
+        commit, the references inside it; the epoch file is already written, by ``_record_epoch``).
         No-op without ``state_dir``."""
         if self.config.state_dir is None:
             return
+        header = Header(self.config.room_id, self.map_epoch, 0, stamp)
+        if self.config.rig_guard:
+            # A frame commits whole: until every sensor built, the last committed one stays on disk.
+            if not self._building():
+                self._references_due = header
+            self._save_rig()
+            return
         # The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
         save_epoch(epoch_path(self.config.state_dir, self.config.room_id), self.map_epoch)
-        header = Header(self.config.room_id, self.map_epoch, 0, stamp)
         for name, path in self._paths().items():
             save_reference(path, self.channels[name].reference, header, self.config.voxel_size)
+
+    def _record_epoch(self, epoch):
+        """With the rig guard, writes ``epoch`` to the room's epoch file before anything carries it,
+        so the file never falls behind an epoch in use, whatever else of a save fails. False when the
+        write fails (disk full, permissions; counted like a failed save): the caller holds what would
+        take the epoch (the build's end, a settle) and the next window tries again. Without the guard
+        or ``state_dir`` it writes nothing and returns True: ``save`` writes the epoch file first and
+        a failure raises, as before the guard."""
+        if not self.config.rig_guard or self.config.state_dir is None:
+            return True
+        try:
+            save_epoch(epoch_path(self.config.state_dir, self.config.room_id), epoch)
+        except Exception as error:  # as _save_rig: the C++ engine catches std::exception
+            self.rig_save_failed += 1
+            self.rig_save_error = str(error)
+            self.epoch_held = True
+            return False
+        self.epoch_held = False
+        return True
+
+    def _save_rig(self):
+        """One ordered commit: the relearned frame's archive, the registration clouds not yet written,
+        the references a save left due, then ``rig_state`` (last: it names the clouds). A new frame's
+        clouds go before its references and carry its ``frame_epoch``, so a commit cut short leaves
+        either the old frame whole or clouds the old ``rig_state``'s CRCs refuse: never one frame's
+        references with another's poses. A failure (disk full, permissions) never leaves
+        ``close_window``: the guard keeps its state in memory, the files on disk stay the last set
+        written, and ``close_window`` retries until a save goes through. (The epoch file is not part
+        of it: ``_record_epoch`` writes each epoch before it is used.)"""
+        if self.config.state_dir is None:
+            return
+        try:
+            room = _room_dir(self.config.state_dir, self.config.room_id)
+            if self._archive_due is not None:
+                files = ["map_epoch", "rig_state"] + [path.name for path in self._paths().values()]
+                files += [rig_files.registration_name(name) for name in self.channels]
+                rig_files.archive(room, self._archive_due, files)
+                self._archive_due = None
+            if any(c.cloud is None for c in self.channels.values()):
+                self.rig_save_pending = False  # building: the new frame saves when it is built
+                return
+            for name, channel in self.channels.items():
+                if channel.registration is None:
+                    data = rig_files.registration_bytes(name, self._frame_epoch, channel.cloud.points)
+                    file = rig_files.registration_name(name)
+                    rig_files.write_atomic(room / file, data)
+                    channel.registration = (file, len(data), zlib.crc32(data))
+            if self._references_due is not None:
+                for name, path in self._paths().items():
+                    save_reference(path, self.channels[name].reference, self._references_due, self.config.voxel_size)
+                self._references_due = None
+            sensors = {name: rig_files.SensorState(channel.pose, channel.baseline, channel.registration)
+                       for name, channel in self.channels.items()}
+            state = rig_files.RigState(self.config.room_id, self.config.voxel_size, self._frame_epoch,
+                                       self._n_realigned, self._g_base, sensors)
+            rig_files.write_atomic(room / "rig_state", rig_files.format_rig_state(state))
+            self.rig_save_pending = False
+        except Exception as error:  # the C++ engine catches std::exception; BaseException still propagates
+            self.rig_save_pending = True
+            self.rig_save_failed += 1
+            self.rig_save_error = str(error)
 
     def add_points(self, sensor, positions):
         """Queues decoded ``(n, 3)`` positions (meters, sensor frame) for the current window."""
@@ -1026,6 +1297,7 @@ class RoomMemory:
 
     def close_window(self, stamp):
         """Integrates the queued frames. Returns the ``ChangeEvent`` messages to publish, in order."""
+        self.window_estimates, self.window_estimate_ms = 0, 0.0
         events = []
         activity = []  # (sensor bit, region) of every activity region, all sensors
         dropped = False
@@ -1035,29 +1307,43 @@ class RoomMemory:
         if tracking:
             self._tracking_windows += 1
         learning = tracking and self._tracking_windows <= self.config.learn_windows
+        guard = self.config.rig_guard
+        now = _nanoseconds(stamp)
+        if guard and tracking:
+            self._guard_triggers(now)
+        elif guard:
+            self._guard_building(now)
+        # A guard check holds every promotion and all learning until it decides.
+        hold = guard and self._check is not None
         for channel in self.channels.values():
             frames, channel.frames = channel.frames, []
             if channel.failed and not frames:
                 dropped = True
             channel.failed = 0
-            if self.state == MemoryState.BUILDING:
-                # A sensor's reference freezes once it is ready while the others catch up, and
-                # only windows with at least one occupied voxel count toward it.
-                if frames and not self._reference_ready(channel):
-                    window = occupancy_map(np.concatenate(frames), self.change)
-                    if len(window.occupied):
-                        observed = VoxelLayer.observe(window, self.change)
-                        channel.stats.add(observed.occupied, observed.known)
-                        channel.reference_windows += 1
-                        self._set_reference(channel, channel.stats.settled(self.config.settle_rule()))
-                        self._observe_rhythm(channel, "add", window.occupied, stamp, tracking)
-                    else:
-                        self._observe_rhythm(channel, "empty", None, stamp, tracking)
-                else:
-                    self._observe_rhythm(channel, "unavailable", None, stamp, tracking)
+            if guard:
+                channel.window = np.concatenate(frames) if frames else _NO_POINTS
+                if len(channel.window):
+                    channel.silent_since = None
+                elif channel.silent_since is None:
+                    channel.silent_since = now
+            # A sensor silent through the build (guard only) builds its reference when it returns,
+            # while the others track.
+            if self.state == MemoryState.BUILDING or channel.builder is not None:
+                self._build(channel, frames, stamp, tracking)
                 continue
+            config = channel.config
             points = np.concatenate(frames) if frames else _NO_POINTS
-            window = occupancy_map(points, self.change) if frames else None
+            if guard:
+                points = rig.corrected(points, channel.pose, self.config.max_range)
+            window = occupancy_map(points, config) if frames else None
+            if guard and channel.mode != "normal":
+                # Moved (or moved while silent): no diff, tracker or learning until it is re-aligned.
+                # Points are in a stale pose, so rhythm does not count the cells as empty.
+                channel.tracker.interrupt()
+                if window is not None and len(window.occupied):
+                    channel.shift = pose_shift(window.occupied, channel.reference.occupied, self.config.voxel_size)
+                self._observe_rhythm(channel, "unavailable", None, stamp, tracking)
+                continue
             # A window without usable points still ages the recent layer, but sends nothing.
             if window is None or not len(window.occupied):
                 channel.recent.append(_NO_POINTS)
@@ -1066,27 +1352,32 @@ class RoomMemory:
                 continue
             channel.recent.append(points)
             reference = channel.reference
-            recent = window if len(channel.recent) == 1 else occupancy_map(np.concatenate(channel.recent), self.change)
+            recent = window if len(channel.recent) == 1 else occupancy_map(np.concatenate(channel.recent), config)
             # The rig-pose estimate uses this window alone, so a move shows in full at once.
-            channel.residual = pose_offset(window.occupied, reference.occupied, self.config.voxel_size)
+            channel.shift = pose_shift(window.occupied, reference.occupied, self.config.voxel_size)
+            channel.residual = None if channel.shift is None else shift_norm(channel.shift)
+            if guard:
+                over = channel.residual is not None and channel.residual > self.config.pose_trigger_m
+                channel.pose_over = channel.pose_over + 1 if over else 0
             # Voxels the reference has not settled keep counting, so new coverage joins it, until
             # the learning budget is spent, and unless the rig may have moved.
-            if learning and channel.residual is not None and channel.residual <= self.config.learn_max_offset_m:
-                observed = VoxelLayer.observe(window, self.change)
+            if (learning and not hold and not channel.learn_off and channel.residual is not None
+                    and channel.residual <= self.config.learn_max_offset_m):
+                observed = VoxelLayer.observe(window, config)
                 channel.stats.add(np.setdiff1d(observed.occupied, reference.known, assume_unique=True),
                                   np.setdiff1d(observed.known, reference.known, assume_unique=True))
                 self._settle_pending = True
-            report = diff(reference.as_occupancy(self.config.voxel_size), recent, self.change, reference.known)
+            report = diff(reference.as_occupancy(self.config.voxel_size), recent, config, reference.known)
             # The recent layer carries a return and its ray for recent_windows windows, so only
             # this window's own evidence counts toward the persistence gate: an appeared region (or
             # the new pose of a move) is supported where this window occupies its voxels, a
             # disappeared one (or the old pose) where this window's rays traverse them.
             gone = [region.keys for region in report.regions if region.kind == "disappeared"]
             gone += [region.from_keys for region in report.regions if region.kind == "moved"]
-            free = cast_rays(window, self.change, np.unique(np.concatenate(gone))) if gone else _EMPTY_KEYS
+            free = cast_rays(window, config, np.unique(np.concatenate(gone))) if gone else _EMPTY_KEYS
             fresh = [region_fresh(region, window.occupied, free, self.config.fresh_min_voxels,
                                   self.config.fresh_min_fraction) for region in report.regions]
-            for state, candidate in channel.tracker.update(report.regions, stamp, self._next_id, fresh):
+            for state, candidate in channel.tracker.update(report.regions, stamp, self._next_id, fresh, hold):
                 events.append(self._event(channel, state, candidate, stamp))
                 self._log_event(events[-1])
             activity.extend((channel.sensor.bit, report.regions[index]) for index in channel.tracker.activity)
@@ -1100,22 +1391,34 @@ class RoomMemory:
             self._activity = (len(activity), sum(region.voxel_count for _, region in activity),
                               functools.reduce(operator.or_, (b for b, _ in activity)), bit, largest)
             self._last_activity_ns = _nanoseconds(stamp)
-        if self.state == MemoryState.BUILDING and all(self._reference_ready(c) for c in self.channels.values()):
+        # With the guard, the build ends only once the epoch file holds the epoch it takes (else BUILDING
+        # holds, and the next window tries again).
+        if self.state == MemoryState.BUILDING and self._built(now) and self._record_epoch(self.map_epoch + 1):
             self.state = MemoryState.TRACKING
             # From here on only the voxels the reference has not settled keep their counts.
             # learn_windows 0 drops those leftovers: this run teaches the reference nothing.
-            for channel in self.channels.values():
+            built = [channel for channel in self.channels.values() if self._reference_ready(channel)]
+            for channel in built:
                 channel.stats.erase(channel.reference.known)
             if self.config.learn_windows == 0:
-                for channel in self.channels.values():
+                for channel in built:
                     channel.stats = VoxelStats()
                 self._settle_pending = False
-            elif any(len(channel.stats.keys) for channel in self.channels.values()):
+            elif any(len(channel.stats.keys) for channel in built):
                 self._settle_pending = True
             self.map_epoch += 1
+            if guard:
+                self._guard_built(now)
             self.save(stamp)
         if self._rhythm is not None:
             self._rhythm.note_epoch(self.map_epoch)
+        if guard and tracking:
+            self._guard_step(now, stamp, events)
+        if guard:
+            for channel in self.channels.values():
+                channel.window = None
+            if self.rig_save_pending:
+                self._save_rig()
         return events
 
     def _observe_rhythm(self, channel, kind, occupied, stamp, tracking):
@@ -1137,6 +1440,490 @@ class RoomMemory:
                 rhythm.note_unavailable(name, stamp.sec, self.map_epoch)
         except Exception:
             rhythm.discard(name, stamp.sec, self.map_epoch)
+
+    def _build(self, channel, frames, stamp, tracking):
+        """One window toward the channel's reference. It freezes once ready, and only windows with
+        at least one occupied voxel count toward it. Rhythm sees that same window: occupied cells,
+        an empty window, or unavailable when occupancy was not evaluated."""
+        if frames and not self._reference_ready(channel):
+            window = occupancy_map(np.concatenate(frames), self.change)
+            if len(window.occupied):
+                observed = VoxelLayer.observe(window, self.change)
+                channel.stats.add(observed.occupied, observed.known)
+                channel.reference_windows += 1
+                self._set_reference(channel, channel.stats.settled(self.config.settle_rule()))
+                if channel.builder is not None:
+                    channel.builder.add(channel.window, self.config.max_range)
+                self._observe_rhythm(channel, "add", window.occupied, stamp, tracking)
+            else:
+                self._observe_rhythm(channel, "empty", None, stamp, tracking)
+        else:
+            self._observe_rhythm(channel, "unavailable", None, stamp, tracking)
+
+    def _built(self, now):
+        """BUILDING is done: every sensor's reference is ready. With the guard, a sensor silent for
+        RESUME_SILENCE_NS does not hold the others (silent channels never block): it builds when it
+        returns. At least one must be ready."""
+        ready = [self._reference_ready(c) for c in self.channels.values()]
+        if all(ready):
+            return True
+        return self.config.rig_guard and any(ready) and all(
+            r or (c.silent_since is not None and now - c.silent_since >= RESUME_SILENCE_NS)
+            for r, c in zip(ready, self.channels.values()))
+
+    # MARK: Rig guard
+
+    def add_imu(self, data, received):
+        """Feeds one CDR ``sensor_msgs/Imu`` received at ``received`` to the rig guard. False when
+        the guard is off or the frame does not decode (counted in ``imu_failed``, never raised)."""
+        if self._detector is None:
+            return False
+        try:
+            sample = decode_imu(data)
+        except Exception:  # rejected frame, not a crash, as in add_cdr and the C++ engine's std::exception
+            self.imu_failed += 1
+            return False
+        self._detector.add(sample, _nanoseconds(received))
+        return True
+
+    def _move_unresolved(self):
+        """From the move until a realignment or a relearn: a moved sensor gone silent (stale) is
+        still moved, only not measurable."""
+        return self._moved_since is not None
+
+    @property
+    def rig_outcome(self):
+        """MOVED from a move until a realignment or a relearn, CHECKING during a check, else the last
+        decision."""
+        if self._move_unresolved():
+            return RigOutcome.MOVED
+        if self._check is not None:
+            return RigOutcome.CHECKING
+        return self._outcome
+
+    def _set_pose(self, channel, pose):
+        channel.pose = pose
+        if pose.is_identity:
+            channel.config = self.change
+        else:
+            channel.config = replace(self.change, max_range=None, origin=tuple(float(np.float32(v)) for v in pose.t))
+            validate(channel.config)
+
+    def _imu_ok(self, now):
+        return self._detector is not None and self._detector.ok(now)
+
+    def _start_check(self, now, causes):
+        self._check = [now, causes, 0]
+        self._causes = causes
+        self._tilt_run = self._gross_run = 0
+        for channel in self.channels.values():
+            channel.results = []
+        self._rig_dirty = True
+
+    def _end_check(self, now, outcome):
+        self._check = None
+        self._outcome = outcome
+        self._gyro = None
+        period = self.config.guard_check_period_s
+        self._next_check = now + int(period * 1e9) if period > 0 else None
+        self._rig_dirty = True
+
+    def _guard_triggers(self, now):
+        """What starts a check, read before the window's channels so the hold covers this window."""
+        causes = 0
+        detector = self._detector
+        if detector.take_shock():
+            causes |= CAUSE_IMU_SHOCK
+            self._watched = False
+        gravity = detector.take_gravity()
+        if gravity is not None:
+            self._gravity = gravity
+        if not detector.ok(now):
+            self._watched = False
+        elif (gravity is not None and self._g_base is not None and detector.quiet(now)
+              and rig.angle_between_deg(gravity, self._g_base) >= self.config.tilt_trigger_deg):
+            causes |= CAUSE_IMU_TILT
+        elif (gravity is not None and self._g_base is None and detector.quiet(now) and not causes
+              and self._check is None and all(c.mode == "normal" for c in self.channels.values())):
+            # No baseline yet (the IMU came up after the build, or a state file without one): quiet
+            # gravity with the rig in place starts it, so a tilt is evidence even where ICP never fits.
+            self._g_base = gravity
+            self._save_rig()
+        if self._next_check is not None and now >= self._next_check:
+            causes |= CAUSE_PERIODIC
+        for channel in self.channels.values():
+            if channel.mode == "normal" and channel.pose_over == 2:
+                causes |= CAUSE_POSE_OFFSET
+            if (channel.frames and channel.builder is None and channel.silent_since is not None
+                    and now - channel.silent_since >= RESUME_SILENCE_NS):
+                causes |= CAUSE_SENSOR_RESUMED
+        if not causes:
+            return
+        if self._check is not None:
+            self._check[1] |= causes
+            self._causes = self._check[1]
+        elif not self._move_unresolved():
+            self._start_check(now, causes)
+
+    def _guard_building(self, now):
+        """Each BUILDING window: the newest gravity, for the baseline the new frame starts with. A
+        shock or rotation during the build is the reference's, never a trigger after it."""
+        detector = self._detector
+        detector.take_shock()
+        detector.take_rotation(now)
+        gravity = detector.take_gravity()
+        if gravity is not None:
+            self._gravity = gravity
+
+    def _guard_built(self, now):
+        """BUILDING → TRACKING: the registration clouds, a new frame, the gravity baseline."""
+        for channel in self.channels.values():
+            if self._reference_ready(channel):
+                self._finish_cloud(channel)
+        self._frame_epoch = self.map_epoch
+        self._g_base = self._gravity
+        self._end_check(now, RigOutcome.IN_PLACE)
+
+    def _finish_cloud(self, channel):
+        channel.cloud = channel.builder.finish(channel.reference.occupied, self.config.voxel_size,
+                                               self.config.reg_max_points)
+        channel.builder = None
+        channel.registration = None
+
+    def _building(self):
+        """A sensor silent through the build has not built its reference yet (guard only)."""
+        return any(c.builder is not None for c in self.channels.values())
+
+    def _joined(self, channel, stamp):
+        """A sensor silent through the build finished its reference: it joins the frame, which is
+        then committed whole."""
+        channel.stats.erase(channel.reference.known)
+        if self.config.learn_windows == 0 or self._tracking_windows >= self.config.learn_windows:
+            channel.stats = VoxelStats()
+        elif len(channel.stats.keys):
+            self._settle_pending = True
+        self._finish_cloud(channel)
+        self._rig_dirty = True
+        if not self._building():
+            self.save(stamp)
+
+    def _guard_step(self, now, stamp, events):
+        for channel in self.channels.values():
+            if channel.builder is not None and self._reference_ready(channel):
+                self._joined(channel, stamp)
+            has = channel.window is not None and len(channel.window) > 0
+            channel.available = has and channel.cloud is not None
+            if channel.mode == "stale" and channel.available:
+                self._channel_moved(channel, stamp, events)  # moved while it was silent
+                if self._moved_since is None:  # the others re-aligned while it was silent
+                    self._moved_since = now
+            elif channel.mode == "moved" and not channel.available:
+                channel.mode, channel.estimates = "stale", []
+                self._rig_dirty = True
+        if self._detector is not None:
+            gyro = self._detector.take_rotation(now)
+            if gyro is not None:
+                self._gyro = gyro
+        if self._check is not None:
+            self._decide(now, stamp, events)
+        if any(c.mode == "moved" for c in self.channels.values()):
+            self._track_moved(now, stamp, events)
+
+    def _rotation_prior(self, channel):
+        """The rotation increment the IMU saw (gyro over the shock, else the tilt), in the channel's
+        frame through the nominal mount for the JT128; None without one."""
+        R = self._gyro
+        if (R is None and self._gravity is not None and self._g_base is not None
+                and rig.angle_between_deg(self._gravity, self._g_base) >= self.config.tilt_trigger_deg):
+            R = rig.rotation_between(self._gravity, self._g_base)
+        if R is None:
+            return None
+        if channel.sensor.name == "jt128":
+            M = rig.Pose(MOUNT)
+            R = M.compose(rig.Pose(R)).compose(M.inverse()).R
+        return R
+
+    def _estimate(self, channel, seed_from_last=False):
+        """ICP of this window against the channel's cloud: (estimate or None, RigChannel result),
+        timed into ``window_estimate_ms``."""
+        start = time.perf_counter()
+        try:
+            return self._align_channel(channel, seed_from_last)
+        finally:
+            self.window_estimates += 1
+            self.window_estimate_ms += (time.perf_counter() - start) * 1000
+
+    def _align_channel(self, channel, seed_from_last):
+        config = self.config
+        limit = config.max_range if config.max_range is not None else config.icp_max_range_m
+        source = rig.source_cloud(channel.window, limit, config.src_voxel_m, config.src_max_points)
+        channel.last_estimate, channel.last_fit = None, False
+        if len(source) < MIN_SOURCE_POINTS:
+            return None, RigChannel.REJECTED
+        scale = rig.median_range(source)
+        shift = channel.shift or (0.0, 0.0, 0.0)
+        reach = math.sqrt((shift[0] * shift[0] + shift[1] * shift[1]) + shift[2] * shift[2])
+        if seed_from_last:
+            seed, sigma = seed_from_last, 0.01
+        else:
+            prior = self._rotation_prior(channel)
+            if prior is not None:
+                base = channel.pose.compose(rig.Pose(prior))
+                seed = rig.Pose(base.R, tuple(base.t[n] + shift[n] for n in range(3)))
+                sigma = reach + math.radians(0.2) * scale
+            else:
+                seed, _ = rig.sweep_seed(source, channel.pose, shift, channel.reference.occupied, config.voxel_size,
+                                         config.align_max_deg)
+                sigma = reach + math.radians(0.5 * rig.SWEEP_STEP_DEG) * scale
+        estimate = rig.align(source, channel.cloud, seed, sigma)
+        channel.last_estimate = estimate
+        if estimate is None:
+            return None, RigChannel.REJECTED
+        floor = 0.5 if channel.baseline is None else max(0.5, config.align_inlier_ratio * channel.baseline)
+        fit = (estimate.inlier_frac >= floor and estimate.rms_m <= config.align_max_rms_m
+               and estimate.observe >= config.observe_min_eig)
+        channel.last_fit = fit
+        if not fit:
+            return estimate, RigChannel.REJECTED
+        increment = channel.pose.increment(estimate.pose)
+        moved = (increment.distance_m >= config.move_min_m
+                 or not increment.cos_angle > math.cos(math.radians(config.move_min_deg)))
+        return estimate, RigChannel.MOVED if moved else RigChannel.IN_PLACE
+
+    def _decide(self, now, stamp, events):
+        """One decision window of a check: per-channel results, move evidence, the room decision."""
+        config = self.config
+        start, _, _ = self._check
+        age = now - start
+        imu_ok = self._imu_ok(now)
+        if imu_ok and not self._detector.quiet(now) and age < int(config.check_max_s * 1e9):
+            return  # the rig is still vibrating: wait for quiet, at most check_max_s
+        available = [c for c in self.channels.values() if c.mode == "normal" and c.available]
+        if not available:
+            return  # nothing to look with: the check waits for a channel
+        self._check[2] += 1
+        self._decision = {}
+        for channel in self.channels.values():
+            if channel.mode != "normal":
+                continue
+            result = self._estimate(channel)[1] if channel.available else RigChannel.UNAVAILABLE
+            channel.results.append(result)
+            self._decision[channel.sensor.name] = result
+        self._rig_dirty = True
+        moved = any(c.results[-1] == RigChannel.MOVED for c in available)
+        tilted = (imu_ok and self._gravity is not None and self._g_base is not None
+                  and rig.angle_between_deg(self._gravity, self._g_base) >= max(config.tilt_trigger_deg, config.move_min_deg))
+        self._tilt_run = self._tilt_run + 1 if tilted else 0
+        # Measured low overlap only: a window without an estimate is a rejection, never evidence.
+        mismatch = all(c.baseline is not None and c.last_estimate is not None
+                       and c.last_estimate.inlier_frac < config.gross_inlier_ratio * c.baseline for c in available)
+        self._gross_run = self._gross_run + 1 if mismatch else 0
+        k = config.align_stable_windows
+        if (moved or self._tilt_run >= k or (self._gross_run >= 2 and not self._watched)):
+            self._enter_moved(now, stamp, events)
+            return
+        if all(len(c.results) >= k and all(r == RigChannel.IN_PLACE for r in c.results[-k:]) for c in available):
+            for channel in available:
+                channel.baseline = channel.last_estimate.inlier_frac
+                channel.learn_off = False
+            if imu_ok and self._gravity is not None:
+                self._g_base = self._gravity
+            self._watched = imu_ok
+            self._end_check(now, RigOutcome.IN_PLACE)
+            self._save_rig()
+            return
+        if (age >= int(config.check_max_s * 1e9) and self._check[2] >= k) or age >= int(2 * config.check_max_s * 1e9):
+            # No evidence and no agreement: keep the pose, release the hold, never relearn.
+            for channel in available:
+                if channel.results[-1] == RigChannel.REJECTED:
+                    channel.learn_off = True
+            self._end_check(now, RigOutcome.INCONCLUSIVE)
+
+    def _enter_moved(self, now, stamp, events):
+        """Move evidence: every available channel not stable in place stops diffing; silent ones go stale."""
+        k = self.config.align_stable_windows
+        start = self._check[0]
+        any_moved = False
+        for channel in self.channels.values():
+            if channel.mode != "normal":
+                continue
+            in_place = len(channel.results) >= k and all(r == RigChannel.IN_PLACE for r in channel.results[-k:])
+            if channel.available and not in_place:
+                self._channel_moved(channel, stamp, events)
+                any_moved = True
+            elif not channel.available and channel.builder is None:
+                channel.mode = "stale"
+        if not any_moved:
+            # The IMU or the overlap said moved, every channel's own fit says in place: trust the fit.
+            for channel in self.channels.values():
+                if channel.mode == "stale":
+                    channel.mode = "normal"
+            self._end_check(now, RigOutcome.IN_PLACE)
+            return
+        for channel in self.channels.values():
+            if channel.builder is not None:
+                self._restart_build(channel)
+        self._check = None
+        self._moved_since = now
+        self._moved_at = Time(start // 1_000_000_000, start % 1_000_000_000)
+        self._watched = False
+        self._rig_dirty = True
+
+    def _restart_build(self, channel):
+        """A sensor still building its reference when the rig moved: the windows so far saw the old
+        pose, so it starts over in the new one."""
+        self._set_reference(channel, VoxelLayer.empty())
+        channel.reference_index = None
+        channel.stats = VoxelStats()
+        channel.reference_windows = 0
+        channel.builder = rig.RegistrationBuilder(self.config.reg_voxel_m)
+
+    def _channel_moved(self, channel, stamp, events):
+        """Expires the channel's open candidates, drops its pending entries and recent layer."""
+        for candidate in sorted(channel.tracker.open, key=lambda c: c.event_id):
+            events.append(self._event(channel, EventState.EXPIRED, candidate, stamp))
+            self._log_event(events[-1])
+        channel.tracker.open, channel.tracker.pending, channel.tracker.activity = [], [], []
+        channel.recent.clear()
+        channel.mode = "moved"
+        channel.estimates = []
+        channel.results = []
+        self._rig_dirty = True
+
+    def _track_moved(self, now, stamp, events):
+        """Each window while moved: ICP of every moved channel; re-align once each has
+        align_stable_windows agreeing, fit, applicable estimates; relearn after relearn_after_s."""
+        config = self.config
+        k = config.align_stable_windows
+        moved = [c for c in self.channels.values() if c.mode == "moved"]
+        self._decision = {}
+        for channel in moved:
+            last = channel.estimates[-1].pose if channel.estimates else (
+                channel.last_estimate.pose if channel.last_fit and channel.last_estimate is not None else False)
+            estimate, result = self._estimate(channel, last)
+            self._decision[channel.sensor.name] = result
+            if result == RigChannel.REJECTED:
+                channel.estimates = []
+            else:
+                channel.estimates = (channel.estimates + [estimate])[-k:]
+        self._rig_dirty = True
+        cos_max = math.cos(math.radians(config.align_max_deg))
+        cos_stable = math.cos(math.radians(STABLE_DEG))
+
+        def ready(channel):
+            if len(channel.estimates) < k:
+                return False
+            newest = channel.estimates[-1].pose
+            for other in channel.estimates[:-1]:
+                difference = other.pose.increment(newest)
+                if difference.distance_m > STABLE_M or difference.cos_angle < cos_stable:
+                    return False
+            return newest.distance_m <= config.align_max_m and newest.cos_angle >= cos_max
+
+        if all(ready(c) for c in moved):
+            realigned = False
+            for channel in moved:
+                estimate = channel.estimates[-1]
+                increment = channel.pose.increment(estimate.pose)
+                if (increment.distance_m >= config.move_min_m
+                        or not increment.cos_angle > math.cos(math.radians(config.move_min_deg))):
+                    channel.delta = (increment.distance_m, increment.angle_deg)
+                    self._set_pose(channel, estimate.pose)
+                    realigned = True
+                channel.baseline = estimate.inlier_frac
+                channel.mode, channel.estimates, channel.results = "normal", [], []
+                channel.residual, channel.pose_over, channel.learn_off = None, 0, False
+            if realigned:
+                self._n_realigned += 1
+            self._moved_since = None
+            imu_ok = self._imu_ok(now)
+            if imu_ok and self._gravity is not None:
+                self._g_base = self._gravity
+            self._watched = imu_ok
+            self._end_check(now, RigOutcome.REALIGNED if realigned else RigOutcome.IN_PLACE)
+            self._save_rig()
+            return
+        # Every moved channel delivered this window (a silent one went stale), so the rebuild has a
+        # sensor to build on; silent ones build when they return (_built).
+        if config.auto_relearn and now - self._moved_since >= int(config.relearn_after_s * 1e9):
+            self._relearn(now, stamp, events)
+
+    def _relearn(self, now, stamp, events):
+        """Archives the state and rebuilds the room through BUILDING: a new room frame. A relearn
+        during the rebuild keeps the archive still due: the files on disk are that frame's, not this one's."""
+        if self.config.state_dir is not None and self._archive_due is None:
+            self._archive_due = f"frame-{self._frame_epoch}"
+        self._references_due = None
+        self.rig_save_pending = False  # the old frame's poses are moot; the new frame saves when it is built
+        for channel in self.channels.values():
+            for candidate in sorted(channel.tracker.open, key=lambda c: c.event_id):
+                events.append(self._event(channel, EventState.EXPIRED, candidate, stamp))
+                self._log_event(events[-1])
+            channel.tracker.open, channel.tracker.pending, channel.tracker.activity = [], [], []
+            channel.recent.clear()
+            self._set_reference(channel, VoxelLayer.empty())
+            channel.reference_index = None
+            channel.stats = VoxelStats()
+            channel.reference_windows = 0
+            self._set_pose(channel, rig.Pose())
+            channel.cloud, channel.registration = None, None
+            channel.builder = rig.RegistrationBuilder(self.config.reg_voxel_m)
+            channel.mode, channel.baseline, channel.results, channel.estimates = "normal", None, [], []
+            channel.last_estimate, channel.last_fit, channel.delta = None, False, None
+            channel.residual, channel.shift, channel.pose_over, channel.learn_off = None, None, 0, False
+        self.state = MemoryState.BUILDING
+        self._map_started = False
+        self._map_bricks = ()
+        self._map_log.clear()
+        self._settle_pending = False
+        self._tracking_windows = 0
+        self._check = None
+        self._moved_since = None
+        self._next_check = None
+        self._n_realigned = 0
+        self._outcome = RigOutcome.RELEARNING
+        self._rig_dirty = True
+        # The archive now (D41). A failure (disk full) does not stop the relearn: close_window
+        # retries, and the new frame commits only after the archive.
+        self._save_rig()
+
+    def rig_pose(self, stamp):
+        """The ``RigPose`` due at ``stamp`` (call once per window, after ``close_window``): on every
+        change of the outcome or decision and every 10 s. None with the guard off or when not due."""
+        if not self.config.rig_guard:
+            return None
+        now = _nanoseconds(stamp)
+        outcome = self.rig_outcome
+        due = (self._rig_dirty or self._rig_sent is None or self._rig_sent[0] != outcome
+               or now - self._rig_sent[1] >= RIG_POSE_PERIOD_NS)
+        if not due:
+            return None
+        poses = {"mid360": None, "jt128": None}
+        pairs = {name: [None, None] for name in ("delta_m", "delta_deg", "inlier_frac", "rms_m", "observe")}
+        sensors, channel_results = 0, [RigChannel.NONE, RigChannel.NONE]
+        for name, channel in self.channels.items():
+            slot = channel.sensor.hz_index
+            poses[name] = channel.pose.rig_pose()
+            if channel.delta is not None:
+                pairs["delta_m"][slot], pairs["delta_deg"][slot] = channel.delta
+            if channel.last_estimate is not None:
+                pairs["inlier_frac"][slot] = channel.last_estimate.inlier_frac
+                pairs["rms_m"][slot] = channel.last_estimate.rms_m
+                pairs["observe"][slot] = channel.last_estimate.observe
+            result = self._decision.get(name, RigChannel.NONE)
+            channel_results[slot] = result
+            if result not in (RigChannel.NONE, RigChannel.UNAVAILABLE):
+                sensors |= channel.sensor.bit
+        tilt = (rig.angle_between_deg(self._gravity, self._g_base)
+                if self._gravity is not None and self._g_base is not None else None)
+        message = RigPose(Header(self.config.room_id, self.map_epoch, self._rig_seq, stamp), outcome, self._causes,
+                          sensors, tuple(channel_results), self._frame_epoch, self._n_realigned, poses["mid360"],
+                          poses["jt128"], *(tuple(pairs[name]) for name in pairs), tilt, self._imu_ok(now),
+                          self._moved_at, self.publisher_generation)
+        self._rig_seq += 1
+        self._rig_sent = (outcome, now)
+        self._rig_dirty = False
+        return message
 
     def activity(self, stamp):
         """The ``Activity`` message at ``stamp`` (call at 1 Hz): the newest tracking window with
@@ -1189,7 +1976,7 @@ class RoomMemory:
         when the deltas since it would exceed ``keyframe_delta_ratio`` of its size. After
         ``learn_windows`` tracking windows, that settle pass drops every sensor's counts. Later
         ticks do not settle, and a keyframe of the unchanged map does not bump ``map_epoch``."""
-        if self.state == MemoryState.BUILDING:
+        if self.state == MemoryState.BUILDING or self.channels[self.map_sensor].builder is not None:
             return None
         ns = _nanoseconds(stamp)
         if not self._map_started:
@@ -1201,18 +1988,23 @@ class RoomMemory:
             return None
         changed = False
         if self._settle_pending:
-            for channel in self.channels.values():
-                fresh = channel.stats.settled(self.config.settle_rule())
-                if not len(fresh.known):
-                    continue
+            # Still building: its counts are its reference's.
+            settled = [(channel, channel.stats.settled(self.config.settle_rule()))
+                       for channel in self.channels.values() if channel.builder is None]
+            settled = [(channel, fresh) for channel, fresh in settled if len(fresh.known)]
+            # With the guard, voxels merge only once the epoch file holds the epoch they take: else the
+            # counts, the references and map_epoch stay as they are, and the next window tries again.
+            held = bool(settled) and not self._record_epoch(self.map_epoch + 1)
+            for channel, fresh in [] if held else settled:
                 channel.stats.erase(fresh.known)
                 self._set_reference(channel, channel.reference.merge(fresh))
                 changed = True
             # The budget is spent: merge whatever just settled, then drop the rest, including
             # counts that never reached the rule. A tick that is not due returned above.
-            if self._tracking_windows >= self.config.learn_windows:
+            if not held and self._tracking_windows >= self.config.learn_windows:
                 for channel in self.channels.values():
-                    channel.stats = VoxelStats()
+                    if channel.builder is None:
+                        channel.stats = VoxelStats()
                 self._settle_pending = False
         if not changed and not keyframe_due:
             return None
@@ -1331,7 +2123,9 @@ class RoomMemory:
         state = self.state
         residuals = [c.residual for c in self.channels.values() if c.residual is not None]
         residual = max(residuals) if residuals and self.state != MemoryState.BUILDING else None
-        if self.last_window_dropped or any(channel.hz == 0 for channel in self.channels.values()):
+        if self.state == MemoryState.TRACKING and self._move_unresolved():
+            state = MemoryState.RIG_MOVED  # outranks DEGRADED: a silent sensor does not hide a move
+        elif self.last_window_dropped or any(channel.hz == 0 for channel in self.channels.values()):
             state = MemoryState.DEGRADED
         message = MemoryStatus(
             header=Header(self.config.room_id, self.map_epoch, self.status_seq, stamp),

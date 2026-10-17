@@ -51,6 +51,8 @@ SENSOR_CODE = {"mid360": SENSOR_MID360, "jt128": SENSOR_JT128}
 SENSOR_NAME = {SENSOR_MID360: "mid360", SENSOR_JT128: "jt128"}
 _RECORD = struct.Struct("<IqQHHHHIIBBH")
 _REGION = struct.Struct("<hhhHH")
+# Same little-endian row as ``_REGION``. The minute seal writes this in one block.
+_REGION_DTYPE = np.dtype([("ix", "<i2"), ("iy", "<i2"), ("iz", "<i2"), ("hits", "<u2"), ("mean", "<u2")])
 _NAME = re.compile(r"^rhythm-(mid360|jt128)-(\d{8})(?:-(\d+))?\.rhy$")
 _QUARANTINE = re.compile(r"^rhythm-(mid360|jt128)-(\d{8})(?:-(\d+))?\.rhy\.(superseded|bad)-(\d+)$")
 _ROOM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -238,9 +240,39 @@ def identity_matches(parsed, expected):
     )
 
 
-def encode_record(minute, map_epoch, closed, with_points, unavailable, clipped, dropped, pose_ok, flags, regions):
-    """One record. ``regions`` is ``(ix, iy, iz, hits, mean)`` in strictly increasing order."""
-    count = len(regions)
+def encode_record(minute, map_epoch, closed, with_points, unavailable, clipped, dropped, pose_ok, flags,
+                  regions=(), packed_regions=None):
+    """One record. ``regions`` is ``(ix, iy, iz, hits, mean)`` in strictly increasing order.
+
+    ``packed_regions`` is that same payload already packed little-endian, one row per
+    ``_REGION``. The minute seal uses it so a full table does not build a Python tuple
+    per region on the callback.
+    """
+    if packed_regions is None:
+        count = len(regions)
+        if count > U16_MAX:
+            raise ValueError("n_regions does not fit in uint16")
+        body = 40 + count * REGION_BYTES
+        buf = bytearray(4 + body)
+        _RECORD.pack_into(
+            buf, 0, body, int(minute), int(map_epoch), int(closed), int(with_points), int(unavailable), 0,
+            int(clipped), int(dropped), int(pose_ok), int(flags), count,
+        )
+        offset = ENVELOPE_BYTES
+        previous = None
+        for region in regions:
+            ix, iy, iz, hits, mean = region
+            current = (int(ix), int(iy), int(iz))
+            if previous is not None and current <= previous:
+                raise ValueError("regions must be strictly increasing")
+            previous = current
+            _REGION.pack_into(buf, offset, current[0], current[1], current[2], int(hits), int(mean))
+            offset += REGION_BYTES
+        struct.pack_into("<I", buf, offset, _crc(buf[4:offset]))
+        return bytes(buf)
+    if len(packed_regions) % REGION_BYTES:
+        raise ValueError("packed regions are not a whole number of region rows")
+    count = len(packed_regions) // REGION_BYTES
     if count > U16_MAX:
         raise ValueError("n_regions does not fit in uint16")
     body = 40 + count * REGION_BYTES
@@ -249,17 +281,10 @@ def encode_record(minute, map_epoch, closed, with_points, unavailable, clipped, 
         buf, 0, body, int(minute), int(map_epoch), int(closed), int(with_points), int(unavailable), 0,
         int(clipped), int(dropped), int(pose_ok), int(flags), count,
     )
-    offset = ENVELOPE_BYTES
-    previous = None
-    for region in regions:
-        ix, iy, iz, hits, mean = region
-        current = (int(ix), int(iy), int(iz))
-        if previous is not None and current <= previous:
-            raise ValueError("regions must be strictly increasing")
-        previous = current
-        _REGION.pack_into(buf, offset, current[0], current[1], current[2], int(hits), int(mean))
-        offset += REGION_BYTES
-    struct.pack_into("<I", buf, offset, _crc(buf[4:offset]))
+    if count:
+        buf[ENVELOPE_BYTES:ENVELOPE_BYTES + len(packed_regions)] = packed_regions
+    end = ENVELOPE_BYTES + len(packed_regions)
+    struct.pack_into("<I", buf, end, _crc(buf[4:end]))
     return bytes(buf)
 
 
@@ -366,54 +391,107 @@ class _Table:
         self._cslot = np.empty(slots, dtype=np.int32)
 
     def clear(self):
+        """Drop occupancy and counts. A complete layout cache stays.
+
+        A minute seal calls this. The next window of the same room writes those slots
+        back and does not probe. The cache is dropped when it is not the whole table:
+        restoring a subset would leave a key past an empty slot, and the next probe
+        would miss it.
+        """
+        if self._cached != self.count:
+            self._cached = 0
         self.used.fill(0)
+        self.hits.fill(0)
+        self.sums.fill(0)
         self.count = 0
-        self._cached = 0
 
     def insert_window(self, ix, iy, iz, counts):
         """Insert unique cells in signed order. The first miss returns how many were not stored.
 
         A miss stops the window: later regions, including ones already in the table, are
-        counted and not updated. An identical cell list reuses the slots from the last
-        complete insert and does not probe again. That update writes each slot from one
-        row, and a repeated index does not accumulate, so the cell list has to be
-        unique. ``_cells`` has already summed each cell into one row.
+        counted and not updated. The cells that fit stay cached in insertion order. The
+        next window reuses those slots when it is that list, or a longer list with that
+        prefix once the table is exactly those cells. A longer tail is then a miss
+        without a probe: the cells are unique, so none of it is already stored, and a
+        miss in a full table would walk every slot. ``clear`` keeps this cache when it
+        is the whole table. The update writes each slot from one row, and a repeated
+        index does not accumulate, so the cell list has to be unique. ``_cells`` has
+        already summed each cell into one row.
         """
         total = len(ix)
         if total == 0:
             return 0
+        begin = 0
         cached = self._cached
-        if (
-            total == cached
-            and np.array_equal(ix, self._cix[:cached])
-            and np.array_equal(iy, self._ciy[:cached])
-            and np.array_equal(iz, self._ciz[:cached])
-        ):
-            slots = self._cslot[:cached]
-            updated = self.hits[slots] + np.uint32(1)
-            np.minimum(updated, np.uint32(U16_MAX), out=updated)
-            self.hits[slots] = updated
-            self.sums[slots] += np.asarray(counts, dtype=np.uint64)
-            return 0
+        if cached and total >= cached and self._prefix_matches(ix, iy, iz, cached):
+            if self.count == 0:
+                self._apply_cached(cached, counts, fresh=True)
+            elif self.count == cached:
+                self._apply_cached(cached, counts, fresh=False)
+            else:
+                cached = 0
+            if cached:
+                if total == cached:
+                    return 0
+                # The prefix is the entire table and it is full. Every later cell misses.
+                if self.count >= self.slots:
+                    return total - cached
+                begin = cached
         packed = ((ix.astype(np.int64) & 0xFFFF) << 32) | ((iy.astype(np.int64) & 0xFFFF) << 16) | (iz.astype(np.int64) & 0xFFFF)
         starts = np.asarray(splitmix64(packed), dtype=np.uint64) & np.uint64(self.mask)
-        for n in range(total):
+        for n in range(begin, total):
+            # Unique cells, and every occupied slot is one of this window's first n.
+            # The next cell is absent. Searching for it would scan the whole table.
+            if self.count >= self.slots and n == self.count:
+                self._remember(ix, iy, iz, n)
+                return total - n
             slot = self._slot(int(ix[n]), int(iy[n]), int(iz[n]), int(starts[n]))
             if slot is None:
-                self._cached = 0
+                if n > 0:
+                    self._remember(ix, iy, iz, n)
                 return total - n
             if n < self.slots:
                 self._cslot[n] = slot
             self.hits[slot] = min(U16_MAX, int(self.hits[slot]) + 1)
             self.sums[slot] = np.uint64(int(self.sums[slot]) + int(counts[n]))
         if total <= self.slots:
-            self._cix[:total] = ix
-            self._ciy[:total] = iy
-            self._ciz[:total] = iz
-            self._cached = total
+            self._remember(ix, iy, iz, total)
         else:
             self._cached = 0
         return 0
+
+    def _prefix_matches(self, ix, iy, iz, cached):
+        return (
+            np.array_equal(ix[:cached], self._cix[:cached])
+            and np.array_equal(iy[:cached], self._ciy[:cached])
+            and np.array_equal(iz[:cached], self._ciz[:cached])
+        )
+
+    def _apply_cached(self, n, counts, fresh):
+        slots = self._cslot[:n]
+        taken = np.asarray(counts[:n], dtype=np.uint64)
+        if fresh:
+            self.used[slots] = 1
+            self.ix[slots] = self._cix[:n]
+            self.iy[slots] = self._ciy[:n]
+            self.iz[slots] = self._ciz[:n]
+            self.hits[slots] = np.uint32(1)
+            self.sums[slots] = taken
+            self.count = n
+            return
+        updated = self.hits[slots] + np.uint32(1)
+        np.minimum(updated, np.uint32(U16_MAX), out=updated)
+        self.hits[slots] = updated
+        self.sums[slots] += taken
+
+    def _remember(self, ix, iy, iz, n):
+        if n <= 0 or n > self.slots:
+            self._cached = 0
+            return
+        self._cix[:n] = ix[:n]
+        self._ciy[:n] = iy[:n]
+        self._ciz[:n] = iz[:n]
+        self._cached = n
 
     def _slot(self, ix, iy, iz, start):
         for step in range(self.slots):
@@ -433,11 +511,13 @@ class _Table:
                 return slot
         return None
 
-    def regions(self, with_points):
-        """Occupied cells with a hit, sorted by signed ``(ix, iy, iz)``. Mean saturates at 65535."""
+    def _occupied(self, with_points):
+        """Occupied rows with a hit, sorted by signed ``(ix, iy, iz)``. ``None`` when there are none."""
+        if with_points <= 0:
+            return None
         taken = np.flatnonzero(self.used)
-        if len(taken) == 0 or with_points <= 0:
-            return ()
+        if len(taken) == 0:
+            return None
         ix = self.ix[taken].astype(np.int32)
         iy = self.iy[taken].astype(np.int32)
         iz = self.iz[taken].astype(np.int32)
@@ -445,17 +525,38 @@ class _Table:
         sums = self.sums[taken]
         keep = hits > 0
         if not np.any(keep):
-            return ()
+            return None
         ix, iy, iz, hits, sums = ix[keep], iy[keep], iz[keep], hits[keep], sums[keep]
         order = np.lexsort((iz, iy, ix))
         # uint64 sum. Casting through int64 would invert a sum above 2^63.
         means = (sums[order] + np.uint64(with_points // 2)) // np.uint64(with_points)
         np.minimum(means, np.uint64(U16_MAX), out=means)
-        ix, iy, iz, hits = ix[order], iy[order], iz[order], hits[order]
+        return ix[order], iy[order], iz[order], hits[order], means
+
+    def regions(self, with_points):
+        """Occupied cells with a hit, sorted by signed ``(ix, iy, iz)``. Mean saturates at 65535."""
+        rows = self._occupied(with_points)
+        if rows is None:
+            return ()
+        ix, iy, iz, hits, means = rows
         return tuple(
             (int(ix[n]), int(iy[n]), int(iz[n]), int(hits[n]), int(means[n]))
-            for n in range(len(order))
+            for n in range(len(ix))
         )
+
+    def pack_regions(self, with_points):
+        """Sorted region payload, little endian. Empty when nothing was hit."""
+        rows = self._occupied(with_points)
+        if rows is None:
+            return b""
+        ix, iy, iz, hits, means = rows
+        packed = np.empty(len(ix), dtype=_REGION_DTYPE)
+        packed["ix"] = ix
+        packed["iy"] = iy
+        packed["iz"] = iz
+        packed["hits"] = hits
+        packed["mean"] = means
+        return packed.tobytes()
 
 
 class _Bin:
@@ -611,10 +712,11 @@ class RhythmAccumulator:
             flags |= FLAG_OVERFLOW
         pose_ok = 0 if opened.with_points == 0 or opened.pose_bad else 1
         # Build the record before dropping the bin. A failure leaves it for ``discard``.
-        regions = state["table"].regions(opened.with_points)
+        # The packed payload stays off the tuple path: a full table is 4096 regions.
         data = encode_record(
             opened.minute, opened.map_epoch, opened.closed, opened.with_points, opened.unavailable,
-            opened.clipped, opened.regions_dropped, pose_ok, flags, regions,
+            opened.clipped, opened.regions_dropped, pose_ok, flags,
+            packed_regions=state["table"].pack_regions(opened.with_points),
         )
         state["bin"] = None
         state["table"].clear()

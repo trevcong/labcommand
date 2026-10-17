@@ -22,12 +22,10 @@ enum Dest: String, CaseIterable, Identifiable {
 
     var windowTitle: String { "LabCommand - \(label)" }
 
+    /// 1-based place in `navCases`, so ⌘1 is the first tab.
     var shortcutKey: String {
-        switch self {
-        case .workspace: return "3"
-        case .settings: return "2"
-        case .liveRoom: return "1"
-        }
+        let index = Self.navCases.firstIndex(of: self) ?? 0
+        return String(index + 1)
     }
 }
 

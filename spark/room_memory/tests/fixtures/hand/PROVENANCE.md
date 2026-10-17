@@ -1,6 +1,6 @@
 # Hand CDR goldens: provenance
 
-Copied byte for byte from `Tests/Fixtures/room/golden/hand/` on the Phase 0 branch (`labcommand-memory` worktree), commit `95f49f2` ("Apply D5/D9/D19: keep all-free bricks, header compression (zlib default), RequestSync message"). They were derived by hand from `ros/labcommand_msgs/msg/*.msg` and `docs/ROOM-MEMORY-PROTOCOL.md` §1; every span is annotated. `memory_status_le.hex` was refreshed from `phase3-design` (PR #13) commit `d751db6` for `events_seq`. `activity_le.hex` and `activity_idle_le.hex` are not copies: they were derived by hand on `room-memory-cpp` from `ros/labcommand_msgs/msg/Activity.msg` (protocol §3.7) in the same annotated format, and copied to `Tests/Fixtures/room/golden/hand/` on `protocol-v2-followups`, when the Swift suite began decoding `Activity`. The protocol v2 goldens (`*_v2_*.hex`, `sync_end_*.hex`) were derived by hand on `pubgen` from the v2 `.msg` files and `PLAN-PUBGEN.md` §2.2 (`activity_v2_le.hex`, `epoch_v2_le.hex` and `epoch_v2_be.hex` on `protocol-v2-followups`, protocol D38), in the same annotated format, and copied to `Tests/Fixtures/room/golden/hand/`; each v2 golden that extends a legacy one repeats its values and appends the new fields, and every v2 golden uses the one publisher generation 1760400000000. Format: whitespace-separated hex bytes, `#` starts a comment.
+Copied byte for byte from `Tests/Fixtures/room/golden/hand/` on the Phase 0 branch (`labcommand-memory` worktree), commit `95f49f2` ("Apply D5/D9/D19: keep all-free bricks, header compression (zlib default), RequestSync message"). They were derived by hand from `ros/labcommand_msgs/msg/*.msg` and `docs/ROOM-MEMORY-PROTOCOL.md` §1; every span is annotated. `memory_status_le.hex` was refreshed from `phase3-design` (PR #13) commit `d751db6` for `events_seq`. `activity_le.hex` and `activity_idle_le.hex` are not copies: they were derived by hand on `room-memory-cpp` from `ros/labcommand_msgs/msg/Activity.msg` (protocol §3.7) in the same annotated format, and copied to `Tests/Fixtures/room/golden/hand/` on `protocol-v2-followups`, when the Swift suite began decoding `Activity`. The protocol v2 goldens (`*_v2_*.hex`, `sync_end_*.hex`) were derived by hand on `pubgen` from the v2 `.msg` files and `PLAN-PUBGEN.md` §2.2 (`activity_v2_le.hex`, `epoch_v2_le.hex` and `epoch_v2_be.hex` on `protocol-v2-followups`, protocol D38), in the same annotated format, and copied to `Tests/Fixtures/room/golden/hand/`; each v2 golden that extends a legacy one repeats its values and appends the new fields, and every v2 golden uses the one publisher generation 1760400000000. `rig_pose_le.hex`, its v2 twin `rig_pose_v2_le.hex` (the same values and generation as the other v2 goldens) and `imu_le.hex` were derived by hand on `rig-guard` the same way, from `ros/labcommand_msgs/msg/RigPose.msg` (protocol §3.9) and ROS 2 Jazzy's `sensor_msgs/msg/Imu.msg`, and copied to `Tests/Fixtures/room/golden/hand/` when the Swift suite began decoding `RigPose` and `Imu`. Format: whitespace-separated hex bytes, `#` starts a comment.
 
 | file | sha256 |
 |---|---|
@@ -15,6 +15,7 @@ Copied byte for byte from `Tests/Fixtures/room/golden/hand/` on the Phase 0 bran
 | `epoch_le.hex` | `5eb7544d8e8cbc2a6e92f770e1dcdbbde74b7af3359e71febcac03ebf303dd8b` |
 | `epoch_v2_be.hex` | `5e837b817325d0700747bb2e8a9e714d839b3db876c2d28eadce7457ecd1d2ef` |
 | `epoch_v2_le.hex` | `ac7d6e31b97a52585093f1b0a2895a50894e1e14b407623e62535995994e4bef` |
+| `imu_le.hex` | `4d396f417dbb6f9d0c8c0f28a15bf633c82382b05f82fd730e38417a396e52ac` |
 | `map_bricks_delta_be.hex` | `3ea657d2000708eb5dae81456ad802584544e1980ffbb40b462050e54a256054` |
 | `map_bricks_delta_le.hex` | `1b48dafbd91316e4a0386fe9202d3f80fd2721177ba3635edd191034e7c6eb3a` |
 | `map_bricks_delta_lzfse_le.hex` | `ddceca55f37a2c65263f44496138e5a062be4c5a04f3dbad4356799d63839280` |
@@ -28,6 +29,8 @@ Copied byte for byte from `Tests/Fixtures/room/golden/hand/` on the Phase 0 bran
 | `request_sync_map_be.hex` | `a301146eb9f9cf0512d1c679fb270a1c6ec95d88319ad87dc9b13c594b0503a2` |
 | `request_sync_map_le.hex` | `8d1da54561d93a617fbaf87b5cc450cd47763a765dcb6a8ad191f467d9a7664f` |
 | `request_sync_map_v2_be.hex` | `38afaeb4b32705afb668f3039681588937fb77f4b32fb128ece6eb6e94d7dcd1` |
+| `rig_pose_le.hex` | `b0c027d497f428669c4d98da8d57e43d3b52a7708316b9ec7be65cd5f3a788ec` |
+| `rig_pose_v2_le.hex` | `65ba44c359ee40c0091a6879933c412c9748012fa1c01b6a70578efd1ba82c97` |
 | `sync_end_events_empty_le.hex` | `56c5c18649f8d2e8df47493fff5e43f9e361cd30b5e97ac412fc10146662f2c9` |
 | `sync_end_events_fallback_le.hex` | `2b6431a0a57e5a0f80be40617c8acbdd2cfef35d3edda99d17e9e921a6616439` |
 | `sync_end_map_replay_be.hex` | `8d4f12e1ada741ff15e817847e30132bcfd0e7704ea1f406ac5599060e293d27` |

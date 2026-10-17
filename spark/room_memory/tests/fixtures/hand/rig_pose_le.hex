@@ -1,0 +1,49 @@
+# labcommand_msgs/RigPose, CDR little endian. Derived by hand from ros/labcommand_msgs/msg/RigPose.msg;
+# see memory_status_le.hex for conventions.
+# Covers: five uint8 fields after the header (uint8[2] has no length prefix), then three pad bytes
+# before the uint64; a uint32 byte order; the two float32[7] poses (a unit quaternion each); NaN as
+# missing in a float32[2]; bool, then padding before the Time (164 bytes after the encapsulation header).
+00 01 00 00                 # encapsulation CDR_LE, options 0
+04 00 00 00                 # pos 0   room_id length 4
+6c 61 62 00                 # pos 4   "lab\0"
+2b 00 00 00 00 00 00 00     # pos 8   map_epoch 43
+16 00 00 00 00 00 00 00     # pos 16  seq 22
+8a 92 ed 68                 # pos 24  stamp.sec 1760400010
+80 b2 e6 0e                 # pos 28  stamp.nanosec 250000000
+03                          # pos 32  outcome REALIGNED
+09                          # pos 33  causes IMU_SHOCK | PERIODIC
+03                          # pos 34  sensors MID360 | JT128
+02                          # pos 35  channel[0] MOVED (Mid-360)
+01                          # pos 36  channel[1] IN_PLACE (JT128)
+00 00 00                    # pos 37  pad to 8
+28 00 00 00 00 00 00 00     # pos 40  frame_epoch 40
+04 03 02 01                 # pos 48  n_realigned 16909060 (0x01020304)
+00 00 00 3d                 # pos 52  mid360_pose tx 0.03125
+00 00 80 bd                 # pos 56  mid360_pose ty -0.0625
+00 00 00 00                 # pos 60  mid360_pose tz 0.0
+00 00 00 3f                 # pos 64  mid360_pose qx 0.5
+00 00 00 3f                 # pos 68  mid360_pose qy 0.5
+00 00 00 3f                 # pos 72  mid360_pose qz 0.5
+00 00 00 3f                 # pos 76  mid360_pose qw 0.5
+00 00 00 00                 # pos 80  jt128_pose tx 0.0
+00 00 00 00                 # pos 84  jt128_pose ty 0.0
+00 00 00 00                 # pos 88  jt128_pose tz 0.0
+00 00 00 00                 # pos 92  jt128_pose qx 0.0
+00 00 00 00                 # pos 96  jt128_pose qy 0.0
+00 00 00 00                 # pos 100 jt128_pose qz 0.0
+00 00 80 3f                 # pos 104 jt128_pose qw 1.0
+00 00 00 3d                 # pos 108 delta_m[0] 0.03125
+00 00 c0 7f                 # pos 112 delta_m[1] NaN (none)
+00 00 00 3f                 # pos 116 delta_deg[0] 0.5
+00 00 c0 7f                 # pos 120 delta_deg[1] NaN (none)
+00 00 40 3f                 # pos 124 inlier_frac[0] 0.75
+00 00 60 3f                 # pos 128 inlier_frac[1] 0.875
+00 00 00 3c                 # pos 132 rms_m[0] 0.0078125
+00 00 80 3b                 # pos 136 rms_m[1] 0.00390625
+00 00 80 3e                 # pos 140 observe[0] 0.25
+00 00 00 3e                 # pos 144 observe[1] 0.125
+00 00 80 3e                 # pos 148 tilt_deg 0.25
+01                          # pos 152 imu_ok true
+00 00 00                    # pos 153 pad to 4
+85 92 ed 68                 # pos 156 moved_at.sec 1760400005
+00 65 cd 1d                 # pos 160 moved_at.nanosec 500000000

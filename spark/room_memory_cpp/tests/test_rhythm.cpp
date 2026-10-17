@@ -302,6 +302,28 @@ TEST(the_first_miss_stops_the_window) {
     CHECK_EQ(static_cast<int>(cut.regions.back().ix), 4095);
 }
 
+TEST(overflow_counts_follow_the_cached_prefix_across_a_minute) {
+    Keys wide;
+    wide.reserve(4097);
+    for (int i = 0; i < 4097; ++i) wide.push_back(pack(i, 0, 0));
+    RhythmAccumulator accumulator({"mid360"}, 1, 2, 60, 60);
+    for (int sec = 0; sec < 60; ++sec) accumulator.add("mid360", sec, wide, 1);
+    accumulator.add("mid360", 60, wide, 1);
+    const RhythmRecord sealed = record_of(accumulator.take());
+    CHECK_EQ(sealed.regions_dropped, std::uint32_t{60});
+    CHECK_EQ(sealed.regions.size(), std::size_t{4096});
+    CHECK(region_ix(sealed, 4096) == nullptr);
+    CHECK(region_ix(sealed, 0) && region_ix(sealed, 0)->hits == 60);
+    CHECK(region_ix(sealed, 4095) && region_ix(sealed, 4095)->hits == 60);
+    CHECK((sealed.flags & room_memory::kFlagOverflow) != 0);
+
+    const RhythmRecord next = record_of(accumulator.flush());
+    CHECK_EQ(next.regions_dropped, std::uint32_t{1});
+    CHECK_EQ(next.regions.size(), std::size_t{4096});
+    CHECK(region_ix(next, 0) && region_ix(next, 0)->hits == 1);
+    CHECK(region_ix(next, 4096) == nullptr);
+}
+
 TEST(hash_slot_uses_the_uint16_lanes) {
     const std::uint64_t packed = (std::uint64_t{std::uint16_t(-1)} << 32) | (std::uint64_t{2} << 16) | 3;
     const int slot = room_memory::rhythm_hash_slot(-1, 2, 3);
