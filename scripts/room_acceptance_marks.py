@@ -12,8 +12,10 @@ import argparse
 import csv
 import json
 import select
+import signal
 import sys
 import time
+import weakref
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -121,7 +123,10 @@ PYTHONPATH=spark/room_memory python3 -m acceptance score --log HARNESS_DIR/topic
 ROW_PROMPTS = {
     "preflight": "Preflight. Container already up. Do not deploy, restart, or change parameters.\n" + WORKSHEET,
     "tripod_bump": (
-        "Tripod bump, before the scored session. Push one leg 3-5 cm, then put it back.\n" + RECOVERY_TEXT
+        "Tripod bump, before the scored session. Push one leg 3-5 cm, then put it back. "
+        "Enter at the push and Enter when the leg is back. That second Enter is complete, "
+        "including when it is sooner than 30 s. A deadline with no Enter leaves the restore "
+        "empty and records restore_unmarked.\n" + RECOVERY_TEXT
     ),
     "harness_handoff": HANDOFF_TEXT.strip(),
     "reference_setup": (
@@ -419,8 +424,12 @@ def _ask(read_line, deadline):
     return text
 
 
-def _collect_observations(read_line, write):
-    found = empty_observations()
+def _collect_observations(read_line, write, found):
+    """Store each accepted answer on ``found`` before asking the next question.
+
+    A stop during a later question keeps the answers already taken. They used to
+    live only in this function's local dict and disappeared with the stack.
+    """
     for key, prompt, parse in QUESTIONS:
         while True:
             write(prompt + "\n")
@@ -458,7 +467,7 @@ def _blank_bump(planned_s, protocol_s):
 
 def _close_bump(row, end_reason, detail, reason):
     """Keep the push, and the restore if it was already taken. Do not invent the missing one."""
-    if row.get("restore_mono_ns") is None:
+    if row.get("restore_mono_ns") is None and row.get("completion") != "restore_unmarked":
         row["completion"] = "aborted"
     row["bump_evaluation"] = "not_evaluated"
     return {
@@ -473,8 +482,9 @@ def _close_bump(row, end_reason, detail, reason):
 def run_bump(clock, read_line, wall, planned_s, protocol_s, write):
     """Mark one bump. ``read_line(deadline_ns)`` returns a line, ``''`` at EOF, or None on timeout.
 
-    A timeout ends the watch at the deadline even when ``clock`` did not move, so a test can
-    cover the deadline without sleeping. Enter before the deadline keeps the original push time.
+    A timeout leaves the restore empty even when ``clock`` did not move, so a test can cover the
+    deadline without sleeping. Enter before the deadline is the normal restore and keeps the
+    original push time. It is ``complete``, including when the leg is back before 30 s.
     """
     planned = _as_stored(planned_s)
     protocol = _as_stored(protocol_s)
@@ -489,25 +499,28 @@ def run_bump(clock, read_line, wall, planned_s, protocol_s, write):
         row["wall_start_utc"] = wall(push)
         write(
             "Watching for %g s. Protocol for this bump is %g s. "
-            "Enter when the leg is back down. Waiting out the deadline records the restore at the deadline.\n"
+            "Press Enter when the leg is back down. That Enter is the restore mark and is complete. "
+            "If the deadline passes with no Enter, the restore stays empty and completion is restore_unmarked.\n"
             % (planned, protocol)
         )
         deadline = push + int(round(float(planned) * NS))
         line = _ask(read_line, deadline)
         if line is None:
-            end = deadline if clock.monotonic_ns() < deadline else int(clock.monotonic_ns())
+            now = int(clock.monotonic_ns())
+            row["t1_mono_ns"] = deadline if now < deadline else now
+            row["restore_mono_ns"] = None
+            row["wall_end_utc"] = None
+            row["actual_duration_s"] = None
+            row["completion"] = "restore_unmarked"
         else:
             end = int(clock.monotonic_ns())
-        row["t1_mono_ns"] = end
-        row["restore_mono_ns"] = end
-        row["wall_end_utc"] = wall(end)
-        actual = (end - push) / float(NS)
-        row["actual_duration_s"] = actual
-        if line is not None or float(planned) + 1e-9 < float(protocol) or actual + 1e-6 < float(protocol):
-            row["completion"] = "shortened"
-        else:
+            row["t1_mono_ns"] = end
+            row["restore_mono_ns"] = end
+            row["wall_end_utc"] = wall(end)
+            row["actual_duration_s"] = (end - push) / float(NS)
             row["completion"] = "complete"
-        row["observations"] = _collect_observations(read_line, write)
+        row["observations"] = empty_observations()
+        _collect_observations(read_line, write, row["observations"])
         evaluation, reason = judge_bump(row["observations"])
         row["bump_evaluation"] = evaluation
         return {
@@ -525,17 +538,57 @@ def run_bump(clock, read_line, wall, planned_s, protocol_s, write):
         return _close_bump(row, "interrupted", "keyboard interrupt", "interrupted")
 
 
+# Incomplete line kept when a deadline passes mid-keystroke. Keyed by the stream so a
+# later read continues it. A full extra line is never stored here: bytes stay in the
+# kernel, where the next select can see them.
+_CARRY = weakref.WeakKeyDictionary()
+
+
+def _read_byte(stdin):
+    """One byte from the kernel, not from TextIOWrapper's buffer.
+
+    ``readline`` pulls later typed-ahead lines into a buffer ``select`` cannot see, so the
+    next deadline misses a line the operator already typed.
+    """
+    raw = getattr(getattr(stdin, "buffer", None), "raw", None)
+    if raw is not None:
+        data = raw.read(1)
+        if not data:
+            return b""
+        if isinstance(data, str):
+            return data.encode("utf-8", "surrogateescape")
+        return data
+    text = stdin.read(1) if hasattr(stdin, "read") else ""
+    if not text:
+        return b""
+    if isinstance(text, bytes):
+        return text
+    return text.encode("utf-8", "surrogateescape")
+
+
 def read_line(deadline_ns, clock=None, stdin=None):
     """Blocking read, or ``select`` until ``deadline_ns``. None means the deadline passed."""
     clock = time if clock is None else clock
     stdin = sys.stdin if stdin is None else stdin
-    if deadline_ns is None:
-        return stdin.readline()
-    timeout = max(0.0, (deadline_ns - clock.monotonic_ns()) / float(NS))
-    ready, _, _ = select.select([stdin], [], [], timeout)
-    if not ready:
-        return None
-    return stdin.readline()
+    pending = _CARRY.pop(stdin, b"")
+    while b"\n" not in pending:
+        if deadline_ns is not None:
+            timeout = max(0.0, (deadline_ns - clock.monotonic_ns()) / float(NS))
+            ready, _, _ = select.select([stdin], [], [], timeout)
+            if not ready:
+                if pending:
+                    _CARRY[stdin] = pending
+                return None
+        chunk = _read_byte(stdin)
+        if chunk == b"":
+            if pending:
+                return pending.decode("utf-8", "surrogateescape")
+            return ""
+        pending += chunk
+    line, _, rest = pending.partition(b"\n")
+    if rest:
+        _CARRY[stdin] = rest
+    return line.decode("utf-8", "surrogateescape") + "\n"
 
 
 def _inside(child, parent):
@@ -594,27 +647,44 @@ def summarize_topics(path):
     candidate = 0
     rig_moved = 0
     imu = 0
+    subscribed = None
+    imu_topics = ("/room_memory/rig", "/livox/imu")
     for line in lines:
-        if "imu_ok" in line or "/livox/imu" in line:
-            imu += 1
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
-            continue
+            obj = None
+        if isinstance(obj, dict) and obj.get("op") == "ready" and isinstance(obj.get("topics"), list):
+            subscribed = list(obj["topics"])
+        topic = obj.get("topic") if isinstance(obj, dict) else None
+        # A ready line names topics. It is not an IMU sample.
+        if not (isinstance(obj, dict) and obj.get("op") == "ready"):
+            if topic in imu_topics or "imu_ok" in line or "/livox/imu" in line:
+                imu += 1
         if not isinstance(obj, dict):
             continue
         message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
-        topic = obj.get("topic")
         if topic == "/room_memory/events" and message.get("state") == "candidate":
             candidate += 1
         if topic == "/room_memory/status" and message.get("state") == "rig_moved":
             rig_moved += 1
+    imu_subscribed = None
+    imu_note = None
+    if subscribed is not None:
+        imu_subscribed = any(item in imu_topics for item in subscribed)
+        if not imu_subscribed:
+            imu_note = (
+                "This log does not include /room_memory/rig or /livox/imu. "
+                "imu_lines 0 is not an observation that the IMU is off."
+            )
     return {
         "path": str(path),
         "lines": len(lines),
         "candidate_lines": candidate,
         "rig_moved_lines": rig_moved,
         "imu_lines": imu,
+        "imu_subscribed": imu_subscribed,
+        "imu_note": imu_note,
     }
 
 
@@ -690,10 +760,15 @@ def write_outputs(out, payload):
         csv_tmp.write_text(_csv_text(payload["scenarios"]), encoding="utf-8")
         json_tmp.replace(json_path)
         csv_tmp.replace(csv_path)
-    except Exception:
+    except BaseException:
         for temporary in (json_tmp, csv_tmp):
             if temporary.exists():
                 temporary.unlink()
+        # A stop between the two replaces would leave one file and refuse the retry.
+        if json_path.exists() and not csv_path.exists():
+            json_path.unlink()
+        elif csv_path.exists() and not json_path.exists():
+            csv_path.unlink()
         raise
 
 
@@ -701,6 +776,8 @@ def _select_specs(text):
     if not text.strip():
         return list(PROCEDURE)
     wanted = [item.strip() for item in text.split(",") if item.strip()]
+    if not wanted:
+        raise ValueError("no scenarios selected")
     known = {spec["id"] for spec in PROCEDURE}
     unknown = [item for item in wanted if item not in known]
     if unknown:
@@ -725,6 +802,85 @@ def _stdin_line(deadline):
     return read_line(deadline, clock=time, stdin=sys.stdin)
 
 
+def _install_operator_stop():
+    """Turn SIGTERM into KeyboardInterrupt.
+
+    Plain ``kill PID`` sends SIGTERM. The default action exits before
+    ``write_outputs``, so the push, the restore, and the answers already taken
+    would be lost. Ctrl-C (SIGINT) already raises KeyboardInterrupt.
+    """
+
+    def _handler(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handler)
+
+
+def _holding_stop_signals(action):
+    """Run ``action`` while SIGINT and SIGTERM cannot split the two output files."""
+    previous = []
+
+    def _hold(signum, frame):
+        return None
+
+    for name in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous.append((name, signal.signal(name, _hold)))
+        except (OSError, ValueError):
+            pass
+    try:
+        return action()
+    finally:
+        for name, handler in reversed(previous):
+            signal.signal(name, handler)
+
+
+def _conduct_bump(clock, read_line, wall, planned, say, summaries):
+    """Run the bump and the handoff. A stop still returns the row already taken."""
+    protocol = 30
+    result = None
+    stopped_after = False
+    try:
+        say(WORKSHEET if WORKSHEET.endswith("\n") else WORKSHEET + "\n")
+        result = run_bump(clock, read_line, wall, planned, protocol, say)
+        if result["end_reason"] != "interrupted":
+            say(HANDOFF_TEXT if HANDOFF_TEXT.endswith("\n") else HANDOFF_TEXT + "\n")
+    except KeyboardInterrupt:
+        stopped_after = True
+        if result is None:
+            result = _close_bump(
+                _blank_bump(_as_stored(planned), protocol),
+                "interrupted",
+                "keyboard interrupt",
+                "interrupted",
+            )
+    session = _session(
+        result["end_reason"],
+        result["detail"],
+        result["bump_evaluation"],
+        result["bump_evaluation_reason"],
+    )
+    payload = _payload("live", "utc", [result["row"]], session, summaries)
+    code = {"complete": 0, "aborted": 0, "eof": 2, "interrupted": 130}[result["end_reason"]]
+    if stopped_after:
+        code = 130
+    return payload, code
+
+
+def _emit(out, payload):
+    """Write both marks files. A stop during the write is retried once with signals held."""
+
+    def _write():
+        write_outputs(out, payload)
+
+    try:
+        _holding_stop_signals(_write)
+    except KeyboardInterrupt:
+        _holding_stop_signals(_write)
+        return True
+    return False
+
+
 def _run(args):
     inputs = {"status": args.status, "topics": args.topics, "recording": args.recording}
     problem = output_error(args.out, inputs)
@@ -737,26 +893,14 @@ def _run(args):
         sys.stderr.write(str(exc) + "\n")
         return 2
     if args.live:
-        _say(WORKSHEET)
-        if not WORKSHEET.endswith("\n"):
-            _say("\n")
-        result = run_bump(
+        payload, code = _conduct_bump(
             time,
             _stdin_line,
             wall_utc,
             30 if args.bump_s is None else args.bump_s,
-            30,
             _say,
+            summaries,
         )
-        _say(HANDOFF_TEXT if HANDOFF_TEXT.endswith("\n") else HANDOFF_TEXT + "\n")
-        session = _session(
-            result["end_reason"],
-            result["detail"],
-            result["bump_evaluation"],
-            result["bump_evaluation_reason"],
-        )
-        payload = _payload("live", "utc", [result["row"]], session, summaries)
-        code = {"complete": 0, "aborted": 0, "eof": 2, "interrupted": 130}[result["end_reason"]]
     else:
         try:
             selected = _select_specs(args.scenarios)
@@ -771,7 +915,8 @@ def _run(args):
         _say(format_rehearsal(payload))
         code = 0
     try:
-        write_outputs(args.out, payload)
+        if _emit(args.out, payload):
+            code = 130
     except OSError as exc:
         sys.stderr.write(str(exc) + "\n")
         return 2
@@ -813,4 +958,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _install_operator_stop()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("interrupted\n")
+        sys.exit(130)

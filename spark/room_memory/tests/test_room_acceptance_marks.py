@@ -8,10 +8,13 @@ import ast
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts" / "room_acceptance_marks.py"
@@ -62,7 +65,16 @@ ALLOWED_IMPORTS = {
     "typing",
     "datetime",
     "select",
+    "signal",
+    "weakref",
 }
+
+# The room-memory image copies only spark/room_memory and runs pytest there.
+# scripts/ and docs/ are not in that tree. Skip rather than error on the missing files.
+pytestmark = pytest.mark.skipif(
+    not SCRIPT.exists(),
+    reason="room acceptance marks script is not in this tree",
+)
 
 
 def load():
@@ -399,9 +411,11 @@ def test_fake_clock_timeout_keeps_the_push_mark():
     row = result["row"]
     assert row["push_mono_ns"] == 1_000
     assert row["t0_mono_ns"] == 1_000
-    assert row["restore_mono_ns"] == 1_000 + 30 * 1_000_000_000
-    assert row["t1_mono_ns"] == row["restore_mono_ns"]
-    assert row["completion"] == "complete"
+    assert row["restore_mono_ns"] is None
+    assert row["wall_end_utc"] is None
+    assert row["wall_start_utc"] == "2026-01-01T00:00:00Z"
+    assert row["t1_mono_ns"] == 1_000 + 30 * 1_000_000_000
+    assert row["completion"] == "restore_unmarked"
     assert result["end_reason"] == "complete"
     assert result["bump_evaluation"] == "observed"
     assert clock.monotonic_ns() == 1_000
@@ -425,7 +439,8 @@ def test_fake_clock_early_enter_does_not_move_the_start():
     assert row["push_mono_ns"] == 5_000
     assert row["restore_mono_ns"] == 5_000 + 5 * 1_000_000_000
     assert row["t1_mono_ns"] == row["restore_mono_ns"]
-    assert row["completion"] == "shortened"
+    assert row["wall_end_utc"] == "2026-01-01T00:00:00Z"
+    assert row["completion"] == "complete"
     assert result["bump_evaluation"] == "not_evaluated"
 
 
@@ -477,7 +492,7 @@ def test_fake_clock_eof_and_interrupt_keep_completed_marks():
     assert later["row"]["t0_mono_ns"] == start
     assert later["row"]["restore_mono_ns"] == start + 4 * 1_000_000_000
     assert later["row"]["t1_mono_ns"] == later["row"]["restore_mono_ns"]
-    assert later["row"]["completion"] == "shortened"
+    assert later["row"]["completion"] == "complete"
     assert later["bump_evaluation"] == "not_evaluated"
     assert later["bump_evaluation_reason"] == "interrupted"
 
@@ -496,6 +511,13 @@ def test_select_timeout_early_enter_and_eof():
         writer.flush()
         far = time.monotonic_ns() + 30 * 1_000_000_000
         assert module.read_line(far, clock=time, stdin=reader) == "\n"
+        writer.write("one\ntwo\n")
+        writer.flush()
+        assert module.read_line(far, clock=time, stdin=reader) == "one\n"
+        short = time.monotonic_ns() + 300_000_000
+        started = time.monotonic()
+        assert module.read_line(short, clock=time, stdin=reader) == "two\n"
+        assert time.monotonic() - started < 0.2
         writer.close()
         assert module.read_line(None, clock=time, stdin=reader) == ""
     finally:
@@ -535,6 +557,246 @@ def test_import_allowlist_blocks_remote_execution():
     source = SCRIPT.read_text(encoding="utf-8")
     assert "docker exec" not in source
     assert "os.system" not in source
+    assert "SIGTERM" in source
+
+
+def test_runbook_matches_harness_head_and_the_stop_path():
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert "1225db5" in text
+    assert "172518b" not in text
+    assert "session_dropped_windows" in text
+    assert "dropped_windows did not change from ready" not in text
+    assert "restore_unmarked" in text
+    assert "records the restore at the deadline" not in text
+    assert "SIGTERM" in text
+    assert 'print("region", msg.get("sensors"), coords + tail)' in text
+    assert 'print("event", row.get("publisher_generation"), msg.get("event_id"))' in text
+    assert 'print("event", row.get("publisher_generation"), msg.get("event_id"), msg.get("kind"))' not in text
+    assert "not an observation that the IMU is off" in text
+
+
+def test_empty_scenario_list_is_refused(tmp_path):
+    module = load()
+    out = tmp_path / "out"
+    assert module.main(["--scenarios", ",", "--out", str(out)]) == 2
+    assert not out.exists()
+    assert module.main(["--scenarios", ", ,", "--out", str(out)]) == 2
+    assert not out.exists()
+    assert module.main(["--live", "--scenarios", ",", "--out", str(out)]) == 2
+    assert not out.exists()
+
+
+def test_harness_topics_log_does_not_count_as_an_imu_observation(tmp_path):
+    module = load()
+    topics = tmp_path / "topics.jsonl"
+    topics.write_text(
+        "\n".join([
+            json.dumps({
+                "op": "ready",
+                "topics": ["/room_memory/status", "/room_memory/events", "/room_memory/activity"],
+            }),
+            json.dumps({
+                "topic": "/room_memory/status",
+                "message": {"state": "tracking", "dropped_windows": 5},
+            }),
+            json.dumps({
+                "topic": "/room_memory/events",
+                "publisher_generation": 4,
+                "message": {"state": "candidate", "event_id": 7, "kind": "appeared"},
+            }),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    summary = module.summarize_topics(topics)
+    assert summary["lines"] == 3
+    assert summary["candidate_lines"] == 1
+    assert summary["imu_lines"] == 0
+    assert summary["imu_subscribed"] is False
+    assert "not an observation" in summary["imu_note"]
+
+
+def test_interrupt_during_questions_keeps_answers_already_taken():
+    module = load()
+    clock = module.ManualClock(2_000)
+    answers = iter(["\n", "on", "off"])
+
+    def read_line(deadline):
+        if deadline is not None:
+            clock.advance(3)
+            return "\n"
+        try:
+            return next(answers)
+        except StopIteration:
+            raise KeyboardInterrupt
+
+    result = module.run_bump(clock, read_line, _wall, 30, 30, _discard)
+    row = result["row"]
+    assert result["end_reason"] == "interrupted"
+    assert result["bump_evaluation_reason"] == "interrupted"
+    assert row["push_mono_ns"] == 2_000
+    assert row["restore_mono_ns"] == 2_000 + 3 * 1_000_000_000
+    assert row["completion"] == "complete"
+    assert row["observations"]["rig_guard"] == "on"
+    assert row["observations"]["auto_relearn"] == "off"
+    assert row["observations"]["relearn_after_s"] is None
+    assert row["bump_evaluation"] == "not_evaluated"
+
+
+def test_interrupt_during_handoff_keeps_the_finished_bump():
+    module = load()
+    clock = module.ManualClock(9)
+
+    def read_line(deadline):
+        if deadline is not None:
+            clock.advance(2)
+            return "\n"
+        return "unknown"
+
+    def say(text):
+        if text.startswith("HANDOFF"):
+            raise KeyboardInterrupt
+
+    payload, code = module._conduct_bump(
+        clock,
+        read_line,
+        _wall,
+        30,
+        say,
+        {"status": None, "topics": None, "recording": None},
+    )
+    assert code == 130
+    row = payload["scenarios"][0]
+    assert row["push_mono_ns"] == 9
+    assert row["restore_mono_ns"] == 9 + 2 * 1_000_000_000
+    assert row["completion"] == "complete"
+    assert row["observations"]["rig_guard"] == "unknown"
+    assert payload["session"]["end_reason"] == "complete"
+    assert payload["session"]["bump_evaluation"] == "not_evaluated"
+
+
+def test_interrupt_before_the_push_still_returns_a_row():
+    module = load()
+
+    def read_line(_deadline):
+        raise AssertionError("should not read")
+
+    def say(_text):
+        raise KeyboardInterrupt
+
+    payload, code = module._conduct_bump(
+        module.ManualClock(0),
+        read_line,
+        _wall,
+        30,
+        say,
+        {"status": None, "topics": None, "recording": None},
+    )
+    assert code == 130
+    row = payload["scenarios"][0]
+    assert row["push_mono_ns"] is None
+    assert row["restore_mono_ns"] is None
+    assert row["completion"] == "aborted"
+    assert payload["session"]["end_reason"] == "interrupted"
+
+
+def test_sigterm_during_the_watch_writes_the_push_mark(tmp_path):
+    proc, out, stdout_path, stderr_path = _spawn_live(tmp_path)
+    try:
+        _wait_live(stdout_path, "push mark", proc)
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        _wait_live(stdout_path, "Watching for", proc)
+        proc.send_signal(signal.SIGTERM)
+        code = proc.wait(timeout=10)
+    finally:
+        _stop_live(proc)
+    assert code == 130
+    stderr = stderr_path.read_text(encoding="utf-8")
+    assert "Traceback" not in stderr
+    body = marks(out)
+    bump = body["scenarios"][0]
+    assert bump["id"] == "tripod_bump"
+    assert bump["push_mono_ns"] is not None
+    assert bump["restore_mono_ns"] is None
+    assert bump["completion"] == "aborted"
+    assert body["session"]["end_reason"] == "interrupted"
+    assert (out / "scenario-marks.csv").is_file()
+    assert (out / "scenario-marks.json").is_file()
+
+
+def test_sigterm_during_questions_keeps_answers_and_the_restore(tmp_path):
+    proc, out, stdout_path, stderr_path = _spawn_live(tmp_path)
+    try:
+        _wait_live(stdout_path, "push mark", proc)
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        _wait_live(stdout_path, "Watching for", proc)
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        _wait_live(stdout_path, "Observed rig_guard?", proc)
+        proc.stdin.write("on\n")
+        proc.stdin.flush()
+        _wait_live(stdout_path, "Observed auto_relearn?", proc)
+        proc.stdin.write("off\n")
+        proc.stdin.flush()
+        _wait_live(stdout_path, "Observed relearn_after_s?", proc)
+        proc.send_signal(signal.SIGTERM)
+        code = proc.wait(timeout=10)
+    finally:
+        _stop_live(proc)
+    assert code == 130
+    assert "Traceback" not in stderr_path.read_text(encoding="utf-8")
+    body = marks(out)
+    bump = body["scenarios"][0]
+    assert bump["push_mono_ns"] is not None
+    assert bump["restore_mono_ns"] is not None
+    assert bump["wall_end_utc"]
+    assert bump["completion"] == "complete"
+    assert bump["observations"]["rig_guard"] == "on"
+    assert bump["observations"]["auto_relearn"] == "off"
+    assert bump["observations"]["relearn_after_s"] is None
+    assert body["session"]["end_reason"] == "interrupted"
+    assert (out / "scenario-marks.csv").is_file()
+
+
+def _spawn_live(tmp_path):
+    out = tmp_path / "marks"
+    stdout_path = tmp_path / "stdout.txt"
+    stderr_path = tmp_path / "stderr.txt"
+    stdout_f = stdout_path.open("w", encoding="utf-8")
+    stderr_f = stderr_path.open("w", encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, str(SCRIPT), "--live", "--bump-s", "30", "--out", str(out)],
+        stdin=subprocess.PIPE,
+        stdout=stdout_f,
+        stderr=stderr_f,
+        text=True,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    stdout_f.close()
+    stderr_f.close()
+    return proc, out, stdout_path, stderr_path
+
+
+def _wait_live(path, needle, proc, timeout_s=10):
+    deadline = time.monotonic() + timeout_s
+    last = ""
+    while time.monotonic() < deadline:
+        last = path.read_text(encoding="utf-8") if path.exists() else ""
+        if needle in last:
+            return last
+        if proc.poll() is not None:
+            break
+        time.sleep(0.02)
+    raise AssertionError("missing %r (exit %s): %r" % (needle, proc.poll(), last))
+
+
+def _stop_live(proc):
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=5)
+    if proc.stdin and not proc.stdin.closed:
+        proc.stdin.close()
 
 
 class _ExplodingStdin:

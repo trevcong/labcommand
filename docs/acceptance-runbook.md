@@ -2,7 +2,7 @@
 
 This file is decision D49 and protocol section 3.13. `~/Developer/lc-tasks/NUMBERING.md` reserves that pair for this checkout. It is the operator procedure for one room visit. It does not add a message, a topic, or a threshold, and it does not amend `docs/ROOM-MEMORY-PROTOCOL.md`.
 
-The scored session is PR #36, branch `g5-acceptance-harness`, commit `172518b` ("Physical acceptance-test harness and scorer"). The commands, label grammar, and exit codes below were read from that commit (`README.md`, `session.py`, `score.py`). If that PR changes, re-read those files before the visit. This checkout does not contain `spark/room_memory/acceptance/` and does not copy it.
+The scored session is PR #36, branch `g5-acceptance-harness`, commit `1225db5` ("Physical acceptance-test harness and scorer"). The commands, label grammar, and exit codes below were read from that commit (`README.md`, `session.py`, `score.py`). If that PR changes, re-read those files before the visit. This checkout does not contain `spark/room_memory/acceptance/` and does not copy it.
 
 `evaluate.py`, the `acceptance_replay` ctest, and the `bag_stream.py` rig-move flags are still deferred. This visit does not run them.
 
@@ -72,9 +72,13 @@ for line in open(sys.argv[1], encoding="utf-8"):
     src = msg.get("from_centroid")
     tail = (" from " + " ".join(str(v) for v in src)) if src else ""
     print("region", msg.get("sensors"), coords + tail)
-    print("event", row.get("publisher_generation"), msg.get("event_id"), msg.get("kind"))
+    kind = msg.get("kind")
+    print("kind", kind)
+    print("event", row.get("publisher_generation"), msg.get("event_id"))
 ' HARNESS_DIR/topics.jsonl
 ```
+
+Paste the `region` line or the `event` line. `event` is three tokens: `event`, the generation, and the id. The `kind` line is how you pick the candidate. Do not append the kind to the event line. The harness asks again when that line is not exactly three tokens.
 
 Use the candidate whose `kind` matches the step: `appeared`, `disappeared`, or `moved`.
 
@@ -99,7 +103,7 @@ skip
 - `region SENSOR x0 y0 z0 x1 y1 z1` is the target aabb. Copy `message.aabb`, which is `[[x0,y0,z0],[x1,y1,z1]]`.
 - `from x y z` is required for a move. Copy `message.from_centroid`. The scorer matches a move only when that point is within 0.50 m of the event's `from_centroid`.
 - The scorer's intersection-over-union minimum is 0.05, after it pads each box by 0.10 m. Copying the aabb is the reliable label. A hand measurement can miss.
-- `event GEN ID` is the log line's `publisher_generation` and `message.event_id`. Kind still has to match the scenario.
+- `event GEN ID` is the log line's `publisher_generation` and `message.event_id`. Kind still has to match the scenario. Kind is not a fourth token on that line.
 - A true detection is a `region` or an `event` association. A blank line or `skip` is an unattributed interval, or at best a temporal match. Either one withholds `full_candidate`.
 - The first matching candidate is the true detection. A later candidate from the same sensor, including the next expiry, is a false alarm. The other sensor can corroborate that same target once.
 - Person rows are different. Before `person_walk` and `person_sit`, `skip` or a person region is allowed. A region that overlaps a candidate there is the detector treating the person as a change, which is not what you want. Prefer `skip` unless you are deliberately marking the person.
@@ -123,7 +127,7 @@ python3 scripts/room_acceptance_marks.py --live --out DIR
 `--live` refuses any scenario other than `tripod_bump`. It does not run the protocol and it does not sleep the hour. `--bump-s` shortens the planned watch. The protocol duration in the file stays 30 s.
 
 1. Press Enter at the push. That timestamp is the start. It is not rewritten when the watch ends.
-2. Press Enter when the leg is back down, or wait for the deadline. Enter early records `shortened`. Waiting out the deadline records the restore at the deadline.
+2. Press Enter when the leg is back down. That is the normal path and records `completion` `complete`, including when it is sooner than 30 s. If the deadline passes with no Enter, `restore_mono_ns` and `wall_end_utc` stay empty and `completion` is `restore_unmarked`. The script does not fill those fields with the deadline. The questions still follow. Finishing them exits 0. `restore_unmarked` is not a harness exit code.
 3. Answer the observation prompts with what you saw:
 
 | prompt | tokens |
@@ -159,7 +163,7 @@ Optional local files are summaries stored next to the answers. They do not becom
 python3 scripts/room_acceptance_marks.py --live --status PATH --topics PATH --recording PATH --out DIR
 ```
 
-Each path is opened read-only. A missing path exits 2 and writes no marks. `--status` must be a JSON object. Copied keys, when present, are `state`, `events_seq`, `map_epoch`, `frame_epoch`, `rig_guard`, `auto_relearn`, `relearn_after_s`, `imu_ok`, `outcome`, and `publisher_generation`. `--topics` stores the path, the line count, and counts of candidate event lines, `rig_moved` status lines, and lines that mention `imu_ok` or `/livox/imu`. `--recording` stores the path, the byte size (a directory sums files one level down, not deeper), and whether `metadata.yaml` is present.
+Each path is opened read-only. A missing path exits 2 and writes no marks. `--status` must be a JSON object. Copied keys, when present, are `state`, `events_seq`, `map_epoch`, `frame_epoch`, `rig_guard`, `auto_relearn`, `relearn_after_s`, `imu_ok`, `outcome`, and `publisher_generation`. `--topics` stores the path, the line count, and counts of candidate event lines, `rig_moved` status lines, and IMU lines (`imu_ok`, `/livox/imu`, or topic `/room_memory/rig`). PR #36's `topics.jsonl` subscribes only to `/room_memory/status`, `/room_memory/events`, and `/room_memory/activity`. On that file `imu_lines` is 0 and `imu_subscribed` is false. That zero is not an observation that the IMU is off. Answer the IMU prompt from the display. `--recording` stores the path, the byte size (a directory sums files one level down, not deeper), and whether `metadata.yaml` is present.
 
 The script refuses to overwrite `scenario-marks.json` or `scenario-marks.csv`, refuses an input path that is one of those files, and refuses an `--out` directory that is the recording or sits inside it. Use a new directory for a second run.
 
@@ -216,10 +220,12 @@ Open `report.json`. Quote both `g5_acceptance` and `confirmed_product_bar`.
 
 | exit | meaning |
 |---|---|
-| 0 | `g5_acceptance` is `full_candidate`. Reference confirmed, every protocol scenario complete and verifiable, three true detections, both person scenarios showed activity and no candidate, idle candidate alarms in verifiable time are at most `--max-false-alarms-per-hour` (default 1), and `dropped_windows` did not change from ready through `session_end`. |
+| 0 | `g5_acceptance` is `full_candidate`. Reference confirmed, every protocol scenario complete and verifiable, three true detections, both person scenarios showed activity and no candidate, idle candidate alarms in verifiable time are at most `--max-false-alarms-per-hour` (default 1), and `session_dropped_windows` is zero. |
 | 1 | The protocol was complete and verifiable, and that candidate bar failed. |
-| 2 | Not a pass. A shortened sit or hour, unverifiable coverage, a session that never became protocol-complete, or lost windows. `candidate_result` may say `inconclusive` or `fail`. `g5_acceptance` is `denied` either way. |
+| 2 | Not a pass. A shortened sit or hour, unverifiable coverage, a session that never became protocol-complete, or lost windows (`session_dropped_windows` nonzero, or a scenario in `lost_window_scenarios`). `candidate_result` may say `inconclusive` or `fail`. `g5_acceptance` is `denied` either way. |
 | 3 | `score` raised. The traceback is on stderr. A crash is not a scored fail. |
+
+`session_dropped_windows` is the change in `dropped_windows` from ready through `session_end`, per publisher generation. The baseline is the last status at or before ready, or that generation's first status at or after ready when the subscriber records ready before the latched status. A lifetime count already on that baseline is not a drop during the session. The counter is measured from 0 only for a generation that first appears after an earlier generation was already seen, which is a restart during the session. A long-running node's lifetime total does not by itself exit 2.
 
 `full_candidate` does not mean Q3 passed. `confirmed_product_bar` is `not_evaluated` when no `CONFIRMED` message was published, and also when `CONFIRMED` messages exist but the static intervals are not a full verifiable baseline plus hour. Today's node emits `CANDIDATE`. `not_evaluated` means the false-CONFIRMED-per-hour bar was not measured. When the field is `pass` or `fail`, each `CONFIRMED` received during a verifiable static interval counted, including one whose candidate was published before the subscription. The candidate score's idle rate is `false_candidate_alarms_per_hour`. The product metric is `false_confirmed_alarms_per_hour`. Do not report one as the other.
 
@@ -227,6 +233,10 @@ A miss with activity somewhere in the window is `miss_with_activity_observed`. N
 
 ## 7. Stop
 
-Ctrl-C the marks script in its own terminal, or `kill` that PID. It writes the rows already taken. The push time stays. The restore time stays if you had already pressed Enter for it. An open watch is `completion` `aborted`, `session.end_reason` is `interrupted`, and the process exits 130. EOF exits 2. Typing `abort` exits 0 with the bump `not_evaluated`.
+Ctrl-C the marks script in its own terminal, or `kill` that PID from another terminal. `kill` sends SIGTERM. Ctrl-C sends SIGINT. Both write the rows already taken and exit 130. The push time stays. The restore time stays if you had already pressed Enter for it. Answers you had already accepted stay, including when the next question is still open. An open watch, with no restore yet, is `completion` `aborted` and `session.end_reason` is `interrupted`. A deadline that passed with no Enter stays `restore_unmarked`, with the restore time empty. If you stop it after the questions are done, while the handoff text is printing or the file is being written, that finished bump row is written as it was and the process still exits 130.
+
+`kill -9` stops the process without writing the file. Do not use it.
+
+EOF exits 2. Typing `abort` exits 0 with the bump `not_evaluated`. The answers accepted before `abort` stay in the file.
 
 Stop the harness by its own PID. It already checkpoints. Do not send keystrokes to LabCommand or to any other app. Do not restart the node to clean up.
