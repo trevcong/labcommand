@@ -13,7 +13,7 @@ import pytest
 from room_memory import guard as g
 from room_memory.core import Config, decode_pointcloud2, occupancy_map
 from room_memory import state as rig_files
-from room_memory.memory import MemoryConfig, RoomMemory, pose_shift
+from room_memory.memory import MemoryConfig, RoomMemory, load_reference, pose_shift
 from room_memory.messages import (CAUSE_IMU_SHOCK, CAUSE_IMU_TILT, CAUSE_PERIODIC, CAUSE_POSE_OFFSET, CAUSE_STARTUP,
                                   SENSOR_JT128, SENSOR_MID360, EventKind, EventState, ImuSample, MemoryState,
                                   RigChannel, RigOutcome, Time)
@@ -697,37 +697,96 @@ def test_a_failed_rig_save_never_leaves_close_window_and_retries(tmp_path):
     assert restarted.rig_outcome == RigOutcome.CHECKING
 
 
-def test_a_failed_relearn_archive_does_not_stop_the_relearn(tmp_path):
-    """The relearn archives the old frame under prev/; when that fails (here prev is a file) the
-    failure is counted and the relearn goes on, and the new frame is saved when it is built."""
+def relearned(tmp_path, blocked):
+    """A guarded engine with an inlier baseline, moved out of reach until it relearns; ``blocked``
+    names files placed in the room just before the move. Returns the engine, a step function, the
+    old frame and the old frame's files on disk at the relearn (map_epoch aside: it only moves on)."""
     memory = guarded(tmp_path, relearn_after_s=5.0)
     far = rooms.rig(0.5, yaw_deg=20.0, roll_deg=3.0)
     imu = imu_stream()
     second = 1
 
-    def step(pose):
+    def step(pose=far):
         nonlocal second
-        trace = drive(memory, [pose], second, imu=imu)
+        drive(memory, [pose], second, imu=imu)
         second += 1
-        return trace
 
     # Until an accepted check gives the Mid-360 an inlier baseline.
     while memory.channels["mid360"].baseline is None:
         step(rooms.Pose())
         assert second < REFERENCE_WINDOWS + 60
     room = tmp_path / "lab"
-    (room / "prev").write_bytes(b"")
+    for name in blocked:
+        (room / name).write_bytes(b"")
     old_frame = memory._frame_epoch
     imu = imu_stream(second - 0.5, roll_deg=3.0)  # the roll confirms the move whatever ICP makes of it
     while memory.rig_outcome != RigOutcome.RELEARNING:
-        step(far)
+        step()
         assert second < REFERENCE_WINDOWS + 100
-    assert memory.rig_save_failed == 1 and "prev" in memory.rig_save_error and not memory.rig_save_pending
-    while memory.state != MemoryState.TRACKING:
-        step(far)
-        assert second < REFERENCE_WINDOWS + 130
-    assert memory._frame_epoch > old_frame and memory.rig_save_failed == 1
+    names = ["rig_state", "reference-mid360.cdr", "registration-mid360.bin"]
+    return memory, step, old_frame, {name: (room / name).read_bytes() for name in names}
+
+
+def rebuild(memory, step):
+    for _ in range(3 * REFERENCE_WINDOWS):
+        if memory.state == MemoryState.TRACKING:
+            return
+        step()
+    assert memory.state == MemoryState.TRACKING
+
+
+def test_a_failed_relearn_archive_holds_the_old_frame_until_it_goes_through(tmp_path):
+    """The relearn archives the old frame under prev/ (D40); when that fails (here prev is a file)
+    the relearn goes on, but the old frame's files stay as they are: the new frame commits only once
+    the archive, retried every window, goes through."""
+    memory, step, old_frame, old_files = relearned(tmp_path, ["prev"])
+    room = tmp_path / "lab"
+    assert memory.rig_save_pending and "prev" in memory.rig_save_error
+    rebuild(memory, step)
+    failed = memory.rig_save_failed
+    step()
+    assert memory.rig_save_pending and memory.rig_save_failed > failed
+    assert memory._frame_epoch > old_frame
+    assert {name: (room / name).read_bytes() for name in old_files} == old_files
+    (room / "prev").unlink()
+    step()
+    assert not memory.rig_save_pending
+    [archive] = (room / "prev").iterdir()
+    assert archive.name.endswith(f"-frame-{old_frame}")
+    assert {name: (archive / name).read_bytes() for name in old_files} == old_files
     assert rig_files.parse_rig_state((room / "rig_state").read_bytes(), "rig_state").frame_epoch == memory._frame_epoch
+
+
+def test_a_new_frame_cut_short_never_loads_with_the_old_frames_poses(tmp_path):
+    """Codex's repro: the rebuilt frame's commit fails part way. With its registration cloud
+    unwritable a restart loads the old frame whole; with rig_state unwritable it refuses the set.
+    Never the new references with the old frame's cloud and pose. Once the writes go through, the
+    new frame loads."""
+    memory, step, old_frame, old_files = relearned(tmp_path, [])
+    room = tmp_path / "lab"
+    blocker = room / "registration-mid360.bin.tmp"
+    blocker.mkdir()
+    rebuild(memory, step)
+    assert memory.rig_save_pending and "registration-mid360.bin.tmp" in memory.rig_save_error
+    assert {name: (room / name).read_bytes() for name in old_files} == old_files
+    old_reference = load_reference(room / "reference-mid360.cdr")[1].occupied
+    assert not np.array_equal(old_reference, memory.channels["mid360"].reference.occupied)
+    old_pose = rig_files.parse_rig_state(old_files["rig_state"], "rig_state").sensors["mid360"].pose
+    restarted = guarded(tmp_path)
+    assert restarted._frame_epoch == old_frame and restarted.channels["mid360"].pose == old_pose
+    assert np.array_equal(restarted.channels["mid360"].reference.occupied, old_reference)
+    blocker.rmdir()
+    (room / "rig_state.tmp").mkdir()
+    step()
+    assert memory.rig_save_pending and "rig_state.tmp" in memory.rig_save_error
+    with pytest.raises(ValueError, match="does not match"):
+        guarded(tmp_path)
+    (room / "rig_state.tmp").rmdir()
+    step()
+    assert not memory.rig_save_pending
+    restarted = guarded(tmp_path)
+    assert restarted._frame_epoch == memory._frame_epoch > old_frame
+    assert len(restarted.channels["mid360"].cloud) == len(memory.channels["mid360"].cloud)
 
 
 def test_a_rig_state_that_does_not_match_its_files_is_refused(tmp_path):

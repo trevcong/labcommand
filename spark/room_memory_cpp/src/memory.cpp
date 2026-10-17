@@ -770,11 +770,15 @@ void RoomMemory::save(const msg::Time& stamp) {
     // The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
     save_epoch(epoch_path(*config_.state_dir, config_.room_id), map_epoch_);
     if (building()) return;  // a frame commits whole: until every sensor built, the last committed one stays on disk
+    if (config_.rig_guard) {
+        references_due_ = header;
+        save_rig();
+        return;
+    }
     const std::vector<std::filesystem::path> all = paths();
     for (std::size_t n = 0; n < all.size(); ++n) {
         save_reference(all[n], channels_[n].reference, header, static_cast<float>(config_.voxel_size));
     }
-    if (config_.rig_guard) save_rig();
 }
 
 void RoomMemory::add_points(const std::string& sensor, std::span<const float> xyz) {
@@ -1686,21 +1690,11 @@ void RoomMemory::track_moved(std::int64_t now, const msg::Time& stamp, std::vect
 }
 
 void RoomMemory::relearn(const msg::Time& stamp, std::vector<msg::ChangeEvent>& events) {
-    // Archives the state and rebuilds the room through BUILDING: a new room frame.
-    if (config_.state_dir) {
-        std::vector<std::string> files{"map_epoch", "rig_state"};
-        for (const std::filesystem::path& path : paths()) files.push_back(path.filename().string());
-        for (const Channel& channel : channels_) files.push_back(registration_name(channel.sensor.name));
-        // A failed archive (disk full) does not stop the relearn: the old frame's files stay in place
-        // until the new frame commits over them, so they are lost then, not now.
-        try {
-            archive(room_dir(*config_.state_dir, config_.room_id), "frame-" + std::to_string(frame_epoch_), files);
-        } catch (const std::exception& error) {
-            ++rig_save_failed_;
-            rig_save_error_ = error.what();
-        }
-    }
-    rig_save_pending_ = false;  // the old frame's files are moot; the new frame saves when it is built
+    // Archives the state and rebuilds the room through BUILDING: a new room frame. A relearn during
+    // the rebuild keeps the archive still due: the files on disk are that frame's, not this one's.
+    if (config_.state_dir && !archive_due_) archive_due_ = "frame-" + std::to_string(frame_epoch_);
+    references_due_.reset();
+    rig_save_pending_ = false;  // the old frame's poses are moot; the new frame saves when it is built
     for (Channel& channel : channels_) {
         for (const Candidate& candidate : channel.tracker.drop_all()) {
             events.push_back(event(channel, msg::EventState::expired, candidate, stamp));
@@ -1738,6 +1732,9 @@ void RoomMemory::relearn(const msg::Time& stamp, std::vector<msg::ChangeEvent>& 
     n_realigned_ = 0;
     outcome_ = msg::RigOutcome::relearning;
     rig_dirty_ = true;
+    // The archive now (D40). A failure (disk full) does not stop the relearn: close_window retries,
+    // and the new frame commits only after the archive.
+    save_rig();
 }
 
 std::optional<msg::RigPose> RoomMemory::rig_pose(const msg::Time& stamp) {
@@ -1827,23 +1824,45 @@ void RoomMemory::load_rig(const std::filesystem::path& room, const std::filesyst
 }
 
 void RoomMemory::save_rig() {
-    // The registration clouds not yet written, then rig_state (last: it names them). A failure (disk
-    // full, permissions) never leaves close_window: the guard keeps its state in memory, the files
-    // on disk stay the last set written, and close_window retries until a save goes through.
+    // One ordered commit: the relearned frame's archive, the registration clouds not yet written,
+    // the references a save left due, then rig_state (last: it names the clouds). A new frame's
+    // clouds go before its references and carry its frame_epoch, so a commit cut short leaves either
+    // the old frame whole or clouds the old rig_state's CRCs refuse: never one frame's references
+    // with another's poses. A failure (disk full, permissions) never leaves close_window: the guard
+    // keeps its state in memory, the files on disk stay the last set written, and close_window
+    // retries until a save goes through. (The epoch file is written ahead: a high-water mark only.)
     if (!config_.state_dir) return;
-    if (std::any_of(channels_.begin(), channels_.end(), [](const Channel& c) { return !c.cloud; })) return;
     try {
         const std::filesystem::path room = room_dir(*config_.state_dir, config_.room_id);
-        RigState state{config_.room_id, config_.voxel_size, frame_epoch_, n_realigned_, g_base_, {}};
+        if (archive_due_) {
+            std::vector<std::string> files{"map_epoch", "rig_state"};
+            for (const std::filesystem::path& path : paths()) files.push_back(path.filename().string());
+            for (const Channel& channel : channels_) files.push_back(registration_name(channel.sensor.name));
+            archive(room, *archive_due_, files);
+            archive_due_.reset();
+        }
+        if (std::any_of(channels_.begin(), channels_.end(), [](const Channel& c) { return !c.cloud; })) {
+            rig_save_pending_ = false;  // building: the new frame saves when it is built
+            return;
+        }
         for (Channel& channel : channels_) {
-            if (!channel.registration) {
-                const std::vector<std::uint8_t> data =
-                    registration_bytes(channel.sensor.name, frame_epoch_, channel.cloud->points());
-                const std::string file = registration_name(channel.sensor.name);
-                write_atomic(room / file, data);
-                const auto crc = static_cast<std::uint32_t>(::crc32(0L, data.data(), static_cast<uInt>(data.size())));
-                channel.registration = RegistrationFile{file, data.size(), crc};
+            if (channel.registration) continue;
+            const std::vector<std::uint8_t> data =
+                registration_bytes(channel.sensor.name, frame_epoch_, channel.cloud->points());
+            const std::string file = registration_name(channel.sensor.name);
+            write_atomic(room / file, data);
+            const auto crc = static_cast<std::uint32_t>(::crc32(0L, data.data(), static_cast<uInt>(data.size())));
+            channel.registration = RegistrationFile{file, data.size(), crc};
+        }
+        if (references_due_) {
+            const std::vector<std::filesystem::path> all = paths();
+            for (std::size_t n = 0; n < all.size(); ++n) {
+                save_reference(all[n], channels_[n].reference, *references_due_, static_cast<float>(config_.voxel_size));
             }
+            references_due_.reset();
+        }
+        RigState state{config_.room_id, config_.voxel_size, frame_epoch_, n_realigned_, g_base_, {}};
+        for (const Channel& channel : channels_) {
             state.sensors.emplace_back(channel.sensor.name,
                                        SensorState{channel.pose, channel.baseline, *channel.registration});
         }

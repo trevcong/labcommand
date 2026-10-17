@@ -2133,37 +2133,115 @@ TEST(a_failed_rig_save_never_leaves_close_window_and_retries) {
     CHECK(restarted.rig_outcome() == O::checking);
 }
 
-TEST(a_failed_relearn_archive_does_not_stop_the_relearn) {
-    // The relearn archives the old frame under prev/; when that fails (here prev is a file) the
-    // failure is counted and the relearn goes on, and the new frame is saved when it is built.
+// A guarded engine with an inlier baseline, moved out of reach until it relearns; `blocked` names
+// files placed in the room just before the move. Keeps the old frame and its files on disk at the
+// relearn (map_epoch aside: it only moves on).
+struct Relearned {
     TempDir dir;
-    const std::filesystem::path room = dir.path / "lab";
-    MemoryConfig config = guarded_config(dir.path.string());
-    config.relearn_after_s = 5.0;
-    RoomMemory memory(config, msg::Time{0, 0}, kGeneration);
-    const rig::Pose far = rooms::rig(0.5, 0.0, 0.0, 20.0, 3.0);
+    std::filesystem::path room = dir.path / "lab";
+    std::unique_ptr<RoomMemory> memory;
     ImuSource imu = imu_stream();
     std::int64_t second = 1;
-    const auto step = [&](const rig::Pose& pose) { drive(memory, repeat(pose, 1), second++, rooms::kFurniture, imu); };
-    // Until an accepted check gives the Mid-360 an inlier baseline.
-    while (!memory.channel("mid360").baseline) {
-        step(rig::Pose{});
-        CHECK(second < kGuardReferenceWindows + 60);
+    std::uint64_t old_frame = 0;
+    std::map<std::string, std::vector<std::uint8_t>> old_files;
+
+    explicit Relearned(const std::vector<std::string>& blocked) {
+        MemoryConfig config = guarded_config(dir.path.string());
+        config.relearn_after_s = 5.0;
+        memory = std::make_unique<RoomMemory>(config, msg::Time{0, 0}, kGeneration);
+        // Until an accepted check gives the Mid-360 an inlier baseline.
+        while (!memory->channel("mid360").baseline) {
+            step(rig::Pose{});
+            CHECK(second < kGuardReferenceWindows + 60);
+        }
+        for (const std::string& name : blocked) std::ofstream(room / name).close();
+        old_frame = saved_rig_state(room).frame_epoch;
+        imu = imu_stream(static_cast<double>(second) - 0.5, 0.0, 50, 3.0);  // the roll confirms the move
+        while (memory->rig_outcome() != O::relearning) {
+            step();
+            CHECK(second < kGuardReferenceWindows + 100);
+        }
+        old_files = files();
     }
-    std::ofstream(room / "prev").close();  // a file where the archive directory goes
-    const std::uint64_t old_frame = saved_rig_state(room).frame_epoch;
-    imu = imu_stream(static_cast<double>(second) - 0.5, 0.0, 50, 3.0);  // the roll confirms the move
-    while (memory.rig_outcome() != O::relearning) {
-        step(far);
-        CHECK(second < kGuardReferenceWindows + 100);
+    void step(const rig::Pose& pose = rooms::rig(0.5, 0.0, 0.0, 20.0, 3.0)) {
+        drive(*memory, repeat(pose, 1), second++, rooms::kFurniture, imu);
     }
-    CHECK(memory.rig_save_failed() == 1 && !memory.rig_save_pending());
-    CHECK(memory.rig_save_error().find("prev") != std::string::npos);
-    while (memory.state() != MemoryState::tracking) {
-        step(far);
-        CHECK(second < kGuardReferenceWindows + 130);
+    void rebuild() {
+        for (int n = 0; n < 3 * kGuardReferenceWindows && memory->state() != MemoryState::tracking; ++n) step();
+        CHECK(memory->state() == MemoryState::tracking);
     }
-    CHECK(memory.rig_save_failed() == 1 && saved_rig_state(room).frame_epoch > old_frame);
+    std::map<std::string, std::vector<std::uint8_t>> files(const std::filesystem::path& from = {}) const {
+        std::map<std::string, std::vector<std::uint8_t>> out;
+        for (const char* name : {"rig_state", "reference-mid360.cdr", "registration-mid360.bin"}) {
+            out[name] = harness::read_bytes((from.empty() ? room : from) / name);
+        }
+        return out;
+    }
+};
+
+TEST(a_failed_relearn_archive_holds_the_old_frame_until_it_goes_through) {
+    // The relearn archives the old frame under prev/ (D40); when that fails (here prev is a file)
+    // the relearn goes on, but the old frame's files stay as they are: the new frame commits only
+    // once the archive, retried every window, goes through.
+    Relearned run({"prev"});
+    RoomMemory& memory = *run.memory;
+    CHECK(memory.rig_save_pending() && memory.rig_save_error().find("prev") != std::string::npos);
+    run.rebuild();
+    const std::int64_t failed = memory.rig_save_failed();
+    run.step();
+    CHECK(memory.rig_save_pending() && memory.rig_save_failed() > failed);
+    CHECK(run.files() == run.old_files);
+    std::filesystem::remove(run.room / "prev");
+    run.step();
+    CHECK(!memory.rig_save_pending());
+    std::vector<std::filesystem::path> archives;
+    for (const auto& entry : std::filesystem::directory_iterator(run.room / "prev")) archives.push_back(entry.path());
+    CHECK_EQ(archives.size(), 1u);
+    const std::string name = archives[0].filename().string();
+    const std::string suffix = "-frame-" + std::to_string(run.old_frame);
+    CHECK(name.size() > suffix.size() && name.substr(name.size() - suffix.size()) == suffix);
+    CHECK(run.files(archives[0]) == run.old_files);
+    CHECK(saved_rig_state(run.room).frame_epoch > run.old_frame);
+}
+
+TEST(a_new_frame_cut_short_never_loads_with_the_old_frames_poses) {
+    // Codex's repro: the rebuilt frame's commit fails part way. With its registration cloud
+    // unwritable a restart loads the old frame whole; with rig_state unwritable it refuses the set.
+    // Never the new references with the old frame's cloud and pose. Once the writes go through, the
+    // new frame loads.
+    Relearned run({});
+    RoomMemory& memory = *run.memory;
+    const std::filesystem::path blocker = run.room / "registration-mid360.bin.tmp";
+    std::filesystem::create_directory(blocker);
+    run.rebuild();
+    CHECK(memory.rig_save_pending() && memory.rig_save_error().find("registration-mid360.bin.tmp") != std::string::npos);
+    CHECK(run.files() == run.old_files);
+    const Keys old_reference = load_reference(run.room / "reference-mid360.cdr").second.occupied;
+    CHECK(old_reference != memory.channel("mid360").reference.occupied);
+    const RigState old_state = parse_rig_state(run.old_files["rig_state"], "rig_state");
+    {
+        RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
+        CHECK_EQ(restarted.rig_pose(msg::Time{0, 0})->frame_epoch, run.old_frame);
+        CHECK(restarted.channel("mid360").pose == old_state.sensors[0].second.pose);
+        CHECK(restarted.channel("mid360").reference.occupied == old_reference);
+    }
+    std::filesystem::remove(blocker);
+    std::filesystem::create_directory(run.room / "rig_state.tmp");
+    run.step();
+    CHECK(memory.rig_save_pending() && memory.rig_save_error().find("rig_state.tmp") != std::string::npos);
+    try {
+        RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
+        throw harness::Failure("a new frame's clouds loaded with the old rig_state");
+    } catch (const std::invalid_argument& error) {
+        if (std::string(error.what()).find("does not match") == std::string::npos) throw harness::Failure(error.what());
+    }
+    std::filesystem::remove(run.room / "rig_state.tmp");
+    run.step();
+    CHECK(!memory.rig_save_pending());
+    RoomMemory restarted(guarded_config(run.dir.path.string()), msg::Time{0, 0}, kGeneration);
+    const std::uint64_t frame = restarted.rig_pose(msg::Time{0, 0})->frame_epoch;
+    CHECK(frame == saved_rig_state(run.room).frame_epoch && frame > run.old_frame);
+    CHECK_EQ(restarted.channel("mid360").cloud->size(), memory.channel("mid360").cloud->size());
 }
 
 TEST(a_rig_state_that_does_not_match_its_files_is_refused) {

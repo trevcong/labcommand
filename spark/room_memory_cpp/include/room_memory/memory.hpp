@@ -467,7 +467,8 @@ public:
     // as SINCE_NONE.
     SyncAnswer sync(const msg::RequestSync& request, const msg::Time& stamp);
     // Writes every sensor's reference and the room's epoch file with the current map_epoch, and
-    // with the rig guard its registration clouds and rig_state. No-op without state_dir.
+    // with the rig guard its registration clouds and rig_state (save_rig: one ordered commit, the
+    // references inside it). No-op without state_dir.
     void save(const msg::Time& stamp);
     // Feeds one CDR sensor_msgs/Imu received at `received` to the rig guard. False when the guard is
     // off or the frame does not decode (counted in imu_failed, never thrown).
@@ -483,9 +484,10 @@ public:
     // single-threaded executor, so this time holds every other callback.
     std::int64_t window_estimates() const { return window_estimates_; }
     double window_estimate_ms() const { return window_estimate_ms_; }
-    // The rig files on disk lag the guard: a write failed (disk full, permissions). The guard runs on
-    // from memory and close_window retries every window; rig_save_failed counts the failed
-    // attempts (a failed relearn archive included) and rig_save_error is the last one's message.
+    // The rig files on disk lag the guard: a write or the relearn's archive failed (disk full,
+    // permissions). The guard runs on from memory and close_window retries every window; until
+    // the archive goes through, the old frame's files stay as they are. rig_save_failed counts the
+    // failed attempts and rig_save_error is the last one's message.
     bool rig_save_pending() const { return rig_save_pending_; }
     std::int64_t rig_save_failed() const { return rig_save_failed_; }
     const std::string& rig_save_error() const { return rig_save_error_; }
@@ -592,6 +594,8 @@ private:
     bool rig_save_pending_ = false;
     std::int64_t rig_save_failed_ = 0;
     std::string rig_save_error_;
+    std::optional<msg::Header> references_due_;  // a save's references, not yet written (save_rig)
+    std::optional<std::string> archive_due_;     // the relearned frame's prev/ name, not yet archived
     std::optional<rig::Vec3d> gravity_;  // the newest window's gravity
     std::optional<rig::Vec3d> g_base_;   // gravity at the last accepted decision
     std::optional<rig::Mat3> gyro_;      // the gyro rotation of the last shock, until the check or move uses it

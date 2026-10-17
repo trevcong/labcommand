@@ -1007,9 +1007,10 @@ class RoomMemory:
         self._detector = (ImuDetector(config.imu_shock_frac, config.imu_gyro_dps, config.imu_quiet_s)
                           if config.rig_guard else None)
         self.imu_failed = 0
-        # The rig files on disk lag the guard: a write failed (disk full, permissions). The guard runs
-        # on from memory and close_window retries every window; rig_save_failed counts the failed
-        # attempts (a failed relearn archive included) and rig_save_error is the last one's message.
+        # The rig files on disk lag the guard: a write or the relearn's archive failed (disk full,
+        # permissions). The guard runs on from memory and close_window retries every window; until
+        # the archive goes through, the old frame's files stay as they are. rig_save_failed counts
+        # the failed attempts and rig_save_error is the last one's message.
         # Measurement only, in no output: the guard's ICP estimates in the last close_window and their
         # wall time in ms (source cloud, seed with its yaw sweep, alignment).
         self.window_estimates = 0
@@ -1017,6 +1018,8 @@ class RoomMemory:
         self.rig_save_pending = False
         self.rig_save_failed = 0
         self.rig_save_error = None
+        self._references_due = None  # a save's references header, not yet written (_save_rig)
+        self._archive_due = None  # the relearned frame's prev/ name, not yet archived
         self._gravity = None  # the newest window's gravity
         self._g_base = None  # gravity at the last accepted decision
         self._gyro = None  # the gyro rotation of the last shock, until the check or move uses it
@@ -1124,7 +1127,8 @@ class RoomMemory:
 
     def save(self, stamp):
         """Writes every sensor's reference and the room's epoch file with the current ``map_epoch``,
-        and with the rig guard its registration clouds and ``rig_state``. No-op without ``state_dir``."""
+        and with the rig guard its registration clouds and ``rig_state`` (``_save_rig``: one ordered
+        commit, the references inside it). No-op without ``state_dir``."""
         if self.config.state_dir is None:
             return
         # The epoch file first: it never lags behind an epoch in use, even if a reference write fails.
@@ -1132,27 +1136,46 @@ class RoomMemory:
         if self._building():
             return  # a frame commits whole: until every sensor built, the last committed one stays on disk
         header = Header(self.config.room_id, self.map_epoch, 0, stamp)
+        if self.config.rig_guard:
+            self._references_due = header
+            self._save_rig()
+            return
         for name, path in self._paths().items():
             save_reference(path, self.channels[name].reference, header, self.config.voxel_size)
-        if self.config.rig_guard:
-            self._save_rig()
 
     def _save_rig(self):
-        """The registration clouds not yet written, then ``rig_state`` (last: it names them). A failure
-        (disk full, permissions) never leaves ``close_window``: the guard keeps its state in memory, the
-        files on disk stay the last set written, and ``close_window`` retries until a save goes through."""
-        if self.config.state_dir is None or any(c.cloud is None for c in self.channels.values()):
+        """One ordered commit: the relearned frame's archive, the registration clouds not yet written,
+        the references a save left due, then ``rig_state`` (last: it names the clouds). A new frame's
+        clouds go before its references and carry its ``frame_epoch``, so a commit cut short leaves
+        either the old frame whole or clouds the old ``rig_state``'s CRCs refuse: never one frame's
+        references with another's poses. A failure (disk full, permissions) never leaves
+        ``close_window``: the guard keeps its state in memory, the files on disk stay the last set
+        written, and ``close_window`` retries until a save goes through. (The epoch file is written
+        ahead: a high-water mark only.)"""
+        if self.config.state_dir is None:
             return
         try:
             room = _room_dir(self.config.state_dir, self.config.room_id)
-            sensors = {}
+            if self._archive_due is not None:
+                files = ["map_epoch", "rig_state"] + [path.name for path in self._paths().values()]
+                files += [rig_files.registration_name(name) for name in self.channels]
+                rig_files.archive(room, self._archive_due, files)
+                self._archive_due = None
+            if any(c.cloud is None for c in self.channels.values()):
+                self.rig_save_pending = False  # building: the new frame saves when it is built
+                return
             for name, channel in self.channels.items():
                 if channel.registration is None:
                     data = rig_files.registration_bytes(name, self._frame_epoch, channel.cloud.points)
                     file = rig_files.registration_name(name)
                     rig_files.write_atomic(room / file, data)
                     channel.registration = (file, len(data), zlib.crc32(data))
-                sensors[name] = rig_files.SensorState(channel.pose, channel.baseline, channel.registration)
+            if self._references_due is not None:
+                for name, path in self._paths().items():
+                    save_reference(path, self.channels[name].reference, self._references_due, self.config.voxel_size)
+                self._references_due = None
+            sensors = {name: rig_files.SensorState(channel.pose, channel.baseline, channel.registration)
+                       for name, channel in self.channels.items()}
             state = rig_files.RigState(self.config.room_id, self.config.voxel_size, self._frame_epoch,
                                        self._n_realigned, self._g_base, sensors)
             rig_files.write_atomic(room / "rig_state", rig_files.format_rig_state(state))
@@ -1718,19 +1741,12 @@ class RoomMemory:
             self._relearn(now, stamp, events)
 
     def _relearn(self, now, stamp, events):
-        """Archives the state and rebuilds the room through BUILDING: a new room frame."""
-        if self.config.state_dir is not None:
-            room = _room_dir(self.config.state_dir, self.config.room_id)
-            files = ["map_epoch", "rig_state"] + [path.name for path in self._paths().values()]
-            files += [rig_files.registration_name(name) for name in self.channels]
-            # A failed archive (disk full) does not stop the relearn: the old frame's files stay in
-            # place until the new frame commits over them, so they are lost then, not now.
-            try:
-                rig_files.archive(room, f"frame-{self._frame_epoch}", files)
-            except Exception as error:  # as the C++ engine's std::exception
-                self.rig_save_failed += 1
-                self.rig_save_error = str(error)
-        self.rig_save_pending = False  # the old frame's files are moot; the new frame saves when it is built
+        """Archives the state and rebuilds the room through BUILDING: a new room frame. A relearn
+        during the rebuild keeps the archive still due: the files on disk are that frame's, not this one's."""
+        if self.config.state_dir is not None and self._archive_due is None:
+            self._archive_due = f"frame-{self._frame_epoch}"
+        self._references_due = None
+        self.rig_save_pending = False  # the old frame's poses are moot; the new frame saves when it is built
         for channel in self.channels.values():
             for candidate in sorted(channel.tracker.open, key=lambda c: c.event_id):
                 events.append(self._event(channel, EventState.EXPIRED, candidate, stamp))
@@ -1759,6 +1775,9 @@ class RoomMemory:
         self._n_realigned = 0
         self._outcome = RigOutcome.RELEARNING
         self._rig_dirty = True
+        # The archive now (D40). A failure (disk full) does not stop the relearn: close_window
+        # retries, and the new frame commits only after the archive.
+        self._save_rig()
 
     def rig_pose(self, stamp):
         """The ``RigPose`` due at ``stamp`` (call once per window, after ``close_window``): on every
