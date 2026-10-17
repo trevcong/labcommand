@@ -116,3 +116,12 @@ def test_either_process_exiting_ends_the_container():
     assert (ROOT / "spark/room_memory_cpp/docker-entrypoint.sh").read_text().splitlines()[-1] == 'exec "$@"'
     assert 'CMD ["ros2", "launch", "room_memory_cpp", "room_memory_cpp.launch.py"]' in (
         ROOT / "spark/room_memory_cpp/Dockerfile").read_text()
+
+
+def test_nodes_log_readiness_when_a_generation_is_allocated():
+    # The deploy waits for this line. Its self-test stub writes the line itself, so --self-test stays
+    # green even when the nodes never log it. Both nodes log it immediately after allocation.
+    python = (ROOT / "spark/room_memory/room_memory/node.py").read_text()
+    cpp = (ROOT / "spark/room_memory_cpp/node/room_memory_node.cpp").read_text()
+    assert "room-memory ready: publisher_generation {self.generation.generation}" in python
+    assert "room-memory ready: publisher_generation %llu" in cpp
