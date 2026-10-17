@@ -215,7 +215,8 @@ def test_the_rig_guard_subscribes_to_the_imu_and_publishes_rig_pose(tmp_path):
     ])
     try:
         assert node.config.rig_guard and node.config.imu_topic == "/livox/imu"
-        assert RIG_TOPIC in {publisher.topic_name for publisher in node.publishers}
+        [rig] = [publisher for publisher in node.publishers if publisher.topic_name == RIG_TOPIC]
+        assert rig.qos_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL
         assert "/livox/imu" in {subscription.topic_name for subscription in node.subscriptions}
         sent = []
         node.rig.publish = sent.append

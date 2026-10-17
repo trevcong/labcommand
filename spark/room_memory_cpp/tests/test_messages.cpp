@@ -379,7 +379,9 @@ Bytes u64le(std::uint64_t value) {
 }
 
 // Derived on rig-guard; the Swift suite decodes neither RigPose nor Imu, so it has no copy (PROVENANCE.md).
-bool in_swift(const std::string& name) { return name != "rig_pose_le.hex" && name != "rig_pose_v2_le.hex" && name != "imu_le.hex"; }
+bool in_swift(const std::string& name) {
+    return name != "rig_pose_le.hex" && name != "rig_pose_v2_le.hex" && name != "imu_le.hex";
+}
 
 Bytes inflate_all(const Bytes& data) {
     z_stream stream{};

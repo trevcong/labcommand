@@ -189,8 +189,8 @@ public:
                 [this, name](std::shared_ptr<const rclcpp::SerializedMessage> message) { on_cloud(name, *message); }));
         }
         if (config.rig_guard) {
-            rig_ = create_generic_publisher(kRigTopic, "labcommand_msgs/msg/RigPose",
-                                            rclcpp::QoS(1).reliable().transient_local());
+            // RigPose is full state too (on change and every 10 s): latched like status (protocol D41).
+            rig_ = create_generic_publisher(kRigTopic, "labcommand_msgs/msg/RigPose", latched_qos());
             if (!config.imu_topic.empty()) {
                 subscriptions_.push_back(create_generic_subscription(
                     config.imu_topic, "sensor_msgs/msg/Imu", rclcpp::SensorDataQoS(),
