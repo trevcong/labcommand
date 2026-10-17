@@ -16,6 +16,7 @@
 
 namespace {
 
+// Checkout: <repo>/ros/labcommand_msgs. Image: the copied tree (ROOM_MEMORY_MSGS_DIR).
 const std::filesystem::path kMsgs = ROOM_MEMORY_MSGS_DIR;
 const std::filesystem::path kNode = ROOM_MEMORY_NODE_SOURCE;
 const std::filesystem::path kHand = std::filesystem::path(ROOM_MEMORY_FIXTURES) / "hand";
@@ -184,7 +185,7 @@ TEST(node_types_are_generated) {
     for (const std::string& name : named) {
         if (!generated.count(name)) {
             throw harness::Failure("room_memory_node uses labcommand_msgs/msg/" + name +
-                                   " but ros/labcommand_msgs does not generate it");
+                                   " but " + (kMsgs / "CMakeLists.txt").string() + " does not generate it");
         }
         if (!std::filesystem::is_regular_file(kMsgs / "msg" / (name + ".msg"))) {
             throw harness::Failure("generated message has no file: " + name + ".msg");
