@@ -556,6 +556,55 @@ def test_a_sensor_silent_through_a_realignment_realigns_when_it_returns():
         assert error_m <= 0.005 and error_deg <= 0.05
 
 
+def test_a_sensor_still_building_when_the_rig_moves_starts_its_build_over():
+    """The JT128 is silent through the build and returns to build its reference while the room
+    tracks. The rig moves two windows into that build: the JT128 starts over in the new pose, so
+    it joins with a reference of one pose and reports nothing on the unchanged room."""
+    memory = guarded(sensors=("mid360", "jt128"))
+    truth = rooms.rig(0.10, yaw_deg=2.0)
+    jt128 = memory.channels["jt128"]
+    trace, built = [], []
+
+    def step(second, pose, sensors):
+        for name in sensors:
+            memory.add_points(name, rooms.scan(pose, seed=second))
+        stamp = Time(second, 0)
+        events = memory.close_window(stamp)
+        trace.append(Window(second, events, memory.status(stamp, 1.0).state, memory.rig_pose(stamp)))
+        built.append(jt128.reference_windows)
+
+    both = ("mid360", "jt128")
+    second = 1
+    # Until an accepted check gives the Mid-360 an inlier baseline, so a fit can say MOVED.
+    while memory.state != MemoryState.TRACKING or memory.channels["mid360"].baseline is None:
+        step(second, rooms.Pose(), ("mid360",))
+        second += 1
+        assert second < REFERENCE_WINDOWS + 60
+    assert jt128.builder is not None and jt128.reference_windows == 0
+    for _ in range(2):
+        step(second, rooms.Pose(), both)
+        second += 1
+    assert jt128.reference_windows == 2
+    moving = len(trace)
+    while jt128.cloud is None:
+        step(second, truth, both)
+        second += 1
+        assert second < REFERENCE_WINDOWS + 100
+    states = [window.state for window in trace[moving:]]
+    assert MemoryState.RIG_MOVED in states
+    # The move restarted the build: the count fell back instead of running on from 2.
+    assert min(built[moving:]) < 2
+    error_m, error_deg = rooms.pose_error(memory.channels["mid360"].pose, truth)
+    assert error_m <= 0.005 and error_deg <= 0.05
+    joined = len(trace)
+    for _ in range(45):
+        step(second, truth, both)
+        second += 1
+    assert {window.state for window in trace[joined:]} == {MemoryState.TRACKING}
+    assert jt128.mode == "normal" and jt128.pose.is_identity
+    assert not [event for window in trace[moving:] for event in window.events]
+
+
 def test_too_few_points_to_register_is_never_move_evidence():
     """Astra's repro: sparse windows, rejected for fewer than MIN_SOURCE_POINTS, after a baseline and
     with no IMU, end checks INCONCLUSIVE; they never enter RIG_MOVED or relearn."""

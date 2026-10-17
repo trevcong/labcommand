@@ -1995,6 +1995,56 @@ TEST(a_sensor_lost_after_a_move_does_not_block_the_relearn) {
     CHECK_EQ(restarted.channel("jt128").cloud->size(), cloud);
 }
 
+TEST(a_sensor_still_building_when_the_rig_moves_starts_its_build_over) {
+    // The JT128 is silent through the build and returns to build its reference while the room
+    // tracks. The rig moves two windows into that build: the JT128 starts over in the new pose, so
+    // it joins with a reference of one pose and reports nothing on the unchanged room.
+    MemoryConfig config = guarded_config();
+    config.sensors = {"mid360", "jt128"};
+    RoomMemory memory(config, msg::Time{0, 0});
+    const rig::Pose truth = rooms::rig(0.10, 0.0, 0.0, 2.0);
+    const Channel& jt128 = memory.channel("jt128");
+    std::vector<Window> trace;
+    std::vector<std::int64_t> built;
+    std::int64_t second = 1;
+    const auto step = [&](const rig::Pose& pose, const std::vector<std::string>& sensors) {
+        for (const std::string& name : sensors) {
+            memory.add_points(name, rooms::scan(pose, rooms::kRoom, rooms::kFurniture, 0.01, static_cast<std::uint64_t>(second)));
+        }
+        const msg::Time t{second++, 0};
+        std::vector<msg::ChangeEvent> events = memory.close_window(t);
+        std::optional<msg::RigPose> rig = memory.rig_pose(t);
+        trace.push_back(Window{t.sec, std::move(events), memory.status(t, 1.0).state, std::move(rig)});
+        built.push_back(static_cast<std::int64_t>(jt128.reference_windows));
+    };
+    const std::vector<std::string> both{"mid360", "jt128"};
+    // Until an accepted check gives the Mid-360 an inlier baseline, so a fit can say MOVED.
+    while (memory.state() != MemoryState::tracking || !memory.channel("mid360").baseline) {
+        step(rig::Pose{}, {"mid360"});
+        CHECK(second < kGuardReferenceWindows + 60);
+    }
+    CHECK(jt128.builder && jt128.reference_windows == 0);
+    for (int n = 0; n < 2; ++n) step(rig::Pose{}, both);
+    CHECK(jt128.reference_windows == 2);
+    const std::size_t moving = trace.size();
+    while (!jt128.cloud) {
+        step(truth, both);
+        CHECK(second < kGuardReferenceWindows + 100);
+    }
+    const std::vector<Window> moved(trace.begin() + static_cast<std::ptrdiff_t>(moving), trace.end());
+    CHECK(has_state(moved, MemoryState::rig_moved));
+    // The move restarted the build: the count fell back instead of running on from 2.
+    CHECK(*std::min_element(built.begin() + static_cast<std::ptrdiff_t>(moving), built.end()) < 2);
+    check_pose(memory.channel("mid360").pose, truth);
+    const std::size_t joined = trace.size();
+    for (int n = 0; n < 45; ++n) step(truth, both);
+    CHECK(std::all_of(trace.begin() + static_cast<std::ptrdiff_t>(joined), trace.end(),
+                      [](const Window& w) { return w.state == MemoryState::tracking; }));
+    CHECK(jt128.mode == Channel::Mode::normal && jt128.pose.is_identity());
+    CHECK(std::all_of(trace.begin() + static_cast<std::ptrdiff_t>(moving), trace.end(),
+                      [](const Window& w) { return w.events.empty(); }));
+}
+
 TEST(the_rig_state_round_trips_and_a_restart_checks_the_pose) {
     TempDir dir;
     const rig::Pose truth = rooms::rig(0.10, 0.0, 0.0, 2.0);

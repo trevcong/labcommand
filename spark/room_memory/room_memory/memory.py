@@ -1615,11 +1615,23 @@ class RoomMemory:
                     channel.mode = "normal"
             self._end_check(now, RigOutcome.IN_PLACE)
             return
+        for channel in self.channels.values():
+            if channel.builder is not None:
+                self._restart_build(channel)
         self._check = None
         self._moved_since = now
         self._moved_at = Time(start // 1_000_000_000, start % 1_000_000_000)
         self._watched = False
         self._rig_dirty = True
+
+    def _restart_build(self, channel):
+        """A sensor still building its reference when the rig moved: the windows so far saw the old
+        pose, so it starts over in the new one."""
+        self._set_reference(channel, VoxelLayer.empty())
+        channel.reference_index = None
+        channel.stats = VoxelStats()
+        channel.reference_windows = 0
+        channel.builder = rig.RegistrationBuilder(self.config.reg_voxel_m)
 
     def _channel_moved(self, channel, stamp, events):
         """Expires the channel's open candidates, drops its pending entries and recent layer."""

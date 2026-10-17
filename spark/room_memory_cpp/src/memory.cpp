@@ -1574,6 +1574,9 @@ void RoomMemory::enter_moved(std::int64_t now, const msg::Time& stamp, std::vect
         end_check(now, msg::RigOutcome::in_place);
         return;
     }
+    for (Channel& channel : channels_) {
+        if (channel.builder) restart_build(channel);
+    }
     check_.reset();
     moved_since_ = now;
     moved_at_ = msg::Time{start / 1'000'000'000, start % 1'000'000'000};
@@ -1591,6 +1594,15 @@ void RoomMemory::channel_moved(Channel& channel, const msg::Time& stamp, std::ve
     channel.estimates.clear();
     channel.results.clear();
     rig_dirty_ = true;
+}
+
+void RoomMemory::restart_build(Channel& channel) {
+    // A sensor still building its reference when the rig moved: the windows so far saw the old pose,
+    // so it starts over in the new one.
+    set_reference(channel, VoxelLayer{});
+    channel.stats = VoxelStats{};
+    channel.reference_windows = 0;
+    channel.builder.emplace(config_.reg_voxel_m);
 }
 
 void RoomMemory::track_moved(std::int64_t now, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events) {

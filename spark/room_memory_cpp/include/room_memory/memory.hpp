@@ -525,6 +525,7 @@ private:
     void guard_built(std::int64_t now);
     void finish_cloud(Channel& channel);
     void joined(Channel& channel, const msg::Time& stamp);
+    void restart_build(Channel& channel);
     void guard_step(std::int64_t now, const msg::Time& stamp, std::vector<msg::ChangeEvent>& events);
     std::optional<rig::Mat3> rotation_prior(const Channel& channel) const;
     msg::RigChannel estimate(Channel& channel, const std::optional<rig::Pose>& seed_from_last = std::nullopt);
