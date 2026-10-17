@@ -26,13 +26,10 @@
 		<true/>
 		<key>NSExceptionDomains</key>
 		<dict>
-			<key>100.118.187.99</key>
+			<key>ts.net</key>
 			<dict>
-				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<key>NSIncludesSubdomains</key>
 				<true/>
-			</dict>
-			<key>192.168.68.65</key>
-			<dict>
 				<key>NSExceptionAllowsInsecureHTTPLoads</key>
 				<true/>
 			</dict>
