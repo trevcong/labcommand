@@ -6,3 +6,6 @@ numpy==2.0.2
 pytest==8.4.2
 mcap==1.4.0
 zstandard==0.25.0
+# Runs the spark/ suite on both runner CPUs: the rig-guard simulations are most of its time.
+pytest-xdist==3.8.0
+execnet==2.1.2

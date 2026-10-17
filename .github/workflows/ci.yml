@@ -45,7 +45,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y build-essential cmake zlib1g-dev libzstd-dev
           python -m pip install -r spark/requirements-ci.txt < /dev/null
           python -m pip check
-          python -c 'import numpy, pytest, mcap, zstandard'
+          python -c 'import numpy, pytest, xdist, mcap, zstandard'
           python --version
           cmake --version
           c++ --version
@@ -60,7 +60,9 @@ jobs:
         id: pytest
         working-directory: spark
         timeout-minutes: 20
-        run: python -m pytest -q -rs --junitxml="$REPORTS/pytest.xml" < /dev/null
+        # The rig-guard simulations (test_guard.py) are CPU-bound and take most of the suite;
+        # one worker per runner CPU keeps the step well inside its limit. --durations names any new slow test.
+        run: python -m pytest -q -rs -n auto --durations=15 --junitxml="$REPORTS/pytest.xml" < /dev/null
       - name: Configure non-ROS C++ targets
         id: configure
         run: |
