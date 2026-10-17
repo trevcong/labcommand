@@ -6,7 +6,9 @@ codec's CDR bytes on ``/room_memory/status`` and ``/room_memory/activity`` (1 Hz
 ``/room_memory/map_bricks`` (after each window, when ``map_update`` has a message), and answers
 ``/room_memory/request_sync`` on the two sync topics, each answer followed by its ``SyncEnd`` on
 ``/room_memory/sync/end`` (protocol §2, §5); the ``labcommand_msgs`` classes only provide the type
-support. The publisher generation is allocated (durably, under ``publisher.lock``) before any
+support. A ``RequestSync`` also arrives as the ``/room_memory/sync/request`` service, which the :8767
+bridge exposes to the Mac (D39); its request is serialized back to the message's bytes and answered
+the same way. The publisher generation is allocated (durably, under ``publisher.lock``) before any
 publisher exists; without it the node refuses to start. A rejected frame logs one warning per
 sensor per 10 s.
 """
@@ -20,8 +22,10 @@ from labcommand_msgs.msg import MapBricks as MapBricksMsg
 from labcommand_msgs.msg import MemoryStatus as MemoryStatusMsg
 from labcommand_msgs.msg import RequestSync as RequestSyncMsg
 from labcommand_msgs.msg import SyncEnd as SyncEndMsg
+from labcommand_msgs.srv import RequestSync as RequestSyncSrv
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.serialization import serialize_message
 from sensor_msgs.msg import PointCloud2
 
 from .generation import GenerationError, allocate_generation
@@ -34,6 +38,7 @@ ACTIVITY_TOPIC = "/room_memory/activity"
 EVENTS_TOPIC = "/room_memory/events"
 MAP_TOPIC = "/room_memory/map_bricks"
 REQUEST_TOPIC = "/room_memory/request_sync"
+REQUEST_SERVICE = "/room_memory/sync/request"
 SYNC_MAP_TOPIC = "/room_memory/sync/map_bricks"
 SYNC_EVENTS_TOPIC = "/room_memory/sync/events"
 SYNC_END_TOPIC = "/room_memory/sync/end"
@@ -113,6 +118,7 @@ class RoomMemoryNode(Node):
         self.sync_events = self.create_publisher(ChangeEventMsg, SYNC_EVENTS_TOPIC, volatile(200))
         self.sync_end = self.create_publisher(SyncEndMsg, SYNC_END_TOPIC, volatile(10))
         self.create_subscription(RequestSyncMsg, REQUEST_TOPIC, self._answer, volatile(10), raw=True)
+        self.create_service(RequestSyncSrv, REQUEST_SERVICE, self._serve_request)
         for name in self.config.sensors:
             sensor = SENSORS[name]
             self.create_subscription(
@@ -154,17 +160,22 @@ class RoomMemoryNode(Node):
         if elapsed_ms > self.config.window_s * 1000:
             self.get_logger().warning(f"window took {elapsed_ms:.0f} ms, longer than window_s")
 
+    def _serve_request(self, request, response):
+        response.accepted = self._answer(serialize_message(request.request))
+        return response
+
     def _answer(self, data):
+        """Publishes the answer and its ``SyncEnd``; False when the request was dropped."""
         try:
             request = RequestSync.from_cdr(data)
         except CDRError as error:
             self.get_logger().warning(f"RequestSync dropped: {error}")
-            return
+            return False
         publisher = self.sync_map if request.topic == SyncTopic.MAP_BRICKS else self.sync_events
         reply, end = self.memory.sync(request, _time(self))
         if end is None:
             self.get_logger().warning(f"RequestSync for room '{request.header.room_id}' dropped: not this room")
-            return
+            return False
         # The answer first, then its manifest (which may still arrive first: it has its own topic).
         for message in reply:
             publisher.publish(message)
@@ -172,6 +183,7 @@ class RoomMemoryNode(Node):
         self.get_logger().info(
             f"RequestSync {request.topic.name} expected_generation {request.expected_generation}: {len(reply)} messages, "
             f"bound {end.bound}, delivered {list(end.delivered)}, unavailable {list(end.unavailable)}")
+        return True
 
     def _publish_status(self):
         now = time.monotonic()

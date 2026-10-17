@@ -1,22 +1,37 @@
-"""The :8767 bridge sidecar must give the Mac a request path (issue #21), read from the launch file as
+"""The :8767 bridge sidecar must give the Mac a request path (issue #21), read from the sources as
 text: nothing here needs ROS.
 
 Live on c5518eb the bridge said ``capabilities: ["connectionGraph"]`` and nothing else, so the Mac had
-no way to send ``RequestSync`` and showed "history incomplete: 20 missing · no request path".
+no way to send ``RequestSync`` and showed "history incomplete: 20 missing · no request path". The
+path is now the node's ``/room_memory/sync/request`` service through the bridge's ``services``
+capability (protocol D39). Client publishing stays off: foxglove_bridge does not enforce
+``client_topic_whitelist``.
 """
 
 import ast
 import pathlib
-
-import pytest
+import re
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 CPP_LAUNCH = ROOT / "spark/room_memory_cpp/launch/room_memory_cpp.launch.py"
 REQUEST_SERVICE = "/room_memory/sync/request"
 
 
+def _module_constants(path):
+    """Top-level assignments of a module that evaluate as literals, without importing it."""
+    constants = {}
+    tree = ast.parse(path.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            try:
+                constants[node.targets[0].id] = ast.literal_eval(node.value)
+            except ValueError:
+                pass
+    return constants
+
+
 def _bridge_parameters():
-    """The literal parameter dict of the launch file's foxglove_bridge Node, as source text per key."""
+    """The parameter dict of the launch file's foxglove_bridge Node, as source text per key."""
     tree = ast.parse(CPP_LAUNCH.read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and any(
@@ -28,8 +43,49 @@ def _bridge_parameters():
     raise AssertionError("no foxglove_bridge Node in the launch file")
 
 
-@pytest.mark.xfail(strict=True, reason="issue #21: the bridge offers no request path")
 def test_bridge_offers_the_request_service():
+    constants = _module_constants(CPP_LAUNCH)
     parameters = _bridge_parameters()
-    assert "service_whitelist" in parameters
-    assert "services" in parameters["capabilities"]
+    assert constants["REQUEST_SERVICE"] == REQUEST_SERVICE
+    assert constants["BRIDGE_CAPABILITIES"] == ["connectionGraph", "services"]
+    assert parameters["service_whitelist"] == "BRIDGE_SERVICE_WHITELIST"
+    assert parameters["capabilities"] == "ParameterValue(capabilities, value_type=List[str])"
+
+
+def test_service_whitelist_admits_only_the_request_service():
+    # The bridge's default is ".*": every node's services, parameter services included.
+    (pattern,) = _module_constants(CPP_LAUNCH)["BRIDGE_SERVICE_WHITELIST"]
+    assert re.fullmatch(pattern, REQUEST_SERVICE)
+    for other in ("/room_memory/sync/request_x", "/x/room_memory/sync/request", "/room_memory/request_sync",
+                  "/room_memory/set_parameters", "/hesai_ros_driver_node/set_parameters", "/lidar/sync/request"):
+        assert not re.search(pattern, other), other
+
+
+def test_client_publish_stays_opt_in():
+    source = CPP_LAUNCH.read_text()
+    assert _module_constants(CPP_LAUNCH)["BRIDGE_ARGUMENTS"]["foxglove_client_publish"] == "false"
+    assert "clientPublish" not in _module_constants(CPP_LAUNCH)["BRIDGE_CAPABILITIES"]
+    # The capabilities expression: BRIDGE_CAPABILITIES, plus clientPublish only when asked for.
+    assert 'repr(["clientPublish"] + BRIDGE_CAPABILITIES)' in source
+    assert '"\'.lower() == \'true\' else ", repr(BRIDGE_CAPABILITIES)' in source
+
+
+def test_every_side_names_the_same_service():
+    python_node = _module_constants(ROOT / "spark/room_memory/room_memory/node.py")
+    assert python_node["REQUEST_SERVICE"] == REQUEST_SERVICE
+    cpp_node = (ROOT / "spark/room_memory_cpp/node/room_memory_node.cpp").read_text()
+    assert f'constexpr const char* kRequestService = "{REQUEST_SERVICE}";' in cpp_node
+    swift = (ROOT / "Sources/LabCommandCore/LiveRoom/LiveRoomClient.swift").read_text()
+    assert f'public static let requestService = "{REQUEST_SERVICE}"' in swift
+    assert 'public static let requestServiceType = "labcommand_msgs/srv/RequestSync"' in swift
+
+
+def test_service_request_is_exactly_one_request_sync():
+    # One nested RequestSync and nothing else: the service request's CDR has the message's layout,
+    # so the Mac sends one encoding on every path.
+    lines = [line.split("#")[0].strip() for line in (ROOT / "ros/labcommand_msgs/srv/RequestSync.srv").read_text().splitlines()]
+    fields = [line for line in lines if line]
+    separator = fields.index("---")
+    assert fields[:separator] == ["RequestSync request"]
+    assert fields[separator + 1:] == ["bool accepted"]
+    assert '"srv/RequestSync.srv"' in (ROOT / "ros/labcommand_msgs/CMakeLists.txt").read_text()

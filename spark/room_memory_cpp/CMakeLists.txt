@@ -119,8 +119,10 @@ if(BUILD_TESTING)
 endif()
 
 if(ROOM_MEMORY_BUILD_NODE)
+  # The topics are generic; the RequestSync service (D39) is typed, so it needs the C++ type support.
+  find_package(labcommand_msgs REQUIRED)
   add_executable(room_memory_node node/room_memory_node.cpp)
-  target_link_libraries(room_memory_node PRIVATE room_memory_core rclcpp::rclcpp)
+  target_link_libraries(room_memory_node PRIVATE room_memory_core rclcpp::rclcpp ${labcommand_msgs_TARGETS})
   install(TARGETS room_memory_node room_memory_offline room_memory_replay room_memory_bag DESTINATION lib/${PROJECT_NAME})
   install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
   ament_package()

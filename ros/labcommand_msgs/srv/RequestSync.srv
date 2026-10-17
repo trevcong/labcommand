@@ -1,0 +1,11 @@
+# labcommand_msgs/RequestSync service: carries one RequestSync to the room-memory node through the
+# :8767 bridge's services capability (protocol D39), on /room_memory/sync/request.
+# Contract: docs/ROOM-MEMORY-PROTOCOL.md in the LabCommand repo (sections 2 and 5).
+#
+# The request is exactly one RequestSync and nothing else, so its CDR has the message's layout:
+# the Mac sends the same bytes it would publish on /room_memory/request_sync.
+# The answer still goes out on the sync topics and /room_memory/sync/end, as for the topic.
+
+RequestSync request
+---
+bool accepted                     # false: the request did not decode, or names another room; nothing was published

@@ -1,14 +1,15 @@
 # room_memory_cpp on ROS 2 Jazzy, next to the lidar-dual container (brief 2.2). Built on the
 # Spark itself, not on the Mac. The build context is the repository root, which must hold
 # ros/labcommand_msgs from the Phase 0 branch (the generic publishers need its type support
-# at run time):
+# at run time, and the RequestSync service at build time):
 #
 #   docker build -f spark/room_memory_cpp/Dockerfile -t labcommand/room-memory-cpp:jazzy .
 #   docker run --rm --net=host --ipc=host -v ~/room-memory:/root/room-memory labcommand/room-memory-cpp:jazzy
 #
 # --net=host and --ipc=host let DDS discovery and shared memory reach the lidar drivers. The
-# launch file also starts a read-only foxglove_bridge on :8767 that relays only /room_memory/*
-# (launch argument foxglove_bridge:=false turns it off).
+# launch file also starts a foxglove_bridge on :8767 that relays only /room_memory/* and exposes
+# only the node's /room_memory/sync/request service, for the Mac's RequestSync (protocol D39); it
+# cannot publish (launch argument foxglove_bridge:=false turns it off).
 # CPU_FLAGS defaults to the build machine's CPU; set it (e.g. -march=armv9-a) when the image
 # is built on a different host than the one it runs on.
 FROM ros:jazzy-ros-base

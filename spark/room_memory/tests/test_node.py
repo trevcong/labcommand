@@ -9,15 +9,20 @@ pytest.importorskip("labcommand_msgs.msg")
 
 from labcommand_msgs.msg import Activity as ActivityMsg  # noqa: E402
 from labcommand_msgs.msg import MemoryStatus as MemoryStatusMsg  # noqa: E402
+from labcommand_msgs.msg import RequestSync as RequestSyncMsg  # noqa: E402
+from labcommand_msgs.srv import RequestSync as RequestSyncSrv  # noqa: E402
 from rclpy.parameter import Parameter  # noqa: E402
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy  # noqa: E402
+from rclpy.serialization import deserialize_message, serialize_message  # noqa: E402
 
 from room_memory.generation import GenerationError, generation_path  # noqa: E402
 from room_memory.memory import SENSORS  # noqa: E402
 from room_memory.messages import (  # noqa: E402
     Activity, Header, MemoryState, MemoryStatus, RequestSync, SyncEnd, SyncTopic,
 )
-from room_memory.node import ACTIVITY_TOPIC, EVENTS_TOPIC, STATUS_TOPIC, SYNC_END_TOPIC, RoomMemoryNode  # noqa: E402
+from room_memory.node import (  # noqa: E402
+    ACTIVITY_TOPIC, EVENTS_TOPIC, REQUEST_SERVICE, STATUS_TOPIC, SYNC_END_TOPIC, RoomMemoryNode,
+)
 from test_messages import T10, TOKEN_A, appeared_event  # noqa: E402
 
 
@@ -162,3 +167,42 @@ def test_answer_publishes_messages_then_sync_end(node, monkeypatch):
     assert [topic for topic, _ in order] == ["end"]
     end = SyncEnd.from_cdr(order[0][1])
     assert end.token == TOKEN_A and end.bound is None and end.publisher_generation == node.generation.generation
+
+
+def _service_request(request):
+    return RequestSyncSrv.Request(request=deserialize_message(request.to_cdr(), RequestSyncMsg))
+
+
+def test_node_offers_the_request_service(node):
+    services = dict(node.get_service_names_and_types_by_node("room_memory", "/"))
+    assert services[REQUEST_SERVICE] == ["labcommand_msgs/srv/RequestSync"]
+
+
+def test_service_request_has_the_message_layout():
+    # The Mac sends its RequestSync CDR as the service-call payload (D39): the request has the
+    # message's layout. rmw leaves alignment padding uninitialized, so compare length and value.
+    request = RequestSync(Header("lab", 7, 41, T10), (7, 41), SyncTopic.EVENTS, 1234, TOKEN_A)
+    data = serialize_message(_service_request(request))
+    assert len(data) == len(request.to_cdr())
+    assert RequestSync.from_cdr(data) == request
+    assert deserialize_message(request.to_cdr(), RequestSyncSrv.Request).request == _service_request(request).request
+
+
+def test_service_answers_like_the_topic(node, monkeypatch):
+    order = []
+    monkeypatch.setattr(node.sync_events, "publish", lambda data: order.append(("events", data)))
+    monkeypatch.setattr(node.sync_end, "publish", lambda data: order.append(("end", data)))
+    request = RequestSync(Header("lab", (1 << 64) - 1, 0, T10), None, SyncTopic.EVENTS, 0, TOKEN_A)
+    response = node._serve_request(_service_request(request), RequestSyncSrv.Response())
+    assert response.accepted
+    assert [topic for topic, _ in order] == ["end"]
+    end = SyncEnd.from_cdr(order[0][1])
+    assert end.token == TOKEN_A and end.publisher_generation == node.generation.generation
+
+
+def test_service_refuses_another_room(node, monkeypatch):
+    order = []
+    monkeypatch.setattr(node.sync_end, "publish", lambda data: order.append(data))
+    request = RequestSync(Header("elsewhere", (1 << 64) - 1, 0, T10), None, SyncTopic.EVENTS, 0, TOKEN_A)
+    assert not node._serve_request(_service_request(request), RequestSyncSrv.Response()).accepted
+    assert order == []

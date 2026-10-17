@@ -2,14 +2,16 @@
 // spark/room_memory/room_memory/node.py, with the same topics, QoS and parameters: status and
 // activity at 1 Hz, events per transition, map_bricks after each window when RoomMemory::map_update has
 // one, and RequestSync answers on the two sync topics, each answer followed by its SyncEnd on
-// /room_memory/sync/end (protocol sections 2 and 5). The publisher generation is allocated
+// /room_memory/sync/end (protocol sections 2 and 5). A RequestSync arrives on its topic or as the
+// /room_memory/sync/request service, which the :8767 bridge exposes to the Mac (D39). The publisher generation is allocated
 // (durably, under publisher.lock) before any publisher exists; without it the node refuses to
 // start. A rejected frame logs one warning per sensor per 10 s (RejectionLog), with the
 // decoder's error.
 //
 // Subscriptions and publishers are generic (serialized), so frames go through the tested
 // decode_pointcloud2 and outputs are the codec's CDR bytes; sensor_msgs and labcommand_msgs
-// only provide the type support at run time.
+// only provide the type support at run time. The service is typed (Jazzy has no generic
+// service): its request is re-serialized to the RequestSync bytes and answered the same way.
 #include <time.h>
 
 #include <chrono>
@@ -21,7 +23,10 @@
 #include <string>
 #include <vector>
 
+#include <labcommand_msgs/msg/request_sync.hpp>
+#include <labcommand_msgs/srv/request_sync.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/serialization.hpp>
 #include <rclcpp/serialized_message.hpp>
 
 #include "room_memory/generation.hpp"
@@ -39,6 +44,7 @@ constexpr const char* kActivityTopic = "/room_memory/activity";
 constexpr const char* kEventsTopic = "/room_memory/events";
 constexpr const char* kMapTopic = "/room_memory/map_bricks";
 constexpr const char* kRequestTopic = "/room_memory/request_sync";
+constexpr const char* kRequestService = "/room_memory/sync/request";
 constexpr const char* kSyncMapTopic = "/room_memory/sync/map_bricks";
 constexpr const char* kSyncEventsTopic = "/room_memory/sync/events";
 constexpr const char* kSyncEndTopic = "/room_memory/sync/end";
@@ -139,6 +145,13 @@ public:
         requests_ = create_generic_subscription(
             kRequestTopic, "labcommand_msgs/msg/RequestSync", volatile_qos(10),
             [this](std::shared_ptr<const rclcpp::SerializedMessage> message) { answer(*message); });
+        request_service_ = create_service<labcommand_msgs::srv::RequestSync>(
+            kRequestService, [this](const std::shared_ptr<labcommand_msgs::srv::RequestSync::Request> request,
+                                    std::shared_ptr<labcommand_msgs::srv::RequestSync::Response> response) {
+                rclcpp::SerializedMessage message;
+                request_serialization_.serialize_message(&request->request, &message);
+                response->accepted = answer(message);
+            });
         for (const std::string& name : memory_->config().sensors) {
             const room_memory::Sensor& sensor = memory_->channel(name).sensor;
             subscriptions_.push_back(create_generic_subscription(
@@ -197,19 +210,20 @@ private:
         activity_->publish(serialized(memory_->activity(now_stamp).to_cdr()));
     }
 
-    void answer(const rclcpp::SerializedMessage& message) {
+    /// Publishes the answer and its SyncEnd; false when the request was dropped.
+    bool answer(const rclcpp::SerializedMessage& message) {
         const rcl_serialized_message_t& raw = message.get_rcl_serialized_message();
         msg::RequestSync request;
         try {
             request = msg::RequestSync::from_cdr(std::span<const std::uint8_t>(raw.buffer, raw.buffer_length));
         } catch (const msg::CDRError& error) {
             RCLCPP_WARN(get_logger(), "RequestSync dropped: %s", error.what());
-            return;
+            return false;
         }
         const RoomMemory::SyncAnswer reply = memory_->sync(request, stamp());
         if (!reply.end) {
             RCLCPP_WARN(get_logger(), "RequestSync for room '%s' dropped: not this room", request.header.room_id.c_str());
-            return;
+            return false;
         }
         // The answer first, then its manifest (which may still arrive first: it has its own topic).
         const auto& publisher = request.topic == msg::SyncTopic::map_bricks ? sync_map_ : sync_events_;
@@ -222,6 +236,7 @@ private:
                     request.topic == msg::SyncTopic::map_bricks ? "MAP_BRICKS" : "EVENTS", expected.c_str(),
                     reply.messages.size(), bound.c_str(), range_list(reply.end->delivered).c_str(),
                     range_list(reply.end->unavailable).c_str());
+        return true;
     }
 
     // First, so it is destroyed last: the lock outlives every publisher.
@@ -236,6 +251,8 @@ private:
     std::shared_ptr<rclcpp::GenericPublisher> sync_events_;
     std::shared_ptr<rclcpp::GenericPublisher> sync_end_;
     std::shared_ptr<rclcpp::GenericSubscription> requests_;
+    rclcpp::Service<labcommand_msgs::srv::RequestSync>::SharedPtr request_service_;
+    rclcpp::Serialization<labcommand_msgs::msg::RequestSync> request_serialization_;
     std::vector<std::shared_ptr<rclcpp::GenericSubscription>> subscriptions_;
     rclcpp::TimerBase::SharedPtr window_timer_;
     rclcpp::TimerBase::SharedPtr status_timer_;
