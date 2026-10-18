@@ -85,6 +85,9 @@ def test_every_side_names_the_same_service():
     swift = (ROOT / "Sources/LabCommandCore/LiveRoom/LiveRoomClient.swift").read_text()
     assert f'public static let requestService = "{REQUEST_SERVICE}"' in swift
     assert 'public static let requestServiceType = "labcommand_msgs/srv/RequestSync"' in swift
+    # NameObject is whitelisted and named here. The node does not advertise it until the wiring PR.
+    assert f'public static let nameObjectService = "{NAME_OBJECT_SERVICE}"' in swift
+    assert 'public static let nameObjectServiceType = "labcommand_msgs/srv/NameObject"' in swift
 
 
 def test_service_request_is_exactly_one_request_sync():

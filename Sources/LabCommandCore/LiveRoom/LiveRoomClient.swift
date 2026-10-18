@@ -159,6 +159,9 @@ public final class LiveRoomClient: ObservableObject {
     /// `RequestSync`, so the call carries the message's CDR unchanged.
     public static let requestService = "/room_memory/sync/request"
     public static let requestServiceType = "labcommand_msgs/srv/RequestSync"
+    /// `NameObject` (D51). The bridge whitelist names it. The node does not advertise it until the wiring PR.
+    public static let nameObjectService = "/room_memory/objects/name"
+    public static let nameObjectServiceType = "labcommand_msgs/srv/NameObject"
     /// URLSession's default cap is 1 MiB; a snapshot may reach 16 MiB raw (D22).
     static let maxMessageBytes = 64 << 20
     static let logCapacity = 200
