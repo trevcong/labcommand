@@ -615,6 +615,10 @@ def _assert_exec_gates(runbook):
         check = runbook.rfind(ps, 0, command)
         assert 0 <= gate < check < command
         assert "room-memory" in runbook[gate:command]
+        assert (
+            "names only room-memory. If that name is not in the check, stop. Do not exec."
+            in runbook[check:command]
+        )
     for name in ("lidar-center", "lidar-dual", "ptp-master"):
         assert name in runbook
     assert "Never name a lidar or driver container." in runbook

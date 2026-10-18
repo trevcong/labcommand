@@ -184,7 +184,7 @@ Needs Trevor. This is the capture `docker exec -i`. The room-memory container na
 docker ps --format '{{.Names}} {{.Image}}'
 ```
 
-Never name a lidar or driver container. `lidar-center`, `lidar-dual`, and `ptp-master` must never be named.
+Never name a lidar or driver container. `lidar-center`, `lidar-dual`, and `ptp-master` must never be named. This command names only `room-memory`. If that name is not in the check, stop. Do not exec.
 
 ```text
 docker exec -i room-memory bash -lc 'source /opt/ros/jazzy/setup.bash && source /ws/install/setup.bash && python3 -u -' > bump-topics.jsonl <<'PY'
@@ -328,7 +328,7 @@ Needs Trevor. This is the harness `docker exec -i` inside `acceptance run --cont
 docker ps --format '{{.Names}} {{.Image}}'
 ```
 
-Never name a lidar or driver container. `lidar-center`, `lidar-dual`, and `ptp-master` must never be named. Pass `--container room-memory` and no other name.
+Never name a lidar or driver container. `lidar-center`, `lidar-dual`, and `ptp-master` must never be named. Pass `--container room-memory` and no other name. This command names only `room-memory`. If that name is not in the check, stop. Do not exec.
 
 ```text
 PYTHONPATH=spark/room_memory python3 -m acceptance run --transport ros2 --container room-memory --out HARNESS_DIR
