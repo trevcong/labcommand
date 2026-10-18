@@ -328,4 +328,116 @@ struct SyncEnd {
     static SyncEnd from_cdr(std::span<const std::uint8_t> data);
 };
 
+// ObjectRegistry (protocol 3.15, D51). v2 only: publisher_generation is required.
+inline constexpr std::size_t kMaxObjectLinks = 32;
+inline constexpr std::size_t kMaxNameableSeeds = 64;
+inline constexpr std::size_t kMaxRecoveredAccepts = 64;
+inline constexpr std::size_t kMaxRecentActionIds = 1024;
+inline constexpr std::size_t kMaxNameBytes = 64;
+
+enum class Baseline : std::uint8_t { anchored = 0, gone = 1, detached = 2, retired = 3 };
+enum class Association : std::uint8_t { none = 0, pending = 1, unresolved = 2 };
+enum class NameOutcome : std::uint8_t {
+    applied = 0,
+    invalid = 1,
+    wrong_room = 2,
+    unknown_event = 3,
+    state_mismatch = 4,
+    storage_failed = 5,
+    stale_revision = 6,
+    unknown_object = 7
+};
+
+// One accepted link from an object to an event. recovered: APPLIED, and no ACCEPTED was logged.
+struct ObjectLink {
+    std::uint64_t event_generation = 0;
+    std::uint64_t event_id = 0;
+    EventKind kind = EventKind::appeared;
+    bool recovered = false;
+    friend bool operator==(const ObjectLink&, const ObjectLink&) = default;
+    void validate(const std::string& what) const;
+};
+
+// A receipt for an accept answered APPLIED and never logged ACCEPTED.
+struct RecoveredAccept {
+    std::uint64_t event_generation = 0;
+    std::uint64_t event_id = 0;
+    EventKind kind = EventKind::appeared;
+    friend bool operator==(const RecoveredAccept&, const RecoveredAccept&) = default;
+    void validate(const std::string& what) const;
+};
+
+// An accepted APPEARED the operator can still name.
+struct NameableSeed {
+    std::uint64_t event_generation = 0;
+    std::uint64_t event_id = 0;
+    std::uint8_t sensor = 0;
+    std::array<float, 3> centroid{};
+    std::array<float, 6> aabb{};
+    std::uint32_t voxel_count = 0;
+    friend bool operator==(const NameableSeed&, const NameableSeed&) = default;
+    void validate(const std::string& what) const;
+};
+
+// One named object. centroid and aabb are empty exactly when baseline is GONE.
+struct RegistryObject {
+    std::uint64_t object_id = 0;
+    std::uint64_t revision = 0;
+    std::string name;
+    Baseline baseline = Baseline::anchored;
+    Association association = Association::none;
+    std::uint64_t association_generation = 0;
+    std::uint64_t association_event_id = 0;
+    std::uint8_t sensor = 0;
+    std::uint64_t frame_epoch = 0;
+    std::optional<std::array<float, 3>> centroid;
+    std::optional<std::array<float, 6>> aabb;
+    std::vector<ObjectLink> links;
+    friend bool operator==(const RegistryObject&, const RegistryObject&) = default;
+    void validate(const std::string& what) const;
+};
+
+// The whole name registry. Association is in the snapshot only.
+struct ObjectRegistry {
+    Header header;
+    std::uint64_t snapshot_seq = 0;
+    std::vector<RegistryObject> objects;
+    std::vector<NameableSeed> seeds;
+    std::vector<std::string> recent_action_ids;
+    std::vector<RecoveredAccept> recovered_accepts;
+    std::uint64_t publisher_generation = 0;
+    friend bool operator==(const ObjectRegistry&, const ObjectRegistry&) = default;
+    void validate() const;
+    Bytes to_cdr() const;
+    static ObjectRegistry from_cdr(std::span<const std::uint8_t> data);
+};
+
+// NameObject request (protocol 3.16). Create, rename, or attach. No operation field.
+struct NameObjectRequest {
+    Header header;
+    std::uint64_t object_id = 0;
+    std::uint64_t expected_revision = 0;
+    std::uint64_t event_generation = 0;
+    std::uint64_t event_id = 0;
+    std::string name;
+    std::string operator_id;
+    std::string action_id;
+    friend bool operator==(const NameObjectRequest&, const NameObjectRequest&) = default;
+    void validate() const;
+    Bytes to_cdr() const;
+    static NameObjectRequest from_cdr(std::span<const std::uint8_t> data);
+};
+
+// NameObject response.
+struct NameObjectResponse {
+    NameOutcome outcome = NameOutcome::applied;
+    std::uint64_t object_id = 0;
+    std::uint64_t revision = 0;
+    bool repeat_differs = false;
+    friend bool operator==(const NameObjectResponse&, const NameObjectResponse&) = default;
+    void validate() const;
+    Bytes to_cdr() const;
+    static NameObjectResponse from_cdr(std::span<const std::uint8_t> data);
+};
+
 }  // namespace room_memory::msg

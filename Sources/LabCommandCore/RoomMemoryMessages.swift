@@ -815,4 +815,271 @@ public enum RoomMemory {
             self.linearAcceleration = linearAcceleration
         }
     }
+
+    /// `RegistryObject.BASELINE_*`.
+    public enum Baseline: UInt8, Sendable, Equatable, CaseIterable {
+        /// The object has an anchor in a room frame.
+        case anchored = 0
+        /// No anchor. `frameEpoch` is 0 and the geometry is absent.
+        case gone = 1
+        /// An anchor that is not the live one. Geometry stays.
+        case detached = 2
+        /// The anchor's frame was retired. Geometry stays.
+        case retired = 3
+    }
+
+    /// `RegistryObject.ASSOCIATION_*`. `.none` writes both association ids as 0.
+    public enum Association: UInt8, Sendable, Equatable, CaseIterable {
+        /// No open event. Both association ids are 0.
+        case none = 0
+        /// An open event is pending. Both ids are non-zero.
+        case pending = 1
+        /// An open event is unresolved. Both ids are non-zero.
+        case unresolved = 2
+    }
+
+    /// `NameObject.OUTCOME_*`.
+    public enum NameOutcome: UInt8, Sendable, Equatable, CaseIterable {
+        /// The change was installed.
+        case applied = 0
+        /// The request shape or a string was rejected.
+        case invalid = 1
+        /// `room_id` is not this room.
+        case wrongRoom = 2
+        /// The seed is not in the nameable FIFO.
+        case unknownEvent = 3
+        /// The seed or the object is not in a state that accepts the operation.
+        case stateMismatch = 4
+        /// The registry could not be saved.
+        case storageFailed = 5
+        /// `expectedRevision` is not the object's revision.
+        case staleRevision = 6
+        /// `objectId` is not in the registry.
+        case unknownObject = 7
+    }
+
+    /// One accepted link from an object to an event (`labcommand_msgs/ObjectLink`).
+    public struct ObjectLink: Sendable, Equatable {
+        /// The linked event's publishing generation. Never 0.
+        public var eventGeneration: UInt64
+        /// `ChangeEvent.eventId` of the linked event. Never 0.
+        public var eventId: UInt64
+        /// The event's kind.
+        public var kind: ChangeEvent.Kind
+        /// The accept was answered APPLIED and no ACCEPTED was logged.
+        public var recovered: Bool
+
+        /// Creates a link.
+        public init(eventGeneration: UInt64, eventId: UInt64, kind: ChangeEvent.Kind, recovered: Bool) {
+            self.eventGeneration = eventGeneration
+            self.eventId = eventId
+            self.kind = kind
+            self.recovered = recovered
+        }
+    }
+
+    /// A receipt for an accept answered APPLIED and never logged ACCEPTED.
+    public struct RecoveredAccept: Sendable, Equatable {
+        /// The accepted event's publishing generation. Never 0.
+        public var eventGeneration: UInt64
+        /// The accepted event's id. Never 0.
+        public var eventId: UInt64
+        /// The event's kind.
+        public var kind: ChangeEvent.Kind
+
+        /// Creates a receipt.
+        public init(eventGeneration: UInt64, eventId: UInt64, kind: ChangeEvent.Kind) {
+            self.eventGeneration = eventGeneration
+            self.eventId = eventId
+            self.kind = kind
+        }
+    }
+
+    /// An accepted APPEARED the operator can still name (`labcommand_msgs/NameableSeed`).
+    public struct NameableSeed: Sendable, Equatable {
+        /// The seed event's publishing generation. Never 0.
+        public var eventGeneration: UInt64
+        /// The seed event's id. Never 0.
+        public var eventId: UInt64
+        /// Exactly one of `.mid360` or `.jt128`.
+        public var sensor: Sensors
+        /// Region centroid, meters, room frame.
+        public var centroid: SIMD3<Float>
+        /// Region bounds, meters, room frame.
+        public var aabb: ChangeEvent.Box
+        /// Voxels in the seed. At least 1.
+        public var voxelCount: UInt32
+
+        /// Creates a seed.
+        public init(
+            eventGeneration: UInt64,
+            eventId: UInt64,
+            sensor: Sensors,
+            centroid: SIMD3<Float>,
+            aabb: ChangeEvent.Box,
+            voxelCount: UInt32
+        ) {
+            self.eventGeneration = eventGeneration
+            self.eventId = eventId
+            self.sensor = sensor
+            self.centroid = centroid
+            self.aabb = aabb
+            self.voxelCount = voxelCount
+        }
+    }
+
+    /// One named object in an `ObjectRegistry` snapshot. `centroid` and `aabb` are nil exactly when `baseline` is `.gone`.
+    public struct RegistryObject: Sendable, Equatable {
+        /// Unique within the snapshot. Never 0.
+        public var objectId: UInt64
+        /// +1 on every durable change of this object. Create lands at 1.
+        public var revision: UInt64
+        /// UTF-8, 1...64 bytes, no control characters.
+        public var name: String
+        /// Whether the object still has an anchor.
+        public var baseline: Baseline
+        /// The open event, if any. Not stored in the registry file.
+        public var association: Association
+        /// The open event's generation when `association` is not `.none`; else 0.
+        public var associationGeneration: UInt64
+        /// The open event's id when `association` is not `.none`; else 0.
+        public var associationEventId: UInt64
+        /// Exactly one of `.mid360` or `.jt128`.
+        public var sensor: Sensors
+        /// The anchor's room frame. 0 when `baseline` is `.gone`.
+        public var frameEpoch: UInt64
+        /// Region centroid, meters. Nil exactly when `baseline` is `.gone`.
+        public var centroid: SIMD3<Float>?
+        /// Region bounds, meters. Nil exactly when `baseline` is `.gone`.
+        public var aabb: ChangeEvent.Box?
+        /// Accepted links, oldest first. At most 32.
+        public var links: [ObjectLink]
+
+        /// Creates a named object.
+        public init(
+            objectId: UInt64,
+            revision: UInt64,
+            name: String,
+            baseline: Baseline,
+            association: Association,
+            associationGeneration: UInt64,
+            associationEventId: UInt64,
+            sensor: Sensors,
+            frameEpoch: UInt64,
+            centroid: SIMD3<Float>?,
+            aabb: ChangeEvent.Box?,
+            links: [ObjectLink] = []
+        ) {
+            self.objectId = objectId
+            self.revision = revision
+            self.name = name
+            self.baseline = baseline
+            self.association = association
+            self.associationGeneration = associationGeneration
+            self.associationEventId = associationEventId
+            self.sensor = sensor
+            self.frameEpoch = frameEpoch
+            self.centroid = centroid
+            self.aabb = aabb
+            self.links = links
+        }
+    }
+
+    /// `labcommand_msgs/ObjectRegistry`: the whole name registry, one snapshot. v2 only; `publisherGeneration` is required.
+    public struct ObjectRegistry: Sendable, Equatable {
+        /// The common fields.
+        public var header: Header
+        /// +1 on every durable or association change within one publisher generation.
+        public var snapshotSeq: UInt64
+        /// Named objects. Object ids are unique.
+        public var objects: [RegistryObject]
+        /// Accepted APPEARED events the operator can still name. At most 64. `(eventGeneration, eventId)` is unique.
+        public var seeds: [NameableSeed]
+        /// APPLIED `NameObject` action ids still in the dedupe ring, oldest first. At most 1024.
+        public var recentActionIds: [String]
+        /// Receipts for accepts answered APPLIED and never logged ACCEPTED. At most 64. Duplicates are allowed.
+        public var recoveredAccepts: [RecoveredAccept]
+        /// The publishing process's generation (protocol §1.4). Required, never 0.
+        public var publisherGeneration: UInt64
+
+        /// Creates a registry snapshot.
+        public init(
+            header: Header,
+            snapshotSeq: UInt64,
+            objects: [RegistryObject] = [],
+            seeds: [NameableSeed] = [],
+            recentActionIds: [String] = [],
+            recoveredAccepts: [RecoveredAccept] = [],
+            publisherGeneration: UInt64
+        ) {
+            self.header = header
+            self.snapshotSeq = snapshotSeq
+            self.objects = objects
+            self.seeds = seeds
+            self.recentActionIds = recentActionIds
+            self.recoveredAccepts = recoveredAccepts
+            self.publisherGeneration = publisherGeneration
+        }
+    }
+
+    /// `NameObject` request: create, rename, or attach one object. The ids' shape is the operation; there is no operation field.
+    public struct NameObjectRequest: Sendable, Equatable {
+        /// The common fields. `roomId` is the room the request names.
+        public var header: Header
+        /// 0 on Create. The object on Rename and Attach.
+        public var objectId: UInt64
+        /// 0 on Create. The object's revision on Rename and Attach.
+        public var expectedRevision: UInt64
+        /// The seed's generation. 0 on Rename. Never 0 on Create or Attach.
+        public var eventGeneration: UInt64
+        /// The seed's event. 0 on Rename. Never 0 on Create or Attach.
+        public var eventId: UInt64
+        /// UTF-8, 1...64 bytes, no control characters.
+        public var name: String
+        /// Who asked. UTF-8, 1...64 bytes, no control characters.
+        public var operatorId: String
+        /// Client id. UTF-8, 1...64 bytes, no control characters.
+        public var actionId: String
+
+        /// Creates a request.
+        public init(
+            header: Header,
+            objectId: UInt64,
+            expectedRevision: UInt64,
+            eventGeneration: UInt64,
+            eventId: UInt64,
+            name: String,
+            operatorId: String,
+            actionId: String
+        ) {
+            self.header = header
+            self.objectId = objectId
+            self.expectedRevision = expectedRevision
+            self.eventGeneration = eventGeneration
+            self.eventId = eventId
+            self.name = name
+            self.operatorId = operatorId
+            self.actionId = actionId
+        }
+    }
+
+    /// `NameObject` response.
+    public struct NameObjectResponse: Sendable, Equatable {
+        /// What the service decided.
+        public var outcome: NameOutcome
+        /// The object the outcome is about. 0 when there is none.
+        public var objectId: UInt64
+        /// The revision the outcome reports. 0 when there is none.
+        public var revision: UInt64
+        /// A repeated `actionId` whose request digest is not the stored one.
+        public var repeatDiffers: Bool
+
+        /// Creates a response.
+        public init(outcome: NameOutcome, objectId: UInt64, revision: UInt64, repeatDiffers: Bool) {
+            self.outcome = outcome
+            self.objectId = objectId
+            self.revision = revision
+            self.repeatDiffers = repeatDiffers
+        }
+    }
 }

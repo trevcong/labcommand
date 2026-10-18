@@ -1106,21 +1106,21 @@ def moved_window():
 
 
 def test_a_failed_archive_leaves_no_partial_archive(tmp_path):
-    """A copy that fails part way (an unreadable file, as a full disk would) removes the archive it
+    """A copy that fails part way (a directory where the cloud file should be) removes the archive it
     started, so a retry takes the same number and pruning never keeps a partial copy over a whole one."""
     room = tmp_path / "lab"
     room.mkdir()
     (room / "rig_state").write_bytes(b"state")
     cloud = room / "registration-mid360.bin"
-    cloud.write_bytes(b"cloud")
+    # A directory makes shutil.copyfile raise IsADirectoryError for root and for any other user.
+    # Mode 0 does not: root still reads the file.
+    cloud.mkdir()
     files = ["rig_state", "registration-mid360.bin"]
-    cloud.chmod(0)
-    try:
-        with pytest.raises(OSError):
-            rig_files.archive(room, "frame-1", files)
-    finally:
-        cloud.chmod(0o644)
+    with pytest.raises(IsADirectoryError):
+        rig_files.archive(room, "frame-1", files)
     assert list((room / "prev").iterdir()) == []
+    cloud.rmdir()
+    cloud.write_bytes(b"cloud")
     target = rig_files.archive(room, "frame-1", files)
     assert target.name == "0001-frame-1" and (target / "registration-mid360.bin").read_bytes() == b"cloud"
 

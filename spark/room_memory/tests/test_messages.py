@@ -99,6 +99,28 @@ def imu():
     return m.ImuSample(T10, "livox_frame", (0.015625, -0.03125, 0.5), (0.0078125, -0.0, -1.0))
 
 
+def object_registry():
+    link = m.ObjectLink(G, 9, m.EventKind.MOVED, True)
+    obj = m.RegistryObject(
+        7, 2, "Scope cart", m.Baseline.ANCHORED, m.Association.PENDING, G, 11, m.SENSOR_MID360, 40,
+        (1.5, -0.25, 0.125), (1.25, -0.5, 0.0, 1.75, 0.0, 0.25), (link,),
+    )
+    seed = m.NameableSeed(
+        G, 10, m.SENSOR_MID360, (2.0, 1.0, 0.5), (1.875, 0.875, 0.375, 2.125, 1.125, 0.625), 8,
+    )
+    return m.ObjectRegistry(
+        head("lab", 43, 4), 3, (obj,), (seed,), ("act-1",), (m.RecoveredAccept(G, 8, m.EventKind.APPEARED),), G,
+    )
+
+
+def name_object_request():
+    return m.NameObjectRequest(head("lab", 43, 2), 0, 0, G, 10, "Scope cart", "trevor", "act-1")
+
+
+def name_object_response():
+    return m.NameObjectResponse(m.NameOutcome.APPLIED, 7, 1, False)
+
+
 class Imu:
     """``decode_imu`` in the ``from_cdr`` shape of the message classes."""
 
@@ -169,6 +191,12 @@ GOLDENS = {
     "rig_pose_le.hex": (m.RigPose, rig_pose, True),
     "rig_pose_v2_le.hex": (m.RigPose, lambda: replace(rig_pose(), publisher_generation=G), True),
     "imu_le.hex": (Imu, imu, True),
+    "object_registry_le.hex": (m.ObjectRegistry, object_registry, True),
+    "object_registry_be.hex": (m.ObjectRegistry, object_registry, False),
+    "name_object_le.hex": (m.NameObjectRequest, name_object_request, True),
+    "name_object_be.hex": (m.NameObjectRequest, name_object_request, False),
+    "name_object_response_le.hex": (m.NameObjectResponse, name_object_response, True),
+    "name_object_response_be.hex": (m.NameObjectResponse, name_object_response, False),
 }
 # v2 goldens whose cut at the legacy length (+ up to 3 bytes) is a valid legacy message.
 V2_EXTENDS_LEGACY = {name for name in GOLDENS if "_v2_" in name}

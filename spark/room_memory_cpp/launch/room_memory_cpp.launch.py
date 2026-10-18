@@ -13,7 +13,9 @@ The sidecar (``foxglove_bridge:=false`` turns it off) listens on ``foxglove_port
 relays only topics matching ``^/room_memory/.*``, so the raw clouds never leave through it; the
 lidar containers' bridge on :8765 is not touched. The Mac's ``RequestSync`` goes over the same
 socket as the node's ``/room_memory/sync/request`` service (protocol D39): the bridge offers
-``services`` with a ``service_whitelist`` of that one name. Every other node's services, the
+``services`` with a ``service_whitelist`` of that name and ``/room_memory/objects/name``
+(protocol D51). The node does not advertise NameObject until the wiring PR. Every other
+node's services, the
 lidar drivers' parameter services included, stay hidden; the bridge enforces this whitelist
 (the default is ``.*``, so it must be set). Client publishing stays off unless
 ``foxglove_client_publish:=true``: foxglove_bridge parses ``client_topic_whitelist`` but does not
@@ -91,12 +93,15 @@ ARGUMENTS = {
     "icp_max_range_m": ("30.0", float),
 }
 
-# The node's RequestSync service, the only one the bridge exposes (D39).
+# The node's RequestSync service (D39) and the NameObject service (D51). The node advertises
+# RequestSync. NameObject is on the whitelist so the bridge will pass it once the wiring PR
+# advertises it; until then the bridge has nothing by that name to offer.
 REQUEST_SERVICE = "/room_memory/sync/request"
-# connectionGraph is read-only (topic names, no data). services carries RequestSync through the
-# service whitelist below; clientPublish is added only by foxglove_client_publish:=true.
+NAME_OBJECT_SERVICE = "/room_memory/objects/name"
+# connectionGraph is read-only (topic names, no data). services carries the whitelisted names
+# below; clientPublish is added only by foxglove_client_publish:=true.
 BRIDGE_CAPABILITIES = ["connectionGraph", "services"]
-BRIDGE_SERVICE_WHITELIST = ["^/room_memory/sync/request$"]
+BRIDGE_SERVICE_WHITELIST = ["^/room_memory/sync/request$", "^/room_memory/objects/name$"]
 
 BRIDGE_ARGUMENTS = {
     "foxglove_bridge": "true",

@@ -14,6 +14,8 @@ Protocol v2 appends fields at the end of ``MemoryStatus``, ``MapBricks``, ``Chan
 at most 3 is a legacy message, padding to 8 then exactly the v2 fields (then at most 3) is v2, and
 anything else is invalid. ``publisher_generation`` (and the ``RequestSync`` v2 fields) are
 ``None`` for the legacy layout; the encoders write it only when they hold one.
+``ObjectRegistry`` and the ``NameObject`` request and response (protocol §3.15, §3.16, D51) exist
+only in v2. Their ``publisher_generation``, on the registry, is a required field, not a detected tail.
 """
 
 import math
@@ -378,6 +380,25 @@ class _Reader:
         if count > available // 16:
             raise Truncated(f"{self.message} CDR: truncated {what} at byte {self.offset} ({count} ranges, have {available} bytes)")
         return tuple((self.u64(f"{what}[{index}].first"), self.u64(f"{what}[{index}].last")) for index in range(count))
+
+    def count_bounded(self, what, cap, min_bytes):
+        """A ``T[]`` or ``T[<=N]`` count. An empty list aligns nothing: the next field aligns itself.
+        A count the remaining bytes cannot hold is truncated before anything is allocated."""
+        count = self.u32(what + " length")
+        available = max(0, len(self.data) - self.offset)
+        if count > available // min_bytes:
+            raise Truncated(
+                f"{self.message} CDR: truncated {what} at byte {self.offset} ({count} entries, have {available} bytes)"
+            )
+        if cap is not None and count > cap:
+            raise Invalid(f"{self.message}: {what} holds {count} entries, above {cap}")
+        return count
+
+    def boolean(self, what):
+        value = self.u8(what)
+        if value > 1:
+            raise Invalid(f"{self.message}: {what} {value} is not a bool")
+        return bool(value)
 
     def is_v2(self, size, what):
         """Decides the layout after the last legacy field: False when at most 3 bytes are left
@@ -1328,3 +1349,443 @@ def decode_imu(data):
         sample.validate()
         return sample
     return _decode(data, "Imu", body)
+
+
+# MARK: Object registry (D51)
+
+
+class Baseline(IntEnum):
+    """``RegistryObject.baseline``."""
+
+    ANCHORED = 0
+    GONE = 1
+    DETACHED = 2
+    RETIRED = 3
+
+
+class Association(IntEnum):
+    """``RegistryObject.association``. NONE writes both association ids as 0."""
+
+    NONE = 0
+    PENDING = 1
+    UNRESOLVED = 2
+
+
+class NameOutcome(IntEnum):
+    """``NameObject`` response outcome."""
+
+    APPLIED = 0
+    INVALID = 1
+    WRONG_ROOM = 2
+    UNKNOWN_EVENT = 3
+    STATE_MISMATCH = 4
+    STORAGE_FAILED = 5
+    STALE_REVISION = 6
+    UNKNOWN_OBJECT = 7
+
+
+_LINK_CAP = 32
+_SEED_CAP = 64
+_RECEIPT_CAP = 64
+_ACTION_CAP = 1024
+_NAME_BYTES = 64
+
+
+def _controls(text):
+    return any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in text)
+
+
+def _bounded_text(text, low, high, what):
+    if not isinstance(text, str) or "\x00" in text:
+        raise Invalid(f"{what} is not NUL-free text")
+    size = len(text.encode("utf-8"))
+    if not low <= size <= high:
+        raise Invalid(f"{what} is {size} bytes, outside {low}...{high}")
+    if _controls(text):
+        raise Invalid(f"{what} contains a control character")
+
+
+def _one_sensor(value, what):
+    if value not in (SENSOR_MID360, SENSOR_JT128):
+        raise Invalid(f"{what} {value} is not one SENSOR_* bit")
+
+
+def _event_ids(generation, event_id, what):
+    _require_int(generation, 1, UINT64_MAX, f"{what}.event_generation")
+    _require_int(event_id, 1, UINT64_MAX, f"{what}.event_id")
+
+
+def _finite_box(centroid, aabb, what):
+    if centroid is None or aabb is None:
+        raise Invalid(f"{what} geometry is missing")
+    if len(centroid) != 3 or len(aabb) != 6:
+        raise Invalid(f"{what} geometry has the wrong rank")
+    _require_finite(centroid, f"{what}.centroid")
+    _require_finite(aabb, f"{what}.aabb")
+    for axis in range(3):
+        if aabb[axis] > aabb[axis + 3]:
+            raise Invalid(f"{what}.aabb is unordered")
+
+
+def _optional_floats(reader, what, count):
+    values = reader.floats(what, count)
+    nans = [math.isnan(value) for value in values]
+    if any(nans) and not all(nans):
+        raise Invalid(f"{reader.message}: {what} is partly NaN")
+    return None if all(nans) else values
+
+
+@dataclass(frozen=True)
+class ObjectLink:
+    """One accepted link from an object to an event (protocol §3.15)."""
+
+    event_generation: int
+    event_id: int
+    kind: EventKind
+    recovered: bool
+
+    def validate(self, what):
+        _event_ids(self.event_generation, self.event_id, what)
+        _enum(EventKind, self.kind, f"{what}.kind")
+        if not isinstance(self.recovered, bool):
+            raise Invalid(f"{what}.recovered {self.recovered!r} is not a bool")
+
+
+@dataclass(frozen=True)
+class RecoveredAccept:
+    """A receipt for an accept answered APPLIED and never logged ACCEPTED."""
+
+    event_generation: int
+    event_id: int
+    kind: EventKind
+
+    def validate(self, what):
+        _event_ids(self.event_generation, self.event_id, what)
+        _enum(EventKind, self.kind, f"{what}.kind")
+
+
+@dataclass(frozen=True)
+class NameableSeed:
+    """An accepted APPEARED the operator can still name."""
+
+    event_generation: int
+    event_id: int
+    sensor: int
+    centroid: Tuple[float, float, float]
+    aabb: Tuple[float, float, float, float, float, float]
+    voxel_count: int
+
+    def __post_init__(self):
+        _f32_fields(self, ("centroid",))
+        object.__setattr__(self, "aabb", tuple(f32(value) for value in self.aabb))
+
+    def validate(self, what):
+        _event_ids(self.event_generation, self.event_id, what)
+        _one_sensor(self.sensor, f"{what}.sensor")
+        _finite_box(self.centroid, self.aabb, what)
+        _require_int(self.voxel_count, 1, (1 << 32) - 1, f"{what}.voxel_count")
+
+
+@dataclass(frozen=True)
+class RegistryObject:
+    """One named object. ``centroid`` and ``aabb`` are ``None`` exactly when ``baseline`` is GONE."""
+
+    object_id: int
+    revision: int
+    name: str
+    baseline: Baseline
+    association: Association
+    association_generation: int
+    association_event_id: int
+    sensor: int
+    frame_epoch: int
+    centroid: Optional[Tuple[float, float, float]]
+    aabb: Optional[Tuple[float, float, float, float, float, float]]
+    links: Tuple[ObjectLink, ...] = ()
+
+    def __post_init__(self):
+        if self.centroid is not None:
+            _f32_fields(self, ("centroid",))
+        if self.aabb is not None:
+            object.__setattr__(self, "aabb", tuple(f32(value) for value in self.aabb))
+
+    def validate(self, what):
+        _require_int(self.object_id, 1, UINT64_MAX, f"{what}.object_id")
+        _require_int(self.revision, 0, UINT64_MAX, f"{what}.revision")
+        _bounded_text(self.name, 1, _NAME_BYTES, f"{what}.name")
+        _enum(Baseline, self.baseline, f"{what}.baseline")
+        _enum(Association, self.association, f"{what}.association")
+        _one_sensor(self.sensor, f"{what}.sensor")
+        _require_int(self.frame_epoch, 0, UINT64_MAX, f"{what}.frame_epoch")
+        gone = self.baseline == Baseline.GONE
+        if gone:
+            if self.frame_epoch != 0 or self.centroid is not None or self.aabb is not None:
+                raise Invalid(f"{what}: GONE has frame 0 and NaN geometry")
+        else:
+            _finite_box(self.centroid, self.aabb, what)
+        if self.association == Association.NONE:
+            if self.association_generation != 0 or self.association_event_id != 0:
+                raise Invalid(f"{what}: association NONE writes both ids as 0")
+        else:
+            _event_ids(self.association_generation, self.association_event_id, f"{what}.association")
+        if len(self.links) > _LINK_CAP:
+            raise Invalid(f"{what}.links holds {len(self.links)} entries, above {_LINK_CAP}")
+        for index, link in enumerate(self.links):
+            link.validate(f"{what}.links[{index}]")
+
+
+@dataclass(frozen=True)
+class ObjectRegistry:
+    """The whole name registry (protocol §3.15). v2 only."""
+
+    header: Header
+    snapshot_seq: int
+    objects: Tuple[RegistryObject, ...]
+    seeds: Tuple[NameableSeed, ...]
+    recent_action_ids: Tuple[str, ...]
+    recovered_accepts: Tuple[RecoveredAccept, ...]
+    publisher_generation: int
+
+    def validate(self):
+        context = "ObjectRegistry"
+        self.header.validate(context)
+        _require_int(self.snapshot_seq, 0, UINT64_MAX, f"{context}: snapshot_seq")
+        _require_int(self.publisher_generation, 1, UINT64_MAX, f"{context}: publisher_generation (0 is GENERATION_UNKNOWN)")
+        if len(self.seeds) > _SEED_CAP:
+            raise Invalid(f"{context}: seeds holds {len(self.seeds)} entries, above {_SEED_CAP}")
+        if len(self.recovered_accepts) > _RECEIPT_CAP:
+            raise Invalid(f"{context}: recovered_accepts holds {len(self.recovered_accepts)} entries, above {_RECEIPT_CAP}")
+        if len(self.recent_action_ids) > _ACTION_CAP:
+            raise Invalid(f"{context}: recent_action_ids holds {len(self.recent_action_ids)} entries, above {_ACTION_CAP}")
+        seen = set()
+        for index, obj in enumerate(self.objects):
+            obj.validate(f"{context}.objects[{index}]")
+            if obj.object_id in seen:
+                raise Invalid(f"{context}.objects[{index}].object_id {obj.object_id} is duplicated")
+            seen.add(obj.object_id)
+        seen_seeds = set()
+        for index, seed in enumerate(self.seeds):
+            seed.validate(f"{context}.seeds[{index}]")
+            key = (seed.event_generation, seed.event_id)
+            if key in seen_seeds:
+                raise Invalid(f"{context}.seeds[{index}] duplicates {(key)}")
+            seen_seeds.add(key)
+        for index, action_id in enumerate(self.recent_action_ids):
+            _bounded_text(action_id, 1, _NAME_BYTES, f"{context}.recent_action_ids[{index}]")
+        for index, receipt in enumerate(self.recovered_accepts):
+            receipt.validate(f"{context}.recovered_accepts[{index}]")
+
+    def to_cdr(self):
+        """CDR little endian, encapsulation header included. Raises ``Invalid``."""
+        self.validate()
+        writer = _Writer()
+        writer.header(self.header)
+        writer.u64(self.snapshot_seq)
+        writer.u32(len(self.objects))
+        for obj in self.objects:
+            writer.u64(obj.object_id)
+            writer.u64(obj.revision)
+            writer.string(obj.name)
+            writer.u8(int(obj.baseline))
+            writer.u8(int(obj.association))
+            writer.u64(obj.association_generation)
+            writer.u64(obj.association_event_id)
+            writer.u8(obj.sensor)
+            writer.u64(obj.frame_epoch)
+            writer.floats(obj.centroid if obj.centroid is not None else (None, None, None))
+            writer.floats(obj.aabb if obj.aabb is not None else (None,) * 6)
+            writer.u32(len(obj.links))
+            for link in obj.links:
+                writer.u64(link.event_generation)
+                writer.u64(link.event_id)
+                writer.u8(int(link.kind))
+                writer.u8(1 if link.recovered else 0)
+        writer.u32(len(self.seeds))
+        for seed in self.seeds:
+            writer.u64(seed.event_generation)
+            writer.u64(seed.event_id)
+            writer.u8(seed.sensor)
+            writer.floats(seed.centroid)
+            writer.floats(seed.aabb)
+            writer.u32(seed.voxel_count)
+        writer.u32(len(self.recent_action_ids))
+        for action_id in self.recent_action_ids:
+            writer.string(action_id)
+        writer.u32(len(self.recovered_accepts))
+        for receipt in self.recovered_accepts:
+            writer.u64(receipt.event_generation)
+            writer.u64(receipt.event_id)
+            writer.u8(int(receipt.kind))
+        writer.u64(self.publisher_generation)
+        return bytes(writer.data)
+
+    @classmethod
+    def from_cdr(cls, data):
+        """Decodes either byte order. Raises ``Truncated`` or ``Invalid``."""
+        def body(reader):
+            header = reader.header("")
+            snapshot_seq = reader.u64("snapshot_seq")
+            objects = tuple(_read_object(reader, index) for index in range(reader.count_bounded("objects", None, 8)))
+            seeds = tuple(_read_seed(reader, index) for index in range(reader.count_bounded("seeds", _SEED_CAP, 8)))
+            actions = tuple(
+                reader.string(f"recent_action_ids[{index}]")
+                for index in range(reader.count_bounded("recent_action_ids", _ACTION_CAP, 5))
+            )
+            receipts = tuple(
+                _read_receipt(reader, index) for index in range(reader.count_bounded("recovered_accepts", _RECEIPT_CAP, 8))
+            )
+            generation = reader.u64("publisher_generation")
+            registry = cls(header, snapshot_seq, objects, seeds, actions, receipts, generation)
+            registry.validate()
+            return registry
+        return _decode(data, "ObjectRegistry", body)
+
+
+def _read_link(reader, what):
+    generation = reader.u64(what + ".event_generation")
+    event_id = reader.u64(what + ".event_id")
+    kind = _enum(EventKind, reader.u8(what + ".kind"), f"ObjectRegistry: {what}.kind")
+    recovered = reader.boolean(what + ".recovered")
+    link = ObjectLink(generation, event_id, kind, recovered)
+    link.validate(f"ObjectRegistry.{what}")
+    return link
+
+
+def _read_object(reader, index):
+    what = f"objects[{index}]"
+    object_id = reader.u64(what + ".object_id")
+    revision = reader.u64(what + ".revision")
+    name = reader.string(what + ".name")
+    baseline = _enum(Baseline, reader.u8(what + ".baseline"), f"ObjectRegistry: {what}.baseline")
+    association = _enum(Association, reader.u8(what + ".association"), f"ObjectRegistry: {what}.association")
+    association_generation = reader.u64(what + ".association_generation")
+    association_event_id = reader.u64(what + ".association_event_id")
+    sensor = reader.u8(what + ".sensor")
+    frame_epoch = reader.u64(what + ".frame_epoch")
+    centroid = _optional_floats(reader, what + ".centroid", 3)
+    aabb = _optional_floats(reader, what + ".aabb", 6)
+    links = tuple(
+        _read_link(reader, f"{what}.links[{link}]") for link in range(reader.count_bounded(what + ".links", _LINK_CAP, 8))
+    )
+    obj = RegistryObject(
+        object_id, revision, name, baseline, association, association_generation, association_event_id, sensor,
+        frame_epoch, centroid, aabb, links,
+    )
+    obj.validate(f"ObjectRegistry.{what}")
+    return obj
+
+
+def _read_seed(reader, index):
+    what = f"seeds[{index}]"
+    seed = NameableSeed(
+        reader.u64(what + ".event_generation"), reader.u64(what + ".event_id"), reader.u8(what + ".sensor"),
+        reader.floats(what + ".centroid", 3), reader.floats(what + ".aabb", 6), reader.u32(what + ".voxel_count"),
+    )
+    seed.validate(f"ObjectRegistry.{what}")
+    return seed
+
+
+def _read_receipt(reader, index):
+    what = f"recovered_accepts[{index}]"
+    receipt = RecoveredAccept(
+        reader.u64(what + ".event_generation"), reader.u64(what + ".event_id"),
+        _enum(EventKind, reader.u8(what + ".kind"), f"ObjectRegistry: {what}.kind"),
+    )
+    receipt.validate(f"ObjectRegistry.{what}")
+    return receipt
+
+
+@dataclass(frozen=True)
+class NameObjectRequest:
+    """``NameObject`` request (protocol §3.16). Create, rename, or attach. No operation field."""
+
+    header: Header
+    object_id: int
+    expected_revision: int
+    event_generation: int
+    event_id: int
+    name: str
+    operator_id: str
+    action_id: str
+
+    def validate(self):
+        context = "NameObject"
+        self.header.validate(context)
+        _require_int(self.object_id, 0, UINT64_MAX, f"{context}: object_id")
+        _require_int(self.expected_revision, 0, UINT64_MAX, f"{context}: expected_revision")
+        _require_int(self.event_generation, 0, UINT64_MAX, f"{context}: event_generation")
+        _require_int(self.event_id, 0, UINT64_MAX, f"{context}: event_id")
+        _bounded_text(self.name, 1, _NAME_BYTES, f"{context}: name")
+        _bounded_text(self.operator_id, 1, _NAME_BYTES, f"{context}: operator_id")
+        _bounded_text(self.action_id, 1, _NAME_BYTES, f"{context}: action_id")
+        create = self.object_id == 0 and self.expected_revision == 0 and self.event_generation != 0 and self.event_id != 0
+        rename = self.object_id != 0 and self.event_generation == 0 and self.event_id == 0
+        attach = self.object_id != 0 and self.event_generation != 0 and self.event_id != 0
+        if not (create or rename or attach):
+            raise Invalid(f"{context}: the ids are not Create, Rename, or Attach")
+
+    def to_cdr(self):
+        """CDR little endian, encapsulation header included. Raises ``Invalid``."""
+        self.validate()
+        writer = _Writer()
+        writer.header(self.header)
+        writer.u64(self.object_id)
+        writer.u64(self.expected_revision)
+        writer.u64(self.event_generation)
+        writer.u64(self.event_id)
+        writer.string(self.name)
+        writer.string(self.operator_id)
+        writer.string(self.action_id)
+        return bytes(writer.data)
+
+    @classmethod
+    def from_cdr(cls, data):
+        """Decodes either byte order. Raises ``Truncated`` or ``Invalid``."""
+        def body(reader):
+            request = cls(
+                reader.header(""), reader.u64("object_id"), reader.u64("expected_revision"),
+                reader.u64("event_generation"), reader.u64("event_id"), reader.string("name"),
+                reader.string("operator_id"), reader.string("action_id"),
+            )
+            request.validate()
+            return request
+        return _decode(data, "NameObject", body)
+
+
+@dataclass(frozen=True)
+class NameObjectResponse:
+    """``NameObject`` response (protocol §3.16)."""
+
+    outcome: NameOutcome
+    object_id: int
+    revision: int
+    repeat_differs: bool
+
+    def validate(self):
+        _enum(NameOutcome, self.outcome, "NameObject: outcome")
+        _require_int(self.object_id, 0, UINT64_MAX, "NameObject: object_id")
+        _require_int(self.revision, 0, UINT64_MAX, "NameObject: revision")
+        if not isinstance(self.repeat_differs, bool):
+            raise Invalid(f"NameObject: repeat_differs {self.repeat_differs!r} is not a bool")
+
+    def to_cdr(self):
+        """CDR little endian, encapsulation header included. Raises ``Invalid``."""
+        self.validate()
+        writer = _Writer()
+        writer.u8(int(self.outcome))
+        writer.u64(self.object_id)
+        writer.u64(self.revision)
+        writer.u8(1 if self.repeat_differs else 0)
+        return bytes(writer.data)
+
+    @classmethod
+    def from_cdr(cls, data):
+        """Decodes either byte order. Raises ``Truncated`` or ``Invalid``."""
+        def body(reader):
+            response = cls(
+                _enum(NameOutcome, reader.u8("outcome"), "NameObject: outcome"),
+                reader.u64("object_id"), reader.u64("revision"), reader.boolean("repeat_differs"),
+            )
+            response.validate()
+            return response
+        return _decode(data, "NameObjectResponse", body)
