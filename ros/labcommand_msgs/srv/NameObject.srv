@@ -1,0 +1,35 @@
+# labcommand_msgs/NameObject: name, rename, or attach one object.
+# /room_memory/objects/name, behind operator_actions and rig_guard.
+# Contract: docs/ROOM-MEMORY-PROTOCOL.md section 3.16 (D51).
+#
+# The request is these fields and nothing else, so its CDR is this layout.
+# object_id 0 and expected_revision 0 create from the seed (event_generation, event_id).
+# A non-zero object_id with event_generation 0 and event_id 0 renames.
+# A non-zero object_id with a non-zero event renames nothing and attaches that seed.
+# Any other combination is INVALID. Event id 0 is not a real event.
+
+string room_id
+uint64 map_epoch
+uint64 seq
+builtin_interfaces/Time stamp
+uint64 object_id                 # 0: Create
+uint64 expected_revision         # 0 on Create; the object's revision on Rename and Attach
+uint64 event_generation          # the seed's generation; 0 on Rename
+uint64 event_id                  # the seed's event; 0 on Rename
+string name                      # UTF-8, 1...64 bytes, no control characters
+string operator_id               # non-empty UTF-8, no control characters, <= 64 bytes
+string action_id                 # client id, non-empty UTF-8, no control characters, <= 64 bytes
+---
+uint8 OUTCOME_APPLIED=0
+uint8 OUTCOME_INVALID=1
+uint8 OUTCOME_WRONG_ROOM=2
+uint8 OUTCOME_UNKNOWN_EVENT=3
+uint8 OUTCOME_STATE_MISMATCH=4
+uint8 OUTCOME_STORAGE_FAILED=5
+uint8 OUTCOME_STALE_REVISION=6
+uint8 OUTCOME_UNKNOWN_OBJECT=7
+
+uint8 outcome                    # OUTCOME_*
+uint64 object_id                 # the object the outcome is about; 0 when there is none
+uint64 revision                  # the revision the outcome reports; 0 when there is none
+bool repeat_differs              # a repeated action_id whose request digest is not the stored one

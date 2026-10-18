@@ -1,0 +1,63 @@
+# labcommand_msgs/ObjectRegistry, CDR little endian. Derived by hand from ros/labcommand_msgs/msg/ObjectRegistry.msg (protocol section 3.15, D51). One object, one link, one seed, one action id, one receipt. publisher_generation is required.
+00 01 00 00                 # encapsulation CDR_LE, options 0
+04 00 00 00              # pos 0    room_id length 4
+6c 61 62 00              # pos 4    room_id "lab\0"
+2b 00 00 00 00 00 00 00  # pos 8    map_epoch 43
+04 00 00 00 00 00 00 00  # pos 16   seq 4
+8a 92 ed 68              # pos 24   stamp.sec 1760400010
+80 b2 e6 0e              # pos 28   stamp.nanosec 250000000
+03 00 00 00 00 00 00 00  # pos 32   snapshot_seq 3
+01 00 00 00              # pos 40   objects length 1
+00 00 00 00              # pos 44   pad to 8
+07 00 00 00 00 00 00 00  # pos 48   objects[0].object_id 7
+02 00 00 00 00 00 00 00  # pos 56   objects[0].revision 2
+0b 00 00 00              # pos 64   objects[0].name length 11
+53 63 6f 70 65 20 63 61 72 74 00 # pos 68   objects[0].name "Scope cart\0"
+00                       # pos 79   objects[0].baseline ANCHORED
+01                       # pos 80   objects[0].association PENDING
+00 00 00 00 00 00 00     # pos 81   pad to 8
+00 44 04 e0 99 01 00 00  # pos 88   objects[0].association_generation
+0b 00 00 00 00 00 00 00  # pos 96   objects[0].association_event_id 11
+01                       # pos 104  objects[0].sensor MID360
+00 00 00 00 00 00 00     # pos 105  pad to 8
+28 00 00 00 00 00 00 00  # pos 112  objects[0].frame_epoch 40
+00 00 c0 3f              # pos 120  objects[0].centroid.x 1.5
+00 00 80 be              # pos 124  objects[0].centroid.y -0.25
+00 00 00 3e              # pos 128  objects[0].centroid.z 0.125
+00 00 a0 3f              # pos 132  objects[0].aabb min_x 1.25
+00 00 00 bf              # pos 136  objects[0].aabb min_y -0.5
+00 00 00 00              # pos 140  objects[0].aabb min_z 0
+00 00 e0 3f              # pos 144  objects[0].aabb max_x 1.75
+00 00 00 00              # pos 148  objects[0].aabb max_y 0
+00 00 80 3e              # pos 152  objects[0].aabb max_z 0.25
+01 00 00 00              # pos 156  objects[0].links length 1
+00 44 04 e0 99 01 00 00  # pos 160  objects[0].links[0].event_generation
+09 00 00 00 00 00 00 00  # pos 168  objects[0].links[0].event_id 9
+02                       # pos 176  objects[0].links[0].kind MOVED
+01                       # pos 177  objects[0].links[0].recovered 1
+00 00                    # pos 178  pad to 4
+01 00 00 00              # pos 180  seeds length 1
+00 44 04 e0 99 01 00 00  # pos 184  seeds[0].event_generation
+0a 00 00 00 00 00 00 00  # pos 192  seeds[0].event_id 10
+01                       # pos 200  seeds[0].sensor MID360
+00 00 00                 # pos 201  pad to 4
+00 00 00 40              # pos 204  seeds[0].centroid.x 2
+00 00 80 3f              # pos 208  seeds[0].centroid.y 1
+00 00 00 3f              # pos 212  seeds[0].centroid.z 0.5
+00 00 f0 3f              # pos 216  seeds[0].aabb min_x 1.875
+00 00 60 3f              # pos 220  seeds[0].aabb min_y 0.875
+00 00 c0 3e              # pos 224  seeds[0].aabb min_z 0.375
+00 00 08 40              # pos 228  seeds[0].aabb max_x 2.125
+00 00 90 3f              # pos 232  seeds[0].aabb max_y 1.125
+00 00 20 3f              # pos 236  seeds[0].aabb max_z 0.625
+08 00 00 00              # pos 240  seeds[0].voxel_count 8
+01 00 00 00              # pos 244  recent_action_ids length 1
+06 00 00 00              # pos 248  recent_action_ids[0] length 6
+61 63 74 2d 31 00        # pos 252  recent_action_ids[0] "act-1\0"
+00 00                    # pos 258  pad to 4
+01 00 00 00              # pos 260  recovered_accepts length 1
+00 44 04 e0 99 01 00 00  # pos 264  recovered_accepts[0].event_generation
+08 00 00 00 00 00 00 00  # pos 272  recovered_accepts[0].event_id 8
+00                       # pos 280  recovered_accepts[0].kind APPEARED
+00 00 00 00 00 00 00     # pos 281  pad to 8
+00 44 04 e0 99 01 00 00  # pos 288  publisher_generation

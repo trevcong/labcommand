@@ -71,6 +71,7 @@ add_library(room_memory_core
   src/imu.cpp
   src/state.cpp
   src/rejectlog.cpp
+  src/objects.cpp
 )
 set_target_properties(room_memory_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(room_memory_core PUBLIC

@@ -16,7 +16,13 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SeqRange.msg"
   "msg/SyncEnd.msg"
   "msg/RigPose.msg"
+  "msg/ObjectLink.msg"
+  "msg/RecoveredAccept.msg"
+  "msg/NameableSeed.msg"
+  "msg/RegistryObject.msg"
+  "msg/ObjectRegistry.msg"
   "srv/RequestSync.srv"
+  "srv/NameObject.srv"
   DEPENDENCIES builtin_interfaces
 )
 
