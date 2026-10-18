@@ -2,10 +2,11 @@
 a .invalid name: nothing leaves this machine. It deploys a room-memory that runs with
 rig_guard:=true and checks that the replacement and every rollback keep that argument.
 
-A rollback whose rm, rename, or start fails exits 3 and prints
-'ROLLBACK FAILED: room-memory is not running' plus the manual recovery command. A rollback that
-brings the original back prints 'rolled back'. A deploy that is already up, whose `docker images`
-then fails while pruning, still exits 0."""
+A rollback whose rm, rename, or start fails exits 3 and prints a recovery command built from the
+containers that are left. The self-test runs that command against the stub and checks that
+room-memory is the original and running. A rollback that brings the original back prints
+'rolled back'. A deploy that is already up, whose `docker images` then fails while pruning,
+still exits 0."""
 
 import pathlib
 import shutil
