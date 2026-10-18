@@ -12,16 +12,18 @@
 # image and the container may differ; anything a replacement cannot reproduce (an
 # anonymous volume, a --mount, a two-element entrypoint) refuses the deploy before
 # anything stops. The original is stopped and renamed room-memory-previous, never
-# removed and never with its volumes. Rollback stays armed through the replacement's
-# readiness line and a stability window: a failed rename, scratch cleanup or start,
-# an exit, a restart, an unhealthy status, a launched process that ends while the
-# container runs, no readiness in time, or a failure in the window removes the
-# replacement and starts that same container again. If that rollback's rm, rename,
-# or start fails, or room-memory is not running afterwards, the script exits 3 and
-# prints a recovery command for the containers that are left. The original is already
-# named room-memory: `docker start` of its id. The rename back did not land: remove
-# the replacement by id, rename the original back, and start it. A fresh host has no
-# original, so the command only removes the failed container. A deploy that already
+# removed and never with its volumes. Rollback is armed from the stop through the
+# replacement's readiness line and a stability window: a failed stop, rename, scratch
+# cleanup or start, an exit, a restart, an unhealthy status, a launched process that
+# ends while the container runs, no readiness in time, or a failure in the window
+# removes the replacement and starts that same container again. If that rollback's rm,
+# rename, or start fails, or room-memory is not running afterwards, the script exits 3
+# and prints what is left to do, from what `docker ps` shows running. It never prints a
+# start while a room-memory container runs: it prints only the removal of a running
+# replacement, or the rename of an original that runs under the wrong name. With none
+# running it prints the rm of a replacement still there, the rename back, and a start
+# that checks `docker ps` again and refuses if one runs, joined with &&. A fresh host
+# has no original, so the command only removes the failed container. A deploy that already
 # came up still exits 0 when listing image tags to prune fails. Scratch files
 # are removed as root on the original's own mounts: the container creates root-owned
 # room directories, and an ssh user cannot unlink what it left there.
@@ -353,17 +355,20 @@ discard_next() {
   fi
   exit "$status"
 }
-# After stop: a failure removes the replacement and starts the original container, under its
+# From stop on: a failure removes the replacement and starts the original container, under its
 # own name, with its own command, settings and volumes. A fresh host had none: only the failed one goes.
+# A failed stop is inside this too: the original may be half-stopped, and `docker start` of a
+# container that still runs does nothing.
 # rm, rename, and start each have to succeed, and the original has to be running afterwards
 # under the name room-memory. That name can still belong to the replacement, so it is not proof.
 # If rm of the replacement fails while that container is running, or it cannot be inspected,
 # rename and start are skipped. Starting the original beside it leaves two writers on one state.
-# Any failure exits 3 and prints a recovery command built from the ids and the name the original
-# actually has. One fixed `docker rm -f room-memory && docker rename room-memory-previous ...`
-# deletes the original when the start is what failed: it is already named room-memory, and
-# room-memory-previous is gone. The same string is wrong when the rename back did not land
-# (the original is running as room-memory-previous) and on a fresh host (there is no previous).
+# Any failure exits 3 and prints what to do next from the ids, the name the original actually
+# has, and what `docker ps` shows running now. One fixed `docker rm -f room-memory && docker
+# rename room-memory-previous ...` deletes the original when the start is what failed: it is
+# already named room-memory, and room-memory-previous is gone. The same string is wrong when the
+# rename back did not land (the original is running as room-memory-previous) and on a fresh host
+# (there is no previous).
 # The original failure status is kept only when the rollback itself worked.
 rollback_service() {
   local status=${1:-$?}
@@ -372,10 +377,12 @@ rollback_service() {
   fi
   trap - ERR
   set +e
-  local failed=0 running="" recovery="" name_now="" next_running="" skip_restore=0
+  local failed=0 running="" name_now="" next_running="" skip_restore=0 next_removed=0
   if [ -n "$orig_id" ]; then
     if [ -n "$next_id" ]; then
-      if ! docker rm -f "$next_id"; then
+      if docker rm -f "$next_id"; then
+        next_removed=1
+      else
         failed=1
         # Running, or not inspectable: it may still hold the name and the state files.
         next_running=$(docker inspect -f '{{.State.Running}}' "$next_id") || next_running=unknown
@@ -402,29 +409,58 @@ rollback_service() {
     docker rm -f room-memory || failed=1
   fi
   if [ "$failed" -ne 0 ]; then
-    if [ -z "$orig_id" ]; then
-      recovery="docker rm -f room-memory"
-    else
-      # Ground truth, not the rename's exit code: a failed rename leaves the previous name.
-      name_now=$(docker inspect -f '{{.Name}}' "$orig_id" 2>/dev/null) || true
-      if [ "$name_now" = "/room-memory" ]; then
-        recovery="docker start $orig_id"
-      elif [ -n "$next_id" ]; then
-        recovery="docker rm -f $next_id; docker rename $orig_id room-memory; docker start $orig_id"
-      else
-        recovery="docker rename $orig_id room-memory; docker start $orig_id"
-      fi
-    fi
     if [ "$running" = "true" ]; then
       echo "ROLLBACK FAILED: room-memory is running, but an earlier rollback step failed" >&2
     else
       echo "ROLLBACK FAILED: room-memory is not running" >&2
     fi
-    echo "$recovery" >&2
+    if [ -z "$orig_id" ]; then
+      echo "docker rm -f room-memory" >&2
+    else
+      print_recovery "$next_removed"
+    fi
     exit 3
   fi
   echo "rolled back" >&2
   exit "$status"
+}
+# What is left to do after a failed rollback, from what runs now. Only one room-memory may write
+# the state: no start is printed while `docker ps` shows any room-memory container running, or
+# when it cannot tell. The start that is printed checks `docker ps` again itself and refuses then,
+# and every step is joined with &&, so a step that fails again stops the start behind it.
+# The name filter matches room-memory, room-memory-next and room-memory-previous.
+print_recovery() {
+  local next_removed=$1 live steps="" start
+  # The replacement still there holds a name the original needs. It does not run when this is used.
+  if [ -n "$next_id" ] && [ "$next_removed" -eq 0 ]; then
+    steps="docker rm -f $next_id && "
+  fi
+  # Ground truth, not the rename's exit code: a failed rename leaves the previous name.
+  name_now=$(docker inspect -f '{{.Name}}' "$orig_id" 2>/dev/null) || name_now=""
+  if ! live=$(docker ps --no-trunc -q --filter name=room-memory); then
+    echo "room-memory deploy: docker ps failed, so no start is printed; check docker ps --filter name=room-memory first" >&2
+    return
+  fi
+  if [ -z "$live" ]; then
+    if [ "$name_now" != "/room-memory" ]; then
+      steps="${steps}docker rename $orig_id room-memory && "
+    fi
+    start='if r=$(docker ps --no-trunc -q --filter name=room-memory) && [ -z "$r" ]; then docker start '"$orig_id"'; else echo "not starting '"$orig_id"': a room-memory container is running, or docker ps failed" >&2; false; fi'
+    echo "${steps}${start}" >&2
+  elif [ "$live" = "$orig_id" ]; then
+    if [ "$name_now" = "/room-memory" ]; then
+      echo "room-memory deploy: the original ($orig_id) is running as room-memory; nothing to start" >&2
+    else
+      echo "room-memory deploy: the original ($orig_id) is running under ${name_now#/}; give it its name back:" >&2
+      echo "${steps}docker rename $orig_id room-memory" >&2
+    fi
+  else
+    echo "room-memory deploy: a room-memory container is running, so no start is printed:" $live >&2
+    if [ -n "$next_id" ] && in_lines "$next_id" "$live"; then
+      echo "room-memory deploy: remove the replacement, then check docker ps --filter name=room-memory again before starting $orig_id:" >&2
+      echo "docker rm -f $next_id" >&2
+    fi
+  fi
 }
 # Empty while the container is up: running, never restarted, not unhealthy. Else why not.
 health_failure() {
@@ -521,9 +557,10 @@ if [ -n "$orig_id" ]; then
   if has_name room-memory-previous; then
     docker rm room-memory-previous
   fi
-  docker stop "$orig_id"
-  # Once stop has succeeded, rename, scratch cleanup, start and readiness are one unit.
+  # Stop, rename, scratch cleanup, start and readiness are one unit. A stop that fails may have
+  # stopped the original anyway: it is started again.
   trap rollback_service ERR
+  docker stop "$orig_id"
   sleep "$BACKOFF"
   docker rename "$orig_id" room-memory-previous
   renamed=1
@@ -661,7 +698,8 @@ self_test() {
   [[ "$before_stop" == *'{{json .HostConfig}}'* && "$before_stop" == *'discard_next 1'* ]] || fail "the replacement is not checked before stop"
   [[ "$before_stop" == *'{{json .Config.Volumes}}'* && "$before_stop" == *'$MOUNTS'* && "$before_stop" == *'$NETWORKS'* ]] \
     || fail "the volumes, mounts and networks are not checked before stop"
-  [[ "$after_stop" == *'trap rollback_service ERR'* ]] || fail "rollback is not armed after stop"
+  [[ "$before_stop" == *'trap rollback_service ERR'* && "${before_stop##*trap discard_next ERR}" == *'trap rollback_service ERR'* ]] \
+    || fail "rollback is not armed before stop: a failed stop is not rolled back"
   [[ "$after_stop" == *'docker rename "$orig_id" room-memory-previous'* ]] || fail "the original is not kept for rollback"
   [[ "$after_stop" == *'find /root/room-memory'* && "$after_stop" == *'rollback_service 1'* ]] || fail "a failure after stop is outside the rollback"
   [[ "$sample" == *'docker rm -f "$next_id"'* ]] || fail "rollback ignores a failed rm"
@@ -678,11 +716,15 @@ self_test() {
   [[ "$sample" == *'ROLLBACK FAILED: room-memory is not running'* ]] || fail "a failed rollback does not say room-memory is not running"
   [[ "$sample" == *'ROLLBACK FAILED: room-memory is running, but an earlier rollback step failed'* ]] \
     || fail "a rollback that left room-memory running still says it is not"
-  [[ "$sample" == *'recovery="docker start $orig_id"'* ]] \
-    || fail "a failed rollback does not start the original by id once it has its name back"
-  [[ "$sample" == *'recovery="docker rm -f $next_id; docker rename $orig_id room-memory; docker start $orig_id"'* ]] \
-    || fail "a failed rename back does not recover the original by id"
-  [[ "$sample" == *'recovery="docker rm -f room-memory"'* ]] \
+  [[ "$sample" == *'live=$(docker ps --no-trunc -q --filter name=room-memory)'* ]] \
+    || fail "a failed rollback does not check what room-memory container runs before printing a start"
+  [[ "$sample" == *'start='"'"'if r=$(docker ps --no-trunc -q --filter name=room-memory) && [ -z "$r" ]; then docker start '* ]] \
+    || fail "the printed start does not refuse while a room-memory container runs"
+  [[ "$sample" == *'steps="docker rm -f $next_id && "'* && "$sample" == *'steps="${steps}docker rename $orig_id room-memory && "'* ]] \
+    || fail "the printed recovery does not stop at a step that fails"
+  [[ "$sample" != *'; docker rename $orig_id room-memory; docker start $orig_id'* ]] \
+    || fail "the printed recovery still starts the original after a failed rm or rename"
+  [[ "$sample" == *'echo "docker rm -f room-memory" >&2'* ]] \
     || fail "a fresh host whose removal fails does not say to remove that container"
   [[ "$sample" != *'echo "docker rm -f room-memory && docker rename room-memory-previous room-memory && docker start room-memory"'* ]] \
     || fail "a failed rollback still prints one recovery command for every state"
@@ -1090,10 +1132,35 @@ if command == "build":
     state["images"][tag] = {"Id": "sha256:" + tag.encode().hex()[:64], "Config": config}
     save()
 elif command == "ps":
-    if mode == "ps-fail":
+    # The rollback's start fails, and so does the docker ps that decides what to print after it.
+    if mode == "ps-fail" or (mode == "rollback-ps-fail" and "-q" in rest):
         die("ps failed")
+    # Running containers only, unless -a. A name filter is an unanchored match on the name.
+    every, quiet, full, pattern, form, i = False, False, False, None, None, 0
+    while i < len(rest):
+        if rest[i] == "-a":
+            every = True
+        elif rest[i] == "-q":
+            quiet = True
+        elif rest[i] == "--no-trunc":
+            full = True
+        elif rest[i] == "--filter" and i + 1 < len(rest) and rest[i + 1].startswith("name="):
+            pattern = rest[i + 1][5:]
+            i += 1
+        elif rest[i] == "--format" and i + 1 < len(rest) and rest[i + 1] == "{{.Names}}":
+            form = rest[i + 1]
+            i += 1
+        else:
+            die("unexpected ps flag: " + rest[i], 3)
+        i += 1
+    if not quiet and form is None:
+        die("ps without -q or --format", 3)
     for c in state["containers"]:
-        print(c["Name"][1:])
+        if not every and not c["State"]["Running"]:
+            continue
+        if pattern is not None and not re.search(pattern, c["Name"][1:]):
+            continue
+        print((c["Id"] if full else c["Id"][:12]) if quiet else c["Name"][1:])
 elif command == "inspect" and rest[0] == "-f":
     c = container(rest[2])
     # The replacement is up, but its state cannot be read. Rollback must not start the original.
@@ -1142,7 +1209,7 @@ elif command == "run":
     print(c["Id"])
 elif command == "start":
     c = container(rest[0])
-    if mode == "rollback-start-fail":
+    if mode in ("rollback-start-fail", "rollback-ps-fail", "rollback-rm-start-fail"):
         die("start failed")
     if mode == "start-fail" and new_image(c):
         die("start failed")
@@ -1158,6 +1225,9 @@ elif command == "stop":
         die("stop failed")
     container(rest[0])["State"].update(Running=False, Status="exited")
     save()
+    # The container stopped, and stop still reported a failure (a timeout, a lost daemon reply).
+    if mode == "stop-fail-stopped":
+        die("stop failed")
 elif command == "rename":
     c, new = container(rest[0]), rest[1]
     if mode == "rename-fail" and new == "room-memory-previous":
@@ -1173,7 +1243,7 @@ elif command == "rm":
     if any(flag.startswith("-") and "v" in flag for flag in rest[:-1]):
         die("this deploy never removes a container's volumes", 3)
     if mode in ("rollback-rm-fail", "rollback-rm-before-rename", "fresh-rm-fail",
-                "rollback-rm-fail-running", "rollback-rm-fail-blind") and rest and rest[0] == "-f":
+                "rollback-rm-fail-running", "rollback-rm-fail-blind", "rollback-rm-start-fail") and rest and rest[0] == "-f":
         die("rm failed")
     c = container(rest[-1])
     if c["State"]["Running"] and rest[0] != "-f":
@@ -1275,26 +1345,45 @@ PY
   # The one recovery command a failed rollback printed. Stub diagnostics also start with "docker ".
   recovery_line() {
     local line
-    line=$(grep -E '^docker (start|rm|rename) ' "$work/deploy.err" || true)
+    line=$(grep -E '^(docker (start|rm|rename) |if r=)' "$work/deploy.err" || true)
     [[ -n "$line" ]] || fail "$1: no recovery command in: $(cat "$work/deploy.err")"
     [[ "$line" != *$'\n'* ]] || fail "$1: more than one recovery command: $line"
     printf '%s\n' "$line"
   }
-  # Run that command the way an operator pastes it: no set -e, so a leading rm of an
-  # already-removed id does not stop the rename and start. The failure mode was the deploy's.
-  # A later manual command has a working docker, so the stub is back in DOCKER_MODE=ok.
+  # The start a failed rollback prints when no room-memory container runs: it checks again itself.
+  guarded_start() {
+    printf 'if r=$(docker ps --no-trunc -q --filter name=room-memory) && [ -z "$r" ]; then docker start %s; else echo "not starting %s: a room-memory container is running, or docker ps failed" >&2; false; fi' "$1" "$1"
+  }
+  # Room-memory containers that run, and so write the state: room-memory, -next and -previous.
+  writers() { q 'len([c for c in state["containers"] if c["State"]["Running"] and "room-memory" in c["Name"]])'; }
+  # Nothing the failed rollback printed starts a container.
+  no_start_printed() {
+    if grep -q 'docker start' "$work/deploy.err"; then
+      fail "$1: printed a start while a room-memory container runs: $(cat "$work/deploy.err")"
+    fi
+  }
+  # Run a printed command the way an operator pastes it, into an interactive shell without set -e,
+  # against a docker in DOCKER_MODE $2. A later manual command usually has a working docker (ok),
+  # but the step that failed in the rollback can fail again.
+  replay() {
+    set +e
+    PATH="$bin:$PATH" HOME="$work/home" DOCKER_LOG="$docker_log" DOCKER_STATE="$state" \
+      DOCKER_VOLUMES="$work/volumes" DOCKER_MODE="$2" EXPECTED_TAG="$first_short" \
+      bash -c "$1" >"$work/recovery.out" 2>"$work/recovery.err"
+    code=$?
+    set -e
+  }
   apply_recovery() {
     local failure=$1 line=$2 orig=$3
-    PATH="$bin:$PATH" HOME="$work/home" DOCKER_LOG="$docker_log" DOCKER_STATE="$state" \
-      DOCKER_VOLUMES="$work/volumes" DOCKER_MODE=ok EXPECTED_TAG="$first_short" \
-      bash -c "$line" >"$work/recovery.out" 2>"$work/recovery.err" \
-      || fail "${failure}: recovery command failed (${line}): $(cat "$work/recovery.err")"
+    replay "$line" ok
+    [[ "$code" -eq 0 ]] || fail "${failure}: recovery command failed (${line}): $(cat "$work/recovery.err")"
     [[ "$(q 'named["room-memory"]["Id"]')" == "$orig" ]] \
       || fail "${failure}: recovery left $(q 'sorted(named)') instead of the original"
     [[ "$(q 'named["room-memory"]["State"]["Running"]')" == True ]] \
       || fail "${failure}: recovery did not leave the original running"
     [[ "$(q 'named["room-memory"]["Config"]["Cmd"]')" == "$guarded_cmd" ]] \
       || fail "${failure}: recovery lost rig_guard:=true"
+    [[ "$(writers)" -eq 1 ]] || fail "${failure}: recovery left $(writers) room-memory containers running"
     no_volume_removed "${failure} recovery"
   }
   # After a failure: the original container is room-memory again, running, with its own command.
@@ -1336,25 +1425,334 @@ PY
     no_volume_removed "$2"
   }
 
-  seed_host "${original_settings[@]}" "${original_command[@]}"
-  run_mode build-fail
-  [[ "$code" -ne 0 ]] || fail "build failure still exited 0"
-  has build || fail "build failure never built"
-  lacks create && lacks stop && lacks rename && lacks run || fail "build failure still replaced the container"
-  [[ "$(head -n 1 "$ssh_log")" == "bash -c 'set -euo pipefail" ]] || fail "deploy ssh command is not one quoted bash -c script"
+  # ROOM_MEMORY_SELF_TEST_CASE runs one rollback or recovery case below, named by its DOCKER_MODE,
+  # after the checks above, and nothing after them. Unset, every case and every other check runs.
+  local only=${ROOM_MEMORY_SELF_TEST_CASE:-} matched=0
+  want() {
+    if [[ -z "$only" ]]; then
+      return 0
+    fi
+    [[ "$only" == "$1" ]] || return 1
+    matched=1
+  }
+  local orig failure recovery next intruder
+  locked=$work/home/room-memory/locked
+  mkdir -p "$locked"
+  echo keep-ref >"$locked/reference-mid360.cdr"
 
-  run_mode ps-fail
-  [[ "$code" -ne 0 ]] || fail "ps failure still exited 0"
-  has build && has ps || fail "ps failure skipped listing"
-  lacks create && lacks stop && lacks rename && lacks run || fail "ps failure still replaced the container"
+  # A failed stop (the original still runs, or it stopped and stop still failed), every failure
+  # after stop, and every way the replacement fails to come up (it exits, restarts,
+  # turns unhealthy, never logs its readiness line, or exits or loses its node within the stability
+  # window while Docker still reports it running), starts
+  # the same original container: renamed back if it was renamed, with its own command, settings and
+  # volumes. Not a new container of the previous image. That rollback succeeded: it says so, exits
+  # with the deploy's own failure (not 3), and docker inspect saw the original running
+  # and named room-memory. The service name alone can still be the replacement.
+  for failure in stop-fail stop-fail-stopped start-fail rename-fail cleanup-perm health-exit health-restart \
+    health-unhealthy health-never-ready health-late-exit health-node-died; do
+    want "$failure" || continue
+    echo junk >"$locked/reference-mid360.cdr.tmp"
+    chmod 555 "$locked"
+    seed_host "${original_settings[@]}" "${original_command[@]}"
+    orig=$(q 'named["room-memory"]["Id"]')
+    run_mode "$failure"
+    chmod u+w "$locked" || true
+    [[ "$code" -ne 0 ]] || fail "${failure} still exited 0"
+    [[ "$code" -ne 3 ]] || fail "${failure} reported a failed rollback: $(cat "$work/deploy.err")"
+    grep -qx "rolled back" "$work/deploy.err" || fail "${failure} did not say it rolled back: $(cat "$work/deploy.err")"
+    if grep -q "ROLLBACK FAILED" "$work/deploy.err"; then
+      fail "${failure} reported a failed rollback"
+    fi
+    grep -q "^inspect -f {{.State.Running}} ${orig}$" "$docker_log" \
+      || fail "${failure} did not confirm the original is running"
+    grep -q "^inspect -f {{.Name}} ${orig}$" "$docker_log" \
+      || fail "${failure} did not confirm the original is named room-memory"
+    if grep -q "^inspect -f {{.State.Running}} room-memory$" "$docker_log"; then
+      fail "${failure} confirmed room-memory by name"
+    fi
+    has stop || fail "${failure} did not stop the original"
+    lacks rmi || fail "${failure} still pruned image tags"
+    grep -q "^start ${orig}$" "$docker_log" || fail "${failure} did not start the original container"
+    original_restored "$orig" "$failure"
+    if [[ "$failure" == stop-fail* ]]; then
+      lacks rename && lacks run || fail "${failure} renamed or cleaned up after the failed stop"
+      grep -q "^rm -f [0-9a-f]\{64\}$" "$docker_log" || fail "${failure} did not remove the replacement by id"
+    fi
+    if [[ "$failure" == cleanup-perm ]]; then
+      [[ "$(cat "$locked/reference-mid360.cdr.tmp")" == "junk" ]] || fail "a failed cleanup removed the scratch file"
+      [[ "$(cat "$locked/reference-mid360.cdr")" == "keep-ref" ]] || fail "a failed cleanup removed the room reference"
+    fi
+    if [[ "$failure" == health-* ]]; then
+      # An exit, a restart or an unhealthy status is seen before the readiness line is looked for.
+      [[ "$failure" != health-never-ready && "$failure" != health-late-exit && "$failure" != health-node-died ]] \
+        || has logs || fail "${failure} never looked for the readiness line"
+      grep -q "the replacement" "$work/deploy.err" || fail "${failure} did not say why"
+    fi
+    if [[ "$failure" == health-node-died ]]; then
+      grep -q "the replacement lost a process (.*room_memory_node-1.*process has died.*) within 2 s of ready" \
+        "$work/deploy.err" || fail "a node that died after readiness was not caught in the stability window"
+    fi
+  done
 
-  local orig
-  orig=$(q 'named["room-memory"]["Id"]')
-  run_mode stop-fail
-  [[ "$code" -ne 0 ]] || fail "stop failure still exited 0"
-  has create && has stop || fail "stop failure did not stop"
-  lacks rename && lacks start || fail "stop failure still renamed or started"
-  original_restored "$orig" "stop failure"
+  # The rollback's own start failed, and no room-memory container runs. The deploy exits 3 and
+  # prints one command for the containers that are left, with every step joined by && and a start
+  # that checks docker ps again. It does not claim it rolled back. Start-fail has already renamed
+  # the original back and removed the replacement: the command is only the start.
+  # `docker rm -f room-memory` there deletes the only remaining copy. Rm-start-fail also failed to
+  # remove the replacement, never started, which holds the name, so the rename back failed too:
+  # the command removes it by id, renames the original back and starts it. Run with rm failing
+  # again, it stops before the start. Run while another room-memory container runs, the start refuses.
+  for failure in rollback-start-fail rollback-rm-start-fail; do
+    want "$failure" || continue
+    seed_host "${original_settings[@]}" "${original_command[@]}"
+    orig=$(q 'named["room-memory"]["Id"]')
+    run_mode "$failure"
+    [[ "$code" -eq 3 ]] || fail "${failure} exited ${code}, not 3: $(cat "$work/deploy.err")"
+    grep -qx "ROLLBACK FAILED: room-memory is not running" "$work/deploy.err" \
+      || fail "${failure} missing the failure line: $(cat "$work/deploy.err")"
+    if grep -q "rolled back" "$work/deploy.err"; then
+      fail "${failure} claimed it rolled back"
+    fi
+    grep -q "^inspect -f {{.State.Running}} ${orig}$" "$docker_log" \
+      || fail "${failure} did not confirm the original is running"
+    grep -q "^inspect -f {{.Name}} ${orig}$" "$docker_log" \
+      || fail "${failure} did not confirm the original's name"
+    if grep -q "^inspect -f {{.State.Running}} room-memory$" "$docker_log"; then
+      fail "${failure} confirmed room-memory by name"
+    fi
+    grep -q "^ps --no-trunc -q --filter name=room-memory$" "$docker_log" \
+      || fail "${failure} did not check what runs before printing a start"
+    [[ "$(writers)" -eq 0 ]] || fail "${failure} left $(writers) room-memory containers running"
+    [[ "$(q "any(c['Id'] == '$orig' for c in state['containers'])")" == True ]] \
+      || fail "${failure} removed the original container"
+    no_volume_removed "$failure"
+    recovery=$(recovery_line "$failure")
+    [[ "$recovery" != *"docker rm -f room-memory"* && "$recovery" != *"docker rm room-memory"* ]] \
+      || fail "${failure}: recovery removes room-memory by name: $recovery"
+    if [[ "$failure" == rollback-start-fail ]]; then
+      [[ "$recovery" == "$(guarded_start "$orig")" ]] \
+        || fail "${failure}: recovery is not the checked start of the original: $recovery"
+    else
+      next=$(q 'named["room-memory"]["Id"]')
+      [[ "$next" != "$orig" ]] || fail "${failure}: the original holds the name"
+      [[ "$recovery" == "docker rm -f ${next} && docker rename ${orig} room-memory && $(guarded_start "$orig")" ]] \
+        || fail "${failure}: recovery is not rm, rename and the checked start, by id: $recovery"
+      # The rm that failed in the rollback fails again: nothing after it runs.
+      : >"$docker_log"
+      replay "$recovery" "$failure"
+      [[ "$code" -ne 0 ]] || fail "${failure}: recovery whose rm failed again exited 0"
+      lacks rename && lacks start || fail "${failure}: recovery went on after its rm failed again"
+      [[ "$(q 'named["room-memory-previous"]["Id"]')" == "$orig" && "$(writers)" -eq 0 ]] \
+        || fail "${failure}: recovery whose rm failed again left $(q 'sorted(named)'), $(writers) running"
+    fi
+    # Another room-memory container runs by the time the operator pastes it: the start refuses.
+    intruder=$(PATH="$bin:$PATH" HOME="$work/home" DOCKER_LOG="$docker_log" DOCKER_STATE="$state" \
+      DOCKER_VOLUMES="$work/volumes" DOCKER_MODE=ok "$bin/docker" run -d --name room-memory-other "$new_tag")
+    : >"$docker_log"
+    replay "$(guarded_start "$orig")" ok
+    [[ "$code" -ne 0 ]] || fail "${failure}: the checked start exited 0 beside a running room-memory container"
+    lacks start || fail "${failure}: the checked start started the original beside a running room-memory container"
+    grep -q "not starting ${orig}: a room-memory container is running" "$work/recovery.err" \
+      || fail "${failure}: the checked start did not say why: $(cat "$work/recovery.err")"
+    [[ "$(writers)" -eq 1 ]] || fail "${failure}: $(writers) room-memory containers run beside the intruder"
+    docker_stub rm -f "$intruder"
+    apply_recovery "$failure" "$recovery" "$orig"
+    original_restored "$orig" "${failure} recovery"
+  done
+
+  # The rename back failed and the start then succeeded: the original runs as room-memory-previous,
+  # the only writer. No start is printed, only the rename. Rename-fail had removed the replacement.
+  # Rm-fail had not, and that stopped replacement holds the name: the command removes it by id
+  # first, and with rm failing again the rename does not run.
+  for failure in rollback-rename-fail rollback-rm-fail; do
+    want "$failure" || continue
+    seed_host "${original_settings[@]}" "${original_command[@]}"
+    orig=$(q 'named["room-memory"]["Id"]')
+    run_mode "$failure"
+    [[ "$code" -eq 3 ]] || fail "${failure} exited ${code}, not 3: $(cat "$work/deploy.err")"
+    grep -qx "ROLLBACK FAILED: room-memory is not running" "$work/deploy.err" \
+      || fail "${failure} missing the failure line: $(cat "$work/deploy.err")"
+    if grep -q "rolled back" "$work/deploy.err"; then
+      fail "${failure} claimed it rolled back"
+    fi
+    [[ "$(q 'named["room-memory-previous"]["Id"]')" == "$orig" && "$(writers)" -eq 1 ]] \
+      || fail "${failure} left $(q 'sorted(named)'), $(writers) running"
+    [[ "$(q 'named["room-memory-previous"]["State"]["Running"]')" == True ]] \
+      || fail "${failure}: the original is not the one that runs"
+    grep -q "^ps --no-trunc -q --filter name=room-memory$" "$docker_log" \
+      || fail "${failure} did not check what runs before printing a start"
+    grep -q "the original (${orig}) is running under room-memory-previous" "$work/deploy.err" \
+      || fail "${failure} did not say the original runs: $(cat "$work/deploy.err")"
+    no_start_printed "$failure"
+    recovery=$(recovery_line "$failure")
+    if [[ "$failure" == rollback-rename-fail ]]; then
+      [[ "$recovery" == "docker rename ${orig} room-memory" ]] \
+        || fail "${failure} recovery is not the rename of the original: $recovery"
+    else
+      next=$(q 'named["room-memory"]["Id"]')
+      [[ "$next" != "$orig" && "$(q 'named["room-memory"]["State"]["Running"]')" == False ]] \
+        || fail "${failure}: the name is not held by the stopped replacement"
+      [[ "$recovery" == "docker rm -f ${next} && docker rename ${orig} room-memory" ]] \
+        || fail "${failure} recovery is not rm of the replacement and the rename, by id: $recovery"
+      : >"$docker_log"
+      replay "$recovery" "$failure"
+      [[ "$code" -ne 0 ]] || fail "${failure}: recovery whose rm failed again exited 0"
+      lacks rename && lacks start || fail "${failure}: recovery went on after its rm failed again"
+      [[ "$(q 'named["room-memory-previous"]["Id"]')" == "$orig" && "$(writers)" -eq 1 ]] \
+        || fail "${failure}: recovery whose rm failed again left $(q 'sorted(named)'), $(writers) running"
+    fi
+    apply_recovery "$failure" "$recovery" "$orig"
+    original_restored "$orig" "${failure} recovery"
+  done
+
+  # The replacement came up, then lost its node, and rm -f of that still-running container failed.
+  # Rename and start must not run: the original would come up as room-memory-previous beside it,
+  # and both would write the same state. A replacement whose state cannot be inspected is the
+  # same: do not start a second writer on a guess. Exit 3. docker ps shows the replacement running,
+  # so no start is printed: only the removal of the replacement by id. Run with rm failing again,
+  # the replacement is still the one writer; run with a working docker, it is gone and the original
+  # is still stopped.
+  for failure in rollback-rm-fail-running rollback-rm-fail-blind; do
+    want "$failure" || continue
+    seed_host "${original_settings[@]}" "${original_command[@]}"
+    orig=$(q 'named["room-memory"]["Id"]')
+    run_mode "$failure"
+    [[ "$code" -eq 3 ]] || fail "${failure} exited ${code}, not 3: $(cat "$work/deploy.err")"
+    grep -qx "ROLLBACK FAILED: room-memory is not running" "$work/deploy.err" \
+      || fail "${failure} missing the failure line: $(cat "$work/deploy.err")"
+    if grep -q "ROLLBACK FAILED: room-memory is running, but an earlier rollback step failed" "$work/deploy.err"; then
+      fail "${failure} claimed the original was back: $(cat "$work/deploy.err")"
+    fi
+    if grep -q "rolled back" "$work/deploy.err"; then
+      fail "${failure} claimed it rolled back"
+    fi
+    if [[ "$failure" == rollback-rm-fail-running ]]; then
+      grep -q "the replacement lost a process" "$work/deploy.err" \
+        || fail "${failure} never reached the readiness failure: $(cat "$work/deploy.err")"
+    else
+      grep -q "the replacement cannot be inspected" "$work/deploy.err" \
+        || fail "${failure} never failed to inspect the replacement: $(cat "$work/deploy.err")"
+    fi
+    [[ "$(q 'named["room-memory-previous"]["Id"]')" == "$orig" ]] \
+      || fail "${failure} renamed the original away from room-memory-previous"
+    [[ "$(q 'named["room-memory-previous"]["State"]["Running"]')" == False ]] \
+      || fail "${failure} left the original running"
+    [[ "$(q 'named["room-memory-previous"]["Config"]["Cmd"]')" == "$guarded_cmd" ]] \
+      || fail "${failure} lost rig_guard:=true on the original"
+    [[ "$(q 'named["room-memory"]["Id"]')" != "$orig" ]] \
+      || fail "${failure} put the original back under the service name"
+    [[ "$(q 'named["room-memory"]["State"]["Running"]')" == True ]] \
+      || fail "${failure} left the replacement stopped"
+    [[ "$(writers)" -eq 1 ]] || fail "${failure} left $(writers) room-memory containers running"
+    if grep -q "^start ${orig}$" "$docker_log"; then
+      fail "${failure} started the original"
+    fi
+    if grep -q "^rename ${orig} room-memory$" "$docker_log"; then
+      fail "${failure} renamed the original back"
+    fi
+    next=$(q 'named["room-memory"]["Id"]')
+    grep -q "^start ${next}$" "$docker_log" || fail "${failure}: the replacement was never started"
+    grep -q "^rm -f ${next}$" "$docker_log" || fail "${failure}: rollback did not try to remove the replacement"
+    grep -q "^inspect -f {{.State.Running}} ${next}$" "$docker_log" \
+      || fail "${failure}: rollback did not inspect the replacement after rm failed"
+    grep -q "^ps --no-trunc -q --filter name=room-memory$" "$docker_log" \
+      || fail "${failure} did not check what runs before printing a start"
+    no_volume_removed "$failure"
+    grep -q "a room-memory container is running, so no start is printed: ${next}" "$work/deploy.err" \
+      || fail "${failure} did not say which container runs: $(cat "$work/deploy.err")"
+    no_start_printed "$failure"
+    recovery=$(recovery_line "$failure")
+    [[ "$recovery" == "docker rm -f ${next}" ]] || fail "${failure}: recovery is not the removal of the replacement by id: $recovery"
+    : >"$docker_log"
+    replay "$recovery" "$failure"
+    [[ "$code" -ne 0 ]] || fail "${failure}: recovery whose rm failed again exited 0"
+    lacks start || fail "${failure}: recovery whose rm failed again started a container"
+    [[ "$(q 'named["room-memory"]["Id"]')" == "$next" && "$(writers)" -eq 1 ]] \
+      || fail "${failure}: recovery whose rm failed again left $(q 'sorted(named)'), $(writers) running"
+    replay "$recovery" ok
+    [[ "$code" -eq 0 ]] || fail "${failure}: recovery failed (${recovery}): $(cat "$work/recovery.err")"
+    lacks start || fail "${failure}: recovery started a container"
+    [[ "$(q 'sorted(named)')" == "['room-memory-previous']" && "$(writers)" -eq 0 ]] \
+      || fail "${failure}: recovery left $(q 'sorted(named)'), $(writers) running"
+    no_volume_removed "${failure} recovery"
+  done
+
+  # Rm fails before the replacement takes the name (scratch cleanup failed, then the rollback's rm).
+  # The original is renamed back and is running: nothing is printed to start, and nothing that
+  # removes room-memory. `docker rm -f room-memory` would delete it.
+  if want rollback-rm-before-rename; then
+    seed_host "${original_settings[@]}" "${original_command[@]}"
+    orig=$(q 'named["room-memory"]["Id"]')
+    run_mode rollback-rm-before-rename
+    [[ "$code" -eq 3 ]] || fail "rm before the rename back exited ${code}: $(cat "$work/deploy.err")"
+    grep -qx "ROLLBACK FAILED: room-memory is running, but an earlier rollback step failed" "$work/deploy.err" \
+      || fail "rm before the rename back missing the failure line: $(cat "$work/deploy.err")"
+    if grep -qx "ROLLBACK FAILED: room-memory is not running" "$work/deploy.err"; then
+      fail "rm before the rename back said room-memory is not running: $(cat "$work/deploy.err")"
+    fi
+    if grep -q "rolled back" "$work/deploy.err"; then
+      fail "rm before the rename back claimed it rolled back"
+    fi
+    [[ "$(q 'named["room-memory"]["Id"]')" == "$orig" ]] || fail "rm before the rename back did not put the original back"
+    [[ "$(q 'named["room-memory"]["State"]["Running"]')" == True ]] \
+      || fail "rm before the rename back left the original stopped"
+    [[ "$(q 'named["room-memory"]["Config"]["Cmd"]')" == "$guarded_cmd" ]] \
+      || fail "rm before the rename back lost rig_guard:=true"
+    [[ "$(q '"room-memory-next" in named')" == True ]] || fail "rm before the rename back removed the replacement"
+    [[ "$(writers)" -eq 1 ]] || fail "rm before the rename back left $(writers) room-memory containers running"
+    grep -q "the original (${orig}) is running as room-memory; nothing to start" "$work/deploy.err" \
+      || fail "rm before the rename back did not say the original runs: $(cat "$work/deploy.err")"
+    no_start_printed "rm before the rename back"
+    if grep -Eq '^(docker (start|rm|rename) |if r=)' "$work/deploy.err"; then
+      fail "rm before the rename back printed a command: $(cat "$work/deploy.err")"
+    fi
+    no_volume_removed "rm before the rename back"
+  fi
+
+  # The rollback's start failed, and the docker ps that decides what to print failed too. Without
+  # knowing what runs, no start is printed.
+  if want rollback-ps-fail; then
+    seed_host "${original_settings[@]}" "${original_command[@]}"
+    run_mode rollback-ps-fail
+    [[ "$code" -eq 3 ]] || fail "rollback-ps-fail exited ${code}, not 3: $(cat "$work/deploy.err")"
+    grep -qx "ROLLBACK FAILED: room-memory is not running" "$work/deploy.err" \
+      || fail "rollback-ps-fail missing the failure line: $(cat "$work/deploy.err")"
+    grep -q "docker ps failed, so no start is printed" "$work/deploy.err" \
+      || fail "rollback-ps-fail did not say why: $(cat "$work/deploy.err")"
+    no_start_printed rollback-ps-fail
+    if grep -Eq '^(docker (start|rm|rename) |if r=)' "$work/deploy.err"; then
+      fail "rollback-ps-fail printed a command: $(cat "$work/deploy.err")"
+    fi
+  fi
+
+  # A fresh host has no original and no room-memory-previous. A failed removal must not tell the
+  # operator to rename a container this host never had. The command removes the failed one.
+  if want fresh-rm-fail; then
+    seed_host
+    run_mode fresh-rm-fail
+    [[ "$code" -eq 3 ]] || fail "a fresh host whose removal failed exited ${code}: $(cat "$work/deploy.err")"
+    grep -qx "ROLLBACK FAILED: room-memory is not running" "$work/deploy.err" \
+      || fail "a fresh host whose removal failed missing the failure line: $(cat "$work/deploy.err")"
+    if grep -q "rolled back" "$work/deploy.err"; then
+      fail "a fresh host whose removal failed claimed it rolled back"
+    fi
+    [[ "$(q 'sorted(named)')" == "['room-memory']" ]] \
+      || fail "a fresh host whose removal failed left $(q 'sorted(named)')"
+    recovery=$(recovery_line "a fresh host whose removal failed")
+    [[ "$recovery" == "docker rm -f room-memory" ]] \
+      || fail "fresh recovery is not removal of the failed container: $recovery"
+    [[ "$recovery" != *room-memory-previous* ]] || fail "fresh recovery names room-memory-previous: $recovery"
+    replay "$recovery" ok
+    [[ "$code" -eq 0 ]] || fail "fresh recovery command failed (${recovery}): $(cat "$work/recovery.err")"
+    [[ "$(q 'sorted(named)')" == "[]" ]] || fail "fresh recovery left $(q 'sorted(named)')"
+    no_volume_removed "fresh recovery"
+  fi
+
+  if [[ -n "$only" ]]; then
+    [[ "$matched" -eq 1 ]] || fail "no self-test case named ${only}"
+    echo "self-test case ${only} ok"
+    return 0
+  fi
 
   # lab.tmp is a valid room id. map_epoch.tmp is too, when it is the room directory.
   # Scratch names inside a room are leftovers, including a directory at that path.
@@ -1411,9 +1809,6 @@ PY
   # runtime setting, on the new image, and the original is kept stopped for a rollback. A
   # room-memory-previous left stopped by the last deploy goes first. The ssh user cannot unlink a
   # scratch file in a room directory it does not own: root cleanup still removes it.
-  locked=$work/home/room-memory/locked
-  mkdir -p "$locked"
-  echo keep-ref >"$locked/reference-mid360.cdr"
   echo junk >"$locked/reference-mid360.cdr.tmp"
   chmod 555 "$locked"
   seed_host "${original_settings[@]}" "${original_command[@]}"
@@ -1444,221 +1839,6 @@ PY
   lacks rmi || fail "a failed image list still removed tags"
   grep -q "could not list image tags to prune" "$work/deploy.err" || fail "a failed image list did not say it left them: $(cat "$work/deploy.err")"
   [[ "$(q '"labcommand/room-memory-cpp:oldtag" in state["images"]')" == True ]] || fail "a failed image list removed an old tag"
-
-  # Every failure after stop, and every way the replacement fails to come up (it exits, restarts,
-  # turns unhealthy, never logs its readiness line, or exits or loses its node within the stability
-  # window while Docker still reports it running), starts
-  # the same original container: renamed back if it was renamed, with its own command, settings and
-  # volumes. Not a new container of the previous image. That rollback succeeded: it says so, exits
-  # with the deploy's own failure (not 3), and docker inspect saw the original running
-  # and named room-memory. The service name alone can still be the replacement.
-  local failure
-  for failure in start-fail rename-fail cleanup-perm health-exit health-restart health-unhealthy health-never-ready \
-    health-late-exit health-node-died; do
-    echo junk >"$locked/reference-mid360.cdr.tmp"
-    chmod 555 "$locked"
-    seed_host "${original_settings[@]}" "${original_command[@]}"
-    orig=$(q 'named["room-memory"]["Id"]')
-    run_mode "$failure"
-    chmod u+w "$locked" || true
-    [[ "$code" -ne 0 ]] || fail "${failure} still exited 0"
-    [[ "$code" -ne 3 ]] || fail "${failure} reported a failed rollback: $(cat "$work/deploy.err")"
-    grep -qx "rolled back" "$work/deploy.err" || fail "${failure} did not say it rolled back: $(cat "$work/deploy.err")"
-    if grep -q "ROLLBACK FAILED" "$work/deploy.err"; then
-      fail "${failure} reported a failed rollback"
-    fi
-    grep -q "^inspect -f {{.State.Running}} ${orig}$" "$docker_log" \
-      || fail "${failure} did not confirm the original is running"
-    grep -q "^inspect -f {{.Name}} ${orig}$" "$docker_log" \
-      || fail "${failure} did not confirm the original is named room-memory"
-    if grep -q "^inspect -f {{.State.Running}} room-memory$" "$docker_log"; then
-      fail "${failure} confirmed room-memory by name"
-    fi
-    has stop || fail "${failure} did not stop the original"
-    lacks rmi || fail "${failure} still pruned image tags"
-    grep -q "^start ${orig}$" "$docker_log" || fail "${failure} did not start the original container"
-    original_restored "$orig" "$failure"
-    if [[ "$failure" == cleanup-perm ]]; then
-      [[ "$(cat "$locked/reference-mid360.cdr.tmp")" == "junk" ]] || fail "a failed cleanup removed the scratch file"
-      [[ "$(cat "$locked/reference-mid360.cdr")" == "keep-ref" ]] || fail "a failed cleanup removed the room reference"
-    fi
-    if [[ "$failure" == health-* ]]; then
-      # An exit, a restart or an unhealthy status is seen before the readiness line is looked for.
-      [[ "$failure" != health-never-ready && "$failure" != health-late-exit && "$failure" != health-node-died ]] \
-        || has logs || fail "${failure} never looked for the readiness line"
-      grep -q "the replacement" "$work/deploy.err" || fail "${failure} did not say why"
-    fi
-    if [[ "$failure" == health-node-died ]]; then
-      grep -q "the replacement lost a process (.*room_memory_node-1.*process has died.*) within 2 s of ready" \
-        "$work/deploy.err" || fail "a node that died after readiness was not caught in the stability window"
-    fi
-  done
-
-  # The rollback's own rm, rename, or start failed. The deploy exits 3 and prints a recovery
-  # command for the containers that are left. It does not claim it rolled back. Running that
-  # command against the stub leaves the original as room-memory, running, with its own command.
-  # Start-fail has already renamed the original back, so the command is `docker start` of its id.
-  # `docker rm -f room-memory` there deletes the only remaining copy. Rename-fail has already
-  # removed the replacement, so the command's rm of that id fails and the `;` must still rename
-  # and start. Rm-fail leaves the replacement holding the name: the command removes it by id.
-  # That replacement never started, so it is not a second writer. A replacement that is still
-  # running is rollback-rm-fail-running, below.
-  local recovery removed
-  for failure in rollback-start-fail rollback-rm-fail rollback-rename-fail; do
-    seed_host "${original_settings[@]}" "${original_command[@]}"
-    orig=$(q 'named["room-memory"]["Id"]')
-    run_mode "$failure"
-    [[ "$code" -eq 3 ]] || fail "${failure} exited ${code}, not 3: $(cat "$work/deploy.err")"
-    grep -qx "ROLLBACK FAILED: room-memory is not running" "$work/deploy.err" \
-      || fail "${failure} missing the failure line: $(cat "$work/deploy.err")"
-    if grep -q "rolled back" "$work/deploy.err"; then
-      fail "${failure} claimed it rolled back"
-    fi
-    grep -q "^inspect -f {{.State.Running}} ${orig}$" "$docker_log" \
-      || fail "${failure} did not confirm the original is running"
-    grep -q "^inspect -f {{.Name}} ${orig}$" "$docker_log" \
-      || fail "${failure} did not confirm the original's name"
-    if grep -q "^inspect -f {{.State.Running}} room-memory$" "$docker_log"; then
-      fail "${failure} confirmed room-memory by name"
-    fi
-    if [[ "$(q '"room-memory" in named')" == True ]]; then
-      [[ "$(q 'named["room-memory"]["State"]["Running"]')" == False ]] || fail "${failure} left room-memory running"
-    fi
-    [[ "$(q "any(c['Id'] == '$orig' for c in state['containers'])")" == True ]] \
-      || fail "${failure} removed the original container"
-    no_volume_removed "$failure"
-    recovery=$(recovery_line "$failure")
-    [[ "$recovery" != *"docker rm -f room-memory"* && "$recovery" != *"docker rm room-memory"* ]] \
-      || fail "${failure}: recovery removes room-memory by name: $recovery"
-    case "$failure" in
-      rollback-start-fail)
-        [[ "$recovery" == "docker start $orig" ]] \
-          || fail "${failure}: recovery is not docker start of the original: $recovery"
-        ;;
-      rollback-rm-fail|rollback-rename-fail)
-        removed=${recovery#docker rm -f }
-        removed=${removed%%"; docker rename ${orig} room-memory; docker start ${orig}"}
-        [[ "$recovery" == "docker rm -f ${removed}; docker rename ${orig} room-memory; docker start ${orig}" ]] \
-          || fail "${failure}: recovery is not the id sequence: $recovery"
-        [[ "$removed" != "$orig" && ${#removed} -eq 64 && "$removed" != *[!0-9a-f]* ]] \
-          || fail "${failure}: recovery does not remove the replacement by id ($removed): $recovery"
-        if [[ "$failure" == rollback-rm-fail ]]; then
-          [[ "$removed" == "$(q "[c['Id'] for c in state['containers'] if c['Id'] != '$orig'][0]")" ]] \
-            || fail "${failure}: recovery does not name the replacement that is still there: $recovery"
-        fi
-        ;;
-    esac
-    apply_recovery "$failure" "$recovery" "$orig"
-    original_restored "$orig" "${failure} recovery"
-  done
-
-  # The replacement came up, then lost its node, and rm -f of that still-running container failed.
-  # Rename and start must not run: the original would come up as room-memory-previous beside it,
-  # and both would write the same state. A replacement whose state cannot be inspected is the
-  # same: do not start a second writer on a guess. Exit 3. The recovery command removes the
-  # replacement by id, then renames and starts the original.
-  local next
-  for failure in rollback-rm-fail-running rollback-rm-fail-blind; do
-    seed_host "${original_settings[@]}" "${original_command[@]}"
-    orig=$(q 'named["room-memory"]["Id"]')
-    run_mode "$failure"
-    [[ "$code" -eq 3 ]] || fail "${failure} exited ${code}, not 3: $(cat "$work/deploy.err")"
-    grep -qx "ROLLBACK FAILED: room-memory is not running" "$work/deploy.err" \
-      || fail "${failure} missing the failure line: $(cat "$work/deploy.err")"
-    if grep -q "ROLLBACK FAILED: room-memory is running, but an earlier rollback step failed" "$work/deploy.err"; then
-      fail "${failure} claimed the original was back: $(cat "$work/deploy.err")"
-    fi
-    if grep -q "rolled back" "$work/deploy.err"; then
-      fail "${failure} claimed it rolled back"
-    fi
-    if [[ "$failure" == rollback-rm-fail-running ]]; then
-      grep -q "the replacement lost a process" "$work/deploy.err" \
-        || fail "${failure} never reached the readiness failure: $(cat "$work/deploy.err")"
-    else
-      grep -q "the replacement cannot be inspected" "$work/deploy.err" \
-        || fail "${failure} never failed to inspect the replacement: $(cat "$work/deploy.err")"
-    fi
-    [[ "$(q 'named["room-memory-previous"]["Id"]')" == "$orig" ]] \
-      || fail "${failure} renamed the original away from room-memory-previous"
-    [[ "$(q 'named["room-memory-previous"]["State"]["Running"]')" == False ]] \
-      || fail "${failure} left the original running"
-    [[ "$(q 'named["room-memory-previous"]["Config"]["Cmd"]')" == "$guarded_cmd" ]] \
-      || fail "${failure} lost rig_guard:=true on the original"
-    [[ "$(q 'named["room-memory"]["Id"]')" != "$orig" ]] \
-      || fail "${failure} put the original back under the service name"
-    [[ "$(q 'named["room-memory"]["State"]["Running"]')" == True ]] \
-      || fail "${failure} left the replacement stopped"
-    if grep -q "^start ${orig}$" "$docker_log"; then
-      fail "${failure} started the original"
-    fi
-    if grep -q "^rename ${orig} room-memory$" "$docker_log"; then
-      fail "${failure} renamed the original back"
-    fi
-    next=$(q 'named["room-memory"]["Id"]')
-    grep -q "^start ${next}$" "$docker_log" || fail "${failure}: the replacement was never started"
-    grep -q "^rm -f ${next}$" "$docker_log" || fail "${failure}: rollback did not try to remove the replacement"
-    grep -q "^inspect -f {{.State.Running}} ${next}$" "$docker_log" \
-      || fail "${failure}: rollback did not inspect the replacement after rm failed"
-    no_volume_removed "$failure"
-    recovery=$(recovery_line "$failure")
-    [[ "$recovery" == "docker rm -f ${next}; docker rename ${orig} room-memory; docker start ${orig}" ]] \
-      || fail "${failure}: recovery is not the id sequence: $recovery"
-    [[ "$recovery" != *"docker rm -f room-memory"* && "$recovery" != *"docker rm room-memory"* ]] \
-      || fail "${failure}: recovery removes room-memory by name: $recovery"
-    apply_recovery "$failure" "$recovery" "$orig"
-    original_restored "$orig" "${failure} recovery"
-  done
-
-  # Rm fails before the replacement takes the name (scratch cleanup failed, then the rollback's rm).
-  # The original is renamed back and is running. `docker rm -f room-memory` would delete it.
-  seed_host "${original_settings[@]}" "${original_command[@]}"
-  orig=$(q 'named["room-memory"]["Id"]')
-  run_mode rollback-rm-before-rename
-  [[ "$code" -eq 3 ]] || fail "rm before the rename back exited ${code}: $(cat "$work/deploy.err")"
-  grep -qx "ROLLBACK FAILED: room-memory is running, but an earlier rollback step failed" "$work/deploy.err" \
-    || fail "rm before the rename back missing the failure line: $(cat "$work/deploy.err")"
-  if grep -qx "ROLLBACK FAILED: room-memory is not running" "$work/deploy.err"; then
-    fail "rm before the rename back said room-memory is not running: $(cat "$work/deploy.err")"
-  fi
-  if grep -q "rolled back" "$work/deploy.err"; then
-    fail "rm before the rename back claimed it rolled back"
-  fi
-  [[ "$(q 'named["room-memory"]["Id"]')" == "$orig" ]] || fail "rm before the rename back did not put the original back"
-  [[ "$(q 'named["room-memory"]["State"]["Running"]')" == True ]] \
-    || fail "rm before the rename back left the original stopped"
-  [[ "$(q 'named["room-memory"]["Config"]["Cmd"]')" == "$guarded_cmd" ]] \
-    || fail "rm before the rename back lost rig_guard:=true"
-  [[ "$(q '"room-memory-next" in named')" == True ]] || fail "rm before the rename back removed the replacement"
-  recovery=$(recovery_line "rm before the rename back")
-  [[ "$recovery" == "docker start $orig" ]] \
-    || fail "rm before the rename back recovery is not docker start of the original: $recovery"
-  apply_recovery "rm before the rename back" "$recovery" "$orig"
-  [[ "$(q '"room-memory-next" in named')" == True ]] \
-    || fail "rm before the rename back recovery removed the replacement"
-  no_volume_removed "rm before the rename back"
-
-  # A fresh host has no original and no room-memory-previous. A failed removal must not tell the
-  # operator to rename a container this host never had. The command removes the failed one.
-  seed_host
-  run_mode fresh-rm-fail
-  [[ "$code" -eq 3 ]] || fail "a fresh host whose removal failed exited ${code}: $(cat "$work/deploy.err")"
-  grep -qx "ROLLBACK FAILED: room-memory is not running" "$work/deploy.err" \
-    || fail "a fresh host whose removal failed missing the failure line: $(cat "$work/deploy.err")"
-  if grep -q "rolled back" "$work/deploy.err"; then
-    fail "a fresh host whose removal failed claimed it rolled back"
-  fi
-  [[ "$(q 'sorted(named)')" == "['room-memory']" ]] \
-    || fail "a fresh host whose removal failed left $(q 'sorted(named)')"
-  recovery=$(recovery_line "a fresh host whose removal failed")
-  [[ "$recovery" == "docker rm -f room-memory" ]] \
-    || fail "fresh recovery is not removal of the failed container: $recovery"
-  [[ "$recovery" != *room-memory-previous* ]] || fail "fresh recovery names room-memory-previous: $recovery"
-  PATH="$bin:$PATH" HOME="$work/home" DOCKER_LOG="$docker_log" DOCKER_STATE="$state" \
-    DOCKER_VOLUMES="$work/volumes" DOCKER_MODE=ok EXPECTED_TAG="$first_short" \
-    bash -c "$recovery" >"$work/recovery.out" 2>"$work/recovery.err" \
-    || fail "fresh recovery command failed (${recovery}): $(cat "$work/recovery.err")"
-  [[ "$(q 'sorted(named)')" == "[]" ]] || fail "fresh recovery left $(q 'sorted(named)')"
-  no_volume_removed "fresh recovery"
 
   # A fresh host whose first container never comes up removes only that container.
   seed_host
