@@ -1,6 +1,11 @@
 """scripts/spark/deploy-room-memory.sh --self-test. Docker and ssh are stubs on PATH and the host is
 a .invalid name: nothing leaves this machine. It deploys a room-memory that runs with
-rig_guard:=true and checks that the replacement and every rollback keep that argument."""
+rig_guard:=true and checks that the replacement and every rollback keep that argument.
+
+A rollback whose rm, rename, or start fails exits 3 and prints
+'ROLLBACK FAILED: room-memory is not running' plus the manual recovery command. A rollback that
+brings the original back prints 'rolled back'. A deploy that is already up, whose `docker images`
+then fails while pruning, still exits 0."""
 
 import pathlib
 import shutil

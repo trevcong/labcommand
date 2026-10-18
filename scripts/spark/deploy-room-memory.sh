@@ -16,7 +16,10 @@
 # readiness line and a stability window: a failed rename, scratch cleanup or start,
 # an exit, a restart, an unhealthy status, a launched process that ends while the
 # container runs, no readiness in time, or a failure in the window removes the
-# replacement and starts that same container again. Scratch files
+# replacement and starts that same container again. If that rollback's rm, rename,
+# or start fails, or room-memory is not running afterwards, the script exits 3 and
+# prints the manual recovery command. A deploy that already came up still exits 0
+# when listing image tags to prune fails. Scratch files
 # are removed as root on the original's own mounts: the container creates root-owned
 # room directories, and an ssh user cannot unlink what it left there.
 # OpenSSH joins its command arguments and the remote login shell parses that
@@ -349,6 +352,9 @@ discard_next() {
 }
 # After stop: a failure removes the replacement and starts the original container, under its
 # own name, with its own command, settings and volumes. A fresh host had none: only the failed one goes.
+# rm, rename, and start each have to succeed, and room-memory has to be running afterwards.
+# Any failure leaves the operator the manual recovery command and exits 3. The original failure
+# status is kept only when the rollback itself worked.
 rollback_service() {
   local status=${1:-$?}
   if [ "$status" -eq 0 ]; then
@@ -356,18 +362,29 @@ rollback_service() {
   fi
   trap - ERR
   set +e
+  local failed=0 running=""
   if [ -n "$orig_id" ]; then
     if [ -n "$next_id" ]; then
-      docker rm -f "$next_id"
+      docker rm -f "$next_id" || failed=1
     fi
     if [ "$renamed" -eq 1 ]; then
-      docker rename "$orig_id" room-memory
+      docker rename "$orig_id" room-memory || failed=1
     fi
     sleep "$BACKOFF"
-    docker start "$orig_id"
+    docker start "$orig_id" || failed=1
+    running=$(docker inspect -f '{{.State.Running}}' room-memory) || failed=1
+    if [ "$running" != "true" ]; then
+      failed=1
+    fi
   else
-    docker rm -f room-memory
+    docker rm -f room-memory || failed=1
   fi
+  if [ "$failed" -ne 0 ]; then
+    echo "ROLLBACK FAILED: room-memory is not running" >&2
+    echo "docker rm -f room-memory && docker rename room-memory-previous room-memory && docker start room-memory" >&2
+    exit 3
+  fi
+  echo "rolled back" >&2
   exit "$status"
 }
 # Empty while the container is up: running, never restarted, not unhealthy. Else why not.
@@ -524,12 +541,17 @@ trap - ERR
 # room-memory-previous stays, stopped, for a manual rollback:
 #   docker rm -f room-memory && docker rename room-memory-previous room-memory && docker start room-memory
 # The next deploy removes it. Drop other tags of this image only, not the one it runs; leave
-# every other image on the host.
-docker images "labcommand/room-memory-cpp" --format '{{.Repository}}:{{.Tag}}' | while IFS= read -r tag; do
+# every other image on the host. Listing those tags is best-effort: room-memory is already the
+# new container, so a failed `docker images` must not fail the deploy.
+image_tags=$(docker images "labcommand/room-memory-cpp" --format '{{.Repository}}:{{.Tag}}') \
+  || echo "room-memory deploy: could not list image tags to prune; leaving them" >&2
+while IFS= read -r tag; do
   if [ -n "$tag" ] && [ "$tag" != "$image" ] && [ "$tag" != "$previous_tag" ]; then
     docker rmi "$tag" || true
   fi
-done
+done <<ENDTAGS
+$image_tags
+ENDTAGS
 END
 )
   template=${template//__SHORT__/$short}
@@ -601,6 +623,13 @@ self_test() {
   [[ "$after_stop" == *'trap rollback_service ERR'* ]] || fail "rollback is not armed after stop"
   [[ "$after_stop" == *'docker rename "$orig_id" room-memory-previous'* ]] || fail "the original is not kept for rollback"
   [[ "$after_stop" == *'find /root/room-memory'* && "$after_stop" == *'rollback_service 1'* ]] || fail "a failure after stop is outside the rollback"
+  [[ "$sample" == *'docker rm -f "$next_id" || failed=1'* ]] || fail "rollback ignores a failed rm"
+  [[ "$sample" == *'docker rename "$orig_id" room-memory || failed=1'* ]] || fail "rollback ignores a failed rename"
+  [[ "$sample" == *'docker start "$orig_id" || failed=1'* ]] || fail "rollback ignores a failed start"
+  [[ "$sample" == *"docker inspect -f '{{.State.Running}}' room-memory"* ]] || fail "rollback does not confirm room-memory is running"
+  [[ "$sample" == *'ROLLBACK FAILED: room-memory is not running'* ]] || fail "a failed rollback does not say room-memory is not running"
+  [[ "$sample" == *'echo "rolled back"'* ]] || fail "a successful rollback does not say so"
+  [[ "$sample" == *'could not list image tags to prune'* ]] || fail "a failed image list can fail the deploy"
   local after_start=${after_stop#*'docker start "$next_id"'}
   [[ "$after_start" == *'wait_ready "$next_id"'* && "$after_start" == *"trap - ERR"* ]] || fail "the rollback is disarmed before readiness"
   [[ "${after_start%%trap - ERR*}" == *'rollback_service 1'* ]] || fail "readiness is outside the rollback"
@@ -1052,7 +1081,12 @@ elif command == "run":
     print(c["Id"])
 elif command == "start":
     c = container(rest[0])
+    if mode == "rollback-start-fail":
+        die("start failed")
     if mode == "start-fail" and new_image(c):
+        die("start failed")
+    # The replacement has to fail so rollback runs; the original's start must still succeed.
+    if mode in ("rollback-rm-fail", "rollback-rename-fail") and new_image(c):
         die("start failed")
     come_up(c)
     save()
@@ -1067,6 +1101,9 @@ elif command == "rename":
     c, new = container(rest[0]), rest[1]
     if mode == "rename-fail" and new == "room-memory-previous":
         die("rename failed")
+    # The forward rename is the new image taking the name. Rollback renames the original back.
+    if mode == "rollback-rename-fail" and new == "room-memory" and not new_image(c):
+        die("rename failed")
     if any(x["Name"] == "/" + new for x in state["containers"]):
         die("name in use: " + new)
     c["Name"] = "/" + new
@@ -1074,12 +1111,16 @@ elif command == "rename":
 elif command == "rm":
     if any(flag.startswith("-") and "v" in flag for flag in rest[:-1]):
         die("this deploy never removes a container's volumes", 3)
+    if mode == "rollback-rm-fail" and rest and rest[0] == "-f":
+        die("rm failed")
     c = container(rest[-1])
     if c["State"]["Running"] and rest[0] != "-f":
         die("container is running")
     state["containers"].remove(c)
     save()
 elif command == "images":
+    if mode == "images-fail":
+        die("images failed")
     for tag in sorted(state["images"]):
         print(tag)
 elif command == "rmi":
@@ -1306,11 +1347,23 @@ PY
   [[ ! -e "$locked/reference-mid360.cdr.tmp" ]] || fail "root cleanup left a scratch file the ssh user could not remove"
   [[ "$(cat "$locked/reference-mid360.cdr")" == "keep-ref" ]] || fail "root cleanup removed the room reference"
 
+  # The new container is up. `docker images` then fails. Pruning is best-effort: the deploy exits 0
+  # and leaves the old tags in place.
+  seed_host "${original_settings[@]}" "${original_command[@]}"
+  orig=$(q 'named["room-memory"]["Id"]')
+  run_mode images-fail
+  replaced "$orig" "a deploy whose image list failed"
+  has images || fail "a failed image list never listed images"
+  lacks rmi || fail "a failed image list still removed tags"
+  grep -q "could not list image tags to prune" "$work/deploy.err" || fail "a failed image list did not say it left them: $(cat "$work/deploy.err")"
+  [[ "$(q '"labcommand/room-memory-cpp:oldtag" in state["images"]')" == True ]] || fail "a failed image list removed an old tag"
+
   # Every failure after stop, and every way the replacement fails to come up (it exits, restarts,
   # turns unhealthy, never logs its readiness line, or exits or loses its node within the stability
   # window while Docker still reports it running), starts
   # the same original container: renamed back if it was renamed, with its own command, settings and
-  # volumes. Not a new container of the previous image.
+  # volumes. Not a new container of the previous image. That rollback succeeded: it says so, exits
+  # with the deploy's own failure (not 3), and docker inspect saw room-memory running.
   local failure
   for failure in start-fail rename-fail cleanup-perm health-exit health-restart health-unhealthy health-never-ready \
     health-late-exit health-node-died; do
@@ -1321,6 +1374,13 @@ PY
     run_mode "$failure"
     chmod u+w "$locked" || true
     [[ "$code" -ne 0 ]] || fail "${failure} still exited 0"
+    [[ "$code" -ne 3 ]] || fail "${failure} reported a failed rollback: $(cat "$work/deploy.err")"
+    grep -qx "rolled back" "$work/deploy.err" || fail "${failure} did not say it rolled back: $(cat "$work/deploy.err")"
+    if grep -q "ROLLBACK FAILED" "$work/deploy.err"; then
+      fail "${failure} reported a failed rollback"
+    fi
+    grep -q "^inspect -f {{.State.Running}} room-memory$" "$docker_log" \
+      || fail "${failure} did not confirm room-memory is running"
     has stop || fail "${failure} did not stop the original"
     lacks rmi || fail "${failure} still pruned image tags"
     grep -q "^start ${orig}$" "$docker_log" || fail "${failure} did not start the original container"
@@ -1339,6 +1399,30 @@ PY
       grep -q "the replacement lost a process (.*room_memory_node-1.*process has died.*) within 2 s of ready" \
         "$work/deploy.err" || fail "a node that died after readiness was not caught in the stability window"
     fi
+  done
+
+  # The rollback's own rm, rename, or start failed. The deploy exits 3, says room-memory is not
+  # running, and prints the manual recovery command. It does not claim it rolled back.
+  local recovery="docker rm -f room-memory && docker rename room-memory-previous room-memory && docker start room-memory"
+  for failure in rollback-start-fail rollback-rm-fail rollback-rename-fail; do
+    seed_host "${original_settings[@]}" "${original_command[@]}"
+    orig=$(q 'named["room-memory"]["Id"]')
+    run_mode "$failure"
+    [[ "$code" -eq 3 ]] || fail "${failure} exited ${code}, not 3: $(cat "$work/deploy.err")"
+    grep -qx "ROLLBACK FAILED: room-memory is not running" "$work/deploy.err" \
+      || fail "${failure} missing the failure line: $(cat "$work/deploy.err")"
+    grep -qx "$recovery" "$work/deploy.err" || fail "${failure} missing the manual recovery command: $(cat "$work/deploy.err")"
+    if grep -q "rolled back" "$work/deploy.err"; then
+      fail "${failure} claimed it rolled back"
+    fi
+    grep -q "^inspect -f {{.State.Running}} room-memory$" "$docker_log" \
+      || fail "${failure} did not inspect room-memory"
+    if [[ "$(q '"room-memory" in named')" == True ]]; then
+      [[ "$(q 'named["room-memory"]["State"]["Running"]')" == False ]] || fail "${failure} left room-memory running"
+    fi
+    [[ "$(q "any(c['Id'] == '$orig' for c in state['containers'])")" == True ]] \
+      || fail "${failure} removed the original container"
+    no_volume_removed "$failure"
   done
 
   # A fresh host whose first container never comes up removes only that container.
