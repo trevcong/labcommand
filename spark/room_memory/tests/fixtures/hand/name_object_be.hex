@@ -1,0 +1,20 @@
+# labcommand_msgs/NameObject request, CDR big endian. Derived by hand from ros/labcommand_msgs/srv/NameObject.srv (protocol section 3.16, D51). A Create: object_id 0, expected_revision 0, seed event set.
+00 00 00 00                 # encapsulation CDR_BE, options 0
+00 00 00 04              # pos 0    room_id length 4
+6c 61 62 00              # pos 4    room_id "lab\0"
+00 00 00 00 00 00 00 2b  # pos 8    map_epoch 43
+00 00 00 00 00 00 00 02  # pos 16   seq 2
+68 ed 92 8a              # pos 24   stamp.sec 1760400010
+0e e6 b2 80              # pos 28   stamp.nanosec 250000000
+00 00 00 00 00 00 00 00  # pos 32   object_id 0 (Create)
+00 00 00 00 00 00 00 00  # pos 40   expected_revision 0
+00 00 01 99 e0 04 44 00  # pos 48   event_generation
+00 00 00 00 00 00 00 0a  # pos 56   event_id 10
+00 00 00 0b              # pos 64   name length 11
+53 63 6f 70 65 20 63 61 72 74 00 # pos 68   name "Scope cart\0"
+00                       # pos 79   pad to 4
+00 00 00 07              # pos 80   operator_id length 7
+74 72 65 76 6f 72 00     # pos 84   operator_id "trevor\0"
+00                       # pos 91   pad to 4
+00 00 00 06              # pos 92   action_id length 6
+61 63 74 2d 31 00        # pos 96   action_id "act-1\0"

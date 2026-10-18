@@ -247,6 +247,60 @@ private let goldenSyncEndMap = Room.SyncEnd(
     publisherGeneration: goldenGeneration, token: tokenC, topic: .mapBricks, bound: 13, delivered: [11...13]
 )
 
+// Named objects (protocol §3.15, §3.16). publisherGeneration is a required field, not a v2 tail.
+private let goldenRegistry = Room.ObjectRegistry(
+    header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 4, stamp: t10),
+    snapshotSeq: 3,
+    objects: [
+        Room.RegistryObject(
+            objectId: 7,
+            revision: 2,
+            name: "Scope cart",
+            baseline: .anchored,
+            association: .pending,
+            associationGeneration: goldenGeneration,
+            associationEventId: 11,
+            sensor: .mid360,
+            frameEpoch: 40,
+            centroid: SIMD3(1.5, -0.25, 0.125),
+            aabb: Room.ChangeEvent.Box(min: SIMD3(1.25, -0.5, 0), max: SIMD3(1.75, 0, 0.25)),
+            links: [
+                Room.ObjectLink(eventGeneration: goldenGeneration, eventId: 9, kind: .moved, recovered: true),
+            ]
+        ),
+    ],
+    seeds: [
+        Room.NameableSeed(
+            eventGeneration: goldenGeneration,
+            eventId: 10,
+            sensor: .mid360,
+            centroid: SIMD3(2, 1, 0.5),
+            aabb: Room.ChangeEvent.Box(min: SIMD3(1.875, 0.875, 0.375), max: SIMD3(2.125, 1.125, 0.625)),
+            voxelCount: 8
+        ),
+    ],
+    recentActionIds: ["act-1"],
+    recoveredAccepts: [
+        Room.RecoveredAccept(eventGeneration: goldenGeneration, eventId: 8, kind: .appeared),
+    ],
+    publisherGeneration: goldenGeneration
+)
+
+private let goldenNameRequest = Room.NameObjectRequest(
+    header: Room.Header(roomId: "lab", mapEpoch: 43, seq: 2, stamp: t10),
+    objectId: 0,
+    expectedRevision: 0,
+    eventGeneration: goldenGeneration,
+    eventId: 10,
+    name: "Scope cart",
+    operatorId: "trevor",
+    actionId: "act-1"
+)
+
+private let goldenNameResponse = Room.NameObjectResponse(
+    outcome: .applied, objectId: 7, revision: 1, repeatDiffers: false
+)
+
 /// Each v2 golden that extends a legacy one, and the legacy file whose length it shares up to its new fields.
 private let v2LegacyTwin: [String: String] = [
     "memory_status_v2_le": "memory_status_le",
@@ -325,6 +379,9 @@ private let littleEndianGoldens: [Golden] = [
     golden("rig_pose_le", goldenRigPose, decode: Room.RigPose.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("rig_pose_v2_le", goldenRigPoseV2, decode: Room.RigPose.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("imu_le", goldenImu, decode: Room.ImuSample.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("object_registry_le", goldenRegistry, decode: Room.ObjectRegistry.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("name_object_le", goldenNameRequest, decode: Room.NameObjectRequest.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("name_object_response_le", goldenNameResponse, decode: Room.NameObjectResponse.decode(cdr:), encode: { try $0.encodedCDR() }),
 ]
 
 private let bigEndianGoldens: [Golden] = [
@@ -335,6 +392,9 @@ private let bigEndianGoldens: [Golden] = [
     golden("request_sync_map_v2_be", goldenRequestMapV2, decode: Room.RequestSync.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("sync_end_map_replay_be", goldenSyncEndMap, decode: Room.SyncEnd.decode(cdr:), encode: { try $0.encodedCDR() }),
     golden("epoch_v2_be", goldenEpochV2, decode: Room.Epoch.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("object_registry_be", goldenRegistry, decode: Room.ObjectRegistry.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("name_object_be", goldenNameRequest, decode: Room.NameObjectRequest.decode(cdr:), encode: { try $0.encodedCDR() }),
+    golden("name_object_response_be", goldenNameResponse, decode: Room.NameObjectResponse.decode(cdr:), encode: { try $0.encodedCDR() }),
 ]
 
 private enum Outcome: Equatable {

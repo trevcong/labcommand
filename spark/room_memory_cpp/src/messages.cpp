@@ -5,6 +5,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <tuple>
 
 #if defined(ROOM_MEMORY_APPLE_LZFSE)
@@ -1191,6 +1192,375 @@ SyncEnd SyncEnd::from_cdr(std::span<const std::uint8_t> data) {
         e.unavailable = reader.ranges("unavailable");
         e.validate();
         return e;
+    });
+}
+
+namespace {
+
+bool has_control(std::string_view text) {
+    std::size_t n = 0;
+    while (n < text.size()) {
+        const auto c = static_cast<unsigned char>(text[n]);
+        std::uint32_t point = c;
+        std::size_t len = 1;
+        if (c >= 0x80) {
+            if (c <= 0xDF && n + 1 < text.size()) {
+                point = (c & 0x1Fu) << 6 | (static_cast<unsigned char>(text[n + 1]) & 0x3Fu);
+                len = 2;
+            } else if (c <= 0xEF && n + 2 < text.size()) {
+                point = (c & 0x0Fu) << 12 | (static_cast<unsigned char>(text[n + 1]) & 0x3Fu) << 6 |
+                        (static_cast<unsigned char>(text[n + 2]) & 0x3Fu);
+                len = 3;
+            } else if (n + 3 < text.size()) {
+                point = (c & 0x07u) << 18 | (static_cast<unsigned char>(text[n + 1]) & 0x3Fu) << 12 |
+                        (static_cast<unsigned char>(text[n + 2]) & 0x3Fu) << 6 |
+                        (static_cast<unsigned char>(text[n + 3]) & 0x3Fu);
+                len = 4;
+            }
+        }
+        if (point < 0x20 || (point >= 0x7F && point <= 0x9F)) return true;
+        n += len;
+    }
+    return false;
+}
+
+void require_text(const std::string& text, std::size_t low, std::size_t high, const std::string& what) {
+    if (!valid_utf8(text) || text.find('\0') != std::string::npos) throw Invalid(what + " is not NUL-free UTF-8");
+    if (text.size() < low || text.size() > high) {
+        throw Invalid(what + " is " + str(std::uint64_t{text.size()}) + " bytes, outside " + str(std::uint64_t{low}) + "..." +
+                      str(std::uint64_t{high}));
+    }
+    if (has_control(text)) throw Invalid(what + " contains a control character");
+}
+
+void require_sensor(std::uint8_t value, const std::string& what) {
+    if (value != kSensorMid360 && value != kSensorJT128) {
+        throw Invalid(what + " " + str(std::uint64_t{value}) + " is not one SENSOR_* bit");
+    }
+}
+
+void require_event_ids(std::uint64_t generation, std::uint64_t event_id, const std::string& what) {
+    if (generation == 0 || event_id == 0) throw Invalid(what + " event id is 0");
+}
+
+void require_finite6(const std::array<float, 6>& values, const std::string& what) {
+    for (const float value : values) {
+        if (!std::isfinite(value)) throw Invalid(what + " is not finite");
+    }
+}
+
+void require_box(const std::array<float, 3>& centroid, const std::array<float, 6>& aabb, const std::string& what) {
+    require_finite(centroid, what + ".centroid");
+    require_finite6(aabb, what + ".aabb");
+    for (int axis = 0; axis < 3; ++axis) {
+        if (aabb[static_cast<std::size_t>(axis)] > aabb[static_cast<std::size_t>(axis + 3)]) {
+            throw Invalid(what + ".aabb is unordered");
+        }
+    }
+}
+
+bool read_bool(Reader& reader, const std::string& what) {
+    const std::uint8_t value = reader.u8(what);
+    if (value > 1) throw Invalid(what + " " + str(std::uint64_t{value}) + " is not a bool");
+    return value == 1;
+}
+
+// A T[] count. An empty list aligns nothing. A count the remaining bytes cannot hold is truncated
+// before anything is reserved. `cap` is nullopt when the protocol has no cap (objects).
+std::uint32_t count_bounded(Reader& reader, const std::string& what, const std::optional<std::size_t>& cap,
+                            std::size_t min_bytes) {
+    const std::uint32_t count = reader.u32(what + " length");
+    const std::size_t available = reader.available();
+    if (min_bytes == 0 || count > available / min_bytes) {
+        throw Truncated("CDR: truncated " + what + " (" + str(std::uint64_t{count}) + " entries, have " +
+                        str(std::uint64_t{available}) + " bytes)");
+    }
+    if (cap && count > *cap) throw Invalid(what + " holds " + str(std::uint64_t{count}) + " entries, above " + str(std::uint64_t{*cap}));
+    return count;
+}
+
+template <std::size_t N>
+std::optional<std::array<float, N>> read_optional_floats(Reader& reader, const std::string& what) {
+    std::array<float, N> values{};
+    std::size_t nans = 0;
+    for (std::size_t n = 0; n < N; ++n) {
+        values[n] = reader.f32(what + "[" + str(std::uint64_t{n}) + "]");
+        if (std::isnan(values[n])) ++nans;
+    }
+    if (nans != 0 && nans != N) throw Invalid(what + " is partly NaN");
+    if (nans == N) return std::nullopt;
+    return values;
+}
+
+template <std::size_t N>
+void write_floats(Writer& writer, const std::optional<std::array<float, N>>& values) {
+    if (!values) {
+        for (std::size_t n = 0; n < N; ++n) writer.f32(std::nullopt);
+        return;
+    }
+    for (const float value : *values) writer.f32(value);
+}
+
+template <std::size_t N>
+void write_floats(Writer& writer, const std::array<float, N>& values) {
+    for (const float value : values) writer.f32(value);
+}
+
+}  // namespace
+
+void ObjectLink::validate(const std::string& what) const {
+    require_event_ids(event_generation, event_id, what);
+    require_enum(kind, 3, what + ".kind");
+}
+
+void RecoveredAccept::validate(const std::string& what) const {
+    require_event_ids(event_generation, event_id, what);
+    require_enum(kind, 3, what + ".kind");
+}
+
+void NameableSeed::validate(const std::string& what) const {
+    require_event_ids(event_generation, event_id, what);
+    require_sensor(sensor, what + ".sensor");
+    require_box(centroid, aabb, what);
+    require_int(voxel_count, 1, (std::int64_t{1} << 32) - 1, what + ".voxel_count");
+}
+
+void RegistryObject::validate(const std::string& what) const {
+    if (object_id == 0) throw Invalid(what + ".object_id 0 is outside 1..." + str(kUint64Max));
+    require_text(name, 1, kMaxNameBytes, what + ".name");
+    require_enum(baseline, 4, what + ".baseline");
+    require_enum(association, 3, what + ".association");
+    require_sensor(sensor, what + ".sensor");
+    if (baseline == Baseline::gone) {
+        if (frame_epoch != 0 || centroid || aabb) throw Invalid(what + ": GONE has frame 0 and NaN geometry");
+    } else {
+        if (!centroid || !aabb) throw Invalid(what + " geometry is missing");
+        require_box(*centroid, *aabb, what);
+    }
+    if (association == Association::none) {
+        if (association_generation != 0 || association_event_id != 0) {
+            throw Invalid(what + ": association NONE writes both ids as 0");
+        }
+    } else {
+        require_event_ids(association_generation, association_event_id, what + ".association");
+    }
+    if (links.size() > kMaxObjectLinks) {
+        throw Invalid(what + ".links holds " + str(std::uint64_t{links.size()}) + " entries, above " + str(std::uint64_t{kMaxObjectLinks}));
+    }
+    for (std::size_t n = 0; n < links.size(); ++n) links[n].validate(what + ".links[" + str(std::uint64_t{n}) + "]");
+}
+
+void ObjectRegistry::validate() const {
+    const std::string context = "ObjectRegistry";
+    header.validate(context);
+    if (publisher_generation == kGenerationUnknown) {
+        throw Invalid(context + ": publisher_generation (0 is GENERATION_UNKNOWN) 0 is outside 1..." + str(kUint64Max));
+    }
+    if (seeds.size() > kMaxNameableSeeds) {
+        throw Invalid(context + ": seeds holds " + str(std::uint64_t{seeds.size()}) + " entries, above " + str(std::uint64_t{kMaxNameableSeeds}));
+    }
+    if (recovered_accepts.size() > kMaxRecoveredAccepts) {
+        throw Invalid(context + ": recovered_accepts holds " + str(std::uint64_t{recovered_accepts.size()}) + " entries, above " +
+                      str(std::uint64_t{kMaxRecoveredAccepts}));
+    }
+    if (recent_action_ids.size() > kMaxRecentActionIds) {
+        throw Invalid(context + ": recent_action_ids holds " + str(std::uint64_t{recent_action_ids.size()}) + " entries, above " +
+                      str(std::uint64_t{kMaxRecentActionIds}));
+    }
+    std::set<std::uint64_t> ids;
+    for (std::size_t n = 0; n < objects.size(); ++n) {
+        const std::string what = context + ".objects[" + str(std::uint64_t{n}) + "]";
+        objects[n].validate(what);
+        if (!ids.insert(objects[n].object_id).second) throw Invalid(what + ".object_id is duplicated");
+    }
+    std::set<std::pair<std::uint64_t, std::uint64_t>> seed_ids;
+    for (std::size_t n = 0; n < seeds.size(); ++n) {
+        const std::string what = context + ".seeds[" + str(std::uint64_t{n}) + "]";
+        seeds[n].validate(what);
+        if (!seed_ids.insert({seeds[n].event_generation, seeds[n].event_id}).second) throw Invalid(what + " is duplicated");
+    }
+    for (std::size_t n = 0; n < recent_action_ids.size(); ++n) {
+        require_text(recent_action_ids[n], 1, kMaxNameBytes, context + ".recent_action_ids[" + str(std::uint64_t{n}) + "]");
+    }
+    for (std::size_t n = 0; n < recovered_accepts.size(); ++n) {
+        recovered_accepts[n].validate(context + ".recovered_accepts[" + str(std::uint64_t{n}) + "]");
+    }
+}
+
+Bytes ObjectRegistry::to_cdr() const {
+    validate();
+    Writer writer;
+    writer.header(header);
+    writer.u64(snapshot_seq);
+    writer.u32(objects.size());
+    for (const RegistryObject& obj : objects) {
+        writer.u64(obj.object_id);
+        writer.u64(obj.revision);
+        writer.string(obj.name);
+        writer.u8(static_cast<std::uint8_t>(obj.baseline));
+        writer.u8(static_cast<std::uint8_t>(obj.association));
+        writer.u64(obj.association_generation);
+        writer.u64(obj.association_event_id);
+        writer.u8(obj.sensor);
+        writer.u64(obj.frame_epoch);
+        write_floats(writer, obj.centroid);
+        write_floats(writer, obj.aabb);
+        writer.u32(obj.links.size());
+        for (const ObjectLink& link : obj.links) {
+            writer.u64(link.event_generation);
+            writer.u64(link.event_id);
+            writer.u8(static_cast<std::uint8_t>(link.kind));
+            writer.u8(link.recovered ? 1 : 0);
+        }
+    }
+    writer.u32(seeds.size());
+    for (const NameableSeed& seed : seeds) {
+        writer.u64(seed.event_generation);
+        writer.u64(seed.event_id);
+        writer.u8(seed.sensor);
+        write_floats(writer, seed.centroid);
+        write_floats(writer, seed.aabb);
+        writer.u32(seed.voxel_count);
+    }
+    writer.u32(recent_action_ids.size());
+    for (const std::string& action_id : recent_action_ids) writer.string(action_id);
+    writer.u32(recovered_accepts.size());
+    for (const RecoveredAccept& receipt : recovered_accepts) {
+        writer.u64(receipt.event_generation);
+        writer.u64(receipt.event_id);
+        writer.u8(static_cast<std::uint8_t>(receipt.kind));
+    }
+    writer.u64(publisher_generation);
+    return writer.take();
+}
+
+ObjectRegistry ObjectRegistry::from_cdr(std::span<const std::uint8_t> data) {
+    return decode<ObjectRegistry>(data, "ObjectRegistry", [](Reader& reader) {
+        ObjectRegistry registry;
+        registry.header = reader.header("");
+        registry.snapshot_seq = reader.u64("snapshot_seq");
+        const std::uint32_t n_objects = count_bounded(reader, "objects", std::nullopt, 8);
+        registry.objects.resize(n_objects);
+        for (std::uint32_t n = 0; n < n_objects; ++n) {
+            const std::string what = "objects[" + str(std::uint64_t{n}) + "]";
+            RegistryObject& obj = registry.objects[n];
+            obj.object_id = reader.u64(what + ".object_id");
+            obj.revision = reader.u64(what + ".revision");
+            obj.name = reader.string(what + ".name");
+            obj.baseline = read_enum<Baseline>(reader.u8(what + ".baseline"), 4, "ObjectRegistry: " + what + ".baseline");
+            obj.association = read_enum<Association>(reader.u8(what + ".association"), 3, "ObjectRegistry: " + what + ".association");
+            obj.association_generation = reader.u64(what + ".association_generation");
+            obj.association_event_id = reader.u64(what + ".association_event_id");
+            obj.sensor = reader.u8(what + ".sensor");
+            obj.frame_epoch = reader.u64(what + ".frame_epoch");
+            obj.centroid = read_optional_floats<3>(reader, what + ".centroid");
+            obj.aabb = read_optional_floats<6>(reader, what + ".aabb");
+            const std::uint32_t n_links = count_bounded(reader, what + ".links", kMaxObjectLinks, 8);
+            obj.links.resize(n_links);
+            for (std::uint32_t link = 0; link < n_links; ++link) {
+                const std::string at = what + ".links[" + str(std::uint64_t{link}) + "]";
+                obj.links[link].event_generation = reader.u64(at + ".event_generation");
+                obj.links[link].event_id = reader.u64(at + ".event_id");
+                obj.links[link].kind = read_enum<EventKind>(reader.u8(at + ".kind"), 3, "ObjectRegistry: " + at + ".kind");
+                obj.links[link].recovered = read_bool(reader, at + ".recovered");
+            }
+        }
+        const std::uint32_t n_seeds = count_bounded(reader, "seeds", kMaxNameableSeeds, 8);
+        registry.seeds.resize(n_seeds);
+        for (std::uint32_t n = 0; n < n_seeds; ++n) {
+            const std::string what = "seeds[" + str(std::uint64_t{n}) + "]";
+            NameableSeed& seed = registry.seeds[n];
+            seed.event_generation = reader.u64(what + ".event_generation");
+            seed.event_id = reader.u64(what + ".event_id");
+            seed.sensor = reader.u8(what + ".sensor");
+            seed.centroid = reader.floats(what + ".centroid");
+            for (std::size_t axis = 0; axis < 6; ++axis) seed.aabb[axis] = reader.f32(what + ".aabb[" + str(std::uint64_t{axis}) + "]");
+            seed.voxel_count = reader.u32(what + ".voxel_count");
+        }
+        const std::uint32_t n_actions = count_bounded(reader, "recent_action_ids", kMaxRecentActionIds, 5);
+        registry.recent_action_ids.resize(n_actions);
+        for (std::uint32_t n = 0; n < n_actions; ++n) {
+            registry.recent_action_ids[n] = reader.string("recent_action_ids[" + str(std::uint64_t{n}) + "]");
+        }
+        const std::uint32_t n_receipts = count_bounded(reader, "recovered_accepts", kMaxRecoveredAccepts, 8);
+        registry.recovered_accepts.resize(n_receipts);
+        for (std::uint32_t n = 0; n < n_receipts; ++n) {
+            const std::string what = "recovered_accepts[" + str(std::uint64_t{n}) + "]";
+            registry.recovered_accepts[n].event_generation = reader.u64(what + ".event_generation");
+            registry.recovered_accepts[n].event_id = reader.u64(what + ".event_id");
+            registry.recovered_accepts[n].kind = read_enum<EventKind>(reader.u8(what + ".kind"), 3, "ObjectRegistry: " + what + ".kind");
+        }
+        registry.publisher_generation = reader.u64("publisher_generation");
+        registry.validate();
+        return registry;
+    });
+}
+
+void NameObjectRequest::validate() const {
+    const std::string context = "NameObject";
+    header.validate(context);
+    require_text(name, 1, kMaxNameBytes, context + ": name");
+    require_text(operator_id, 1, kMaxNameBytes, context + ": operator_id");
+    require_text(action_id, 1, kMaxNameBytes, context + ": action_id");
+    const bool create = object_id == 0 && expected_revision == 0 && event_generation != 0 && event_id != 0;
+    const bool rename = object_id != 0 && event_generation == 0 && event_id == 0;
+    const bool attach = object_id != 0 && event_generation != 0 && event_id != 0;
+    if (!create && !rename && !attach) throw Invalid(context + ": the ids are not Create, Rename, or Attach");
+}
+
+Bytes NameObjectRequest::to_cdr() const {
+    validate();
+    Writer writer;
+    writer.header(header);
+    writer.u64(object_id);
+    writer.u64(expected_revision);
+    writer.u64(event_generation);
+    writer.u64(event_id);
+    writer.string(name);
+    writer.string(operator_id);
+    writer.string(action_id);
+    return writer.take();
+}
+
+NameObjectRequest NameObjectRequest::from_cdr(std::span<const std::uint8_t> data) {
+    return decode<NameObjectRequest>(data, "NameObject", [](Reader& reader) {
+        NameObjectRequest request;
+        request.header = reader.header("");
+        request.object_id = reader.u64("object_id");
+        request.expected_revision = reader.u64("expected_revision");
+        request.event_generation = reader.u64("event_generation");
+        request.event_id = reader.u64("event_id");
+        request.name = reader.string("name");
+        request.operator_id = reader.string("operator_id");
+        request.action_id = reader.string("action_id");
+        request.validate();
+        return request;
+    });
+}
+
+void NameObjectResponse::validate() const {
+    require_enum(outcome, 8, "NameObject: outcome");
+}
+
+Bytes NameObjectResponse::to_cdr() const {
+    validate();
+    Writer writer;
+    writer.u8(static_cast<std::uint8_t>(outcome));
+    writer.u64(object_id);
+    writer.u64(revision);
+    writer.u8(repeat_differs ? 1 : 0);
+    return writer.take();
+}
+
+NameObjectResponse NameObjectResponse::from_cdr(std::span<const std::uint8_t> data) {
+    return decode<NameObjectResponse>(data, "NameObjectResponse", [](Reader& reader) {
+        NameObjectResponse response;
+        response.outcome = read_enum<NameOutcome>(reader.u8("outcome"), 8, "NameObject: outcome");
+        response.object_id = reader.u64("object_id");
+        response.revision = reader.u64("revision");
+        response.repeat_differs = read_bool(reader, "repeat_differs");
+        response.validate();
+        return response;
     });
 }
 

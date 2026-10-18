@@ -1,0 +1,7 @@
+# labcommand_msgs/NameObject response, CDR big endian. Derived by hand from ros/labcommand_msgs/srv/NameObject.srv (protocol section 3.16). APPLIED, repeat_differs 0. Seven pad bytes align object_id.
+00 00 00 00                 # encapsulation CDR_BE, options 0
+00                       # pos 0    outcome APPLIED
+00 00 00 00 00 00 00     # pos 1    pad to 8
+00 00 00 00 00 00 00 07  # pos 8    object_id 7
+00 00 00 00 00 00 00 01  # pos 16   revision 1
+00                       # pos 24   repeat_differs 0

@@ -41,8 +41,10 @@ import sys
 import zlib
 
 from builtin_interfaces.msg import Time
-from labcommand_msgs.msg import (Activity, ChangeEvent, Epoch, MapBricks, MemoryStatus, RequestSync,
+from labcommand_msgs.msg import (Activity, ChangeEvent, Epoch, MapBricks, MemoryStatus, NameableSeed,
+                                 ObjectLink, ObjectRegistry, RecoveredAccept, RegistryObject, RequestSync,
                                  SeqRange, SyncEnd)
+from labcommand_msgs.srv import NameObject
 from rclpy.serialization import serialize_message
 
 NAN = float("nan")
@@ -291,6 +293,70 @@ def sync_end_events_fallback_le():
     return sync_end(1, token, RequestSync.TOPIC_EVENTS, 120, [(10, 10), (21, 120)], [(11, 20)])
 
 
+def object_registry_le():
+    """One anchored object, one seed, one recent action id, one recovered accept (§3.15)."""
+    link = ObjectLink()
+    link.event_generation = GENERATION
+    link.event_id = 9
+    link.kind = ObjectLink.KIND_MOVED
+    link.recovered = True
+    obj = RegistryObject()
+    obj.object_id = 7
+    obj.revision = 2
+    obj.name = "Scope cart"
+    obj.baseline = RegistryObject.BASELINE_ANCHORED
+    obj.association = RegistryObject.ASSOCIATION_PENDING
+    obj.association_generation = GENERATION
+    obj.association_event_id = 11
+    obj.sensor = RegistryObject.SENSOR_MID360
+    obj.frame_epoch = 40
+    obj.centroid = [1.5, -0.25, 0.125]
+    obj.aabb = [1.25, -0.5, 0.0, 1.75, 0.0, 0.25]
+    obj.links = [link]
+    seed = NameableSeed()
+    seed.event_generation = GENERATION
+    seed.event_id = 10
+    seed.sensor = NameableSeed.SENSOR_MID360
+    seed.centroid = [2.0, 1.0, 0.5]
+    seed.aabb = [1.875, 0.875, 0.375, 2.125, 1.125, 0.625]
+    seed.voxel_count = 8
+    receipt = RecoveredAccept()
+    receipt.event_generation = GENERATION
+    receipt.event_id = 8
+    receipt.kind = RecoveredAccept.KIND_APPEARED
+    msg = common(ObjectRegistry(), "lab", 43, 4, *T10)
+    msg.snapshot_seq = 3
+    msg.objects = [obj]
+    msg.seeds = [seed]
+    msg.recent_action_ids = ["act-1"]
+    msg.recovered_accepts = [receipt]
+    msg.publisher_generation = GENERATION
+    return msg
+
+
+def name_object_le():
+    """A Create: object_id 0, expected_revision 0, seed (G, 10) (§3.16)."""
+    msg = common(NameObject.Request(), "lab", 43, 2, *T10)
+    msg.object_id = 0
+    msg.expected_revision = 0
+    msg.event_generation = GENERATION
+    msg.event_id = 10
+    msg.name = "Scope cart"
+    msg.operator_id = "trevor"
+    msg.action_id = "act-1"
+    return msg
+
+
+def name_object_response_le():
+    """APPLIED for object 7 at revision 1, repeat_differs false (§3.16)."""
+    msg = NameObject.Response()
+    msg.outcome = NameObject.Response.OUTCOME_APPLIED
+    msg.object_id = 7
+    msg.revision = 1
+    msg.repeat_differs = False
+    return msg
+
+
 GOLDENS = [
     epoch_v2_le,
     activity_v2_le,
@@ -301,6 +367,9 @@ GOLDENS = [
     request_sync_events_v2_le,
     sync_end_events_empty_le,
     sync_end_events_fallback_le,
+    object_registry_le,
+    name_object_le,
+    name_object_response_le,
 ]
 
 # Legacy layout (no publisher_generation, no request token): not producible from the v2 .msg files

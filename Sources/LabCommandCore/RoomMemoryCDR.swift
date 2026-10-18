@@ -942,6 +942,423 @@ extension RoomMemory.ImuSample {
     }
 }
 
+// MARK: - Named objects
+
+/// Caps from protocol §3.15. Objects have no cap; the byte bound is the limit.
+private enum NameWire {
+    static let maxLinks = 32
+    static let maxSeeds = 64
+    static let maxReceipts = 64
+    static let maxActionIds = 1024
+    static let maxTextBytes = 64
+    static let minRecordBytes = 8
+    static let minStringBytes = 5
+}
+
+extension RoomMemory.ObjectLink {
+    func validate(_ what: String) throws {
+        try RoomCDR.requireEventPair(eventGeneration, eventId, what)
+    }
+}
+
+extension RoomMemory.RecoveredAccept {
+    func validate(_ what: String) throws {
+        try RoomCDR.requireEventPair(eventGeneration, eventId, what)
+    }
+}
+
+extension RoomMemory.NameableSeed {
+    func validate(_ what: String) throws {
+        try RoomCDR.requireEventPair(eventGeneration, eventId, what)
+        try RoomCDR.requireOneSensor(sensor, "\(what).sensor")
+        try RoomCDR.requireBox(centroid, aabb, what)
+        guard voxelCount >= 1 else {
+            throw RoomMemoryCDRError.invalid("\(what).voxel_count \(voxelCount) is outside 1...\(UInt32.max)")
+        }
+    }
+}
+
+extension RoomMemory.RegistryObject {
+    func validate(_ what: String) throws {
+        guard objectId != 0 else {
+            throw RoomMemoryCDRError.invalid("\(what).object_id 0 is outside 1...\(UInt64.max)")
+        }
+        try RoomCDR.requireText(name, bytes: 1, NameWire.maxTextBytes, "\(what).name")
+        try RoomCDR.requireOneSensor(sensor, "\(what).sensor")
+        if baseline == .gone {
+            guard frameEpoch == 0, centroid == nil, aabb == nil else {
+                throw RoomMemoryCDRError.invalid("\(what): GONE has frame 0 and NaN geometry")
+            }
+        } else {
+            guard let centroid, let aabb else {
+                throw RoomMemoryCDRError.invalid("\(what) geometry is missing")
+            }
+            try RoomCDR.requireBox(centroid, aabb, what)
+        }
+        switch association {
+        case .none:
+            guard associationGeneration == 0, associationEventId == 0 else {
+                throw RoomMemoryCDRError.invalid("\(what): association NONE writes both ids as 0")
+            }
+        case .pending, .unresolved:
+            try RoomCDR.requireEventPair(associationGeneration, associationEventId, "\(what).association")
+        }
+        guard links.count <= NameWire.maxLinks else {
+            throw RoomMemoryCDRError.invalid("\(what).links holds \(links.count) entries, above \(NameWire.maxLinks)")
+        }
+        for (index, link) in links.enumerated() {
+            try link.validate("\(what).links[\(index)]")
+        }
+    }
+}
+
+extension RoomMemory.ObjectRegistry {
+    /// Encodes the message as CDR little endian, including the encapsulation header.
+    ///
+    /// - Throws: `RoomMemoryCDRError.invalid` when the message breaks the protocol contract.
+    public func encodedCDR() throws -> Data {
+        try validate()
+        var writer = RoomCDRWriter()
+        writer.header(header)
+        writer.u64(snapshotSeq)
+        writer.registryObjects(objects)
+        writer.nameableSeeds(seeds)
+        writer.u32(UInt32(recentActionIds.count))
+        for actionId in recentActionIds {
+            writer.string(actionId)
+        }
+        writer.u32(UInt32(recoveredAccepts.count))
+        for receipt in recoveredAccepts {
+            writer.u64(receipt.eventGeneration)
+            writer.u64(receipt.eventId)
+            writer.u8(receipt.kind.rawValue)
+        }
+        writer.u64(publisherGeneration)
+        return writer.data
+    }
+
+    /// Decodes a CDR `labcommand_msgs/ObjectRegistry`, including the encapsulation header.
+    ///
+    /// Accepts either byte order. The input may be a slice.
+    ///
+    /// - Throws: `RoomMemoryCDRError` on truncated or invalid input.
+    public static func decode(cdr data: Data) throws -> RoomMemory.ObjectRegistry {
+        try RoomCDR.decode(data, message: "ObjectRegistry") { reader in
+            let header = try reader.header("")
+            let snapshotSeq = try reader.u64("snapshot_seq")
+            let objects = try reader.registryObjects()
+            let seeds = try reader.nameableSeeds()
+            let actionCount = try reader.boundedCount("recent_action_ids", cap: NameWire.maxActionIds, minBytes: NameWire.minStringBytes)
+            var recentActionIds: [String] = []
+            recentActionIds.reserveCapacity(actionCount)
+            for index in 0..<actionCount {
+                recentActionIds.append(try reader.string("recent_action_ids[\(index)]"))
+            }
+            let receiptCount = try reader.boundedCount("recovered_accepts", cap: NameWire.maxReceipts, minBytes: NameWire.minRecordBytes)
+            var recoveredAccepts: [RoomMemory.RecoveredAccept] = []
+            recoveredAccepts.reserveCapacity(receiptCount)
+            for index in 0..<receiptCount {
+                let what = "recovered_accepts[\(index)]"
+                let receipt = RoomMemory.RecoveredAccept(
+                    eventGeneration: try reader.u64(what + ".event_generation"),
+                    eventId: try reader.u64(what + ".event_id"),
+                    kind: try reader.rawEnum(what + ".kind", "KIND_*")
+                )
+                try receipt.validate("ObjectRegistry.\(what)")
+                recoveredAccepts.append(receipt)
+            }
+            let generation = try reader.u64("publisher_generation")
+            let registry = RoomMemory.ObjectRegistry(
+                header: header,
+                snapshotSeq: snapshotSeq,
+                objects: objects,
+                seeds: seeds,
+                recentActionIds: recentActionIds,
+                recoveredAccepts: recoveredAccepts,
+                publisherGeneration: generation
+            )
+            try registry.validate()
+            return registry
+        }
+    }
+
+    func validate() throws {
+        let context = "ObjectRegistry"
+        try header.validate(context)
+        guard publisherGeneration != 0 else {
+            throw RoomMemoryCDRError.invalid("\(context): publisher_generation 0 is GENERATION_UNKNOWN, invalid in a Spark message")
+        }
+        guard seeds.count <= NameWire.maxSeeds else {
+            throw RoomMemoryCDRError.invalid("\(context): seeds holds \(seeds.count) entries, above \(NameWire.maxSeeds)")
+        }
+        guard recoveredAccepts.count <= NameWire.maxReceipts else {
+            throw RoomMemoryCDRError.invalid("\(context): recovered_accepts holds \(recoveredAccepts.count) entries, above \(NameWire.maxReceipts)")
+        }
+        guard recentActionIds.count <= NameWire.maxActionIds else {
+            throw RoomMemoryCDRError.invalid("\(context): recent_action_ids holds \(recentActionIds.count) entries, above \(NameWire.maxActionIds)")
+        }
+        var seenIds: Set<UInt64> = []
+        for (index, object) in objects.enumerated() {
+            let what = "\(context).objects[\(index)]"
+            try object.validate(what)
+            guard seenIds.insert(object.objectId).inserted else {
+                throw RoomMemoryCDRError.invalid("\(what).object_id is duplicated")
+            }
+        }
+        struct SeedKey: Hashable {
+            var generation: UInt64
+            var eventId: UInt64
+        }
+        var seenSeeds: Set<SeedKey> = []
+        for (index, seed) in seeds.enumerated() {
+            let what = "\(context).seeds[\(index)]"
+            try seed.validate(what)
+            let key = SeedKey(generation: seed.eventGeneration, eventId: seed.eventId)
+            guard seenSeeds.insert(key).inserted else {
+                throw RoomMemoryCDRError.invalid("\(what) is duplicated")
+            }
+        }
+        for (index, actionId) in recentActionIds.enumerated() {
+            try RoomCDR.requireText(actionId, bytes: 1, NameWire.maxTextBytes, "\(context).recent_action_ids[\(index)]")
+        }
+        for (index, receipt) in recoveredAccepts.enumerated() {
+            try receipt.validate("\(context).recovered_accepts[\(index)]")
+        }
+    }
+}
+
+extension RoomMemory.NameObjectRequest {
+    /// Encodes the request as CDR little endian, including the encapsulation header.
+    ///
+    /// - Throws: `RoomMemoryCDRError.invalid` when the request breaks the protocol contract.
+    public func encodedCDR() throws -> Data {
+        try validate()
+        var writer = RoomCDRWriter()
+        writer.header(header)
+        writer.u64(objectId)
+        writer.u64(expectedRevision)
+        writer.u64(eventGeneration)
+        writer.u64(eventId)
+        writer.string(name)
+        writer.string(operatorId)
+        writer.string(actionId)
+        return writer.data
+    }
+
+    /// Decodes a CDR `NameObject` request, including the encapsulation header.
+    ///
+    /// Accepts either byte order. The input may be a slice.
+    ///
+    /// - Throws: `RoomMemoryCDRError` on truncated or invalid input.
+    public static func decode(cdr data: Data) throws -> RoomMemory.NameObjectRequest {
+        try RoomCDR.decode(data, message: "NameObject") { reader in
+            let request = RoomMemory.NameObjectRequest(
+                header: try reader.header(""),
+                objectId: try reader.u64("object_id"),
+                expectedRevision: try reader.u64("expected_revision"),
+                eventGeneration: try reader.u64("event_generation"),
+                eventId: try reader.u64("event_id"),
+                name: try reader.string("name"),
+                operatorId: try reader.string("operator_id"),
+                actionId: try reader.string("action_id")
+            )
+            try request.validate()
+            return request
+        }
+    }
+
+    func validate() throws {
+        let context = "NameObject"
+        try header.validate(context)
+        try RoomCDR.requireText(name, bytes: 1, NameWire.maxTextBytes, "\(context): name")
+        try RoomCDR.requireText(operatorId, bytes: 1, NameWire.maxTextBytes, "\(context): operator_id")
+        try RoomCDR.requireText(actionId, bytes: 1, NameWire.maxTextBytes, "\(context): action_id")
+        let create = objectId == 0 && expectedRevision == 0 && eventGeneration != 0 && eventId != 0
+        let rename = objectId != 0 && eventGeneration == 0 && eventId == 0
+        let attach = objectId != 0 && eventGeneration != 0 && eventId != 0
+        guard create || rename || attach else {
+            throw RoomMemoryCDRError.invalid("\(context): the ids are not Create, Rename, or Attach")
+        }
+    }
+}
+
+extension RoomMemory.NameObjectResponse {
+    /// Encodes the response as CDR little endian, including the encapsulation header.
+    ///
+    /// - Throws: `RoomMemoryCDRError.invalid` when the response breaks the protocol contract.
+    public func encodedCDR() throws -> Data {
+        var writer = RoomCDRWriter()
+        writer.u8(outcome.rawValue)
+        writer.u64(objectId)
+        writer.u64(revision)
+        writer.u8(repeatDiffers ? 1 : 0)
+        return writer.data
+    }
+
+    /// Decodes a CDR `NameObject` response, including the encapsulation header.
+    ///
+    /// Accepts either byte order. The input may be a slice.
+    ///
+    /// - Throws: `RoomMemoryCDRError` on truncated or invalid input.
+    public static func decode(cdr data: Data) throws -> RoomMemory.NameObjectResponse {
+        try RoomCDR.decode(data, message: "NameObjectResponse") { reader in
+            let response = RoomMemory.NameObjectResponse(
+                outcome: try reader.rawEnum("outcome", "OUTCOME_*"),
+                objectId: try reader.u64("object_id"),
+                revision: try reader.u64("revision"),
+                repeatDiffers: try reader.boolean("repeat_differs")
+            )
+            return response
+        }
+    }
+}
+
+extension RoomCDRWriter {
+    fileprivate mutating func registryObjects(_ objects: [RoomMemory.RegistryObject]) {
+        u32(UInt32(objects.count))
+        for object in objects {
+            u64(object.objectId)
+            u64(object.revision)
+            string(object.name)
+            u8(object.baseline.rawValue)
+            u8(object.association.rawValue)
+            u64(object.associationGeneration)
+            u64(object.associationEventId)
+            u8(object.sensor.rawValue)
+            u64(object.frameEpoch)
+            if let centroid = object.centroid {
+                vector(centroid)
+            } else {
+                quietNaNs(3)
+            }
+            if let aabb = object.aabb {
+                vector(aabb.min)
+                vector(aabb.max)
+            } else {
+                quietNaNs(6)
+            }
+            u32(UInt32(object.links.count))
+            for link in object.links {
+                u64(link.eventGeneration)
+                u64(link.eventId)
+                u8(link.kind.rawValue)
+                u8(link.recovered ? 1 : 0)
+            }
+        }
+    }
+
+    fileprivate mutating func nameableSeeds(_ seeds: [RoomMemory.NameableSeed]) {
+        u32(UInt32(seeds.count))
+        for seed in seeds {
+            u64(seed.eventGeneration)
+            u64(seed.eventId)
+            u8(seed.sensor.rawValue)
+            vector(seed.centroid)
+            vector(seed.aabb.min)
+            vector(seed.aabb.max)
+            u32(seed.voxelCount)
+        }
+    }
+}
+
+extension RoomCDRReader {
+    fileprivate mutating func registryObjects() throws -> [RoomMemory.RegistryObject] {
+        let count = try boundedCount("objects", cap: nil, minBytes: NameWire.minRecordBytes)
+        var objects: [RoomMemory.RegistryObject] = []
+        objects.reserveCapacity(count)
+        for index in 0..<count {
+            let what = "objects[\(index)]"
+            let linkCountAt = what + ".links"
+            let objectId = try u64(what + ".object_id")
+            let revision = try u64(what + ".revision")
+            let name = try string(what + ".name")
+            let baseline: RoomMemory.Baseline = try rawEnum(what + ".baseline", "BASELINE_*")
+            let association: RoomMemory.Association = try rawEnum(what + ".association", "ASSOCIATION_*")
+            let associationGeneration = try u64(what + ".association_generation")
+            let associationEventId = try u64(what + ".association_event_id")
+            let sensorRaw = try u8(what + ".sensor")
+            let frameEpoch = try u64(what + ".frame_epoch")
+            let centroid = try optionalVector(what + ".centroid")
+            let aabb = try optionalBox(what + ".aabb")
+            let linkCount = try boundedCount(linkCountAt, cap: NameWire.maxLinks, minBytes: NameWire.minRecordBytes)
+            var links: [RoomMemory.ObjectLink] = []
+            links.reserveCapacity(linkCount)
+            for link in 0..<linkCount {
+                let at = "\(linkCountAt)[\(link)]"
+                let item = RoomMemory.ObjectLink(
+                    eventGeneration: try u64(at + ".event_generation"),
+                    eventId: try u64(at + ".event_id"),
+                    kind: try rawEnum(at + ".kind", "KIND_*"),
+                    recovered: try boolean(at + ".recovered")
+                )
+                try item.validate("ObjectRegistry.\(at)")
+                links.append(item)
+            }
+            let object = RoomMemory.RegistryObject(
+                objectId: objectId,
+                revision: revision,
+                name: name,
+                baseline: baseline,
+                association: association,
+                associationGeneration: associationGeneration,
+                associationEventId: associationEventId,
+                sensor: RoomMemory.Sensors(rawValue: sensorRaw),
+                frameEpoch: frameEpoch,
+                centroid: centroid,
+                aabb: aabb,
+                links: links
+            )
+            try object.validate("ObjectRegistry.\(what)")
+            objects.append(object)
+        }
+        return objects
+    }
+
+    fileprivate mutating func nameableSeeds() throws -> [RoomMemory.NameableSeed] {
+        let count = try boundedCount("seeds", cap: NameWire.maxSeeds, minBytes: NameWire.minRecordBytes)
+        var seeds: [RoomMemory.NameableSeed] = []
+        seeds.reserveCapacity(count)
+        for index in 0..<count {
+            let what = "seeds[\(index)]"
+            let eventGeneration = try u64(what + ".event_generation")
+            let eventId = try u64(what + ".event_id")
+            let sensor = RoomMemory.Sensors(rawValue: try u8(what + ".sensor"))
+            guard let centroid = try optionalVector(what + ".centroid") else {
+                throw RoomMemoryCDRError.invalid("ObjectRegistry: \(what).centroid is not finite")
+            }
+            guard let aabb = try optionalBox(what + ".aabb") else {
+                throw RoomMemoryCDRError.invalid("ObjectRegistry: \(what).aabb is not finite")
+            }
+            let seed = RoomMemory.NameableSeed(
+                eventGeneration: eventGeneration,
+                eventId: eventId,
+                sensor: sensor,
+                centroid: centroid,
+                aabb: aabb,
+                voxelCount: try u32(what + ".voxel_count")
+            )
+            try seed.validate("ObjectRegistry.\(what)")
+            seeds.append(seed)
+        }
+        return seeds
+    }
+
+    /// Three float32s. All NaN is nil; a NaN mixed with any other value is invalid.
+    private mutating func optionalVector(_ what: String) throws -> SIMD3<Float>? {
+        guard let values = try optionalFloats(3, what) else { return nil }
+        return SIMD3(values[0], values[1], values[2])
+    }
+
+    /// Six float32s, `min` then `max`. All NaN is nil; a NaN mixed with any other value is invalid.
+    private mutating func optionalBox(_ what: String) throws -> RoomMemory.ChangeEvent.Box? {
+        guard let values = try optionalFloats(6, what) else { return nil }
+        return RoomMemory.ChangeEvent.Box(
+            min: SIMD3(values[0], values[1], values[2]),
+            max: SIMD3(values[3], values[4], values[5])
+        )
+    }
+}
+
 extension RoomMemory.Header {
     func validate(_ context: String) throws {
         guard !roomId.isEmpty else {
@@ -1006,6 +1423,47 @@ enum RoomCDR {
     static func requireValid(_ time: RoomMemory.Time, _ what: String) throws {
         guard time.nanosec < 1_000_000_000 else {
             throw RoomMemoryCDRError.invalid("\(what).nanosec \(time.nanosec) is not below 1e9")
+        }
+    }
+
+    /// Canonical quiet NaN (`0x7FC00000`). Nil geometry is this pattern on the wire, not `Float.nan`.
+    static let quietNaNBits: UInt32 = 0x7FC0_0000
+
+    /// UTF-8 of `low...high` bytes, with no control scalar (U+0000...U+001F, U+007F...U+009F).
+    static func requireText(_ text: String, bytes low: Int, _ high: Int, _ what: String) throws {
+        let size = text.utf8.count
+        guard (low...high).contains(size) else {
+            throw RoomMemoryCDRError.invalid("\(what) is \(size) bytes, outside \(low)...\(high)")
+        }
+        for scalar in text.unicodeScalars {
+            let value = scalar.value
+            if value < 0x20 || (value >= 0x7F && value <= 0x9F) {
+                throw RoomMemoryCDRError.invalid("\(what) contains a control character")
+            }
+        }
+    }
+
+    /// Both ids of a link, seed, receipt, or non-NONE association. Neither is ever 0.
+    static func requireEventPair(_ generation: UInt64, _ eventId: UInt64, _ what: String) throws {
+        guard generation != 0, eventId != 0 else {
+            throw RoomMemoryCDRError.invalid("\(what) event id is 0")
+        }
+    }
+
+    /// Exactly one of `SENSOR_MID360` (1) or `SENSOR_JT128` (2). A mask is invalid.
+    static func requireOneSensor(_ sensor: RoomMemory.Sensors, _ what: String) throws {
+        guard sensor == .mid360 || sensor == .jt128 else {
+            throw RoomMemoryCDRError.invalid("\(what) \(sensor.rawValue) is not one SENSOR_* bit")
+        }
+    }
+
+    /// Finite centroid and box, each max ≥ its min.
+    static func requireBox(_ centroid: SIMD3<Float>, _ aabb: RoomMemory.ChangeEvent.Box, _ what: String) throws {
+        try requireFinite(centroid, "\(what).centroid")
+        try requireFinite(aabb.min, "\(what).aabb min")
+        try requireFinite(aabb.max, "\(what).aabb max")
+        guard all(aabb.min .<= aabb.max) else {
+            throw RoomMemoryCDRError.invalid("\(what).aabb is unordered")
         }
     }
 }
@@ -1154,6 +1612,14 @@ struct RoomCDRWriter {
         f32(value.z)
     }
 
+    /// One canonical quiet NaN, bits `RoomCDR.quietNaNBits`.
+    mutating func quietNaN() { u32(RoomCDR.quietNaNBits) }
+
+    /// `count` canonical quiet NaNs, the wire form of missing geometry.
+    mutating func quietNaNs(_ count: Int) {
+        for _ in 0..<count { quietNaN() }
+    }
+
     mutating func string(_ value: String) {
         let utf8 = Array(value.utf8)
         u32(UInt32(utf8.count + 1))
@@ -1300,6 +1766,62 @@ struct RoomCDRReader {
             throw RoomMemoryCDRError.invalid("\(message): \(what()) \(value) is not a STATE_* value")
         }
         return state
+    }
+
+    /// A `T[]` or `T[<=N]` count. An empty list aligns nothing: the next field aligns itself.
+    /// A count the remaining bytes cannot hold (`count > available / minBytes`) is truncated
+    /// before anything is reserved. A count above `cap` that those bytes could hold is invalid.
+    /// `cap` nil is the objects list, which has no protocol cap.
+    mutating func boundedCount(_ what: @autoclosure () -> String, cap: Int?, minBytes: Int) throws -> Int {
+        let name = what()
+        let count = Int(try u32(name + " length"))
+        let available = max(0, bytes.count - offset)
+        guard minBytes > 0, count <= available / minBytes else {
+            throw RoomMemoryCDRError.truncated(
+                "\(message) CDR: truncated \(name) at byte \(offset) (\(count) entries, have \(available) bytes)"
+            )
+        }
+        if let cap, count > cap {
+            throw RoomMemoryCDRError.invalid("\(message): \(name) holds \(count) entries, above \(cap)")
+        }
+        return count
+    }
+
+    /// CDR bool: a byte 0 or 1. Any other value is invalid.
+    mutating func boolean(_ what: @autoclosure () -> String) throws -> Bool {
+        let name = what()
+        let value = try u8(name)
+        guard value <= 1 else {
+            throw RoomMemoryCDRError.invalid("\(message): \(name) \(value) is not a bool")
+        }
+        return value == 1
+    }
+
+    /// A `uint8` enum. `label` is the protocol family, such as `BASELINE_*`.
+    mutating func rawEnum<T: RawRepresentable>(_ what: @autoclosure () -> String, _ label: String) throws -> T where T.RawValue == UInt8 {
+        let name = what()
+        let value = try u8(name)
+        guard let decoded = T(rawValue: value) else {
+            throw RoomMemoryCDRError.invalid("\(message): \(name) \(value) is not a \(label) value")
+        }
+        return decoded
+    }
+
+    /// `count` float32s. All NaN is nil. A NaN mixed with any other value is invalid.
+    /// Anything that is not NaN, infinity included, is returned for the caller to judge.
+    mutating func optionalFloats(_ count: Int, _ what: @autoclosure () -> String) throws -> [Float]? {
+        let name = what()
+        var values: [Float] = []
+        values.reserveCapacity(count)
+        var nans = 0
+        for index in 0..<count {
+            let value = try f32(name + "[\(index)]")
+            if value.isNaN { nans += 1 }
+            values.append(value)
+        }
+        if nans == 0 { return values }
+        if nans == count { return nil }
+        throw RoomMemoryCDRError.invalid("\(message): \(name) is partly NaN")
     }
 
     /// Reads a sequence count and checks that `count × elementSize` bytes remain, so a

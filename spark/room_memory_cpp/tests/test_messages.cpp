@@ -299,10 +299,63 @@ SyncEnd sync_end_map_replay() {
 }
 
 // The v2 field a legacy cut lacks: publisher_generation, or RequestSync.expected_generation.
+ObjectRegistry object_registry() {
+    ObjectRegistry registry;
+    registry.header = head("lab", 43, 4);
+    registry.snapshot_seq = 3;
+    registry.publisher_generation = kG;
+    RegistryObject obj;
+    obj.object_id = 7;
+    obj.revision = 2;
+    obj.name = "Scope cart";
+    obj.baseline = Baseline::anchored;
+    obj.association = Association::pending;
+    obj.association_generation = kG;
+    obj.association_event_id = 11;
+    obj.sensor = static_cast<std::uint8_t>(kSensorMid360);
+    obj.frame_epoch = 40;
+    obj.centroid = std::array<float, 3>{1.5f, -0.25f, 0.125f};
+    obj.aabb = std::array<float, 6>{1.25f, -0.5f, 0.f, 1.75f, 0.f, 0.25f};
+    obj.links.push_back(ObjectLink{kG, 9, EventKind::moved, true});
+    registry.objects.push_back(obj);
+    NameableSeed seed;
+    seed.event_generation = kG;
+    seed.event_id = 10;
+    seed.sensor = static_cast<std::uint8_t>(kSensorMid360);
+    seed.centroid = {2.f, 1.f, 0.5f};
+    seed.aabb = {1.875f, 0.875f, 0.375f, 2.125f, 1.125f, 0.625f};
+    seed.voxel_count = 8;
+    registry.seeds.push_back(seed);
+    registry.recent_action_ids.push_back("act-1");
+    registry.recovered_accepts.push_back(RecoveredAccept{kG, 8, EventKind::appeared});
+    return registry;
+}
+
+NameObjectRequest name_object_request() {
+    NameObjectRequest request;
+    request.header = head("lab", 43, 2);
+    request.object_id = 0;
+    request.expected_revision = 0;
+    request.event_generation = kG;
+    request.event_id = 10;
+    request.name = "Scope cart";
+    request.operator_id = "trevor";
+    request.action_id = "act-1";
+    return request;
+}
+
+NameObjectResponse name_object_response() {
+    return NameObjectResponse{NameOutcome::applied, 7, 1, false};
+}
+
+// The v2 field a legacy cut lacks: publisher_generation, or RequestSync.expected_generation.
+// NameObject has no publisher generation; a prefix of it must throw, so this value is unused.
 template <typename T>
 std::optional<std::uint64_t> generation_of(const T& value) {
     if constexpr (std::is_same_v<T, RequestSync>) {
         return value.expected_generation;
+    } else if constexpr (std::is_same_v<T, NameObjectRequest> || std::is_same_v<T, NameObjectResponse>) {
+        return std::uint64_t{1};
     } else if constexpr (std::is_same_v<T, SyncEnd>) {
         return value.publisher_generation;
     } else {
@@ -365,6 +418,12 @@ const std::map<std::string, Golden>& goldens() {
         {"rig_pose_v2_le.hex", golden<RigPose>(rig_pose_v2, true)},
         {"imu_le.hex", Golden{[](const Bytes& data) { return decode_imu(data) == imu(); }, [] { return imu().to_cdr(); },
                               [](const Bytes& data) { (void)decode_imu(data); }, [](const Bytes& data) { (void)decode_imu(data); return false; }, true}},
+        {"object_registry_le.hex", golden<ObjectRegistry>(object_registry, true)},
+        {"object_registry_be.hex", golden<ObjectRegistry>(object_registry, false)},
+        {"name_object_le.hex", golden<NameObjectRequest>(name_object_request, true)},
+        {"name_object_be.hex", golden<NameObjectRequest>(name_object_request, false)},
+        {"name_object_response_le.hex", golden<NameObjectResponse>(name_object_response, true)},
+        {"name_object_response_be.hex", golden<NameObjectResponse>(name_object_response, false)},
     };
     return table;
 }
@@ -431,7 +490,7 @@ TEST(every_hand_golden_is_covered) {
         CHECK(goldens().count(entry.path().filename().string()) == 1);
     }
     CHECK_EQ(files, goldens().size());
-    CHECK_EQ(files, std::size_t{30});
+    CHECK_EQ(files, std::size_t{36});
 }
 
 TEST(hand_goldens_match_the_swift_copies) {
