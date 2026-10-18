@@ -1,6 +1,5 @@
 // The rig guard's files: the registration cloud and rig_state codecs, their parse errors, atomic
 // writes and archives, and byte identity with the Python engine (room_memory/state.py).
-#include <unistd.h>
 #include <zlib.h>
 
 #include <cmath>
@@ -390,30 +389,26 @@ TEST(archive_numbers_removes_and_keeps_three) {
 }
 
 TEST(a_failed_archive_leaves_no_partial_archive) {
-    // A copy that fails part way (an unreadable file, as a full disk would) removes the archive it
+    // A copy that fails part way (a directory where the cloud file should be) removes the archive it
     // started, so a retry takes the same number and pruning never keeps a partial copy over a whole one.
-    // Before the try below: harness::Skip is a std::exception, and that catch would count it as success.
-    if (::geteuid() == 0) {
-        throw harness::Skip(
-            "Docker builds on the Spark run as root, permission-based fault injection cannot fail for root, "
-            "so the test cannot pass there");
-    }
+    // A directory makes std::filesystem::copy_file throw for root and for any other user. perms::none
+    // does not: root still reads the file.
     TempDir dir;
     const std::filesystem::path room = dir.path / "lab";
     touch(room / "rig_state", "state");
-    touch(room / "registration-mid360.bin", "cloud");
+    const std::filesystem::path cloud = room / "registration-mid360.bin";
+    std::filesystem::create_directory(cloud);
     const std::vector<std::string> files{"rig_state", "registration-mid360.bin"};
-    std::filesystem::permissions(room / "registration-mid360.bin", std::filesystem::perms::none);
     bool thrown = false;
     try {
         archive(room, "frame-1", files);
     } catch (const std::exception&) {
         thrown = true;
     }
-    std::filesystem::permissions(room / "registration-mid360.bin", std::filesystem::perms::owner_read |
-                                                                       std::filesystem::perms::owner_write);
     CHECK(thrown);
     CHECK(std::filesystem::is_empty(room / "prev"));
+    std::filesystem::remove(cloud);
+    touch(cloud, "cloud");
     const std::filesystem::path target = archive(room, "frame-1", files);
     CHECK_EQ(target, room / "prev" / "0001-frame-1");
     CHECK_EQ(harness::read_text(target / "registration-mid360.bin"), std::string("cloud"));
