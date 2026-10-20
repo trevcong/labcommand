@@ -471,10 +471,11 @@ public:
     // references inside it; the epoch file is already written, by record_epoch). No-op without
     // state_dir.
     void save(const msg::Time& stamp);
-    // Non-rig runtime saves: failed writes leave the in-memory state usable and retry at the
-    // next close_window, even without new observations. Counts consecutive failed attempts;
-    // a successful retry clears the count, pending flag and error. Startup saves still throw.
-    bool save_pending() const { return save_pending_; }
+    // Non-rig runtime saves: a failed epoch write holds the build/settle until its next attempt;
+    // failed reference writes retry at the next close_window, even without new observations.
+    // Both report pending and count failed attempts until the held epoch and save succeed,
+    // clearing the count, pending flag and error. Startup saves still throw.
+    bool save_pending() const { return save_pending_ || (!config_.rig_guard && epoch_held_); }
     std::int64_t save_failed() const { return save_failed_; }
     const std::string& save_error() const { return save_error_; }
     // Feeds one CDR sensor_msgs/Imu received at `received` to the rig guard. False when the guard is
@@ -538,12 +539,11 @@ private:
         std::int64_t decisions = 0;
     };
     void load_rig(const std::filesystem::path& room, const std::filesystem::path& path);
-    // With the rig guard, writes `epoch` to the room's epoch file before anything carries it, so the
+    // Writes `epoch` to the room's epoch file before anything carries it, so the
     // file never falls behind an epoch in use, whatever else of a save fails. False when the write
     // fails (disk full, permissions; counted like a failed save): the caller holds what would take
-    // the epoch (the build's end, a settle) and the next window tries again. Without the guard or
-    // state_dir it writes nothing and returns true: save writes the epoch file first, with
-    // runtime failures counted and retried by save_runtime.
+    // the epoch (the build's end, a settle) and the next window tries again. Without state_dir
+    // it writes nothing and returns true.
     bool record_epoch(std::uint64_t epoch);
     void save_rig();
     void set_pose(Channel& channel, const rig::Pose& pose);

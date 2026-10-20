@@ -762,7 +762,7 @@ void RoomMemory::load(const msg::Time& start) {
     // seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
     // before it names a message after it. Saved at once, so the next restart moves on again.
     // Nothing carries the new epoch yet: a start that cannot record it stops here.
-    if (!record_epoch(epoch + 1)) throw std::runtime_error(rig_save_error_);
+    if (!record_epoch(epoch + 1)) throw std::runtime_error(config_.rig_guard ? rig_save_error_ : save_error_);
     map_epoch_ = epoch + 1;
     save(start);
     state_ = msg::MemoryState::tracking;
@@ -795,8 +795,10 @@ void RoomMemory::save_runtime(const msg::Time& stamp) {
     try {
         save(stamp);
         save_pending_ = false;
-        save_failed_ = 0;
-        save_error_.clear();
+        if (!epoch_held_) {
+            save_failed_ = 0;
+            save_error_.clear();
+        }
     } catch (const std::exception& error) {
         save_pending_ = true;
         ++save_failed_;
@@ -1030,7 +1032,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         activity_ = std::move(summary);
         last_activity_ns_ = nanoseconds(stamp);
     }
-    // With the guard, the build ends only once the epoch file holds the epoch it takes (else BUILDING
+    // The build ends only once the epoch file holds the epoch it takes (else BUILDING
     // holds, and the next window tries again).
     if (state_ == msg::MemoryState::building && built(now) && record_epoch(map_epoch_ + 1)) {
         state_ = msg::MemoryState::tracking;
@@ -1124,7 +1126,7 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
             VoxelLayer fresh = channel.stats.settled(config_.settle_rule());
             if (!fresh.known.empty()) settled.emplace_back(&channel, std::move(fresh));
         }
-        // With the guard, voxels merge only once the epoch file holds the epoch they take: else the
+        // Voxels merge only once the epoch file holds the epoch they take: else the
         // counts, the references and map_epoch stay as they are, and the next window tries again.
         const bool held = !settled.empty() && !record_epoch(map_epoch_ + 1);
         if (!held) {
@@ -1865,12 +1867,17 @@ void RoomMemory::load_rig(const std::filesystem::path& room, const std::filesyst
 }
 
 bool RoomMemory::record_epoch(std::uint64_t epoch) {
-    if (!config_.rig_guard || !config_.state_dir) return true;
+    if (!config_.state_dir) return true;
     try {
         save_epoch(epoch_path(*config_.state_dir, config_.room_id), epoch);
     } catch (const std::exception& error) {
-        ++rig_save_failed_;
-        rig_save_error_ = error.what();
+        if (config_.rig_guard) {
+            ++rig_save_failed_;
+            rig_save_error_ = error.what();
+        } else {
+            ++save_failed_;
+            save_error_ = error.what();
+        }
         epoch_held_ = true;
         return false;
     }
