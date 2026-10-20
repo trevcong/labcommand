@@ -127,15 +127,20 @@ v2 compares positions only through one function [proposal]:
 
 `compare_positions(obs_a, obs_b, known_at) -> Comparison`, with fields `comparable`, `reason`, `frame`, `distance_m`, `sigma_m`, `revisions_used`.
 
+**Resolved frame.** At `known_at`, each observation resolves to at most one map revision:
+
+- a `map` observation resolves to the revision it is bound to;
+- a `body` observation resolves to its session's *active map revision*. That is the newest visible map revision built from the session's active trajectory revision (§2.3). If no such revision is visible yet, it has no resolved frame. A `body` observation whose pose is `invalid` under the active trajectory revision (§2.3) has no position at all, and is not comparable (`invalid_pose`).
+
 Two observations are comparable at `known_at` only when one of these holds:
 
-1. both are `body` observations of the **same session**, compared under that session's active trajectory revision (the map revision built from it); or
-2. both are `map` observations bound to the **same map revision**; or
-3. each is in a frame with a visible `validated` alignment into the **same reference revision**, and the positions are compared there.
+1. both are `body` observations of the **same session**, compared under that session's active trajectory revision, whether or not a map revision has been built from it yet; or
+2. both resolve to the **same map revision**, whatever their `geometry_frame`. A `body` and a `map` observation are comparable when the `map` one is bound to the `body` one's active map revision. This is how a same-session absence, which is always `map`-frame (below), rechecks a `body`-frame sighting; or
+3. each resolved frame has a visible `validated` alignment into the **same reference revision**, and the positions are compared there.
 
-Anything else returns `comparable = False` with a reason (`different_frames`, `no_validated_alignment`, `alignment_retracted`, `superseded_revision`). It never returns a distance. In particular, a position from trajectory revision 1 is never compared with one from revision 2.
+Anything else returns `comparable = False` with a reason (`different_frames`, `no_validated_alignment`, `alignment_retracted`, `superseded_revision`, `no_map_revision`, `invalid_pose`). It never returns a distance. In particular, a position from trajectory revision 1 is never compared with one from revision 2. A `body` observation under T2 against a `map` observation bound to a revision built from T1 is `superseded_revision`. If T2 has no map revision yet, the reason is `no_map_revision`.
 
-`sigma_m` is `sqrt(σa² + σb²)`, plus each alignment's `rms_m` when case 3 applies.
+`sigma_m` is `sqrt(σa² + σb²)`, plus each alignment's `rms_m` when case 3 applies. The pose leg of a `body` observation adds nothing: v1 records no pose σ, only the bracket check (`pose_quality`), and that check is the only gate on it [provisional].
 
 Uses:
 - **Absence.** v1's step 3 (`map_id = s.map_id`, DESIGN §6) becomes "comparable with s", tested in the absence's own frame (below).
@@ -143,9 +148,9 @@ Uses:
 
 **Absence across frames** [proposal]. An absence region and its one coverage number are exact only in the frame where the region was measured, its *native* frame. v2 never re-boxes that region in another frame. Re-boxing a rotated region adds corners nobody measured, and v1's tightness test can still accept a footprint sitting in one of them (V2-5e: the 45° re-box of `[-0.03, 0.03]²` passes `_region_is_tight` for a footprint at `[0.033, 0.039]²`, which lies wholly outside the measured square). Instead, s's footprint is brought into the absence's native frame and v1's step 3 runs there:
 
-1. **Map the footprint.** Take the 8 corners of s's footprint (DESIGN §6: its AABB, else its centroid) into the absence's native frame. For two frames with alignments, the path is s's validated alignment into reference revision B, then the inverse of the absence frame's validated alignment into the same B. These are two star edges into one reference, not a chain (§2.4). In the same frame, it is the identity.
+1. **Map the footprint.** Take the 8 corners of s's footprint (DESIGN §6: its AABB, else its centroid) into the absence's native frame. For two frames with alignments, the path is s's validated alignment into reference revision B, then the inverse of the absence frame's validated alignment into the same B. These are two star edges into one reference, not a chain (§2.4). Between two `map` observations in the same revision, it is the identity. For a `body` sighting, the corners start in its body frame, and the first leg is its pose under the active trajectory revision: a rigid transform, rotation included. They are never projected into the map and re-boxed first. That is the re-boxing trap above, with no alignment involved: the box would hold corners nobody measured and would loosen the margin in step 3. The pose leg adds nothing to the growth in step 2 (see `sigma_m` above).
 2. **Containment.** Grow the AABB of the mapped corners on every side by the sum of the alignments' `rms_m`. That box must lie inside the region (inclusive). It is a superset of the true footprint, so passing it implies the real footprint is inside the measured region.
-3. **Margin.** Map the region's 8 corners the other way, into s's frame. They must lie inside s's footprint grown by `ABSENCE_MAX_MARGIN_M` per side. This is measured against the true footprint, not the grown box from step 2, so the margin never loosens.
+3. **Margin.** Map the region's 8 corners the other way, into s's frame (for a `body` sighting, its body frame). They must lie inside s's footprint grown by `ABSENCE_MAX_MARGIN_M` per side. This is measured against the true footprint, not the grown box from step 2, so the margin never loosens.
 4. **Coverage** is the absence's recorded number, for its region as recorded. It is never rescaled or reused for a derived region.
 
 With the identity transform and `rms_m = 0`, steps 2 and 3 are exactly v1's `_region_is_tight`. I checked this on 20,000 random box pairs against 90ae03e's function and found no disagreement. Under a rotation, a region counts only if it holds the whole rotated footprint and still fits within footprint + margin. Otherwise it does not count, and s stays `LAST_SEEN`.
@@ -184,7 +189,7 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 
 `object_status(object_id, now, known_at=None, frame=None) -> ObjectStatus` [proposal]:
 
-- `frame=None` means "the frame of the newest sighting". A reference frame may be named. Only aligned evidence takes part then.
+- `frame=None` means "the resolved frame of the newest sighting" (§2.5). A `body` sighting with no resolved frame reports its session and active trajectory revision instead, and only rule 1 of §2.5 applies to it. A reference frame may be named. Only aligned evidence takes part then.
 - The return adds `known_at` (the `txn_id` used), `frame`, `revisions_used`, `complete`, `purged_ids` and `purged_unattributed` (§2.9) to v1's fields. v1's `purged_sightings` becomes `len(purged_ids) + purged_unattributed` at `known_at`. `open_look_again` is X's requests that are open at `known_at` (§2.1), not their state at the time of the query. `measured` and `hypothesis` stay separate sub-records (v1 invariant I16).
 - A **report** is canonical JSON of statuses plus a fingerprint: `schema_version`, `constants_sha256` (a hash of every constant in DESIGN §5 and v2's new ones), `known_at`, `now`. Regenerating a report on a store whose `constants_sha256` differs raises `ReproducibilityError`. It never recomputes the answer under new thresholds.
 
@@ -200,7 +205,7 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 
 ## 3. Acceptance scenarios (future tests)
 
-These are written to become `spatio/memory/tests/test_v2_*.py`, one test per case. They use v1's notation (DESIGN §9): `t0 = 1.76e9`, a "valid detection of X" with `measurement_confidence = 0.9` and a model interpretation linking it to X at confidence 0.9, and "absence over X" with coverage 1.0 and a region equal to X's AABB. `K1 < K2 < …` are transaction ids in write order. One session S1 spans `[t0, t0 + 200]` unless stated.
+These are written to become `spatio/memory/tests/test_v2_*.py`, one test per case. They use v1's notation (DESIGN §9): `t0 = 1.76e9`, a "valid detection of X" with `measurement_confidence = 0.9` and a model interpretation linking it to X at confidence 0.9, and "absence over X" with coverage 1.0 and a region equal to X's AABB. `K1 < K2 < …` are transaction ids in write order. One session S1 spans `[t0, t0 + 200]` unless stated. S1 has trajectory revision T1 and map revision R1 built from it. Unless stated, a detection is `body`-frame with an identity pose under T1 throughout, so its footprint is X's AABB in R1. An absence is bound to R1. V2-1 is therefore a body/map recheck, compared under rule 2 of §2.5.
 
 ### V2-1. A late observation does not rewrite the past
 
@@ -291,6 +296,18 @@ The drift investigation's lesson in test form: a pose error must not read as an 
 - Given a `map`-frame detection of X bound to map revision R1 (built from T1), and T2 recorded with map revision R2.
 - The R1 detection is not projected into R2. Comparing it with an R2 observation returns `comparable = False`.
 - X's status in frame R2 uses only observations re-extracted from R2. With none yet, X in R2 is `UNKNOWN`, and in R1 it is unchanged.
+
+`test_V2_4d_body_sighting_map_absence_same_revision`
+- Given a body-frame detection D of X at `t0` (K1), footprint `[0.5, 0.7] × [-0.1, 0.1] × [0, 0.4]` in the body frame. T1's pose at `t0` is a 20° yaw about z with translation (2, 1, 0), valid. Its corners map into R1 with AABB about `[2.436, 2.692] × [1.077, 1.333] × [0, 0.4]`.
+- An absence A in R1 at `t0 + 5` (K2) has region `[2.42, 2.71] × [1.06, 1.35] × [-0.01, 0.41]` and coverage 1.0. Its corners in D's body frame span about `[0.415, 0.787] × [-0.187, 0.185] × [-0.01, 0.41]`, within the footprint + 0.10 m.
+- At `now = t0 + 10, known_at = K2`: `compare_positions(D, A)` is comparable with `frame == R1` and `revisions_used == {T1, R1}`. X is `NOT_SEEN_ON_RECHECK` with `absence.observation_id == A`.
+- At `known_at = K1` X is `CURRENT` (V2-1).
+
+`test_V2_4e_body_sighting_map_absence_mismatched_revision`
+- The same D and A, then trajectory revision T2 (parent T1, same pose at `t0`) at K3, and map revision R2 built from T2 at K4.
+- At `known_at = K3`: `compare_positions(D, A)` returns `comparable = False, reason = "no_map_revision"`. At `known_at = K4`: `reason = "superseded_revision"`. `distance_m is None` both times.
+- At `now = t0 + 10`, X is `CURRENT` with `absence is None` for `known_at ≥ K3`, in frame R2 from K4 on. At `known_at = K2` it is still `NOT_SEEN_ON_RECHECK`, byte-identical to the answer before K3 (V2-3).
+- A map-frame absence A2 re-extracted from R2 with A's region (K5) makes X `NOT_SEEN_ON_RECHECK` again for `known_at ≥ K5`.
 
 ### V2-5. Unaligned sessions stay separate
 
