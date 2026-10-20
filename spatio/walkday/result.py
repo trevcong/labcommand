@@ -58,6 +58,10 @@ import math
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
+
+from spatio.manifest.jsonio import write_json_atomic
+from spatio.walkcheck.values import measurement_values
 
 from spatio.wall_scoring import (
     PATCH_ORIGINS, WallScoringError as ResultError, acceptance_blockers,
@@ -86,7 +90,7 @@ def _load(path, required=True):
         return None
     try:
         with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+            data = measurement_values(json.load(f))
     except (OSError, ValueError) as exc:
         raise ResultError(f"cannot read {path}: {exc}")
     if not isinstance(data, dict):
@@ -493,12 +497,11 @@ def render(report: dict) -> str:
 
 
 def _write(session, name, data):
-    with open(os.path.join(session, name), "w", encoding="utf-8") as f:
-        if isinstance(data, str):
-            f.write(data)
-        else:
-            json.dump(data, f, indent=2)
-            f.write("\n")
+    path = Path(session) / name
+    if isinstance(data, str):
+        path.write_text(data, encoding="utf-8")
+    else:
+        write_json_atomic(path, data)
 
 
 EXIT = {"PASS": 0, "FAIL": 1, "NOT_EVALUABLE": 2}

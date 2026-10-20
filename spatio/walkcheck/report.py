@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import math
 from pathlib import Path
 
 import numpy as np
 
 from spatio.walkcheck.defaults import HISTORICAL_LABEL, PROVISIONAL_LABEL
+from spatio.manifest.jsonio import write_json_atomic
+from spatio.walkcheck.values import explicit_measurements, measurement_values
 
 
 def plain(obj):
@@ -26,20 +27,21 @@ def plain(obj):
     if isinstance(obj, (float, np.floating)):
         value = float(obj)
         if not math.isfinite(value):
-            return None
+            raise ValueError("non-finite measured value")
         return round(value, 6)
     if isinstance(obj, int):
         return obj
     if obj is None or isinstance(obj, str):
         return obj
-    return str(obj)
+    raise TypeError(f"unsupported report value: {type(obj).__name__}")
 
 
 def write_json(path: Path, report: dict) -> None:
-    path.write_text(json.dumps(plain(report), indent=2) + "\n", encoding="utf-8")
+    write_json_atomic(path, explicit_measurements(plain(report)))
 
 
 def render_markdown(report: dict) -> str:
+    report = measurement_values(report)
     result = report["result"]
     lines = [
         f"# Walk check: {result}",

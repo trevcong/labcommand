@@ -10,6 +10,7 @@ from spatio.series.validate import (
     InputRejected, Unreadable, REPLAY_LABEL, WALK_SCHEMA, parse_walk_result,
 )
 from spatio.wall_scoring import WallScoringError, patch_provenance, score_walls, wall_verdict
+from spatio.walkcheck.values import measurement_values
 
 
 def read_json(path: str):
@@ -32,6 +33,11 @@ def adapt_walkcheck(report: dict, metadata: dict, source_path: str, *,
     """
     def reject(message):
         raise InputRejected(source_path, message)
+
+    try:
+        report = measurement_values(report)
+    except ValueError as exc:
+        reject(str(exc))
 
     if not isinstance(report, dict) or report.get("schema") != "spatio.walkcheck.v1":
         reject("adapter requires spatio.walkcheck.v1")
