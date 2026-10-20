@@ -80,7 +80,4 @@ No Spark, protected container, app, GitHub, push, PR, or other worktree operatio
 were performed. This is the builder's evidence packet, not an independent review.
 No operational approval from Trevor is needed for these local fixes.
 
-Changes are **uncommitted**. `git add -- spatio/PLAN-p2batch.md` failed with:
-`Unable to create '/Users/tconf/Developer/labcommand/.git/worktrees/spatio-fix-p2batch/index.lock': Operation not permitted`.
-The sandbox prevents writing this worktree's git metadata. No permission bypass
-was attempted; commit locally from a context that can write that metadata.
+Commit status: Codex could not write Git metadata, so the orchestrator committed each fix separately (one commit per issue). Codex made no commit or push.
