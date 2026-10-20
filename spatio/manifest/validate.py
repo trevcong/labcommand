@@ -122,7 +122,17 @@ def _check_config_hash(data, session):
                 "%s: config not verifiable here (%s)" % (session, config_file),
             )
         ]
-    digest, _nbytes = hash_file(found)
+    try:
+        digest, _nbytes = hash_file(found)
+    except OSError as exc:
+        # The path exists but cannot be read. That is the M5 warning,
+        # not an exception that aborts the rest of the sessions.
+        return [
+            warning(
+                "M5",
+                "%s: config not verifiable here (%s)" % (session, exc),
+            )
+        ]
     if digest != sha:
         return [
             error(
@@ -172,7 +182,16 @@ def _check_files(data, session):
         if found is None:
             findings.append(error("M6", "%s: listed file is missing" % prefix))
             continue
-        digest, actual = hash_file(found)
+        try:
+            digest, actual = hash_file(found)
+        except OSError as exc:
+            findings.append(
+                error(
+                    "M6",
+                    "%s: listed file is not readable (%s)" % (prefix, exc),
+                )
+            )
+            continue
         if digest != sha or actual != nbytes:
             findings.append(
                 error(

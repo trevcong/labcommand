@@ -383,6 +383,60 @@ class ManifestTests(unittest.TestCase):
         self.assertIn("config not verifiable here", warnings[0].message)
         self.assertEqual(_errors(findings), [])
 
+    def test_validate_config_permission_error_is_m5_warning(self):
+        # A missing path is not the same as a file that exists and cannot
+        # be read. PermissionError must become the M5 warning and must not
+        # abort a later session or JSON output.
+        session, manifest = self._build()
+        other_config = self._make_config(name="other-sensor.yaml", text="lidar_type: 2\n")
+        other, _other_manifest = self._build(run_id="run-other", config=other_config)
+        config = Path(manifest["config_file"])
+        config.chmod(0)
+        try:
+            with self.assertRaises(PermissionError):
+                with open(config, "rb") as handle:
+                    handle.read(1)
+            findings = validate_session(session)
+            warnings = [item for item in _warnings(findings) if item.rule == "M5"]
+            self.assertEqual(len(warnings), 1, findings)
+            self.assertIn("config not verifiable here", warnings[0].message)
+            self.assertFalse(
+                any(item.rule == "M5" and item.severity == "ERROR" for item in findings),
+                findings,
+            )
+            listed = self._run(["validate", "--json", str(session), str(other)])
+        finally:
+            config.chmod(0o644)
+        self.assertNotIn("Traceback", listed.stderr)
+        self.assertEqual(listed.returncode, 1, listed.stdout + listed.stderr)
+        payload = json.loads(listed.stdout)
+        self.assertTrue(
+            any(
+                row["rule"] == "M5"
+                and row["severity"] == "WARNING"
+                and row["session"] == str(session)
+                for row in payload
+            ),
+            payload,
+        )
+        # The same unreadable bytes are also the listed config file. M6
+        # reports that it could not be read, and the other session is
+        # still checked.
+        self.assertTrue(
+            any(
+                row["rule"] == "M6"
+                and row["severity"] == "ERROR"
+                and "not readable" in row["message"]
+                and row["session"] == str(session)
+                for row in payload
+            ),
+            payload,
+        )
+        self.assertFalse(
+            any(row["session"] == str(other) and row["severity"] == "ERROR" for row in payload),
+            payload,
+        )
+
     def test_validate_files_hash_mismatch_is_error(self):
         session, _manifest = self._build()
         data = self._load(session)
@@ -422,6 +476,78 @@ class ManifestTests(unittest.TestCase):
             if item.rule == "M6" and "map.pcd" in item.message
         ]
         self.assertTrue(size_errors, findings)
+
+    def test_listed_relative_path_is_not_satisfied_by_config_basename(self):
+        config = self._make_config(name="sensor.yaml", text="lidar_type: 1\n")
+        source = self._make_source(name="collision-recording")
+        session, manifest = self._build(config=config, source=source)
+        nested = self._write(session / "archive" / "sensor.yaml", "lidar_type: 99\n")
+        config_entry = {
+            "sha256": manifest["config_sha256"],
+            "bytes": config.stat().st_size,
+        }
+        data = self._load(session)
+        # The nested file exists and differs. Recording the config hash
+        # under that longer name used to match the config by basename
+        # and produce no findings.
+        data["files"]["archive/sensor.yaml"] = dict(config_entry)
+        self._save(session, data)
+        findings = validate_session(session)
+        collisions = [
+            item
+            for item in _errors(findings)
+            if item.rule == "M6" and "archive/sensor.yaml" in item.message
+        ]
+        self.assertTrue(collisions, findings)
+
+        honest = sha256_file(nested)
+        data = self._load(session)
+        data["files"]["archive/sensor.yaml"] = {
+            "sha256": honest,
+            "bytes": nested.stat().st_size,
+        }
+        self._save(session, data)
+        findings = validate_session(session)
+        self.assertFalse(
+            any(
+                item.rule == "M6" and "archive/sensor.yaml" in item.message
+                for item in findings
+            ),
+            findings,
+        )
+        self.assertEqual(_errors(findings), [])
+
+        # A same-named file in the session still must not shadow the
+        # exact config basename.
+        self._write(session / "sensor.yaml", "not-the-config\n")
+        findings = validate_session(session)
+        self.assertFalse(
+            any(
+                item.rule == "M6" and "files['sensor.yaml']" in item.message
+                for item in findings
+            ),
+            findings,
+        )
+        self.assertEqual(_errors(findings), [])
+
+        # A nested name is not satisfied by bag/<basename> either.
+        nested.unlink()
+        decoy = self._write(source / "bag" / "sensor.yaml", "decoy-in-bag\n")
+        data = self._load(session)
+        data["files"]["archive/sensor.yaml"] = {
+            "sha256": sha256_file(decoy),
+            "bytes": decoy.stat().st_size,
+        }
+        self._save(session, data)
+        findings = validate_session(session)
+        missing = [
+            item
+            for item in _errors(findings)
+            if item.rule == "M6"
+            and "archive/sensor.yaml" in item.message
+            and "missing" in item.message
+        ]
+        self.assertTrue(missing, findings)
 
     def test_source_fingerprint_null_hash_ok(self):
         session, manifest = self._build(hash_bag=False)
@@ -540,6 +666,17 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertTrue(placement_within_tolerance(on_tolerance))
 
+    def test_placement_tolerance_other_than_provisional_warns(self):
+        other = self._reference("run-a", placement_tolerance_m=0.02)
+        findings = validate_physical_reference(other, expected_run_id="run-a")
+        warnings = [item for item in _warnings(findings) if item.rule == "P3"]
+        self.assertEqual(len(warnings), 1, findings)
+        self.assertIn("provisional", warnings[0].message)
+        self.assertEqual(_errors(findings), [])
+        exact = self._reference("run-a")
+        exact_findings = validate_physical_reference(exact, expected_run_id="run-a")
+        self.assertFalse(any(item.rule == "P3" for item in exact_findings), exact_findings)
+
     def test_physical_reference_negative_or_nan_residual_rejected(self):
         bad_values = (-0.001, float("nan"), float("inf"), float("-inf"), True, "0.1")
         for value in bad_values:
@@ -644,6 +781,78 @@ class ManifestTests(unittest.TestCase):
                             child.unlink()
                     if not any(protected.iterdir()):
                         protected.rmdir()
+
+    def test_build_refuses_absent_protected_roots(self):
+        import spatio.manifest.build as build_mod
+
+        names = [path.name for path in build_mod._FORBIDDEN_ROOTS]
+        self.assertIn("sessions", names)
+        self.assertIn("recordings", names)
+        self.assertIn("spark-src", names)
+
+        # The real spark-src directory exists here. Refuse it with a
+        # missing config so a broken guard still cannot create a child.
+        real_spark = (
+            Path.home()
+            / "Developer"
+            / "spatio-data"
+            / "spark-src"
+            / "g2-manifest-guard-test"
+        )
+        self.assertFalse(real_spark.exists())
+        try:
+            with self.assertRaises(ManifestBuildError) as caught:
+                build_manifest(
+                    real_spark,
+                    real_spark.name,
+                    str(self.root / "missing-recording"),
+                    "mid360",
+                    "unknown",
+                    str(self.root / "missing-config.yaml"),
+                    "none",
+                    "must not be written",
+                )
+            self.assertIn("refusing to write", str(caught.exception))
+            self.assertFalse(real_spark.exists())
+        finally:
+            if real_spark.is_dir():
+                for child in list(real_spark.iterdir()):
+                    if child.is_file():
+                        child.unlink()
+                if not any(real_spark.iterdir()):
+                    real_spark.rmdir()
+
+        # The bug is the exists() skip. These roots are absent, including
+        # a spark-src root, and a successful build would create them.
+        absent_parent = self.root / "no-such-spatio-data"
+        self.assertFalse(absent_parent.exists())
+        roots = tuple(absent_parent / name for name in ("sessions", "recordings", "spark-src"))
+        source = self._make_source(name="absent-root-recording")
+        config = self._make_config(name="absent-root.yaml", text="lidar_type: 3\n")
+        original = build_mod._FORBIDDEN_ROOTS
+        build_mod._FORBIDDEN_ROOTS = roots
+        try:
+            for root in roots:
+                self.assertFalse(root.exists())
+                protected = root / "g2-manifest-guard-test"
+                with self.assertRaises(ManifestBuildError) as caught:
+                    build_manifest(
+                        protected,
+                        protected.name,
+                        str(source),
+                        "mid360",
+                        "unknown",
+                        str(config),
+                        "none",
+                        "must not be written",
+                    )
+                self.assertIn("refusing to write", str(caught.exception))
+                self.assertIn(root.name, str(caught.exception))
+                self.assertFalse(protected.exists())
+                self.assertFalse((protected / "manifest.json").exists())
+                self.assertFalse(root.exists())
+        finally:
+            build_mod._FORBIDDEN_ROOTS = original
 
     def test_cli_exit_codes(self):
         source = self._make_source(name="cli-recording")

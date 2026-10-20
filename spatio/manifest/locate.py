@@ -92,21 +92,24 @@ def locate_config_file(config_file, session_dir):
 def locate_listed_file(name, session_dir, source_recording, config_file):
     """Resolve one ``files`` entry.
 
-    A config entry is the ``--config-file`` path when the names match, so a
-    same-named file dropped into the session folder cannot shadow it.
-    Other names are looked up in the session folder, then the recording.
+    The config path is used only when ``name`` is exactly that file's
+    basename, so a session file of the same name cannot shadow it. A longer
+    relative path is resolved in full: ``archive/sensor.yaml`` is not the
+    config, and it is not a file under ``bag/`` that merely shares the
+    last component.
     """
     if not safe_relative_name(name):
         return None
     candidates = []
-    if isinstance(config_file, str) and config_file and Path(config_file).name == Path(name).name:
+    if isinstance(config_file, str) and config_file and name == Path(config_file).name:
         candidates.append(Path(config_file))
     if session_dir is not None:
         candidates.append(Path(session_dir) / name)
     if isinstance(source_recording, str) and source_recording:
         source = Path(source_recording)
         candidates.append(source / name)
-        candidates.append(source / "bag" / Path(name).name)
+        if Path(name).name == name:
+            candidates.append(source / "bag" / name)
     return _first_file(candidates)
 
 

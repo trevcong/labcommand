@@ -18,6 +18,8 @@ from spatio.manifest.findings import error, warning
 
 
 PHYSICAL_SCHEMA = "spatio.physical_reference/1"
+# 1 cm. Approved as provisional by Trevor's delegate. A different positive
+# value warns (P3) and is not rejected.
 PROPOSED_TOLERANCE_M = 0.01
 HEADING_VALUES = ("ok", "off", "not_checked")
 
@@ -181,8 +183,8 @@ def validate_physical_reference(data, expected_run_id=None):
             findings.append(
                 warning(
                     "P3",
-                    "placement_tolerance_m is %s; the proposed tolerance is 0.01 m "
-                    "and has not been approved" % tolerance,
+                    "placement_tolerance_m is %s; the approved provisional "
+                    "tolerance is 0.01 m" % tolerance,
                 )
             )
     return findings

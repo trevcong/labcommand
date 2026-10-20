@@ -33,12 +33,14 @@ _FORBIDDEN_ROOTS = (
 
 
 def assert_output_allowed(session_dir):
-    """Refuse destinations under the shared recording and session trees."""
+    """Refuse destinations under the shared recording and session trees.
+
+    The protected root does not have to exist. Skipping a missing root
+    would let ``mkdir`` create it and write the manifest underneath.
+    """
     resolved = Path(session_dir).expanduser().resolve()
     for root in _FORBIDDEN_ROOTS:
-        if not root.exists():
-            continue
-        root_resolved = root.resolve()
+        root_resolved = root.expanduser().resolve()
         if resolved == root_resolved or root_resolved in resolved.parents:
             raise ManifestBuildError(
                 "refusing to write a manifest under %s" % root_resolved
