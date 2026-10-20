@@ -524,6 +524,19 @@ class ResultTest(unittest.TestCase):
         self.assertFalse((runs[2] / result.RETIRED).exists())
         self.assertEqual(self.walk(runs[2])["walkday_settings"], self.stage1(runs[2]))
 
+    def test_unreadable_input_gate_still_gives_a_rejection_report(self):
+        # The rejection report itself reads logs/input_gate.json; a bad one must
+        # not escape as exit 1 (FAIL) and leave the earlier PASS walkday.md.
+        s = make_session(self.tmp, "badgate")
+        self.assertEqual(run(s), 0)
+        (s / "logs" / "input_gate.json").write_text("not json")
+        self.assertEqual(run(s), 3)
+        self.assertFalse((s / "walk_result.json").exists())
+        rep = json.loads((s / "walkday.json").read_text())
+        self.assertEqual(rep["stopped_at"], "result")
+        self.assertIn("input_gate.json", rep["reasons"][0])
+        self.assertNotIn("PASS", (s / "walkday.md").read_text())
+
     def test_provenance_config_hash_must_match_the_manifest(self):
         # Replay's manifest hashes the same --config path process.sh hashed
         # (checked on real sessions); a different hash is contradictory input.

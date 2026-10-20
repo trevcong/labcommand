@@ -489,7 +489,10 @@ def _prov_summary(prov, settings=None, changed=()):
 
 
 def stopped(session: str, stage: str, reason: str):
-    gate = _load(os.path.join(session, "logs", "input_gate.json"), required=False)
+    try:
+        gate = _load(os.path.join(session, "logs", "input_gate.json"), required=False)
+    except ResultError as exc:          # a stop report must always be written
+        gate, reason = None, f"{reason}; also {exc}"
     try:
         prov = _prov_summary(_provenance(session))
     except ResultError as exc:
