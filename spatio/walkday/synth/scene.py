@@ -25,8 +25,8 @@ G = 9.80665
 class SceneParams:
     # Time base (s since epoch). Arbitrary; not taken from any recording.
     t0: float = 1800000000.0
-    hold_start_s: float = 8.0          # parked on the marks
-    hold_end_s: float = 8.0            # parked at the end
+    hold_start_s: float = 12.0         # parked on the marks (protocol: >= 10 s; walkcheck needs 8 s of detected stillness)
+    hold_end_s: float = 12.0           # parked at the end
     ramp_s: float = 3.0                # speed-up / slow-down time
     loop_s: float = 50.0               # time spent moving (incl. ramps)
     # Loop: an ellipse around the room centre (metres).

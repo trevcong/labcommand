@@ -191,7 +191,8 @@ python3 -m spatio.manifest validate "$SESSION" || stop manifest "g2 validate fou
 say "[6/9] walk check (B)"
 python3 -m spatio.walkcheck "$SESSION" --stationary-window "$STATIONARY_WINDOW_S" --max-gap "$MAX_GAP_S" \
   --min-path-length "$MIN_PATH_LENGTH_M" --min-excursion "$MIN_EXCURSION_M" \
-  --max-endpoint-spread "$MAX_ENDPOINT_SPREAD_M" --max-endpoint-speed "$MAX_ENDPOINT_SPEED_M_S"
+  --max-endpoint-spread "$MAX_ENDPOINT_SPREAD_M" --max-endpoint-speed "$MAX_ENDPOINT_SPEED_M_S" \
+  --max-hold-speed "$MAX_HOLD_SPEED_M_S" --min-hold "$MIN_HOLD_S"
 rc=$?
 case $rc in 0|1|2) say "walk checker exit $rc" ;; *) stop walk-check "walkcheck could not use the session (exit $rc)" ;; esac
 
