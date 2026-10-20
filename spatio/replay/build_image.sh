@@ -29,6 +29,10 @@ PINNED_REV="$(command cat "$HERE/FASTLIO_REVISION")"
   echo "FAST-LIO source revision '$FL_REV' does not match pinned revision '$PINNED_REV'; refusing image build" >&2
   exit 2
 }
+[[ $(dirty "$FL") == false ]] || {
+  echo "FAST-LIO source checkout is dirty; refusing image build" >&2
+  exit 2
+}
 CTX="$(mktemp -d "${TMPDIR:-/tmp}/spatio-replay-ctx.XXXXXX")"
 trap 'rm -rf "$CTX"' EXIT
 

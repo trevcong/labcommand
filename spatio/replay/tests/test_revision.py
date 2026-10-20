@@ -140,7 +140,7 @@ def test_matching_image_replays_without_source_checkout_or_spec(harness):
     assert all(IMAGE_ID in c for c in commands if c[0] in ("run", "create"))
 
 
-def build_source(harness, revision):
+def build_source(harness, revision, status=""):
     root, env = harness
     src = root / "source"
     for relative in ("FAST_LIO_ROS2/src/laserMapping.cpp",
@@ -152,12 +152,16 @@ def build_source(harness, revision):
         path.write_text("fixture source\n")
     env["SPATIO_SRC"] = str(src)
     env["SOURCE_REV"] = revision
+    env["SOURCE_STATUS"] = status
     executable(root / "bin" / "git", r'''
 import os, sys
 args = sys.argv[1:]
 assert args[0] == "-C" and args[1].startswith(os.environ["SPATIO_SRC"]), args
 if args[2:] == ["rev-parse", "HEAD"]:
     print(os.environ["SOURCE_REV"])
+elif args[2:] == ["status", "--porcelain"]:
+    if args[1].endswith("/FAST_LIO_ROS2"):
+        print(os.environ["SOURCE_STATUS"], end="")
 elif args[2:] not in (["status", "--porcelain"], ["diff", "HEAD"]):
     raise AssertionError(args)
 ''')
@@ -182,3 +186,16 @@ def test_build_refuses_source_drift_before_docker(harness):
     assert result.returncode == 2, result.stdout + result.stderr
     assert "does not match pinned revision" in result.stderr
     assert calls(harness) == []
+
+
+@pytest.mark.parametrize("status", [" M src/laserMapping.cpp\n",
+                                    "M  src/laserMapping.cpp\n",
+                                    "?? src/experiment.cpp\n"])
+def test_build_refuses_dirty_pinned_source_before_docker(harness, status):
+    root, _ = harness
+    build_source(harness, PIN, status=status)
+    result = run_script(harness, "build_image.sh")
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "FAST-LIO source checkout is dirty" in result.stderr
+    assert calls(harness) == []
+    assert not (root / "build.json").exists()
