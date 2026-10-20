@@ -13,7 +13,10 @@ from pathlib import Path
 
 import numpy as np
 
-from spatio.replaycompare.compare import DIAGNOSTIC_LABEL, compare_sessions
+from spatio.replaycompare.compare import (
+    DIAGNOSTIC_LABEL, compare_sessions, _rotation_angles_deg,
+    _rotation_angle_deg_from_matrix,
+)
 from spatio.replaycompare.pcd import read_pcd, voxel_downsample, write_pcd
 from spatio.replaycompare.report import format_markdown
 from spatio.replaycompare.tum import write_tum
@@ -59,6 +62,24 @@ def _write_session(root, run_id, poses, points, binary=False, double=False):
 
 
 class ReplayCompareTests(unittest.TestCase):
+    def test_rotation_precision_at_zero_and_half_turn(self):
+        # Nontrivial equal quaternions must not acquire an arccos roundoff angle.
+        quat = np.array([[0.1, 0.2, 0.3, 0.4]])
+        for other in (quat, -quat):
+            np.testing.assert_array_equal(_rotation_angles_deg(quat, other), [0.0])
+        for angle in (1e-9, 0.12, math.pi - 1e-9, math.pi):
+            with self.subTest(angle=angle):
+                q = np.array([[0., 0., math.sin(angle / 2), math.cos(angle / 2)]])
+                want = math.degrees(angle)
+                for sign in (-1, 1):
+                    got = _rotation_angles_deg(np.array([IDENTITY]), sign * q)[0]
+                    self.assertAlmostEqual(got / want, 1.0, places=12)
+                c, s = math.cos(angle), math.sin(angle)
+                matrix = np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]])
+                got = _rotation_angle_deg_from_matrix(matrix)
+                self.assertAlmostEqual(got / want, 1.0, places=12)
+        self.assertEqual(_rotation_angle_deg_from_matrix(np.eye(3)), 0.0)
+
     def test_identical_sessions_zero_difference(self):
         poses = _line_poses()
         with tempfile.TemporaryDirectory() as tmp:
