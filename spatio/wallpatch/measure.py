@@ -16,10 +16,15 @@ from spatio.wallpatch.doubled import (
     MIN_PEAK_MASS,
     PEAK_MERGE_M,
     RULE_TEXT,
+    SPLIT_STEP,
+    SPLIT_TURN_DEG,
     UNCERTAIN_SEPARATION_M,
     VALLEY_HEIGHT_RATIO,
     analyze_distances,
     reconcile_axes,
+    stepped_band,
+    stepped_band_reason,
+    thick_band_reason,
 )
 from spatio.wallpatch.errors import MapShaMismatch, WallpatchError
 from spatio.wallpatch.figures import write_note_figure, write_patch_figure
@@ -116,6 +121,10 @@ def measure_map(map_path, patches_path, out_dir, accuracy_label=None, verbose=Fa
             "peak_merge_m": PEAK_MERGE_M,
             "confident_separation_m": CONFIDENT_SEPARATION_M,
             "undetermined_separation_m": UNCERTAIN_SEPARATION_M,
+            "pass_needs_band_under_m": SEPARATION_GATE_M,
+            "core_band_fraction": 1.0 - MIN_PEAK_MASS,
+            "stepped_band_split_step": SPLIT_STEP,
+            "stepped_band_turn_deg": SPLIT_TURN_DEG,
         },
         "patches": measured,
     }
@@ -252,6 +261,30 @@ def _measure_one(name, points, spec, invalid_reason):
         sep_pass = bool(separation is not None and separation <= SEPARATION_GATE_M)
     else:
         sep_pass = None
+    if p95_pass is True and sep_pass is True:
+        # Fail safe. The hint is only approximate and the pooled fit can tilt.
+        # A pass needs a band too thin to hold two surfaces at the gate.
+        thick = thick_band_reason(fit_stats["core_band_m"], SEPARATION_GATE_M)
+        if thick is not None:
+            return _blank(name, n_cropped, thick, spec)
+        # Sheets that only partly overlap tilt the fit and thin the band.
+        # The hint cannot be trusted to undo that tilt, so this check does
+        # not use it.
+        # A step can run across the wall at any angle, so the split direction
+        # turns through the wall plane in SPLIT_TURN_DEG steps.
+        along_axis, _across_axis, vertical_axis = box_axes(normal)
+        delta = points - plane_point
+        along = project(delta, along_axis)
+        vertical = project(delta, vertical_axis)
+        turns = np.radians(np.arange(0.0, 180.0, SPLIT_TURN_DEG))
+        stepped = stepped_band(
+            signed, [np.cos(t) * along + np.sin(t) * vertical for t in turns]
+        )
+        step_reason = stepped_band_reason(stepped, SEPARATION_GATE_M)
+        if step_reason is not None:
+            return _blank(name, n_cropped, step_reason, spec)
+    else:
+        stepped = None
     across, vertical, mask = _slice_frame(points, plane_point, normal)
     if separation_axis == "normal_hint":
         # The histogram is the hint gap. The scatter uses that same axis.
@@ -275,6 +308,8 @@ def _measure_one(name, points, spec, invalid_reason):
         "residuals": {
             "p95_abs_m": fit_stats["p95_abs_m"],
             "thickness_m": fit_stats["thickness_m"],
+            "core_band_m": fit_stats["core_band_m"],
+            "stepped_band_m": stepped,
             "p2_5_m": fit_stats["p2_5_m"],
             "p97_5_m": fit_stats["p97_5_m"],
             "bin_width_m": fit_stats["bin_width_m"],
@@ -452,6 +487,14 @@ def _markdown(report):
             lines.append("- p95 |residual|: %s" % _metres(residuals["p95_abs_m"]))
             lines.append(
                 "- Thickness (p97.5 - p2.5): %s" % _metres(residuals["thickness_m"])
+            )
+            lines.append(
+                "- Narrowest band holding %d%%: %s"
+                % (int(round(100 * (1.0 - MIN_PEAK_MASS))), _metres(residuals["core_band_m"]))
+            )
+            lines.append(
+                "- Same band after removing a step's tilt (checked on passes only): %s"
+                % _metres(residuals["stepped_band_m"])
             )
         lines.append("- Doubled: %s" % patch["doubled"])
         lines.append("- Separation: %s" % _metres(patch["separation_m"]))
