@@ -642,6 +642,184 @@ class SeriesTest(unittest.TestCase):
 
         self.assertTrue(counts_toward_series(fitted))
 
+    def test_zero_length_path_with_moving_true_cannot_pass(self):
+        zero_return = {"d3_m": 0.0, "horizontal_m": 0.0, "vertical_m": 0.0}
+        zero_and_still = dict(
+            path_length_m=0.0,
+            drift_pct_of_path=None,
+            return_error=zero_return,
+        )
+        self.assert_rejected(
+            make_walk("zero-both", **zero_and_still),
+            "zero-length path",
+            "zero-both.json",
+        )
+        self.assert_rejected(
+            make_walk("zero-path", path_length_m=0.0),
+            "validity.moving is true",
+            "zero-path.json",
+        )
+        with self.assertRaises(InputRejected) as zero_series:
+            self.series_of(
+                [
+                    make_walk("z1", **zero_and_still),
+                    make_walk("z2", **zero_and_still),
+                    make_walk("z3", **zero_and_still),
+                ],
+                "zero-return",
+            )
+        self.assertIn("zero-length path", str(zero_series.exception))
+        self.assertIn("run-0.json", str(zero_series.exception))
+        with self.assertRaises(InputRejected) as positive_series:
+            self.series_of(
+                [
+                    make_walk("p1", path_length_m=0.0),
+                    make_walk("p2", path_length_m=0.0),
+                    make_walk("p3", path_length_m=0.0),
+                ],
+                "positive-return",
+            )
+        self.assertIn("path_length_m is 0", str(positive_series.exception))
+        self.assertIn("moving", str(positive_series.exception))
+        # A claimed failure is still a contradictory motion claim.
+        self.assert_rejected(
+            make_walk(
+                "fail-zero",
+                status="FAIL",
+                reasons=["path length was zero"],
+                path_length_m=0.0,
+            ),
+            "zero-length path",
+            "fail-zero.json",
+        )
+        # Stationary and not measured are not the same claim.
+        still = self.load(
+            make_walk(
+                "still-zero",
+                status="FAIL",
+                reasons=["the cart did not move"],
+                path_length_m=0.0,
+                drift_pct_of_path=None,
+                validity={"moving": False},
+                return_error=zero_return,
+            ),
+            "still-zero.json",
+        )
+        self.assertEqual(still.path_length_m, 0.0)
+        self.assertIs(still.validity.moving, False)
+        self.assertFalse(still.w1_supports_pass())
+        unmeasured = self.load(make_walk("null-path", path_length_m=None), "null-path.json")
+        self.assertIsNone(unmeasured.path_length_m)
+        from spatio.series.report import counts_toward_series
+
+        self.assertTrue(counts_toward_series(unmeasured))
+        # Exact zero is the cutoff. No must-move minimum is applied.
+        small = self.load(
+            make_walk(
+                "small-path",
+                path_length_m=0.01,
+                drift_pct_of_path=None,
+                return_error=zero_return,
+            ),
+            "small-path.json",
+        )
+        self.assertEqual(small.path_length_m, 0.01)
+        self.assertTrue(counts_toward_series(small))
+
+    def test_identical_endpoint_windows_cannot_pass(self):
+        same = {
+            "start_window_s": [0.0, 10.0],
+            "end_window_s": [0.0, 10.0],
+            "d3_m": 0.0,
+            "horizontal_m": 0.0,
+            "vertical_m": 0.0,
+        }
+        self.assert_rejected(
+            make_walk("same-window", return_error=same),
+            "overlap",
+            "same-window.json",
+        )
+        with self.assertRaises(InputRejected) as caught:
+            self.series_of(
+                [
+                    make_walk("w1", return_error=same),
+                    make_walk("w2", return_error=same),
+                    make_walk("w3", return_error=same),
+                ],
+                "same-windows",
+            )
+        self.assertIn("overlap", str(caught.exception))
+        self.assertIn("[0.0, 10.0]", str(caught.exception))
+        self.assertNotIn("reversed", str(caught.exception))
+        separated = self.load(
+            make_walk(
+                "separated",
+                return_error={"start_window_s": [0.0, 10.0], "end_window_s": [11.0, 21.0]},
+            ),
+            "separated.json",
+        )
+        self.assertEqual(separated.return_error.start_window_s, [0.0, 10.0])
+        self.assertEqual(separated.return_error.end_window_s, [11.0, 21.0])
+        missing_end = self.load(
+            make_walk("null-end", return_error={"end_window_s": None}),
+            "null-end.json",
+        )
+        self.assertIsNone(missing_end.return_error.end_window_s)
+        from spatio.series.report import counts_toward_series
+
+        self.assertTrue(counts_toward_series(missing_end))
+
+    def test_overlapping_or_reversed_windows_rejected(self):
+        self.assert_rejected(
+            make_walk(
+                "partial",
+                return_error={"start_window_s": [0.0, 10.0], "end_window_s": [5.0, 15.0]},
+            ),
+            "overlap",
+            "partial.json",
+        )
+        self.assert_rejected(
+            make_walk(
+                "contained",
+                return_error={"start_window_s": [0.0, 30.0], "end_window_s": [10.0, 20.0]},
+            ),
+            "overlap",
+            "contained.json",
+        )
+        self.assert_rejected(
+            make_walk(
+                "touch",
+                return_error={"start_window_s": [0.0, 10.0], "end_window_s": [10.0, 20.0]},
+            ),
+            "overlap",
+            "touch.json",
+        )
+        self.assert_rejected(
+            make_walk(
+                "reversed",
+                return_error={"start_window_s": [20.0, 30.0], "end_window_s": [0.0, 10.0]},
+            ),
+            "reversed",
+            "reversed.json",
+        )
+        with self.assertRaises(InputRejected) as caught:
+            self.load(
+                make_walk(
+                    "reversed-check",
+                    return_error={"start_window_s": [20.0, 30.0], "end_window_s": [0.0, 10.0]},
+                ),
+                "reversed-check.json",
+            )
+        self.assertNotIn("overlap", str(caught.exception))
+        self.assert_rejected(
+            make_walk(
+                "crossed",
+                return_error={"start_window_s": [10.0, 20.0], "end_window_s": [0.0, 15.0]},
+            ),
+            "overlap",
+            "crossed.json",
+        )
+
     def test_null_rendered_not_measured_not_zero(self):
         data = make_walk(
             "missing-horizontal",

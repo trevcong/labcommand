@@ -241,8 +241,10 @@ def parse_walk_result(data: Any, source_path: str) -> WalkResult:
     )
     _check_w3_w4(evaluated, accuracy_label, data.get("physical_reference") if "physical_reference" in data else _MISSING, errors)
 
+    # One rule for numbers that cannot be true together. A minimum of 0 on
+    # path_length_m still allows a measured zero; this is what rejects it.
+    _check_absurd_numbers(path_length, validity, return_error, errors)
     if return_error is not None:
-        _check_components(return_error, errors)
         _check_threshold(return_error, errors)
 
     if (
@@ -380,6 +382,7 @@ def _optional_bool(value: Any, name: str, errors: List[str]) -> Optional[bool]:
 
 
 def _optional_window(value: Any, name: str, errors: List[str]) -> Optional[List[float]]:
+    # One window only. The start/end pair is checked in _check_absurd_numbers.
     if value is None:
         return None
     if not isinstance(value, list) or len(value) != 2:
@@ -617,12 +620,67 @@ def _check_w3_w4(
         )
 
 
+def _check_absurd_numbers(
+    path_length: Optional[float],
+    validity: Optional[Validity],
+    error: Optional[ReturnError],
+    errors: List[str],
+) -> None:
+    """Reject numeric claims that cannot describe one return.
+
+    This is the one parser rule for an absurd combination. It does not add a
+    minimum path, a minimum gap, or a window length. Three checks:
+
+    - each measured return component must fit inside d3, and both together
+      must match it;
+    - validity.moving true cannot sit beside a path length of exactly 0;
+    - when both endpoint windows are present, the end window must start
+      after the start window ends. A shared instant counts as overlap.
+    """
+    if error is not None:
+        _check_components(error, errors)
+        _check_endpoint_windows(error, errors)
+    _check_zero_path(path_length, validity, errors)
+
+
+def _check_zero_path(
+    path_length: Optional[float],
+    validity: Optional[Validity],
+    errors: List[str],
+) -> None:
+    if path_length is None or validity is None or validity.moving is not True:
+        return
+    if path_length == 0.0:
+        errors.append(
+            "path_length_m is 0 while validity.moving is true; "
+            "a moving run cannot have a zero-length path"
+        )
+
+
+def _check_endpoint_windows(error: ReturnError, errors: List[str]) -> None:
+    start = error.start_window_s
+    end = error.end_window_s
+    if start is None or end is None:
+        return
+    if end[0] > start[1]:
+        return
+    if end[1] < start[0]:
+        relation = "are reversed"
+    else:
+        relation = "overlap"
+    errors.append(
+        "return_error.end_window_s %s and return_error.start_window_s %s %s; "
+        "the end window must start after the start window ends"
+        % (end, start, relation)
+    )
+
+
 def _check_components(error: ReturnError, errors: List[str]) -> None:
     """Reject a component that cannot fit inside the reported 3D return.
 
-    This is the one parser rule for an impossible return vector. A null axis
-    does not skip it: each measured component is checked on its own against
-    d3. When both components are present they must also match d3.
+    Called only from _check_absurd_numbers. A null axis does not skip the
+    check: each measured component is checked on its own against d3. When
+    both components are present they must also match d3.
     """
     if error.d3_m is None:
         return
