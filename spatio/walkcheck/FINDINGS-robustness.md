@@ -97,8 +97,4 @@ Independent review remains a separate team responsibility.
 No additional Trevor approval is needed for these local changes. Physical
 walks and acceptance remain separate, approval-dependent work.
 
-Commit status: changes are **uncommitted**. The local `git add` attempt failed
-with exit 128: Git could not create
-`/Users/tconf/Developer/labcommand/.git/worktrees/spatio-robustness/index.lock`
-(`Operation not permitted`). This session cannot write the worktree's Git
-metadata. No permission bypass or push was attempted.
+Commit status: Codex could not write Git metadata in its sandbox, so the orchestrator committed these changes (5d232de). No push was attempted by Codex.
