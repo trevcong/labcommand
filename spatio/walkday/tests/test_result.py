@@ -4,6 +4,7 @@ Sessions are built from walkcheck's synthetic helpers (square loop with
 parked ends, four-wall room), scored by the real walk checker and wall-patch
 tool, then turned into walk_result.json."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -16,7 +17,10 @@ from pathlib import Path
 from spatio.series.cli import main as series_main
 from spatio.series.validate import load_walk_result
 from spatio.walkcheck.cli import main as walkcheck_main
-from spatio.walkcheck.synthetic import doubled_wall, four_wall_room, hold_and_square, insert_time_gap, write_tum, write_pcd_binary
+import numpy as np
+
+from spatio.walkcheck.synthetic import (doubled_wall, four_wall_room, hold_and_square, insert_time_gap,
+                                      vertical_wall, write_pcd_binary, write_tum)
 from spatio.wallpatch.cli import main as wallpatch_main
 from spatio.walkday import result
 
@@ -29,7 +33,7 @@ def quiet(fn, *a):
 
 
 def make_session(root, run_id, offset=(0.05, 0.0, 0.0), xyz=None, gap=False, evaluated=False,
-                 reference=None, source=None, patches=True):
+                 reference=None, source=None, patches=True, boxes=None):
     s = Path(root) / run_id
     (s / "logs").mkdir(parents=True)
     rows = hold_and_square(offset=offset)
@@ -45,7 +49,15 @@ def make_session(root, run_id, offset=(0.05, 0.0, 0.0), xyz=None, gap=False, eva
     if reference is not None:
         (s / "physical_reference.json").write_text(json.dumps(reference))
     assert quiet(walkcheck_main, [str(s)]) in (0, 1, 2)
-    if patches:
+    if boxes is not None:              # explicit patch boxes, as with process.sh --patches
+        (s / "wallpatch").mkdir()
+        digest = hashlib.sha256((s / "map.pcd").read_bytes()).hexdigest()
+        (s / "wallpatch" / "patches.json").write_text(json.dumps({
+            "schema": "spatio.wall_patches/1", "map_sha256": digest,
+            "patches": [{"name": f"chosen-{i}", "box_map_frame": b} for i, b in enumerate(boxes)]}))
+        assert quiet(wallpatch_main, ["measure", str(s), "--patches", str(s / "wallpatch" / "patches.json"),
+                                      "--out", str(s / "wallpatch")]) == 0
+    elif patches:
         (s / "wallpatch").mkdir()
         assert quiet(wallpatch_main, ["suggest", str(s / "map.pcd"), "--n", "2",
                                       "--out", str(s / "wallpatch" / "patches.json")]) == 0
@@ -103,14 +115,35 @@ class ResultTest(unittest.TestCase):
         self.assertIsNone(w["return_error"]["d3_m"])
         load_walk_result(str(s / "walk_result.json"))
 
-    def test_doubled_wall_fails_a_good_loop(self):
-        room = four_wall_room()
-        xyz = __import__("numpy").vstack([room, doubled_wall(separation_m=0.08)])
-        s = make_session(self.tmp, "rdbl", xyz=xyz)
-        code = run(s)
+    def test_doubled_wall_in_a_chosen_patch_fails_a_good_loop(self):
+        # Rewritten (task I): doubled walls are decided on measured patches, as the
+        # workplan defines them. A patch box over an 8 cm doubled wall must FAIL a
+        # loop whose return error alone would pass.
+        xyz = np.vstack([four_wall_room(), doubled_wall(separation_m=0.08)])
+        box = {"center_m": [1.04, 1.5, 1.1], "normal_hint": [1.0, 0.0, 0.0], "half_extent_m": [0.5, 0.25, 0.5]}
+        s = make_session(self.tmp, "rdbl", xyz=xyz, boxes=[box])
+        self.assertEqual(run(s), 1)
         w = self.walk(s)
-        self.assertNotEqual(w["status"], "PASS")
-        self.assertIn(code, (1, 2))
+        self.assertEqual(w["status"], "FAIL")
+        self.assertTrue(w["walls"]["doubled_wall_suspected"])
+
+    def test_solid_pillar_is_a_warning_not_a_failure(self):
+        # Since fd3cf19 the whole-map check reports the two faces of a 0.5 m pillar
+        # as a ~50 cm doubled wall. That stays visible as a WARNING; patches decide.
+        rng = np.random.default_rng(2)
+        pillar = [vertical_wall(2.25, "x", 1500, 1.75, 2.25, 0, 2.4, 0.004, rng),
+                  vertical_wall(2.75, "x", 1500, 1.75, 2.25, 0, 2.4, 0.004, rng),
+                  vertical_wall(1.75, "y", 1500, 2.25, 2.75, 0, 2.4, 0.004, rng),
+                  vertical_wall(2.25, "y", 1500, 2.25, 2.75, 0, 2.4, 0.004, rng)]
+        s = make_session(self.tmp, "rpillar", xyz=np.vstack([four_wall_room()] + pillar))
+        wc = json.loads((s / "walkcheck.json").read_text())
+        self.assertTrue(wc["walls"]["doubled_wall"])          # the whole-map flag fires
+        self.assertEqual(run(s), 0)
+        self.assertFalse(self.walk(s)["walls"]["doubled_wall_suspected"])
+        report = json.loads((s / "walkday.json").read_text())
+        self.assertTrue(report["walls"]["whole_map_doubled_flag"])
+        self.assertTrue(any("cannot tell a ghost wall" in x for x in report["walls"]["warnings"]))
+        self.assertIn("WARNING", (s / "walkday.md").read_text())
 
     def test_missing_wall_patches_is_not_evaluable(self):
         s = make_session(self.tmp, "rnp", patches=False)

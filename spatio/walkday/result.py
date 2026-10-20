@@ -15,10 +15,16 @@ Exit codes: 0 PASS, 1 FAIL, 2 NOT-EVALUABLE, 3 bad or contradictory input.
 
 Run status (stricter than spatio.series W1, never looser):
   PASS only if the walk checker says PASS (return error < 0.10 m with parked,
-  continuous, moving endpoints; no end-onto-start alignment), no doubled wall
-  is suspected (whole-map check and every measured patch), the whole-map
-  95th-percentile point-to-plane residual is within the wall gate, and every
-  measured patch passes its p95 and separation gates.
+  continuous, moving endpoints; no end-onto-start alignment), no measured wall
+  patch is doubled, the whole-map 95th-percentile point-to-plane residual is
+  within the wall gate, and every measured patch passes its p95 and separation
+  gates. Doubled walls are decided on the patches, as the workplan defines
+  them ("revisit wall separation <= 5 cm on the two preselected patches").
+  The walk checker's whole-map doubled-wall flag is shown as a WARNING, not
+  used: since fd3cf19 it has no upper separation cap and reports the two faces
+  of any solid object (a 0.5 m pillar reads as a 50 cm doubled wall), so it
+  cannot tell a ghost wall from furniture. Walkcheck itself never let walls
+  change its verdict; requiring that flag was this module's own extra rule.
   NOT_EVALUABLE if the walk checker says NOT-EVALUABLE (its return error is then
   withheld from walk_result.json and kept in walkday.json), or the wall evidence
   is incomplete (a patch undetermined/not measurable, or no patch measured).
@@ -76,24 +82,28 @@ def _cm_to_m(v):
 
 
 def wall_evidence(walkcheck: dict, wallpatch, gate_m: float):
-    """Combine the whole-map check with the measured patches.
+    """Doubled walls from the measured patches; whole-map p95 as a gate; the
+    whole-map doubled flag as a warning only (see module docstring).
 
-    Returns (p95_m, doubled_suspected True/False/None, failures, notes, patches).
+    Returns (p95_m, doubled_suspected True/False/None, failures, notes, patches, warnings).
     """
-    failures, notes, patches = [], [], []
+    failures, notes, patches, warnings = [], [], [], []
     whole = walkcheck.get("walls") or {}
     p95 = None
     doubled = []
     if whole.get("status") == "OK":
         p95 = _cm_to_m(whole.get("p95_point_to_plane_cm"))
-        doubled.append(whole.get("doubled_wall") if isinstance(whole.get("doubled_wall"), bool) else None)
         if p95 is None:
             doubled.append(None)
+            notes.append("whole-map p95 missing")
         elif p95 > gate_m:
             failures.append(f"whole-map wall p95 {p95 * 100:.1f} cm > gate {gate_m * 100:g} cm")
         if whole.get("doubled_wall") is True:
-            failures.append("whole-map check found a doubled wall "
-                            f"(largest revisit separation {whole.get('max_revisit_separation_cm')} cm)")
+            warnings.append(
+                "whole-map check suspects a doubled wall (revisit separation "
+                f"{whole.get('revisit_separation_cm')} cm, largest {whole.get('max_revisit_separation_cm')} cm). "
+                "It cannot tell a ghost wall from two faces of a real object (pillar, crate, thin wall): "
+                "inspect topdown.png. Not used for PASS/FAIL; the patches decide.")
     else:
         doubled.append(None)
         notes.append(f"whole-map wall check not evaluable: {whole.get('reason')}")
@@ -130,7 +140,7 @@ def wall_evidence(walkcheck: dict, wallpatch, gate_m: float):
         suspected = None
     else:
         suspected = False
-    return p95, suspected, failures, notes, patches
+    return p95, suspected, failures, notes, patches, warnings
 
 
 def build(session: str, gate_m: float, gate_state: str, patch_source: str):
@@ -164,7 +174,7 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str):
     wc_result = wc.get("result")
     if wc_result not in ("PASS", "FAIL", "NOT-EVALUABLE"):
         raise ResultError(f"walkcheck result {wc_result!r}")
-    p95, doubled, wall_fail, wall_notes, patches = wall_evidence(wc, wp, gate_m)
+    p95, doubled, wall_fail, wall_notes, patches, wall_warn = wall_evidence(wc, wp, gate_m)
 
     d3 = _num(rts.get("error_3d_m"))
     horiz = _cm_to_m(rts.get("error_horizontal_cm"))
@@ -239,7 +249,8 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str):
         "timestamps": {k: ts.get(k) for k in ("max_dt_s", "backward_steps", "gap_steps", "fault")},
         "walls": {"whole_map_p95_m": p95, "doubled_wall_suspected": doubled, "gate_m": gate_m,
                   "gate_label": PROVISIONAL, "patch_source": patch_source, "patches": patches,
-                  "failures": wall_fail, "notes": wall_notes},
+                  "failures": wall_fail, "notes": wall_notes, "warnings": wall_warn,
+                  "whole_map_doubled_flag": (wc.get("walls") or {}).get("doubled_wall")},
         "input_gate": None if gate is None else {k: gate.get(k) for k in ("evaluable", "blocking", "warnings")},
         "manifest": {k: manifest.get(k) for k in ("sensor", "fastlio_revision", "config_file",
                                                   "config_sha256", "image", "source_recording")},
@@ -364,6 +375,10 @@ def render(report: dict) -> str:
                  f"p95 {_f(p['p95_abs_m'], 100, ' cm')}, separation {_f(p['separation_m'], 100, ' cm')}")
     for x in w["failures"]:
         L.append(f"- FAIL: {x}")
+    for x in w.get("warnings") or []:
+        L.append(f"- WARNING: {x}")
+        L.append("  (The Trail tab shows the walk checker's own wall gate, so it can say FAIL here "
+                 "while this report decides on the patches.)")
     for x in w["notes"]:
         L.append(f"- note: {x}")
     L += ["", "## Physical reference", ""]
