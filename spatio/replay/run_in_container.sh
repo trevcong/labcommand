@@ -48,13 +48,15 @@ wait_for_line() {  # file pattern timeout_s
 }
 
 stop_proc() {  # pid name timeout_s ; SIGINT then wait, SIGKILL as last resort
-  local pid=$1 name=$2 t=$3 i=0
+  local pid=$1 name=$2 t=$3 i=0 rc
   kill -INT "$pid" 2>/dev/null || { say "$name already exited"; wait "$pid" 2>/dev/null; return; }
   while kill -0 "$pid" 2>/dev/null; do
     sleep 1; i=$((i + 1))
     if [[ $i -ge $t ]]; then say "WARNING: $name did not stop in ${t}s; SIGKILL"; kill -KILL "$pid"; break; fi
   done
-  wait "$pid" 2>/dev/null; say "$name stopped (exit $?) after ${i}s"
+  wait "$pid" 2>/dev/null; rc=$?
+  say "$name stopped (exit $rc) after ${i}s"
+  return "$rc"
 }
 
 say "starting FAST-LIO (params: /cfg/config.yaml; runtime_pos_log_enable:=true for per-scan timing)"
@@ -94,9 +96,12 @@ done
 say "drained: odom_watch saw $n /Odometry messages"
 
 stop_proc "$REC" recorder 60
+REC_RC=$?
 stop_proc "$WATCH" odom_watch 10
+WATCH_RC=$?
 FL_ALIVE=1; kill -0 "$FL" 2>/dev/null || FL_ALIVE=0   # FAST-LIO must still be running here
 stop_proc "$FL" fastlio 120
+FL_RC=$?
 trap - EXIT
 cp -a /ws/src/FAST_LIO_ROS2/Log "$LOGS/fastlio_Log" 2>/dev/null || true
 
@@ -107,8 +112,12 @@ rc1=${PIPESTATUS[0]}
 
 say "building map from recorded /cloud_registered"
 python3 "$T/bag_to_map.py" "$LOGS/output_bag" "$OUT/map.pcd" --voxel "${MAP_VOXEL:-0.03}" \
+    --display-out "$OUT/map_display.pcd" \
     --summary "$LOGS/map_summary.json" >>"$LOGS/runner.log" 2>&1
 rc2=$?
-say "done (playback rc=$PLAY_RC, fastlio alive at end=$FL_ALIVE, trajectory rc=$rc1, map rc=$rc2)"
+say "done (playback rc=$PLAY_RC, recorder rc=$REC_RC, odom_watch rc=$WATCH_RC, fastlio rc=$FL_RC, fastlio alive at end=$FL_ALIVE, trajectory rc=$rc1, map rc=$rc2)"
 # Any failed step fails the replay, even when partial outputs exist.
-[[ $PLAY_RC == 0 && $FL_ALIVE == 1 && $rc1 == 0 && $rc2 == 0 ]]
+for rc in "$PLAY_RC" "$REC_RC" "$WATCH_RC" "$FL_RC" "$rc1" "$rc2"; do
+  [[ $rc == 0 ]] || exit "$rc"
+done
+[[ $FL_ALIVE == 1 ]]

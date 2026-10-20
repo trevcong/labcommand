@@ -28,7 +28,7 @@
 #   --max-seconds N   hard limit for the container run (default 3600)
 #   --fastdds-profile FILE  Fast DDS XML profile for every node in the container
 #                     (e.g. configs/fastdds_big_shm.xml for large PointCloud2)
-#   --map-voxel M     map.pcd voxel size in metres (default 0.03)
+#   --map-voxel M     map_display.pcd voxel size in metres (default 0.03)
 #
 # Isolation: --network none, private ROS_DOMAIN_ID, recording mounted read-only
 # (as a named volume copy), CPU/memory/pids limits, all capabilities dropped.
@@ -72,7 +72,7 @@ mkdir -p "$SESSIONS_ROOT"
 SESSION="$(cd "$SESSIONS_ROOT" && pwd)/$RUN_ID"
 # A session folder may already hold logs/ from an earlier pipeline stage
 # (walk-day input check); outputs are never overwritten.
-for f in trajectory.tum map.pcd manifest.json logs/output_bag; do
+for f in trajectory.tum map.pcd map_display.pcd manifest.json logs/output_bag; do
   [[ -e $SESSION/$f ]] && { echo "session already has $f, refusing to overwrite: $SESSION" >&2; exit 2; }
 done
 # The copy must be complete: every bag file present and its MCAP summary
@@ -181,6 +181,10 @@ fi
 for f in trajectory.tum map.pcd; do
   [[ -s $SESSION/$f ]] || { echo "ERROR: replay produced no $f" >&2; [[ $RC == 0 ]] && RC=4; }
 done
+if [[ $MODE == replay && ! -s $SESSION/map_display.pcd ]]; then
+  echo "ERROR: replay produced no map_display.pcd" >&2
+  if [[ $RC == 0 ]]; then RC=4; fi
+fi
 
 # Provenance and run details (outside the contract manifest).
 dk run --rm --name "spatio-prov-$RUN_ID" --network none "$IMAGE_TAG" cat /opt/spatio/provenance.json > "$SESSION/logs/image_provenance.json"
@@ -197,7 +201,7 @@ json.dump({
   "limits": {"cpus": $CPUS, "memory": "$MEM", "shm": "1g", "pids": 1024, "max_seconds": $MAX_SECONDS},
   "fastdds_profile": "${DDS_PROFILE:-default}",
   "fastlio_param_overrides": {"runtime_pos_log_enable": True} if "$MODE" == "replay" else {},
-  "map": "map.pcd = copied map_saver.py ($MAP_VOXEL m voxel) fed offline from recorded /cloud_registered" if "$MODE" == "replay" else "map.pcd = copy of recording's $HIST_MAP",
+  "map": "map.pcd = all finite registered XYZ points for scoring; map_display.pcd = copied map_saver.py ($MAP_VOXEL m voxel) for display" if "$MODE" == "replay" else "map.pcd = copy of recording's $HIST_MAP (filtering provenance unknown)",
 }, open(sys.argv[1], "w"), indent=2)
 EOF
 echo "$RC" > "$SESSION/logs/container_exit_code"
@@ -205,7 +209,7 @@ echo "$RC" > "$SESSION/logs/container_exit_code"
 # Contract manifest.  (SENSOR: --sensor, else derived from the bag's message types.)
 if [[ $MODE == replay ]]; then
   M_REV=$FL_REV M_IMAGE="$IMAGE_TAG@$IMAGE_ID" M_CONFIG=$CONFIG
-  M_NOTES="Offline FAST-LIO re-run on the Mac (colima, aarch64) of the copied recording; played ${LIDAR} + ${IMU} only at rate ${RATE}${DURATION:+, first ${DURATION} s only}. trajectory.tum = recorded /Odometry header stamps. map.pcd = copied map_saver.py (${MAP_VOXEL} m voxel) over recorded /cloud_registered. Container exit ${RC}. ${CONFIG_NOTE}"
+  M_NOTES="Offline FAST-LIO re-run on the Mac (colima, aarch64) of the copied recording; played ${LIDAR} + ${IMU} only at rate ${RATE}${DURATION:+, first ${DURATION} s only}. trajectory.tum = recorded /Odometry header stamps. map.pcd = all finite registered XYZ points for scoring. map_display.pcd = copied map_saver.py (${MAP_VOXEL} m voxel) over recorded /cloud_registered, for display only. Container exit ${RC}. ${CONFIG_NOTE}"
 else
   # Original Spark run: revision only known if the recording says so.
   M_REV="$(sed -n 's/^FAST_LIO_ROS2: *//p' "$REC/provenance.txt" 2>/dev/null | head -1 || true)"
