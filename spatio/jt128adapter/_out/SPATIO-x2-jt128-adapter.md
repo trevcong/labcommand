@@ -214,3 +214,75 @@ Spec correction: whole-scope IMU consistency requires complete pairing and
 nonzero evidence on every axis; matched contradictions still take precedence.
 Full package suite: 35 ran, 34 passed, one existing missing-PCAP skip. [skip ci]
 ```
+
+
+## Review fixes — x2b
+
+Accepted the single P2 finding in `sp-rv-x2b-final.md`, reviewed at `73ae70a`.
+That commit contains the previous review fixes; the earlier blocked-commit
+paragraphs above are historical records, not the current branch state.
+
+**Built:** one central verdict gate now requires an unrestricted full pass and
+exact agreement between decoded counts and MCAP summary inventory for all three
+analyzed topics: `/slam/points`, `/lidar_imu`, and `/slam/imu`. Other bag topics
+are not decoded by this checker. The report exposes this check as
+`scope.whole_bag_covered`. A partial window cannot produce any “consistent with
+vendored source” row. Observed contradictions retain “inconsistent (evidence)”.
+Existing pairing, excitation, residual, and provenance requirements remain.
+This is a deliberate tightening of the bag-level consistency specification.
+
+**Regression evidence:** three tests were added. The 6 ms synthetic window reads
+2 of 6 clouds and 2 of 4 raw/adapted IMU pairs; all eight rows now remain “not
+determinable from this bag” for otherwise matching data. A 1 s window containing
+all 6 clouds and 4 pairs also remains unknown because it is explicitly bounded.
+An unrestricted pass with a simulated omitted cloud or omitted raw/adapted pair
+cannot claim consistency. A contradictory 6 ms window still flags field layout,
+gyro conversion, acceleration handling, and time origin as inconsistent. Before
+the fix, the new tests produced four failing subtests in two tests; the third
+confirmed the existing contradiction behavior. Existing full-pass positive
+verdict tests still pass. The existing direct IMU test helper explicitly supplies
+complete bag coverage so its pairing/excitation checks remain meaningful.
+
+**How to run / validation:** CLI syntax is unchanged:
+`python3 -m spatio.jt128adapter.bagcheck RECORDING --out OUTPUT [--max-seconds SECONDS]`.
+Remove `--max-seconds` to permit whole-bag consistency verdicts. The shared-lock
+requirement in section 2 still applies to large historical recording reads.
+The full package suite ran serially with numerical worker limits:
+
+```sh
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python3 -m unittest discover -s spatio/jt128adapter/tests -t . -v
+```
+
+**38 tests ran: 37 passed, 0 failed, 1 existing skip** for the unavailable
+`jt128_one_frame.pcap`. Log: `spatio/jt128adapter/_out/x2b-review-fixes-tests.log`
+(ignored by Git). No tests, skips, vendor bytes, or numeric tolerances were
+weakened. `git diff --check` passed. Swift tests/build were not run because this
+change touches only the Python package and its findings.
+
+**Limits and approvals:** all new measurements above are synthetic. No real bag
+decode, FAST-LIO replay, Spark contact, or physical accuracy evaluation occurred.
+Inventory agreement is a coverage check, not proof of calibration, physical
+units, or vendor provenance. The milestone wall/window/gap/motion/memory/placement
+thresholds remain **provisional**, as approved; this fix does not implement or
+change those gates. No numeric option or numeric validation guard was added.
+No additional Trevor approval is needed for this local correction. The requested
+external findings file and tracked package copy contain this same section.
+
+
+### x2b local commit blocked
+
+The requested local `git add` and `git commit` both failed before staging:
+
+```text
+fatal: Unable to create '/Users/tconf/Developer/labcommand/.git/worktrees/spatio-x2-jt128-adapter/index.lock': Operation not permitted
+```
+
+The x2b correction is **uncommitted**; HEAD remains `73ae70a`. Approval policy is
+never, so no escalation or permission bypass was attempted. An environment that
+permits the worktree Git metadata write is needed to finish the already-authorized
+local commit. Suggested subject:
+`Require whole-bag coverage for x2b consistency verdicts [skip ci]`.
+Commit body must state the spec correction: positive consistency requires an
+unrestricted pass and decoded inventory agreement across all analyzed topics;
+subset contradictions remain evidence. Test result: 38 ran, 37 passed, one
+existing missing-PCAP skip. End the message with `[skip ci]`.

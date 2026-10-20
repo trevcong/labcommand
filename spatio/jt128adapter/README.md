@@ -41,6 +41,13 @@ per-scan data, aggregate distributions, IMU matching and eight verdicts.
 vendored seconds interpretation; that naming does not prove the bag's units.
 Receipt time is never labelled acquisition or firing time.
 
+Every "consistent with vendored source" verdict requires an unrestricted full
+pass and decoded counts equal to the whole-bag inventory for all three analyzed
+topics (`/slam/points`, `/lidar_imu`, `/slam/imu`). The report records this as
+`scope.whole_bag_covered`. Any `--max-seconds` window, even one containing all
+messages, leaves positive consistency "not determinable from this bag".
+Contradictions observed in a subset still produce "inconsistent (evidence)".
+
 The reader explicitly uses `NonSeekingReader` in physical file order. Payload
 memory scales with MCAP chunk size and the current decoded cloud, rather than
 all clouds in the bag; compact per-scan/IMU records still grow with the recording.

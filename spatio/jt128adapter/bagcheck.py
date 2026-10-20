@@ -152,9 +152,13 @@ def cloud_arrays(msg):
     return fields, arrays
 
 
-def verdicts(points, imu, raw_points_present=False):
+def verdicts(points, imu, raw_points_present=False, *, whole_bag_covered=False):
     rows = []
     def add(prop, status, evidence):
+        if status == consistent and not whole_bag_covered:
+            status = unknown
+            evidence += (" Whole-bag consistency requires an unrestricted full pass and "
+                         "decoded counts matching the inventory for all three analyzed topics.")
         rows.append({"property": prop, "verdict": status, "evidence": evidence})
     consistent = "consistent with vendored source"
     unknown = "not determinable from this bag"
@@ -273,18 +277,22 @@ def inspect_bag(recording, max_seconds=None):
               "header_step_s": distribution(np.diff(sorted(s["header_stamp_ns"] for s in scans)) / 1e9),
               "scans": scans}
     imu = imu_report(raw, adapted)
+    scope = {"max_seconds": max_seconds, "receipt_start_ns": start, "receipt_end_exclusive_ns": end,
+             "full_pass": max_seconds is None}
+    scope["whole_bag_covered"] = scope["full_pass"] and all(
+        counts[topic] == inventory[topic] for topic in TOPICS)
     return {"vendor_sha256": hashlib.sha256(VENDOR.read_bytes()).hexdigest(),
             "provenance": "not verified to be the version that produced the 20260826T221936Z bag",
             "reader": {"api": "mcap_ros2.reader.read_ros2_messages(NonSeekingReader, log_time_order=False)",
                        "mcap": version("mcap"), "mcap_ros2": version("mcap-ros2-support"),
                        "python": sys.version, "ros_runtime": False},
             "sources": sources, "inventory_whole_bag": dict(inventory), "decoded_counts": dict(counts),
-            "scope": {"max_seconds": max_seconds, "receipt_start_ns": start, "receipt_end_exclusive_ns": end,
-                      "full_pass": max_seconds is None},
+            "scope": scope,
             "physical_accuracy_evaluated": False,
             "evidence_boundary": "Historical recording inspection only; no replay executed here; physical accuracy not evaluated. No raw-to-adapted point mapping or firing-time claim is established.",
             "points": points, "imu": imu,
-            "verdicts": verdicts(points, imu, "/lidar_points" in inventory)}
+            "verdicts": verdicts(points, imu, "/lidar_points" in inventory,
+                                 whole_bag_covered=scope["whole_bag_covered"])}
 
 
 def markdown(report):

@@ -284,10 +284,58 @@ class Bagcheck(unittest.TestCase):
         self.assertEqual(report["imu"]["matched"], 2)
         self.assertEqual(report["inventory_whole_bag"]["/slam/points"], 6)
 
+    def test_window_cannot_establish_whole_bag_consistency(self):
+        path = self.fixture(chunk_size=1, cloud_count=6)
+        for seconds, clouds, pairs in ((.006, 2, 2), (1., 6, 4)):
+            with self.subTest(seconds=seconds):
+                report = bagcheck.inspect_bag(path, seconds)
+                self.assertFalse(report["scope"]["full_pass"])
+                self.assertEqual(report["points"]["messages"], clouds)
+                self.assertEqual(report["imu"]["matched"], pairs)
+                self.assertEqual(report["inventory_whole_bag"],
+                                 {"/slam/points": 6, "/lidar_imu": 4, "/slam/imu": 4})
+                for row in report["verdicts"]:
+                    self.assertEqual(row["verdict"], "not determinable from this bag")
+
+    def test_full_pass_requires_decoded_counts_to_match_inventory(self):
+        path = self.fixture(chunk_size=1, cloud_count=6)
+        original = bagcheck.stream_messages
+        # Simulate an incomplete decode despite an unrestricted requested pass.
+        # Dropping both IMU samples preserves complete pairing of the subset.
+        for omitted in (("/slam/points",), ("/lidar_imu", "/slam/imu")):
+            def incomplete(path, start, end):
+                remaining = set(omitted)
+                for record in original(path, start, end):
+                    if record.channel.topic in remaining:
+                        remaining.remove(record.channel.topic)
+                    else:
+                        yield record
+            with self.subTest(omitted=omitted), patch.object(
+                    bagcheck, "stream_messages", side_effect=incomplete):
+                report = bagcheck.inspect_bag(path)
+                self.assertTrue(report["scope"]["full_pass"])
+                self.assertNotEqual(report["decoded_counts"], report["inventory_whole_bag"])
+                for row in report["verdicts"]:
+                    self.assertEqual(row["verdict"], "not determinable from this bag")
+
+    def test_window_preserves_observed_contradictions(self):
+        fields = [dict(field) for field in bagcheck.EXPECTED_FIELDS]
+        fields[3]["offset"] = 13  # A valid buffer with a non-vendor intensity layout.
+        path = make_mcap(self.root / "contradiction.mcap", fields,
+                         gyro_scale=1., accel_scale=9.81, first_time=.02,
+                         chunk_size=1, cloud_count=6)
+        report = bagcheck.inspect_bag(path, .006)
+        self.assertFalse(report["scope"]["full_pass"])
+        self.assertEqual(report["imu"]["matched"], 2)
+        verdicts = {v["property"]: v["verdict"] for v in report["verdicts"]}
+        for prop in ("field layout", "gyro conversion", "accel handling", "time origin"):
+            self.assertEqual(verdicts[prop], "inconsistent (evidence)")
+
     def imu_verdicts(self, raw, adapted):
         points = bagcheck.inspect_bag(self.fixture())["points"]
         return {v["property"]: v["verdict"]
-                for v in bagcheck.verdicts(points, bagcheck.imu_report(raw, adapted))}
+                for v in bagcheck.verdicts(points, bagcheck.imu_report(raw, adapted),
+                                          whole_bag_covered=True)}
 
     def test_zero_imu_pairs_do_not_establish_conversion(self):
         zero = [(0, [0., 0., 0.], [0., 0., 0.], "hesai_lidar")]
