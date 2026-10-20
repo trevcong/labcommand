@@ -51,10 +51,11 @@ def report(zones_data, scans_data, voxel_size, grid_origin, uncertainty_m, min_f
     }
 
 
-def markdown(result):
-    def safe(value):
-        return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+def safe(value):
+    return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
+
+def markdown(result):
     lines = ["# Clearance evidence", "", result["claim"],
              "Physical accuracy not evaluated. Rule provisions are supplied inputs.",
              f"Voxel size: {result['voxel_size_m']:g} m. "
@@ -83,7 +84,7 @@ def provenance_lines(provenance):
              f"extrinsics {provenance['extrinsics_sha256']}; "
              f"trajectory {provenance['trajectory_sha256']}; "
              f"scans {provenance['scans_sha256']}.",
-             f"Time basis: {provenance['time_basis']}."]
+             f"Time basis: {safe(provenance['time_basis'])}."]
     if provenance["limitations"]:
         lines.append("Provenance limitations (apply to every zone, including PASS):")
         lines += [f"- {key}: {prov.LIMITATIONS[key]}" for key in provenance["limitations"]]

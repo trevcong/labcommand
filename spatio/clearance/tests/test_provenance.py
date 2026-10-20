@@ -94,8 +94,8 @@ def test_translated_zone_with_same_id_rule_and_depth_blocks_reuse():
 def test_reordered_zone_document_keys_still_match_geometry():
     zones = zones_doc()
     volume = zones["zones"][0]["required_volume"]
-    zones["zones"][0]["required_volume"] = dict(reversed(list(volume.items())))
-    volume["max"] = [1.0, .1, .1]
+    volume = dict(reversed(list(volume.items())), max=[1.0, .1, .1])  # int vs float
+    zones["zones"][0]["required_volume"] = volume
     assert build_report(result(INPUTS), zones, "walk", supplied())["counts"]["PASS"] == 1
 
 
@@ -134,6 +134,16 @@ def test_missing_timing_and_ray_provenance_is_a_limitation_on_the_pass():
     rendered = markdown_report(out)
     assert "Provenance limitations (apply to every zone, including PASS):" in rendered
     assert "no\\_time\\_basis" in rendered and "scans\\_not\\_reverified" in rendered
+
+
+def test_time_basis_is_literal_single_line_markdown():
+    source = result(dict(INPUTS, time_basis="stamp | sec\n# heading"))
+    assert source["provenance"]["time_basis"] == "stamp | sec\n# heading"
+    rendered = markdown(source)
+    assert "Time basis: stamp \\| sec # heading." in rendered
+    assert "\n# heading" not in rendered
+    rendered = markdown_report(build_report(source, zones_doc(), "walk", supplied()))
+    assert "\n# heading" not in rendered
 
 
 def test_only_missing_time_basis_is_listed():

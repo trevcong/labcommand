@@ -89,7 +89,8 @@ An unsupplied recording or scans file is listed in `reuse_limitations`
 `provenance` and lists all limitations in the Markdown.
 
 JSON has `schema: "spatio.clearance_report.v1"`, `walk_id`, `frame_id`,
-`settings`, `scan_count`, `scan_time_range`, `counts` (all four status keys),
+`settings`, `scan_count`, `scan_time_range`, `provenance`, `reuse_limitations`,
+`counts` (all four status keys),
 `zone_count`, `zones`, `failures`, and `rechecks`. `physical_accuracy_evaluated`
 remains false. Each zone item contains the complete unchanged upstream record
 under `evidence` plus `map_position_m`. Failures contain only FAIL items;
