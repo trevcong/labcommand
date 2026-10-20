@@ -117,7 +117,8 @@ stop() {  # stage reason
   echo "!! NOT-EVALUABLE: stopped at $1"
   echo "!! $2"
   echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-  python3 -m spatio.walkday.result "$SESSION" --stopped-at "$1" --reason "$2" >/dev/null
+  # "written": result.py already wrote the report with its own reason (exit 3).
+  [[ ${3:-} == written ]] || python3 -m spatio.walkday.result "$SESSION" --stopped-at "$1" --reason "$2" >/dev/null
   echo "report: $SESSION/walkday.md"
   exit 2
 }
@@ -252,7 +253,7 @@ SPEC_ARGS=()
 python3 -m spatio.walkday.result "$SESSION" --wall-gate-m "$WALL_GATE_M" --wall-gate-state "$WALL_GATE_STATE" \
   --patch-source "$PATCH_SOURCE" --patch-origin "$PATCH_ORIGIN" ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
 rc=$?
-[[ $rc == 3 ]] && stop result "could not build walk_result.json (see output above)"
+[[ $rc == 3 ]] && stop result "could not build walk_result.json (see output above)" written
 echo
 if [[ $rc == 2 ]]; then
   echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"

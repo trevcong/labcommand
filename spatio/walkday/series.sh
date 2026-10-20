@@ -31,6 +31,11 @@ done
 [[ -n $SERIES_ID ]] || SERIES_ID="$(IFS=+; echo "${RUNS[*]}")"
 [[ $SERIES_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.+-]*$ ]] || { echo "bad series id: $SERIES_ID" >&2; exit 2; }
 
+OUT="$ROOT/series/$SERIES_ID"
+STAGED="$OUT/spatio_series"   # spatio.series' own verdict; the walk-day gate writes the final one
+# Never leave an old verdict, including when a run below has lost its walk_result.json.
+rm -f "$OUT/series.md" "$OUT/series.json" "$STAGED/series.md" "$STAGED/series.json"
+
 FILES=() MISSING=0
 for r in "${RUNS[@]}"; do
   f="$ROOT/$r/walk_result.json"
@@ -48,10 +53,7 @@ if [[ $MISSING == 1 ]]; then
   exit 2
 fi
 
-OUT="$ROOT/series/$SERIES_ID"
-STAGED="$OUT/spatio_series"   # spatio.series' own verdict; the walk-day gate writes the final one
 mkdir -p "$STAGED"
-rm -f "$OUT/series.md" "$OUT/series.json" "$STAGED/series.md" "$STAGED/series.json"   # never leave an old verdict
 python3 -m spatio.series compare "${FILES[@]}" --out "$STAGED" --series-id "$SERIES_ID"
 rc=$?
 case $rc in

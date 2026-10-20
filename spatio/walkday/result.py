@@ -14,6 +14,10 @@ synthetic recording, its SYNTHETIC.json ground truth. The second form records
 a run that stopped before scoring (NOT-EVALUABLE; no walk_result.json).
 
 Exit codes: 0 PASS, 1 FAIL, 2 NOT-EVALUABLE, 3 bad or contradictory input.
+Either form first moves an earlier walk_result.json aside (walk_result.json.retired;
+deleted again when a new one is written). So after exit 3 or a stopped run the
+session has no walk_result.json and series.sh refuses it; walkday.md/json then
+say why (stopped at result: rejected ...).
 
 Run status (stricter than spatio.series W1, never looser):
   PASS only if the walk checker says PASS (return error < 0.10 m with parked,
@@ -641,6 +645,17 @@ def _write(session, name, data):
 
 
 EXIT = {"PASS": 0, "FAIL": 1, "NOT_EVALUABLE": 2}
+RETIRED = "walk_result.json.retired"
+
+
+def _retire(session):
+    """Move an earlier walk_result.json aside before scoring again. Only a
+    successful build writes a new one, so a rejected re-score (exit 3) or a
+    stopped re-run can never leave an earlier result for series.sh to count.
+    A mark inside the file would not do: spatio.series ignores extra keys."""
+    path = os.path.join(session, "walk_result.json")
+    if os.path.exists(path):
+        os.replace(path, os.path.join(session, RETIRED))
 
 
 def main(argv=None) -> int:
@@ -659,18 +674,24 @@ def main(argv=None) -> int:
     if not os.path.isdir(args.session):
         print(f"result: no session folder {args.session}", file=sys.stderr)
         return 3
-    if not (math.isfinite(args.wall_gate_m) and args.wall_gate_m > 0):
-        print("result: --wall-gate-m must be a positive number", file=sys.stderr)
-        return 3
+    _retire(args.session)
     try:
+        if not (math.isfinite(args.wall_gate_m) and args.wall_gate_m > 0):
+            raise ResultError("--wall-gate-m must be a positive number")
         if args.stopped_at:
             report = stopped(args.session, args.stopped_at, args.reason)
         else:
             walk, report = build(args.session, args.wall_gate_m, args.wall_gate_state, args.patch_source,
                                  args.patch_origin, args.spec)
             _write(args.session, "walk_result.json", walk)
+            if os.path.exists(os.path.join(args.session, RETIRED)):
+                os.remove(os.path.join(args.session, RETIRED))
     except ResultError as exc:
         print(f"result: {exc}", file=sys.stderr)
+        # Replace any earlier walkday.md/json too: it may still say PASS.
+        report = stopped(args.session, "result", f"rejected, no walk_result.json: {exc}")
+        _write(args.session, "walkday.json", report)
+        _write(args.session, "walkday.md", render(report))
         return 3
     _write(args.session, "walkday.json", report)
     _write(args.session, "walkday.md", render(report))

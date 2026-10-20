@@ -482,12 +482,47 @@ class ResultTest(unittest.TestCase):
         self.assertEqual(got["values"]["MIN_HOLD_S"], 7.0)
         self.assertEqual(dict(got["values"], MIN_HOLD_S=6.0), self.stage1(s)["values"])
         # A walk check that does not record its parameters cannot be checked: refused.
+        # Review P2 (result.py:672): the earlier walk_result.json stays in place
+        # here, as it would on a real re-score; the rejection must retire it.
         wc = json.loads((s / "walkcheck.json").read_text())
         del wc["parameters"]["min_hold_s"]
         (s / "walkcheck.json").write_text(json.dumps(wc))
-        (s / "walk_result.json").unlink()
+        self.assertTrue((s / "walk_result.json").exists())
         self.assertEqual(run(s), 3)
         self.assertFalse((s / "walk_result.json").exists())
+        self.assertTrue((s / result.RETIRED).exists())
+
+    def test_rejected_rescore_retires_the_earlier_result_and_the_series_no_longer_passes(self):
+        # Review P2 (result.py:672): exit 3 left the previous PASS walk_result.json
+        # in place, so series.sh could still PASS from it.
+        spec = write_spec(Path(self.tmp) / "spec.json")
+        runs = [self.preselected(f"rj{i}", spec=spec)[0] for i in range(3)]
+        self.assertEqual(self.series_sh(runs, "rj")[1], "PASS")
+        before = (runs[2] / "walk_result.json").read_text()
+        wc = json.loads((runs[2] / "walkcheck.json").read_text())
+        hold = wc["parameters"].pop("min_hold_s")
+        (runs[2] / "walkcheck.json").write_text(json.dumps(wc))
+        self.assertEqual(run(runs[2], "--patch-origin", "preselected", "--spec", spec[0]), 3)
+        self.assertFalse((runs[2] / "walk_result.json").exists())
+        self.assertEqual((runs[2] / result.RETIRED).read_text(), before)   # kept, under a name nothing reads
+        rep = json.loads((runs[2] / "walkday.json").read_text())
+        self.assertEqual((rep["status"], rep["stopped_at"]), ("NOT_EVALUABLE", "result"))
+        self.assertIn("min_hold_s", rep["reasons"][0])
+        self.assertNotIn("PASS", (runs[2] / "walkday.md").read_text())
+        # Same series id: the earlier PASS series.json must not survive either.
+        rc, verdict, out = self.series_sh(runs, "rj")
+        self.assertEqual((rc, verdict), (2, None), out)
+        self.assertIn("rj2 has no walk_result.json", out)
+        self.assertFalse((Path(self.tmp) / "series" / "rj" / "spatio_series" / "series.json").exists())
+        # A stopped re-run (process.sh --stopped-at) retires it the same way.
+        self.assertEqual(quiet(result.main, [str(runs[1]), "--stopped-at", "input-gate", "--reason", "x"]), 2)
+        self.assertFalse((runs[1] / "walk_result.json").exists())
+        # Scoring successfully again writes a fresh result and drops the retired copy.
+        wc["parameters"]["min_hold_s"] = hold
+        (runs[2] / "walkcheck.json").write_text(json.dumps(wc))
+        self.assertEqual(run(runs[2], "--patch-origin", "preselected", "--spec", spec[0]), 0)
+        self.assertFalse((runs[2] / result.RETIRED).exists())
+        self.assertEqual(self.walk(runs[2])["walkday_settings"], self.stage1(runs[2]))
 
     def test_provenance_config_hash_must_match_the_manifest(self):
         # Replay's manifest hashes the same --config path process.sh hashed
