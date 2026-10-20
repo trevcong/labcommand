@@ -54,7 +54,7 @@ Precedence is input error (exit 1), then NOT_EVALUABLE, then REPLAY_ONLY, then P
 - R3. The series is PASS only when three consecutive attempts all count. The earliest three are named. Other non-counting attempts stay in the table and under Retained failed attempts.
 - R4. If every run has physical accuracy not evaluated, the verdict is REPLAY_ONLY and the label is "replay demonstrated; physical accuracy not evaluated".
 - R5. Fewer than 3 attempts, once the stronger verdicts above do not apply, is INCOMPLETE. A retained failure does not rule the series out before three attempts exist. Three or more attempts with no counting triple is FAIL.
-- Boundary. A 3D return error of exactly 0.10 m is not under 0.10 m, so that run fails.
+- Boundary. A 3D return error of exactly 0.10 m is not under 0.10 m, so that run fails. Each measured component, and the combined length of the two components, uses that same strict comparison. The 1 mm consistency tolerance does not move this boundary.
 - Null. A null measurement is "not measured". It is never read as zero.
 - Gates. The return threshold is 0.10 m and the placement tolerance is 0.01 m (provisional). A looser number in the file is rejected. Wall p95 is shown and is not an acceptance gate. W1 uses the doubled-wall flag only. The 5 cm wall gate is provisional.
 """

@@ -820,6 +820,265 @@ class SeriesTest(unittest.TestCase):
             "crossed.json",
         )
 
+    def test_component_on_return_gate_cannot_pass_inside_tolerance(self):
+        # The 1 mm consistency allowance must not pull a 10 cm length under the gate.
+        on_horizontal = {"d3_m": 0.0995, "horizontal_m": 0.10, "vertical_m": 0.0}
+        on_vertical = {"d3_m": 0.0995, "horizontal_m": 0.0, "vertical_m": 0.10}
+        null_vertical = {"d3_m": 0.0995, "horizontal_m": 0.10, "vertical_m": None}
+        null_horizontal = {"d3_m": 0.0995, "horizontal_m": None, "vertical_m": 0.10}
+        # 0.08/0.06 is a 10 cm combined length. Each component is under 10 cm.
+        combined = {"d3_m": 0.0995, "horizontal_m": 0.08, "vertical_m": 0.06}
+        # Still inside the 1 mm band, and the combined length is over 10 cm.
+        over_band = {"d3_m": 0.0995, "horizontal_m": 0.08032, "vertical_m": 0.06024}
+        wider_than_d3 = {"d3_m": 0.0995, "horizontal_m": 0.1004, "vertical_m": 0.0}
+        cases = (
+            ("h-boundary", on_horizontal, "horizontal_m"),
+            ("v-boundary", on_vertical, "vertical_m"),
+            ("h-null", null_vertical, "horizontal_m"),
+            ("v-null", null_horizontal, "vertical_m"),
+            ("norm", combined, "sqrt"),
+            ("norm-over", over_band, "sqrt"),
+            ("h-over-band", wider_than_d3, "horizontal_m"),
+        )
+        for name, error, fragment in cases:
+            self.assert_rejected(
+                make_walk(name, return_error=error),
+                fragment,
+                "%s.json" % name,
+            )
+            with self.assertRaises(InputRejected) as caught:
+                self.series_of(
+                    [
+                        make_walk("%s-1" % name, return_error=error),
+                        make_walk("%s-2" % name, return_error=error),
+                        make_walk("%s-3" % name, return_error=error),
+                    ],
+                    name,
+                )
+            text = str(caught.exception)
+            self.assertIn(fragment, text)
+            self.assertIn("not <", text)
+            self.assertIn("run-0.json", text)
+            self.assertIn("consistency tolerance does not apply", text)
+        # A null axis is not zero, so it does not invent a combined length.
+        with self.assertRaises(InputRejected) as null_case:
+            self.load(make_walk("h-null-check", return_error=null_vertical), "h-null-check.json")
+        self.assertNotIn("sqrt", str(null_case.exception))
+        with self.assertRaises(InputRejected) as null_other:
+            self.load(make_walk("v-null-check", return_error=null_horizontal), "v-null-check.json")
+        self.assertNotIn("sqrt", str(null_other.exception))
+        # 0.08 and 0.06 are each under the gate. Only the combined length fails.
+        with self.assertRaises(InputRejected) as norm_case:
+            self.load(make_walk("norm-check", return_error=combined), "norm-check.json")
+        norm_text = str(norm_case.exception)
+        self.assertIn("0.100000", norm_text)
+        self.assertNotIn("return_error.horizontal_m", norm_text)
+        self.assertNotIn("return_error.vertical_m", norm_text)
+
+        from spatio.series.report import counts_toward_series, status_note
+
+        honest_error = on_horizontal
+        honest = make_walk(
+            "honest-gate",
+            status="FAIL",
+            reasons=["horizontal return is not under 0.10 m"],
+            return_error=honest_error,
+        )
+        loaded = self.load(honest, "honest-gate.json")
+        self.assertFalse(loaded.w1_supports_pass())
+        self.assertFalse(counts_toward_series(loaded))
+        self.assertIsNone(status_note(loaded))
+        report = self.series_of(
+            [
+                make_walk(
+                    "f1",
+                    status="FAIL",
+                    reasons=["combined return is not under 0.10 m"],
+                    return_error=combined,
+                ),
+                make_walk(
+                    "f2",
+                    status="FAIL",
+                    reasons=["combined return is not under 0.10 m"],
+                    return_error=combined,
+                ),
+                make_walk(
+                    "f3",
+                    status="FAIL",
+                    reasons=["combined return is not under 0.10 m"],
+                    return_error=combined,
+                ),
+            ],
+            "honest-gate",
+        )
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertEqual(report["counted_run_ids"], [])
+        self.assertIsNone(report["runs"][0]["status_note"])
+
+        under = {"d3_m": 0.0995, "horizontal_m": 0.0995, "vertical_m": 0.0}
+        passed = self.series_of(
+            [
+                make_walk("u1", return_error=under),
+                make_walk("u2", return_error=under),
+                make_walk("u3", return_error=under),
+            ],
+            "just-under",
+        )
+        self.assertEqual(passed["verdict"], "PASS")
+        self.assertEqual(passed["counted_run_ids"], ["u1", "u2", "u3"])
+        null_under = self.load(
+            make_walk(
+                "null-under",
+                return_error={"d3_m": 0.0995, "horizontal_m": 0.0995, "vertical_m": None},
+            ),
+            "null-under.json",
+        )
+        self.assertTrue(null_under.w1_supports_pass())
+        self.assertTrue(counts_toward_series(null_under))
+
+    def test_zero_duration_moving_run_cannot_pass(self):
+        # Review: change only duration_s on a passing fixture. Path stays 42 m
+        # and the endpoint windows still span 210 s.
+        self.assert_rejected(
+            make_walk("zero-duration", duration_s=0),
+            "duration_s is 0",
+            "zero-duration.json",
+        )
+        with self.assertRaises(InputRejected) as caught:
+            self.series_of(
+                [
+                    make_walk("d1", duration_s=0),
+                    make_walk("d2", duration_s=0),
+                    make_walk("d3", duration_s=0),
+                ],
+                "zero-duration",
+            )
+        text = str(caught.exception)
+        self.assertIn("duration_s is 0", text)
+        self.assertIn("validity.moving is true", text)
+        self.assertIn("path_length_m is 42.0", text)
+        self.assertIn("span 210.000000 s", text)
+        self.assertIn("run-0.json", text)
+        # A claimed failure does not make the same contradiction legal.
+        self.assert_rejected(
+            make_walk(
+                "fail-duration",
+                status="FAIL",
+                reasons=["duration was zero"],
+                duration_s=0,
+            ),
+            "duration_s is 0",
+            "fail-duration.json",
+        )
+        # Each claim is enough on its own.
+        self.assert_rejected(
+            make_walk(
+                "moving-only",
+                duration_s=0,
+                path_length_m=None,
+                drift_pct_of_path=None,
+                return_error={"start_window_s": None, "end_window_s": None},
+            ),
+            "validity.moving is true",
+            "moving-only.json",
+        )
+        with self.assertRaises(InputRejected) as moving_only:
+            self.load(
+                make_walk(
+                    "moving-only-check",
+                    duration_s=0,
+                    path_length_m=None,
+                    drift_pct_of_path=None,
+                    return_error={"start_window_s": None, "end_window_s": None},
+                ),
+                "moving-only-check.json",
+            )
+        moving_text = str(moving_only.exception)
+        self.assertNotIn("path_length_m", moving_text)
+        self.assertNotIn("endpoint windows", moving_text)
+        self.assert_rejected(
+            make_walk(
+                "windows-only",
+                status="FAIL",
+                reasons=["duration does not cover the endpoint windows"],
+                duration_s=0,
+                path_length_m=0.0,
+                drift_pct_of_path=None,
+                validity={"moving": False},
+                return_error={"d3_m": 0.0, "horizontal_m": 0.0, "vertical_m": 0.0},
+            ),
+            "endpoint windows",
+            "windows-only.json",
+        )
+        with self.assertRaises(InputRejected) as windows_only:
+            self.load(
+                make_walk(
+                    "windows-only-check",
+                    status="FAIL",
+                    reasons=["duration does not cover the endpoint windows"],
+                    duration_s=0,
+                    path_length_m=0.0,
+                    drift_pct_of_path=None,
+                    validity={"moving": False},
+                    return_error={"d3_m": 0.0, "horizontal_m": 0.0, "vertical_m": 0.0},
+                ),
+                "windows-only-check.json",
+            )
+        windows_text = str(windows_only.exception)
+        self.assertNotIn("validity.moving is true", windows_text)
+        self.assertNotIn("path_length_m", windows_text)
+        self.assert_rejected(
+            make_walk(
+                "travel-only",
+                status="FAIL",
+                reasons=["duration was zero"],
+                duration_s=0,
+                path_length_m=42.0,
+                validity={"moving": False},
+                return_error={
+                    "d3_m": 0.0,
+                    "horizontal_m": 0.0,
+                    "vertical_m": 0.0,
+                    "start_window_s": None,
+                    "end_window_s": None,
+                },
+            ),
+            "path_length_m is 42.0",
+            "travel-only.json",
+        )
+        # A stationary measured zero, a null duration, and one second still load.
+        still = self.load(
+            make_walk(
+                "still-duration",
+                status="FAIL",
+                reasons=["the cart did not move"],
+                duration_s=0,
+                path_length_m=0.0,
+                drift_pct_of_path=None,
+                validity={"moving": False},
+                return_error={
+                    "d3_m": 0.0,
+                    "horizontal_m": 0.0,
+                    "vertical_m": 0.0,
+                    "start_window_s": None,
+                    "end_window_s": None,
+                },
+            ),
+            "still-duration.json",
+        )
+        self.assertEqual(still.duration_s, 0.0)
+        self.assertIs(still.validity.moving, False)
+        self.assertFalse(still.w1_supports_pass())
+        from spatio.series.report import counts_toward_series
+
+        unmeasured = self.load(make_walk("null-duration", duration_s=None), "null-duration.json")
+        self.assertIsNone(unmeasured.duration_s)
+        self.assertTrue(counts_toward_series(unmeasured))
+        short = self.load(make_walk("one-second", duration_s=1.0), "one-second.json")
+        self.assertEqual(short.duration_s, 1.0)
+        self.assertTrue(short.w1_supports_pass())
+        self.assertTrue(counts_toward_series(short))
+
     def test_null_rendered_not_measured_not_zero(self):
         data = make_walk(
             "missing-horizontal",

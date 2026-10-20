@@ -22,6 +22,7 @@ PLACEMENT_TOLERANCE_M = 0.01
 WALL_GATE_M = 0.05
 # A measured horizontal or vertical component must fit inside d3.
 # When both components exist, d3 must also match their root sum square.
+# That 1 mm allowance is consistency only. It does not move the 0.10 m gate.
 COMPONENT_TOLERANCE_M = 0.001
 REPLAY_LABEL = "replay demonstrated; physical accuracy not evaluated"
 WALK_SCHEMA = "spatio.walk_result/1"
@@ -141,7 +142,10 @@ class WalkResult:
     def w1_supports_pass(self) -> bool:
         """True when the milestone numbers themselves allow status PASS.
 
-        Uses the fixed 0.10 m gate, not a wider threshold from the file.
+        Uses the fixed 0.10 m gate on the 3D return, on each measured
+        component, and on the combined length of the two components. The
+        1 mm consistency tolerance is not part of that comparison. A wider
+        threshold from the file is not used.
         """
         error = self.return_error
         validity = self.validity
@@ -156,7 +160,7 @@ class WalkResult:
         ):
             return False
         return (
-            error.d3_m < RETURN_THRESHOLD_M
+            not _return_gate_failures(error)
             and _same_metre(error.threshold_m, RETURN_THRESHOLD_M)
             and validity.timestamps_monotonic is True
             and validity.resets == 0
@@ -242,8 +246,9 @@ def parse_walk_result(data: Any, source_path: str) -> WalkResult:
     _check_w3_w4(evaluated, accuracy_label, data.get("physical_reference") if "physical_reference" in data else _MISSING, errors)
 
     # One rule for numbers that cannot be true together. A minimum of 0 on
-    # path_length_m still allows a measured zero; this is what rejects it.
-    _check_absurd_numbers(path_length, validity, return_error, errors)
+    # duration_s and path_length_m still allows a measured zero; this is
+    # what rejects a zero that contradicts the rest of the file.
+    _check_absurd_numbers(duration, path_length, validity, return_error, errors)
     if return_error is not None:
         _check_threshold(return_error, errors)
 
@@ -621,6 +626,7 @@ def _check_w3_w4(
 
 
 def _check_absurd_numbers(
+    duration: Optional[float],
     path_length: Optional[float],
     validity: Optional[Validity],
     error: Optional[ReturnError],
@@ -629,18 +635,22 @@ def _check_absurd_numbers(
     """Reject numeric claims that cannot describe one return.
 
     This is the one parser rule for an absurd combination. It does not add a
-    minimum path, a minimum gap, or a window length. Three checks:
+    minimum path, a minimum duration, a minimum gap, or a window length.
+    Four checks:
 
     - each measured return component must fit inside d3, and both together
       must match it;
     - validity.moving true cannot sit beside a path length of exactly 0;
     - when both endpoint windows are present, the end window must start
-      after the start window ends. A shared instant counts as overlap.
+      after the start window ends. A shared instant counts as overlap;
+    - a duration of exactly 0 cannot sit beside a moving claim, a positive
+      path length, or endpoint windows that span a positive time.
     """
     if error is not None:
         _check_components(error, errors)
         _check_endpoint_windows(error, errors)
     _check_zero_path(path_length, validity, errors)
+    _check_zero_duration(duration, path_length, validity, error, errors)
 
 
 def _check_zero_path(
@@ -655,6 +665,43 @@ def _check_zero_path(
             "path_length_m is 0 while validity.moving is true; "
             "a moving run cannot have a zero-length path"
         )
+
+
+def _check_zero_duration(
+    duration: Optional[float],
+    path_length: Optional[float],
+    validity: Optional[Validity],
+    error: Optional[ReturnError],
+    errors: List[str],
+) -> None:
+    """Reject a measured duration of exactly 0 that contradicts the run.
+
+    Called only from _check_absurd_numbers. Exact 0 is the cutoff. A positive
+    duration is not compared with the window span, and this is not a
+    must-move minimum. A null duration is not measured.
+    """
+    if duration is None or duration != 0.0:
+        return
+    claims = []
+    if validity is not None and validity.moving is True:
+        claims.append("validity.moving is true")
+    if path_length is not None and path_length > 0.0:
+        claims.append("path_length_m is %s" % path_length)
+    span = _endpoint_span_s(error)
+    if span is not None and span > 0.0:
+        claims.append("the endpoint windows span %.6f s" % span)
+    if not claims:
+        return
+    errors.append(
+        "duration_s is 0 while %s; a measured duration of 0 cannot sit beside that claim"
+        % " and ".join(claims)
+    )
+
+
+def _endpoint_span_s(error: Optional[ReturnError]) -> Optional[float]:
+    if error is None or error.start_window_s is None or error.end_window_s is None:
+        return None
+    return error.end_window_s[1] - error.start_window_s[0]
 
 
 def _check_endpoint_windows(error: ReturnError, errors: List[str]) -> None:
@@ -714,6 +761,43 @@ def _check_one_component(
             "(a measured component cannot exceed the 3D return; tolerance 0.001 m)"
             % (name, component, d3_m)
         )
+
+
+_GATE_NOTE = "strict return gate; the 0.001 m consistency tolerance does not apply"
+
+
+def _return_gate_failures(error: ReturnError) -> List[str]:
+    """Lengths that are not strictly under the 0.10 m return gate.
+
+    The 1 mm consistency tolerance is not applied. A null component is not
+    measured, so it is skipped. The combined length is checked only when
+    both components are present, and a null is never read as zero.
+    """
+    bits = []
+    if error.d3_m is None or not error.d3_m < RETURN_THRESHOLD_M:
+        bits.append(
+            "return_error.d3_m %s is not < %s" % (error.d3_m, RETURN_THRESHOLD_M)
+        )
+    for name, component in (
+        ("horizontal_m", error.horizontal_m),
+        ("vertical_m", error.vertical_m),
+    ):
+        if component is not None and not component < RETURN_THRESHOLD_M:
+            bits.append(
+                "return_error.%s %s is not < %s (%s)"
+                % (name, component, RETURN_THRESHOLD_M, _GATE_NOTE)
+            )
+    if error.horizontal_m is not None and error.vertical_m is not None:
+        norm = math.sqrt(
+            error.horizontal_m * error.horizontal_m
+            + error.vertical_m * error.vertical_m
+        )
+        if not norm < RETURN_THRESHOLD_M:
+            bits.append(
+                "sqrt(horizontal_m^2 + vertical_m^2) = %.6f is not < %s (%s)"
+                % (norm, RETURN_THRESHOLD_M, _GATE_NOTE)
+            )
+    return bits
 
 
 def _check_threshold(error: ReturnError, errors: List[str]) -> None:
@@ -782,10 +866,8 @@ def _pass_failures(error: ReturnError, validity: Validity, walls: Walls) -> List
     bits = []
     if error.threshold_m is None or not _same_metre(error.threshold_m, RETURN_THRESHOLD_M):
         bits.append("return_error.threshold_m is not 0.10")
-    elif error.d3_m is None or not error.d3_m < RETURN_THRESHOLD_M:
-        bits.append(
-            "return_error.d3_m %s is not < %s" % (error.d3_m, RETURN_THRESHOLD_M)
-        )
+    else:
+        bits.extend(_return_gate_failures(error))
     if validity.timestamps_monotonic is not True:
         bits.append("validity.timestamps_monotonic is %s" % validity.timestamps_monotonic)
     if validity.resets != 0:
