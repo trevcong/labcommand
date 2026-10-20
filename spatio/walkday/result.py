@@ -174,7 +174,9 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str,
     if wc_result not in ("PASS", "FAIL", "NOT-EVALUABLE"):
         raise ResultError(f"walkcheck result {wc_result!r}")
     settings, settings_changed = _settings_used(prov, wc, gate_m, gate_state)
-    p95, doubled, wall_fail, wall_notes, patches, wall_warn = score_walls(wc, wp, gate_m, wall_patches)
+    p95, doubled, wall_fail, wall_notes, patches, wall_warn = score_walls(
+        wc, wp, gate_m, wall_patches, map_path=os.path.join(session, "map.pcd"),
+    )
 
     d3 = _num(rts.get("error_3d_m"))
     horiz = _cm_to_m(rts.get("error_horizontal_cm"))

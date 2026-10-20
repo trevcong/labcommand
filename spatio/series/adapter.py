@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 
 from spatio.series.validate import (
     InputRejected, Unreadable, REPLAY_LABEL, WALK_SCHEMA, parse_walk_result,
@@ -92,7 +93,10 @@ def adapt_walkcheck(report: dict, metadata: dict, source_path: str, *,
         provenance = patch_provenance(
             patch_origin, spec_path, metadata["physical_reference"], wallpatch, patches_file
         )
-        p95, doubled, failures, notes, _, warnings = score_walls(report, wallpatch, gate_m, provenance)
+        p95, doubled, failures, notes, _, warnings = score_walls(
+            report, wallpatch, gate_m, provenance,
+            map_path=os.path.join(os.path.dirname(source_path), "map.pcd"),
+        )
     except WallScoringError as exc:
         reject(str(exc))
     status, reasons = wall_verdict(producer_status, reasons, doubled, failures, notes)

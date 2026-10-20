@@ -209,21 +209,46 @@ def _same_box(want, got, tol=1e-9):
 
 
 def _sha_file(path):
+    digest = hashlib.sha256()
     with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def score_walls(walkcheck, wallpatch, gate_m, provenance):
+def _check_map(wallpatch, map_path):
+    """Bind supplied patch measurements to the run's actual map bytes."""
+    if wallpatch is None:
+        return
+    _patches(wallpatch)
+    expected = wallpatch.get("map_sha256")
+    if not isinstance(expected, str) or len(expected) != 64 or any(
+        c not in "0123456789abcdefABCDEF" for c in expected
+    ):
+        raise WallScoringError("wallpatch map_sha256 must be 64 hex characters")
+    try:
+        actual = _sha_file(map_path)
+    except OSError as exc:
+        raise WallScoringError(f"cannot read run map {map_path}: {exc}") from exc
+    if expected.lower() != actual:
+        raise WallScoringError(
+            f"wallpatch map_sha256 {expected} does not match run map {map_path} (sha256 {actual})"
+        )
+
+
+def score_walls(walkcheck, wallpatch, gate_m, provenance, *, map_path):
     """Return the same evidence tuple to both converters.
 
     verified retains the existing meaning: a named, uniquely measured,
     spec-matching patch with both gates passed and no doubled wall. Without
     any such preselected patch the wall verdict is NOT_EVALUABLE, even if
-    diagnostic failures exist. With verified evidence, known failures remain
+    diagnostic failures exist. Supplied patch reports must hash-match map_path.
+    With verified evidence, known failures remain
     FAIL; otherwise every required patch must be verified before PASS.
     """
     if _num(gate_m) is None or gate_m <= 0:
         raise WallScoringError("wall gate must be a positive finite number")
+    _check_map(wallpatch, map_path)
     p95, doubled, failures, notes, patches, warnings = wall_evidence(walkcheck, wallpatch, gate_m)
     blockers = acceptance_blockers(provenance)
     verified = provenance.get("verified", []) if isinstance(provenance, dict) else []

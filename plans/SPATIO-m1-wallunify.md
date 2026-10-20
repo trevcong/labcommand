@@ -86,3 +86,46 @@ no Swift code changed, so no Swift build or app launch was needed. No Spark,
 containers, historical recordings, GitHub, or other workstreams were touched.
 No additional approval is needed for these edits. Waiving the whole-map flag
 would be a separate rule change requiring evidence and Trevor's decision.
+
+## Fix round 1: bind wall reports to the run map
+
+Addressed the single P2 at the end of `sp-rv-wallunify.txt`. The shared
+`score_walls` now checks every supplied wall report's `map_sha256` against
+the actual map bytes before using its wall measurements. Series adapt reads
+`map.pcd` beside its input walkcheck report; walk-day reads `SESSION/map.pcd`.
+The commands above still apply; keep the run's map beside `walkcheck.json`.
+Map hashing reads 1 MiB chunks rather than loading the full map into memory.
+
+A mismatch, missing/malformed hash, or unreadable map rejects the input:
+walk-day exits 3 and retires an earlier `walk_result.json`; series adapt exits 1
+without writing a new result. An absent optional wall report still follows the
+existing NOT_EVALUABLE rule. No wall thresholds or existing verdict assertions
+were loosened.
+
+Eight new synthetic parity cases cover another session's report, changed map
+bytes, missing map, a directory in place of the map, and missing, null,
+non-hexadecimal, or non-string hashes. The cross-session case uses two different
+generated maps with exactly the same frozen spec, each independently passing
+with its own evidence. Adapt receives the other session's report path directly;
+walk-day receives a copy at its usual session path. Both must reject with the
+same diagnostic. Tests also check retirement of walk-day's earlier PASS.
+
+Before the fix, the cross-session regression failed as intended:
+**1 failed, 39 deselected, 14 warnings in 8.04 seconds**; walk-day incorrectly
+returned PASS. After the fix, the focused rejection suite passed:
+**8 passed, 32 deselected, 14 warnings in 10.11 seconds**.
+
+Full requested validation, `python3 -m pytest -q spatio .github/scripts`,
+exited 0: **870 passed, 1 skipped, 0 failed, 16 warnings in 104.33 seconds**.
+The existing skip remains `test_adapter_on_real_jt128_pcap_points`, whose
+`jt128_one_frame.pcap` fixture is unavailable on this Mac. Warnings remain
+dependency deprecations and the existing invalid regex escape in
+`spatio/bagtiming/reader.py`. `git diff --check` passed. No tests were deleted,
+weakened, or newly skipped.
+
+This verifies map-content binding on synthetic local inputs, not physical
+accuracy. A matching hash identifies identical map bytes; it does not
+authenticate a hand-edited report or establish when the walkcheck report was
+generated. No historical recording-specific settings were added. No Swift
+changes, build, app launch, Spark access, or container operations were needed.
+No additional Trevor approval is needed. Changes remain uncommitted as requested.

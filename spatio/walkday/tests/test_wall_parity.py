@@ -22,7 +22,7 @@ def test_malformed_patch_report_is_rejected(report):
 @pytest.mark.parametrize("gate", [0, -1, float("nan"), float("inf"), True])
 def test_invalid_wall_gate_is_rejected(gate):
     with pytest.raises(WallScoringError, match="wall gate"):
-        score_walls({}, None, gate, None)
+        score_walls({}, None, gate, None, map_path=None)
 
 
 @pytest.mark.parametrize("case,expected", [
@@ -132,3 +132,68 @@ def test_converter_wall_parity(tmp_path, case, expected):
         assert adapted["walls"]["doubled_wall_suspected"] is None
     if case == "zero_verified_failed":
         assert any("doubled wall" in reason for reason in adapted["reasons"])
+
+
+@pytest.mark.parametrize("case", [
+    "cross_session", "changed_map", "missing_map", "map_directory",
+    "missing_hash", "null_hash", "malformed_hash", "nonstring_hash",
+])
+def test_converter_rejects_unbound_wall_report(tmp_path, capsys, case):
+    boxes = [
+        {"center_m": [0, 2, 1.2], "normal_hint": [1, 0, 0], "half_extent_m": [.2, 1, 1]},
+        {"center_m": [2.5, 0, 1.2], "normal_hint": [0, 1, 0], "half_extent_m": [1, .2, 1]},
+    ]
+    session = make_session(tmp_path, "target", xyz=four_wall_room(seed=3), boxes=boxes)
+    spec = session / "test-spec.json"
+    common = ["--patch-origin", "preselected", "--spec", str(spec),
+              "--wall-gate-state", "approved"]
+    assert quiet(result.main, [str(session), *common]) == 0
+    original = json.loads((session / "walk_result.json").read_text())
+    metadata = json.loads((session / "manifest.json").read_text())
+    metadata.update(recorded_at=original["recorded_at"], physical_reference=None)
+    meta_path = session / "series-metadata.json"
+    meta_path.write_text(json.dumps(metadata))
+    wp_path = session / "wallpatch" / "wallpatch.json"
+    wp = json.loads(wp_path.read_text())
+    adapt_wp_path = wp_path
+    message = "wallpatch map_sha256"
+    if case == "cross_session":
+        other = make_session(tmp_path, "other", xyz=four_wall_room(seed=17), boxes=boxes)
+        # Both walks pass with their own evidence and the exact same frozen spec.
+        assert (other / "test-spec.json").read_bytes() == spec.read_bytes()
+        assert quiet(result.main, [str(other), *common]) == 0
+        adapt_wp_path = other / "wallpatch" / "wallpatch.json"
+        foreign = json.loads(adapt_wp_path.read_text())
+        assert foreign["map_sha256"] != wp["map_sha256"]
+        wp = foreign
+    elif case == "changed_map":
+        with (session / "map.pcd").open("ab") as handle:
+            handle.write(b"\n")
+    elif case in ("missing_map", "map_directory"):
+        (session / "map.pcd").unlink()
+        if case == "map_directory":
+            (session / "map.pcd").mkdir()
+        message = "cannot read run map"
+    elif case == "missing_hash":
+        del wp["map_sha256"]
+    else:
+        wp["map_sha256"] = {"null_hash": None, "malformed_hash": "g" * 64,
+                            "nonstring_hash": 123}[case]
+    wp_path.write_text(json.dumps(wp))
+
+    assert result.main([str(session), *common]) == 3
+    walkday_error = capsys.readouterr().err.removeprefix("result: ").strip()
+    assert message in walkday_error
+    assert not (session / "walk_result.json").exists()
+    assert json.loads((session / result.RETIRED).read_text()) == original
+    rejected = json.loads((session / "walkday.json").read_text())
+    assert rejected["status"] == "NOT_EVALUABLE"
+    assert any(walkday_error in reason for reason in rejected["reasons"])
+
+    output = session / "adapted.json"
+    assert series_main([
+        "adapt", str(session / "walkcheck.json"), "--metadata", str(meta_path),
+        "--wallpatch", str(adapt_wp_path), "--out", str(output), *common,
+    ]) == 1
+    assert capsys.readouterr().err.strip().endswith(walkday_error)
+    assert not output.exists()

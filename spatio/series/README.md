@@ -64,6 +64,11 @@ the reference must also contain its `spec_sha256`; it must match that spec.
 walk-day. Supply the measured patch report and the frozen spec explicitly;
 the adapter does not discover them from neighboring files. `--patches` retains
 the source patch-file hash. `--patch-origin` defaults to `auto_suggested`.
+When a patch report is supplied, its `map_sha256` must match the actual
+`map.pcd` beside the input walkcheck report. Keep these two run artifacts
+together, including when copying them elsewhere. A missing or malformed hash,
+unreadable map, or hash mismatch rejects conversion. Walk-day applies the same
+check against `SESSION/map.pcd`.
 Auto suggestions, no spec, zero verified patches, or an incomplete required
 patch set cannot PASS. At least two uniquely named preselected patches must
 match the spec (including boxes where fixed), be measured, and pass their gates.
