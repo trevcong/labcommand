@@ -11,14 +11,49 @@ from spatio.walkcheck.synthetic import (
 )
 
 
+# A readable cloud so trajectory tests are not tripped by the missing-map rule.
+_TINY_MAP = [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.1]]
+
+
 def _score(tmp_path, rows, **kwargs):
     comments = kwargs.pop("comments", ())
     manifest = kwargs.pop("manifest", None)
     stops = kwargs.pop("stops", None)
     xyz = kwargs.pop("xyz", None)
+    if xyz is None:
+        xyz = _TINY_MAP
     dest = tmp_path / "session"
     write_session(dest, rows, xyz=xyz, manifest=manifest, stops=stops, comments=comments)
     return evaluate_session(dest, **kwargs)
+
+
+def _polyline(waypoints, rate=10.0):
+    quat = yaw_quat(0.0)
+    rows = []
+    for (t0, p0), (t1, p1) in zip(waypoints, waypoints[1:]):
+        steps = int(round((t1 - t0) * rate))
+        for i in range(steps):
+            frac = i / steps
+            xyz = tuple(a + (b - a) * frac for a, b in zip(p0, p1))
+            rows.append((t0 + (t1 - t0) * frac, *xyz, *quat))
+    t1, p1 = waypoints[-1]
+    rows.append((t1, *p1, *quat))
+    return rows
+
+
+def _out_and_back(end_from, end_to, end_t0=30.0, end_t1=35.0):
+    """Stationary start, a square, then a straight 5 s end window."""
+    return _polyline(
+        [
+            (0.0, (0.0, 0.0, 0.0)),
+            (6.0, (0.0, 0.0, 0.0)),
+            (12.0, (3.0, 0.0, 0.0)),
+            (18.0, (3.0, 3.0, 0.0)),
+            (24.0, (0.0, 3.0, 0.0)),
+            (end_t0, end_from),
+            (end_t1, end_to),
+        ]
+    )
 
 
 def test_five_cm_passes(tmp_path):
@@ -164,7 +199,7 @@ def test_gap_just_over_the_threshold_can_be_relaxed(tmp_path):
 def test_comments_and_blank_lines_are_ignored(tmp_path):
     dest = tmp_path / "session"
     rows = hold_and_square(offset=(0.05, 0.0, 0.0))
-    write_session(dest, rows, comments=("# a comment",))
+    write_session(dest, rows, xyz=_TINY_MAP, comments=("# a comment",))
     text = (dest / "trajectory.tum").read_text(encoding="utf-8")
     lines = text.splitlines()
     lines.insert(3, "")
@@ -176,7 +211,7 @@ def test_comments_and_blank_lines_are_ignored(tmp_path):
 
 def test_malformed_line_is_not_evaluable(tmp_path):
     dest = tmp_path / "session"
-    write_session(dest, hold_and_square(offset=(0.05, 0.0, 0.0)))
+    write_session(dest, hold_and_square(offset=(0.05, 0.0, 0.0)), xyz=_TINY_MAP)
     text = (dest / "trajectory.tum").read_text(encoding="utf-8")
     (dest / "trajectory.tum").write_text(text + "1 2 3\n", encoding="utf-8")
     report = evaluate_session(dest)
@@ -232,6 +267,72 @@ def test_intermediate_stop_is_sanity_only(tmp_path):
     assert stop["name"] == "east-mark"
     assert stop["max_mean_separation_cm"] == pytest.approx(20.0, abs=0.05)
     assert report["return_to_start"]["error_3d_cm"] == pytest.approx(4.0, abs=0.05)
+
+
+def test_cancelling_end_window_is_not_evaluable(tmp_path):
+    """Codex P1. The end window travels from -30 cm to +30 cm.
+
+    Its mean matches the start, and the last pose is +30 cm away. The old
+    checker returned PASS. A moving window is not a parked endpoint.
+    """
+    report = _score(tmp_path, _out_and_back((-0.30, 0.0, 0.0), (0.30, 0.0, 0.0)))
+    assert report["result"] == "NOT-EVALUABLE"
+    assert report["result"] != "PASS"
+    assert report["reasons"] == ["endpoint_not_stationary"]
+    assert report["return_to_start"] is None
+    ends = report["endpoints"]
+    assert ends["start_spread_cm"] == pytest.approx(0.0, abs=0.05)
+    assert ends["end_mean_xyz_m"][0] == pytest.approx(0.0, abs=1e-6)
+    assert ends["end_last_xyz_m"][0] == pytest.approx(0.30, abs=1e-6)
+    assert ends["end_spread_cm"] == pytest.approx(30.0, abs=0.05)
+    assert ends["end_speed_cm_s"] == pytest.approx(12.0, abs=0.1)
+    assert ends["stationary"] is False
+
+
+def test_slow_drift_over_the_spread_limit_is_not_evaluable(tmp_path):
+    """8 cm of drift at 3.2 cm/s. Speed is under the limit. Spread is not.
+
+    The window mean is the start, so dropping the spread check would pass.
+    """
+    report = _score(tmp_path, _out_and_back((-0.08, 0.0, 0.0), (0.08, 0.0, 0.0)))
+    assert report["result"] == "NOT-EVALUABLE"
+    assert report["reasons"] == ["endpoint_not_stationary"]
+    ends = report["endpoints"]
+    assert ends["end_spread_cm"] == pytest.approx(8.0, abs=0.05)
+    assert ends["end_spread_cm"] > ends["spread_limit_cm"]
+    assert ends["end_speed_cm_s"] < ends["speed_limit_cm_s"]
+    assert ends["end_mean_xyz_m"][0] == pytest.approx(0.0, abs=1e-6)
+    assert ends["spread_limit_cm"] == pytest.approx(5.0, abs=1e-6)
+
+
+def test_fast_jitter_inside_the_spread_limit_is_not_evaluable(tmp_path):
+    """±4 cm at 10 Hz stays inside 5 cm and is far faster than 10 cm/s.
+
+    Dropping the speed check would pass, because the mean is the start.
+    """
+    quat = yaw_quat(0.0)
+    rows = _polyline(
+        [
+            (0.0, (0.0, 0.0, 0.0)),
+            (6.0, (0.0, 0.0, 0.0)),
+            (12.0, (3.0, 0.0, 0.0)),
+            (18.0, (3.0, 3.0, 0.0)),
+            (24.0, (0.0, 3.0, 0.0)),
+            (30.0, (0.04, 0.0, 0.0)),
+        ]
+    )
+    rows = rows[:-1]
+    for i in range(51):
+        x = 0.04 if i % 2 == 0 else -0.04
+        rows.append((30.0 + i * 0.1, x, 0.0, 0.0, *quat))
+    report = _score(tmp_path, rows)
+    assert report["result"] == "NOT-EVALUABLE"
+    assert report["reasons"] == ["endpoint_not_stationary"]
+    ends = report["endpoints"]
+    assert ends["end_spread_cm"] < ends["spread_limit_cm"]
+    assert ends["end_speed_cm_s"] > ends["speed_limit_cm_s"]
+    assert ends["speed_limit_cm_s"] == pytest.approx(10.0, abs=1e-6)
+    assert ends["end_mean_xyz_m"][0] == pytest.approx(0.0, abs=1e-3)
 
 
 def test_historical_label_follows_the_manifest_flag(tmp_path):

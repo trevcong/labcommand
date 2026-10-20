@@ -9,10 +9,14 @@ from pathlib import Path
 import numpy as np
 
 from spatio.walkcheck.defaults import (
+    ENDPOINT_STATIONARITY_LABEL,
     HISTORICAL_LABEL,
+    MAX_ENDPOINT_SPEED_M_S,
+    MAX_ENDPOINT_SPREAD_M,
     MAX_GAP_S,
     MIN_EXCURSION_M,
     MIN_PATH_LENGTH_M,
+    PROVISIONAL_LABEL,
     RETURN_PASS_M,
     SCHEMA,
     STATIONARY_WINDOW_S,
@@ -30,6 +34,8 @@ ASSUMPTIONS = [
     "The 3D error does not use that assumption.",
     "Heading is the yaw difference about Z. It is reported and it is not part of the pass rule.",
     "A path that does not move enough fails even when the start and end positions match.",
+    "A window that is still moving is not scored. Its mean can sit on the start "
+    "while the cart is somewhere else.",
     "The wall number is a geometric estimate on vertical planar patches. "
     "Floors, ceilings, and clutter are left out. Two real parallel surfaces "
     "look the same as a doubled wall from drift.",
@@ -47,6 +53,8 @@ def evaluate_session(
     max_gap_s: float = MAX_GAP_S,
     min_path_length_m: float = MIN_PATH_LENGTH_M,
     min_excursion_m: float = MIN_EXCURSION_M,
+    max_endpoint_spread_m: float = MAX_ENDPOINT_SPREAD_M,
+    max_endpoint_speed_m_s: float = MAX_ENDPOINT_SPEED_M_S,
     write: bool = True,
 ) -> dict:
     session = Path(session_dir)
@@ -76,14 +84,20 @@ def evaluate_session(
         max_gap_s=max_gap_s,
         min_path_length_m=min_path_length_m,
         min_excursion_m=min_excursion_m,
+        max_endpoint_spread_m=max_endpoint_spread_m,
+        max_endpoint_speed_m_s=max_endpoint_speed_m_s,
     )
 
     map_xyz = None
+    map_problem = None
+    map_detail = None
     if not map_path.is_file():
         walls = wall_sharpness(np.zeros((0, 3)))
         walls["reason"] = "missing_map"
         walls["status"] = "NOT-EVALUABLE"
         walls["proposed_gate_result"] = "NOT-EVALUABLE"
+        map_problem = "missing_map"
+        map_detail = "map.pcd is missing"
     else:
         try:
             map_xyz = read_pcd_xyz(map_path)
@@ -94,13 +108,21 @@ def evaluate_session(
             walls["reason"] = f"unreadable_map: {exc}"
             walls["status"] = "NOT-EVALUABLE"
             walls["proposed_gate_result"] = "NOT-EVALUABLE"
+            map_problem = "unreadable_map"
+            map_detail = f"map.pcd could not be read: {exc}"
 
-    if scored["evaluated"]:
-        reasons = list(scored["result_reasons"])
-        result = "FAIL" if reasons else "PASS"
-    else:
-        reasons = list(scored["result_reasons"])
+    # A missing or unreadable map is an input failure. It is not the wall
+    # gate. The wall gate never changes this result.
+    reasons = list(scored["result_reasons"])
+    if map_problem:
+        reasons.append(map_problem)
+    if (not scored["evaluated"]) or map_problem:
         result = "NOT-EVALUABLE"
+    else:
+        result = "FAIL" if reasons else "PASS"
+    detail = scored.get("detail")
+    if map_detail:
+        detail = f"{detail} {map_detail}" if detail else map_detail
 
     stop_report = {
         "provided": bool(stops_list) or stops_error is not None,
@@ -148,6 +170,26 @@ def evaluate_session(
         notes.append(f"manifest.json could not be read: {manifest_error}")
     if stops_error:
         notes.append(f"Intermediate stops could not be read: {stops_error}")
+    notes.append(
+        f"Stationary window {stationary_window_s:g} s, gap limit {max_gap_s:g} s, "
+        f"path at least {min_path_length_m:g} m, and excursion at least {min_excursion_m:g} m "
+        f"are {PROVISIONAL_LABEL}."
+    )
+    notes.append(
+        f"Endpoint windows over {max_endpoint_spread_m * 100:g} cm from their own mean, "
+        f"or faster than {max_endpoint_speed_m_s * 100:g} cm/s, are not evaluable. "
+        f"{ENDPOINT_STATIONARITY_LABEL}"
+    )
+    if map_problem == "missing_map":
+        notes.append(
+            "map.pcd is missing. A missing required input is not evaluable. "
+            "The wall gate is a separate check and did not make this decision."
+        )
+    elif map_problem == "unreadable_map":
+        notes.append(
+            "map.pcd could not be read. An unreadable required input is not evaluable. "
+            "The wall gate is a separate check and did not make this decision."
+        )
 
     returned = scored["return_to_start"]
     title = result
@@ -162,7 +204,7 @@ def evaluate_session(
         "schema": SCHEMA,
         "result": result,
         "reasons": reasons,
-        "detail": scored.get("detail"),
+        "detail": detail,
         "session_dir": str(session.resolve()),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "parameters": {
@@ -173,8 +215,11 @@ def evaluate_session(
             "min_path_length_m": min_path_length_m,
             "min_excursion_m": min_excursion_m,
             "min_window_samples": 3,
+            "max_endpoint_spread_m": max_endpoint_spread_m,
+            "max_endpoint_speed_m_s": max_endpoint_speed_m_s,
             "vertical_axis": "z",
             "alignment": "none",
+            "provisional_label": PROVISIONAL_LABEL,
             "wall_voxel_m": walls.get("voxel_m"),
             "wall_gate_cm": walls.get("proposed_gate_cm"),
             "wall_gate_label": walls.get("proposed_gate_label"),
@@ -200,6 +245,7 @@ def evaluate_session(
         },
         "timestamps": scored["timestamps"],
         "return_to_start": returned,
+        "endpoints": scored.get("endpoints"),
         "motion": scored["motion"],
         "drift": {
             "path_length_m": None if not scored["motion"] else scored["motion"]["path_length_m"],

@@ -1,7 +1,8 @@
 """TUM trajectory parsing and the return-to-start score.
 
 The end window is never aligned onto the start window. The error is the
-distance between the two mean positions.
+distance between the two mean positions. A window that is still moving
+does not get a pass or a fail: its mean can cancel the motion.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ from pathlib import Path
 import numpy as np
 
 from spatio.walkcheck.defaults import (
+    MAX_ENDPOINT_SPEED_M_S,
+    MAX_ENDPOINT_SPREAD_M,
     MAX_GAP_S,
     MIN_EXCURSION_M,
     MIN_PATH_LENGTH_M,
@@ -78,6 +81,8 @@ def score_trajectory(
     max_gap_s: float = MAX_GAP_S,
     min_path_length_m: float = MIN_PATH_LENGTH_M,
     min_excursion_m: float = MIN_EXCURSION_M,
+    max_endpoint_spread_m: float = MAX_ENDPOINT_SPREAD_M,
+    max_endpoint_speed_m_s: float = MAX_ENDPOINT_SPEED_M_S,
 ) -> dict:
     """Score one parsed trajectory. Does not read the map."""
     if not loaded.get("ok"):
@@ -90,6 +95,7 @@ def score_trajectory(
             "return_to_start": None,
             "motion": None,
             "timestamps": None,
+            "endpoints": None,
         }
 
     t = np.asarray(loaded["t"], dtype=np.float64)
@@ -119,9 +125,17 @@ def score_trajectory(
 
     windows = None
     if not reasons:
-        windows = _windows(t, xyz, quat, window_s)
+        windows = _windows(
+            t,
+            xyz,
+            quat,
+            window_s,
+            max_endpoint_spread_m,
+            max_endpoint_speed_m_s,
+        )
         if windows["reason"]:
             reasons.append(windows["reason"])
+    endpoints = None if windows is None else windows.get("endpoints")
 
     if reasons:
         return {
@@ -133,6 +147,7 @@ def score_trajectory(
             "return_to_start": None,
             "motion": None,
             "timestamps": timestamps,
+            "endpoints": endpoints,
         }
 
     assert windows is not None
@@ -196,6 +211,7 @@ def score_trajectory(
         "return_to_start": return_block,
         "motion": motion,
         "timestamps": timestamps,
+        "endpoints": endpoints,
     }
 
 
@@ -317,7 +333,14 @@ def _timestamp_report(t: np.ndarray, max_gap_s: float) -> dict:
     return report
 
 
-def _windows(t: np.ndarray, xyz: np.ndarray, quat: np.ndarray, window_s: float) -> dict:
+def _windows(
+    t: np.ndarray,
+    xyz: np.ndarray,
+    quat: np.ndarray,
+    window_s: float,
+    max_spread_m: float,
+    max_speed_m_s: float,
+) -> dict:
     t0 = float(t[0])
     t1 = float(t[-1])
     if t1 - t0 < 2.0 * window_s:
@@ -329,32 +352,85 @@ def _windows(t: np.ndarray, xyz: np.ndarray, quat: np.ndarray, window_s: float) 
         }
     start = t <= (t0 + window_s)
     end = (t >= (t1 - window_s)) & ~start
-    if int(start.sum()) < MIN_WINDOW_SAMPLES or int(end.sum()) < MIN_WINDOW_SAMPLES:
+    n_start = int(start.sum())
+    n_end = int(end.sum())
+    if n_start < MIN_WINDOW_SAMPLES or n_end < MIN_WINDOW_SAMPLES:
         return {
             "reason": "window_too_few_samples",
             "detail": (
-                f"start window has {int(start.sum())} poses, "
-                f"end window has {int(end.sum())}"
+                f"start window has {n_start} poses, end window has {n_end}"
             ),
         }
+    start_mean, start_spread, start_speed = _window_motion(t[start], xyz[start])
+    end_mean, end_spread, end_speed = _window_motion(t[end], xyz[end])
+    # At the limit still counts as parked. The wall gate uses the same idea.
+    stationary = (
+        start_spread <= max_spread_m
+        and end_spread <= max_spread_m
+        and start_speed <= max_speed_m_s
+        and end_speed <= max_speed_m_s
+    )
+    endpoints = {
+        "start_spread_cm": start_spread * 100.0,
+        "end_spread_cm": end_spread * 100.0,
+        "start_speed_cm_s": start_speed * 100.0,
+        "end_speed_cm_s": end_speed * 100.0,
+        "spread_limit_cm": max_spread_m * 100.0,
+        "speed_limit_cm_s": max_speed_m_s * 100.0,
+        "start_mean_xyz_m": start_mean,
+        "end_mean_xyz_m": end_mean,
+        "end_last_xyz_m": np.asarray(xyz[end][-1], dtype=np.float64),
+        "stationary": stationary,
+    }
     start_q = _average_quaternion(quat[start])
     end_q = _average_quaternion(quat[end])
     if start_q is None or end_q is None:
-        return {"reason": "bad_quaternion", "detail": "could not average the window quaternions"}
+        return {
+            "reason": "bad_quaternion",
+            "detail": "could not average the window quaternions",
+            "endpoints": endpoints,
+        }
+    if not stationary:
+        return {
+            "reason": "endpoint_not_stationary",
+            "detail": (
+                "An endpoint window is still moving, so its mean is not a parked position. "
+                f"Start spread {start_spread * 100.0:.2f} cm at {start_speed * 100.0:.2f} cm/s. "
+                f"End spread {end_spread * 100.0:.2f} cm at {end_speed * 100.0:.2f} cm/s. "
+                f"Limits are {max_spread_m * 100.0:.2f} cm and {max_speed_m_s * 100.0:.2f} cm/s."
+            ),
+            "endpoints": endpoints,
+        }
     return {
         "reason": None,
         "detail": None,
+        "endpoints": endpoints,
         "start_window_s": [t0, t0 + window_s],
         "end_window_s": [t1 - window_s, t1],
-        "start_samples": int(start.sum()),
-        "end_samples": int(end.sum()),
-        "start_mean_xyz": xyz[start].mean(axis=0),
-        "end_mean_xyz": xyz[end].mean(axis=0),
+        "start_samples": n_start,
+        "end_samples": n_end,
+        "start_mean_xyz": start_mean,
+        "end_mean_xyz": end_mean,
         "start_quat": start_q,
         "end_quat": end_q,
         "start_yaw_deg": _yaw_deg(start_q),
         "end_yaw_deg": _yaw_deg(end_q),
     }
+
+
+def _window_motion(t: np.ndarray, xyz: np.ndarray):
+    """Mean position, max distance from that mean, and mean speed."""
+    mean = xyz.mean(axis=0)
+    spread = float(np.linalg.norm(xyz - mean, axis=1).max())
+    if len(xyz) < 2:
+        return mean, spread, 0.0
+    path = float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum())
+    duration = float(t[-1] - t[0])
+    if duration <= 0.0:
+        speed = 0.0 if path == 0.0 else math.inf
+    else:
+        speed = path / duration
+    return mean, spread, speed
 
 
 def _average_quaternion(quat: np.ndarray) -> np.ndarray | None:

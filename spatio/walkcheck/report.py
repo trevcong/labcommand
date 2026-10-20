@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from spatio.walkcheck.defaults import HISTORICAL_LABEL, PROPOSED_WALL_LABEL
+from spatio.walkcheck.defaults import HISTORICAL_LABEL, PROVISIONAL_LABEL
 
 
 def plain(obj):
@@ -88,7 +88,25 @@ def render_markdown(report: dict) -> str:
         lines.append(f"- Full attitude error: {_deg(returned['attitude_error_deg'])} deg")
         inside = "inside" if returned["within_threshold"] else "not inside"
         lines.append(f"- 3D threshold: below 10 cm. This measurement is {inside} that threshold.")
+        endpoints = report.get("endpoints") or {}
+        if endpoints:
+            lines.append(
+                f"- Endpoint spread: start {_cm(endpoints['start_spread_cm'])} cm, "
+                f"end {_cm(endpoints['end_spread_cm'])} cm "
+                f"(limit {_cm(endpoints['spread_limit_cm'])} cm)."
+            )
+            lines.append(
+                f"- Endpoint speed: start {_cm(endpoints['start_speed_cm_s'])} cm/s, "
+                f"end {_cm(endpoints['end_speed_cm_s'])} cm/s "
+                f"(limit {_cm(endpoints['speed_limit_cm_s'])} cm/s)."
+            )
         lines.append("")
+        if result == "NOT-EVALUABLE":
+            lines.append(
+                "The return numbers are printed for inspection. "
+                "The result is not evaluable, so they are not a pass or a fail."
+            )
+            lines.append("")
         if result == "FAIL" and returned["within_threshold"]:
             lines.append(
                 "The 3D gap is under 10 cm. The result is still FAIL because the path "
@@ -190,7 +208,7 @@ def render_markdown(report: dict) -> str:
             f"over 5 cm. Result: {walls['proposed_gate_result']}."
         )
     lines.append(
-        f"This gate is {PROPOSED_WALL_LABEL}. It does not change the walk result."
+        f"This gate is {PROVISIONAL_LABEL}. It does not change the walk result."
     )
     if walls.get("finite_point_count"):
         low = walls["bounds_min_m"]

@@ -55,14 +55,40 @@ def test_wall_gate_does_not_change_the_walk_verdict(tmp_path):
     assert open_report["walls"]["proposed_gate_result"] == "PASS"
 
 
-def test_missing_map_still_scores_the_trajectory(tmp_path):
+def test_missing_map_is_not_evaluable(tmp_path):
+    """Spec correction for Codex P2.
+
+    The old test, test_missing_map_still_scores_the_trajectory, expected
+    PASS with no map. A missing required input is NOT-EVALUABLE. The return
+    numbers stay in the report for inspection and are not a pass.
+    """
     dest = tmp_path / "session"
     write_session(dest, hold_and_square(offset=(0.05, 0.0, 0.0)))
     report = evaluate_session(dest)
-    assert report["result"] == "PASS"
+    assert report["result"] == "NOT-EVALUABLE"
+    assert report["result"] != "PASS"
+    assert "missing_map" in report["reasons"]
     assert report["walls"]["status"] == "NOT-EVALUABLE"
     assert report["walls"]["reason"] == "missing_map"
+    assert report["return_to_start"]["error_3d_cm"] == pytest.approx(5.0, abs=0.05)
+    text = (dest / "walkcheck.md").read_text(encoding="utf-8")
+    assert "not a pass or a fail" in text
     assert (dest / "topdown.png").is_file()
+
+
+def test_readable_map_with_too_few_points_does_not_change_the_verdict(tmp_path):
+    dest = tmp_path / "session"
+    write_session(
+        dest,
+        hold_and_square(offset=(0.05, 0.0, 0.0)),
+        xyz=[[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.1]],
+    )
+    report = evaluate_session(dest)
+    assert report["result"] == "PASS"
+    assert report["walls"]["status"] == "NOT-EVALUABLE"
+    assert report["walls"]["reason"] == "too_few_points"
+    assert "missing_map" not in report["reasons"]
+    assert "unreadable_map" not in report["reasons"]
 
 
 def test_missing_trajectory(tmp_path):
@@ -96,13 +122,26 @@ def test_fixture_sample_session(tmp_path):
     assert HISTORICAL_LABEL in text
 
 
+def test_report_labels_the_approved_rules_as_provisional(tmp_path):
+    dest = tmp_path / "session"
+    write_session(dest, hold_and_square(offset=(0.05, 0.0, 0.0)), xyz=sharp_wall(count=800, seed=7))
+    report = evaluate_session(dest)
+    phrase = "provisional (approved for now, revisit after real data)"
+    assert report["walls"]["proposed_gate_label"] == phrase
+    assert report["parameters"]["provisional_label"] == phrase
+    text = (dest / "walkcheck.md").read_text(encoding="utf-8")
+    assert phrase in text
+    assert "not part of the delegate's approved list" in text
+
+
 def test_cli_exit_codes(tmp_path):
     passing = tmp_path / "pass"
     failing = tmp_path / "fail"
     broken = tmp_path / "broken"
-    write_session(passing, hold_and_square(offset=(0.05, 0.0, 0.0)))
-    write_session(failing, hold_and_square(offset=(0.15, 0.0, 0.0)))
-    write_session(broken, insert_time_gap(hold_and_square(), after_t=10.0, extra_s=2.0))
+    tiny = [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.1]]
+    write_session(passing, hold_and_square(offset=(0.05, 0.0, 0.0)), xyz=tiny)
+    write_session(failing, hold_and_square(offset=(0.15, 0.0, 0.0)), xyz=tiny)
+    write_session(broken, insert_time_gap(hold_and_square(), after_t=10.0, extra_s=2.0), xyz=tiny)
 
     assert main([str(passing)]) == 0
     assert main([str(failing)]) == 1
@@ -132,6 +171,9 @@ def test_compressed_map_does_not_crash(tmp_path):
         b"WIDTH 1\nHEIGHT 1\nPOINTS 1\nDATA binary_compressed\nxxxx"
     )
     report = evaluate_session(dest)
-    assert report["result"] == "PASS"
+    assert report["result"] == "NOT-EVALUABLE"
+    assert report["result"] != "PASS"
+    assert "unreadable_map" in report["reasons"]
     assert report["walls"]["status"] == "NOT-EVALUABLE"
     assert "binary_compressed" in report["walls"]["reason"]
+    assert (dest / "walkcheck.json").is_file()
