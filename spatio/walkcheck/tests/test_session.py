@@ -163,6 +163,24 @@ def test_cli_exit_codes(tmp_path):
     assert completed.stdout.splitlines()[-1].startswith("PASS")
 
 
+def test_cli_rejects_a_nonfinite_threshold(tmp_path):
+    """Codex P2. `nan` and `inf` must not turn a gate off."""
+    dest = tmp_path / "session"
+    rows = insert_time_gap(hold_and_square(offset=(0.05, 0.0, 0.0)), after_t=10.0, extra_s=10.1)
+    write_session(dest, rows, xyz=[[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.1]])
+    for args in (
+        ["--max-gap", "nan"],
+        ["--max-gap", "inf"],
+        ["--max-gap", "-1"],
+        ["--max-endpoint-spread", "inf"],
+        ["--stationary-window", "nan"],
+    ):
+        with pytest.raises(SystemExit) as caught:
+            main([str(dest), *args])
+        assert caught.value.code == 2
+    assert not (dest / "walkcheck.json").exists()
+
+
 def test_compressed_map_does_not_crash(tmp_path):
     dest = tmp_path / "session"
     write_session(dest, hold_and_square(offset=(0.05, 0.0, 0.0)))

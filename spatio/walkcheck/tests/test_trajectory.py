@@ -7,8 +7,10 @@ from spatio.walkcheck.synthetic import (
     insert_time_gap,
     stationary_rows,
     write_session,
+    write_tum,
     yaw_quat,
 )
+from spatio.walkcheck.trajectory import ThresholdError, parse_tum, score_trajectory
 
 
 # A readable cloud so trajectory tests are not tripped by the missing-map rule.
@@ -186,6 +188,36 @@ def test_timestamp_gap_is_not_evaluable(tmp_path):
     assert report["result"] == "NOT-EVALUABLE"
     assert report["reasons"] == ["timestamp_gap"]
     assert report["return_to_start"] is None
+
+
+def test_nonfinite_gap_limit_cannot_pass_a_gap(tmp_path):
+    """Codex P2. `--max-gap nan` used to score a 10.1 s step as PASS.
+
+    Comparisons with NaN are false, so the gap gate never fired. The same
+    hole exists for an infinite gap limit, and for an infinite endpoint
+    spread on a window that travels from -30 cm to +30 cm.
+    """
+    rows = insert_time_gap(hold_and_square(offset=(0.05, 0.0, 0.0)), after_t=10.0, extra_s=10.1)
+    blocked = _score(tmp_path / "blocked", rows)
+    assert blocked["result"] == "NOT-EVALUABLE"
+    assert blocked["reasons"] == ["timestamp_gap"]
+    tum_path = tmp_path / "trajectory.tum"
+    write_tum(tum_path, rows)
+    loaded = parse_tum(tum_path.read_text(encoding="utf-8"))
+    in_memory = score_trajectory(loaded)
+    assert in_memory["evaluated"] is False
+    assert "timestamp_gap" in in_memory["result_reasons"]
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ThresholdError):
+            score_trajectory(loaded, max_gap_s=bad)
+        with pytest.raises(ThresholdError):
+            _score(tmp_path / "api", rows, max_gap_s=bad)
+    moving = _out_and_back((-0.30, 0.0, 0.0), (0.30, 0.0, 0.0))
+    assert _score(tmp_path / "moving", moving)["result"] == "NOT-EVALUABLE"
+    with pytest.raises(ThresholdError):
+        _score(tmp_path / "spread", moving, max_endpoint_spread_m=float("inf"))
+    with pytest.raises(ThresholdError):
+        _score(tmp_path / "speed", moving, max_endpoint_speed_m_s=float("nan"))
 
 
 def test_gap_just_over_the_threshold_can_be_relaxed(tmp_path):

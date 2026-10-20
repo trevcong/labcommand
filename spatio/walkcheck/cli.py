@@ -14,6 +14,7 @@ from spatio.walkcheck.defaults import (
     STATIONARY_WINDOW_S,
 )
 from spatio.walkcheck.evaluate import SessionDirError, evaluate_session
+from spatio.walkcheck.trajectory import ThresholdError
 
 _EXIT = {"PASS": 0, "FAIL": 1, "NOT-EVALUABLE": 2}
 
@@ -72,12 +73,6 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
-    if args.stationary_window <= 0 or args.max_gap <= 0:
-        parser.error("stationary window and max gap must be positive")
-    if args.min_path_length < 0 or args.min_excursion < 0:
-        parser.error("motion minimums cannot be negative")
-    if args.max_endpoint_spread < 0 or args.max_endpoint_speed < 0:
-        parser.error("endpoint spread and speed limits cannot be negative")
     try:
         report = evaluate_session(
             args.session_dir,
@@ -88,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
             max_endpoint_spread_m=args.max_endpoint_spread,
             max_endpoint_speed_m_s=args.max_endpoint_speed,
         )
+    except ThresholdError as exc:
+        parser.error(str(exc))
     except SessionDirError as exc:
         print(str(exc), file=sys.stderr)
         return 3

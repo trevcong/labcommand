@@ -20,7 +20,7 @@ PYTHONPATH=. spatio/walkcheck/.venv/bin/python -m spatio.walkcheck /path/to/sess
 PYTHONPATH=. spatio/walkcheck/.venv/bin/python -m pytest spatio/walkcheck/tests -q
 ```
 
-`--stationary-window` is seconds (default 5). `--max-gap` is the largest allowed timestamp step in seconds (default 1). `--max-endpoint-spread` is metres (default 0.05). `--max-endpoint-speed` is metres per second (default 0.10).
+`--stationary-window` is seconds (default 5). `--max-gap` is the largest allowed timestamp step in seconds (default 1). `--max-endpoint-spread` is metres (default 0.05). `--max-endpoint-speed` is metres per second (default 0.10). A limit that is not a finite number, including NaN and infinity, is rejected. It does not turn a gate off.
 
 Exit codes: 0 PASS, 1 FAIL, 2 NOT-EVALUABLE, 3 the session directory cannot be used.
 

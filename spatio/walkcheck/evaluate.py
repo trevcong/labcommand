@@ -24,7 +24,12 @@ from spatio.walkcheck.defaults import (
 from spatio.walkcheck.pcd import PcdError, read_pcd_xyz
 from spatio.walkcheck.plot import write_topdown
 from spatio.walkcheck.report import plain, render_markdown, write_json
-from spatio.walkcheck.trajectory import load_tum, score_stops, score_trajectory
+from spatio.walkcheck.trajectory import (
+    check_scoring_thresholds,
+    load_tum,
+    score_stops,
+    score_trajectory,
+)
 from spatio.walkcheck.walls import wall_sharpness
 
 ASSUMPTIONS = [
@@ -57,6 +62,14 @@ def evaluate_session(
     max_endpoint_speed_m_s: float = MAX_ENDPOINT_SPEED_M_S,
     write: bool = True,
 ) -> dict:
+    check_scoring_thresholds(
+        window_s=stationary_window_s,
+        max_gap_s=max_gap_s,
+        min_path_length_m=min_path_length_m,
+        min_excursion_m=min_excursion_m,
+        max_endpoint_spread_m=max_endpoint_spread_m,
+        max_endpoint_speed_m_s=max_endpoint_speed_m_s,
+    )
     session = Path(session_dir)
     if not session.is_dir():
         raise SessionDirError(f"session directory not found: {session}")

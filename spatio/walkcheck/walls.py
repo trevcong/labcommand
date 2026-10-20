@@ -4,6 +4,11 @@ Two half-cell-shifted voxel grids are fit with local PCA. The reported
 residual is the worse grid, so a voxel boundary cannot hide a doubled wall.
 Points are not downsampled before the residual.
 
+A doubled sheet inside one cell fails the single-plane planarity test:
+the gap is a large part of a 30 cm cell. Those cells are measured before
+they would have been discarded. Dropping them left a thin sliver that
+could pass the gate after a small shift.
+
 This is a geometric estimate. Two real parallel surfaces look the same as
 drift. The number does not change the walk verdict.
 """
@@ -54,7 +59,8 @@ def wall_sharpness(
         "proposed_gate_label": PROPOSED_WALL_LABEL,
         "method": (
             f"voxel PCA, {voxel_m:.2f} m cells, two grids half a cell apart, "
-            "vertical patches only, no downsampling"
+            "vertical patches only, no downsampling. "
+            "A cell with two thin sheets is kept even when one plane does not fit."
         ),
     }
     if len(finite) < min_cell_points:
@@ -162,17 +168,26 @@ def _phase(points, voxel, origin, planarity_min, max_abs_nz, min_cell_points) ->
         normal = evecs[:, 0].astype(np.float64, copy=True)
         if not np.isfinite(normal).all():
             continue
-        if abs(float(normal[2])) > max_abs_nz or planarity < planarity_min:
-            continue
         signed = np.dot(centered, normal)
         if not np.isfinite(signed).all():
             continue
-        residuals.append(np.abs(signed))
-        cell = tuple(int(v) for v in ijk_sorted[start])
-        patches.append((cell, centroid.astype(np.float64, copy=True), normal))
+        # Floors and ceilings are not wall evidence.
+        if abs(float(normal[2])) > max_abs_nz:
+            continue
+        # Two sheets make the cell look thick, so the single-plane test
+        # fails and the cell used to be dropped. A later shift can then
+        # leave only a thin sliver, which passes. Look first.
         layer = _layer_separation(signed, min_cell_points)
         if layer is not None:
             separations.append(layer)
+        single_plane = planarity >= planarity_min
+        if not single_plane and layer is None:
+            continue
+        residuals.append(np.abs(signed))
+        if not single_plane:
+            continue
+        cell = tuple(int(v) for v in ijk_sorted[start])
+        patches.append((cell, centroid.astype(np.float64, copy=True), normal))
 
     by_cell = {cell: (centroid, normal) for cell, centroid, normal in patches}
     for cell, centroid, normal in patches:

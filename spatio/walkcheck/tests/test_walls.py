@@ -43,6 +43,29 @@ def test_one_doubled_wall_in_a_room_is_flagged():
     assert scored["p95_point_to_plane_cm"] > wall_sharpness(room)["p95_point_to_plane_cm"]
 
 
+def test_shifted_doubled_sheet_cannot_pass():
+    """Codex P2. A 15 cm double wall fails the gate at every cell alignment.
+
+    Translating the cloud by 5 cm used to drop the mixed cells as
+    non-planar. The leftover sliver was 1,057 of 8,000 points, p95 was
+    1.67 cm, and the wall gate passed.
+    """
+    cloud = doubled_wall(separation_m=0.15)
+    for shift_m in (0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30):
+        scored = wall_sharpness(cloud + np.array([shift_m, 0.0, 0.0]))
+        assert scored["status"] == "OK", shift_m
+        assert scored["doubled_wall"] is True, shift_m
+        assert scored["proposed_gate_result"] == "FAIL", shift_m
+        assert scored["revisit_separation_cm"] is not None, shift_m
+        assert scored["revisit_separation_cm"] > 5.0, shift_m
+    sharp = wall_sharpness(sharp_wall() + np.array([0.05, 0.0, 0.0]))
+    assert sharp["doubled_wall"] is False
+    assert sharp["proposed_gate_result"] == "PASS"
+    room = wall_sharpness(four_wall_room() + np.array([0.05, 0.0, 0.0]))
+    assert room["doubled_wall"] is False
+    assert room["proposed_gate_result"] == "PASS"
+
+
 def test_too_few_points_is_not_evaluable():
     tiny = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64)
     scored = wall_sharpness(tiny)

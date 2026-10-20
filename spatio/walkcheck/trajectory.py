@@ -25,6 +25,47 @@ from spatio.walkcheck.defaults import (
 )
 
 
+class ThresholdError(ValueError):
+    """A scoring limit is not a usable finite number."""
+
+
+def check_scoring_thresholds(
+    *,
+    window_s: float,
+    max_gap_s: float,
+    min_path_length_m: float,
+    min_excursion_m: float,
+    max_endpoint_spread_m: float,
+    max_endpoint_speed_m_s: float,
+) -> None:
+    """Reject a scoring limit that is not a real, in-range number.
+
+    This is the one check for those six limits. A NaN gap compares false
+    against every step, so the gap would pass. An infinite spread or
+    speed compares true against every window, so a moving cart would
+    pass. Pose timestamps are a different check and are not judged here.
+    The numeric limits themselves stay provisional.
+    """
+    _finite_limit("stationary window", window_s, positive=True)
+    _finite_limit("max gap", max_gap_s, positive=True)
+    _finite_limit("minimum path length", min_path_length_m, positive=False)
+    _finite_limit("minimum excursion", min_excursion_m, positive=False)
+    _finite_limit("endpoint spread", max_endpoint_spread_m, positive=False)
+    _finite_limit("endpoint speed", max_endpoint_speed_m_s, positive=False)
+
+
+def _finite_limit(name: str, value, *, positive: bool) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.floating)):
+        raise ThresholdError(f"{name} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ThresholdError(f"{name} must be a finite number")
+    if positive and number <= 0.0:
+        raise ThresholdError(f"{name} must be positive")
+    if not positive and number < 0.0:
+        raise ThresholdError(f"{name} cannot be negative")
+
+
 def load_tum(path: Path) -> dict:
     """Parse a TUM file. A bad data line fails the whole file."""
     try:
@@ -85,6 +126,14 @@ def score_trajectory(
     max_endpoint_speed_m_s: float = MAX_ENDPOINT_SPEED_M_S,
 ) -> dict:
     """Score one parsed trajectory. Does not read the map."""
+    check_scoring_thresholds(
+        window_s=window_s,
+        max_gap_s=max_gap_s,
+        min_path_length_m=min_path_length_m,
+        min_excursion_m=min_excursion_m,
+        max_endpoint_spread_m=max_endpoint_spread_m,
+        max_endpoint_speed_m_s=max_endpoint_speed_m_s,
+    )
     if not loaded.get("ok"):
         return {
             "evaluated": False,
