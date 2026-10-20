@@ -1,0 +1,274 @@
+# Spatio memory v2: time, revisions and alignment (design only)
+
+Status: design only, written 2026-10-20 for job B3 of the solidity plan. No code, schema or test changes come with it. Schema v2 needs Trevor's approval before anyone builds it (DESIGN §3, northstar M3).
+
+Tags, as in the northstar: **[measured]** is read in the code cited; **[proposal]** is my recommendation, not decided; **[provisional]** marks a number Trevor sets before it is used.
+
+## 0. What this is grounded in
+
+- **The v1 store is not on main.** `spatio/memory/` (`store.py`, `api_stub.py`, `DESIGN.md`, `tests/`) exists only on the unmerged branch `spatio-memory`, at commit 90ae03e, checked out at `~/Developer/spatio-memory`. That branch is 5 commits ahead of its merge base d675f8a (PR #48) and is absent from origin/main 4de8ec7. Every `store.py:N`, `api_stub.py:N` and `DESIGN §N` below refers to 90ae03e. The northstar's "implementation is Grok's task" is stale: the store and its invariant tests are written, just not merged.
+- **Room memory** citations (`spark/room_memory`, `spark/room_memory_cpp`, `docs/ROOM-MEMORY-PROTOCOL.md`) refer to 4de8ec7, the base of this branch.
+- Other inputs: `SPATIO-northstar.md` (layers 2–3, M3, M4) and `SPATIO-drift-investigation.md` (what a "trajectory error" looks like on real walks) in `lc-tasks/plans`.
+
+v2 keeps every v1 rule: measurements and guesses in separate tables and fields; `CURRENT` only from a fresh measured sighting with a valid pose; not looking is not absence; queries take `now` and never read a clock. It adds what v1 cannot express:
+
+1. acquisition time vs knowledge time;
+2. retractions that do not rewrite the past;
+3. map and trajectory revisions;
+4. validated cross-session transforms;
+5. immutable evidence, reconciled with retention;
+6. unaligned sessions kept separate.
+
+## 1. What v1 does today, and where it stops
+
+| Topic | v1 as built [measured] | Consequence |
+|---|---|---|
+| Time axes | Queries have one time argument, `now`, in sensor time. `_newest_sighting_id` filters only `acquired_at <= now` (`store.py:1697-1712`); absences likewise (`:1777-1810`). Every row has a wall-time `created_at`, but no query reads it | A row inserted late changes the answer for every past `now`. "What did we know at T" cannot be asked |
+| Retraction | `interpretations.retracted_at` is set once (`:1446-1465`, trigger `:394-414`). The `sightings` view filters `retracted_at IS NULL` with no time bound (`:472-481`) | A retraction is retroactive: yesterday's report, recomputed today, silently changes |
+| Retraction scope | Only interpretations can be retracted. Observations are immutable (`:368-372`) and can only be deleted by the purge (`:374-379`) | A sensor fault found later has no honest record: the row can neither be withdrawn nor deleted |
+| Maps | `sessions.map_id` is `UNIQUE` (`:166`); `add_session` refuses a second session per map (`:1152-1153`). A map is `map_id` + `map_pcd_sha256` (`:154-162`) with no revision | One session per map. Any re-run of the map is a new map |
+| Trajectory | One `trajectory_sha256` per session (`:169`). Pose and centroid are stored in the map frame on the observation (`:193-274`) and are immutable | A corrected trajectory cannot be applied. The old positions stay baked in |
+| Cross-session | Absences count only with `map_id = s.map_id` (`:1789`) | Correctly conservative; it is also why nothing compares walks (DESIGN §3) |
+| Deletion | `purge_expired` deletes camera rows and cascades their interpretations (`:1825` on). It leaves only a counter, `objects.purged_sightings` (`:189`) | Evidence a past report used can vanish. Only the count survives |
+| Schema identity | Thresholds are written into the view SQL as literals (`:142-149`, `:472-481`). `thumbnail_gc` is created lazily by the first purge without bumping `user_version` (`:364-366`, `:1814-1823`) | A reproducible answer must name the constants, not only the schema version. Two v1 files at `user_version` 1 can differ by one table, so a migration must accept both |
+| Clocks | Sensor time is checked to be UNIX UTC (`api_stub.py:35-36`, `ClockError`). DESIGN §2 lists exactly two cross-clock comparisons (retention; look-again fulfilment) | Kept. v2 adds a third axis (§2.1) and says which comparisons use it |
+
+Room memory already solves the same problems for a stationary rig, in a different form [measured]:
+
+| Room memory | What it does | What v2 takes from it |
+|---|---|---|
+| `map_epoch` | A revision counter, bumped on every reference change (`memory.py:1372`, `:1947`). The reference file is overwritten in place, atomically (`save_reference`, `memory.py:342-347`). Old revisions are kept only when a relearn archives the frame (`archive_due_ = "frame-<epoch>"`, `memory.cpp:1713`, `:1874`) | A revision identifier. v2 keeps every revision; it does not overwrite |
+| `frame_epoch` and relearn | A relearn starts a new room frame (`memory.py:1786`, `:1513-1518`). `Registry::apply_frame_change` retires every anchor of another frame and keeps its geometry; it never transforms it (`objects.cpp:736-760`) | Positions are never moved into a new frame by assumption. Old-frame geometry stays in its frame, marked as such |
+| Re-alignment (D40) | A pose maps a sensor's current frame into its reference frame, and "re-alignment changes it and nothing else" (protocol §3.9). An estimate counts only with inlier fraction ≥ 0.9 × baseline, RMS ≤ 0.02 m and λ_min/Σw ≥ 0.02 (`memory.hpp:304-327`) | A transform is its own record, gated by recorded fit metrics. Applying it changes no evidence |
+| Publisher generation (D34) | `g = max(stored + 1, now_ms)`, written durably before use (protocol §5.1) | A knowledge sequence that only rises, floored by the wall clock (§2.1) |
+| Honest-state rule 2 | "Absence of returns ≠ absence of object" (protocol §6) | Kept unchanged (v1 already follows it) |
+
+Wall scoring has the input-binding pattern v2 reuses for evidence: `_check_map` refuses a measurement whose `map_sha256` is not the run map's bytes (`spatio/wall_scoring.py:297-314`).
+
+Nothing in this design changes room memory or wall scoring.
+
+## 2. Design
+
+### 2.1 Acquisition time and knowledge time
+
+There are three axes. Each comparison uses one of them, and the doc says which.
+
+| Axis | Columns | Source | Compared with |
+|---|---|---|---|
+| Acquisition (sensor) time | `acquired_at`, session `t_start`/`t_end` | the sensor clock, UNIX UTC, as v1 | the query's `now` |
+| Knowledge sequence | `recorded_txn` on every row; `retracted_txn` on every retraction | the store: one integer per write transaction, strictly increasing | the query's `known_at` |
+| Wall time | `transactions.recorded_at` | injected `wallclock`, as v1 | only retention (as v1), and resolving a wall-time `known_at` to a transaction |
+
+**Transactions** [proposal]. Every public write opens one row in a new `transactions` table: `txn_id INTEGER PRIMARY KEY AUTOINCREMENT`, `recorded_at REAL`, `writer TEXT`, `operation TEXT`. Every row the write inserts carries that `txn_id` as `recorded_txn`. `recorded_at = max(previous recorded_at, wallclock())`, the same floor as the publisher generation (protocol §5.1), so the wall column never goes backwards even if the clock does. Ordering always uses `txn_id`, never wall time.
+
+**Queries.** Every read takes `known_at`, a `txn_id`. It is optional only in the sense that `None` means "the newest committed transaction"; the answer always reports the `txn_id` it used, so it can be run again. `known_at_wall(T)` is a pure helper that returns the newest `txn_id` with `recorded_at ≤ T`.
+
+**Visibility rule.** For a query at `(now, known_at)`, a row is visible when `recorded_txn ≤ known_at` and it has no retraction with `retracted_txn ≤ known_at`. Then v1's rules run unchanged on the visible rows, with `acquired_at ≤ now` as before. A late observation is visible only to queries whose `known_at` is at or after its ingest; it never changes an answer given before it was recorded.
+
+**Look-again fulfilment** keeps v1's rule: the fulfilling observation's `acquired_at` must be ≥ the request's creation time. v2 states the request's creation time as its transaction's `recorded_at`, so this stays v1's single sensor-vs-wall comparison, with the same caveat (unverified without a disciplined sensor clock, DESIGN §2). An observation acquired before the request but ingested after it does not fulfil it.
+
+### 2.2 Retractions
+
+[proposal] One append-only table replaces v1's in-row `retracted_at`:
+
+`retractions(retraction_id, target_kind, target_id, recorded_txn, reason, retracted_by)`, with `target_kind` one of `interpretation`, `observation`, `alignment`, `trajectory_revision`.
+
+- A target can be retracted once (`UNIQUE (target_kind, target_id)`). A retraction cannot itself be retracted. To undo one, add the content again as a new row. This keeps the history one-directional, as v1's trigger does.
+- Retracting an **observation** is new. It is for a measurement later found bad (a sensor fault, a clock offset, the wrong session). The row stays, immutable; it stops counting from `retracted_txn` on. It is not a deletion and not an absence.
+- A **correction** is one transaction: retract the old row and insert its replacement. Both carry the same `recorded_txn`, so no `known_at` can see neither or both.
+- `retracted_by` is an operator id or `model:<name>@<version>`. A model may retract only interpretations it wrote [proposal]. A model can never retract an observation, alignment or trajectory revision ("guesses never flow down", northstar §2).
+
+### 2.3 Map and trajectory revisions
+
+A walk produces a trajectory, and the map is built from it. The two are revised together.
+
+- `trajectory_revisions(trajectory_revision_id, session_id, revision, tum_sha256, parent_revision_id, method, method_version, params_sha256, reason, recorded_txn)`. Revision 1 is the session's FAST-LIO output. A loop-closure back end, an offline bundle adjustment or a timing fix adds revision 2, with its parent.
+- `map_revisions(map_id, revision, map_pcd_sha256, trajectory_revision_id, built_by, recorded_txn)`. A map revision names the trajectory revision it was built from. Every revision is kept. This is room memory's `map_epoch`, without the overwrite.
+- A **frame** is `(map_id, revision)`. Every stored position names its frame, as v1's positions name their `map_id`.
+- The session's **active** trajectory revision at `known_at` is its newest revision visible at `known_at` (§2.1). A retracted revision falls back to its parent.
+
+**Observation geometry** comes in two kinds [proposal]:
+
+| `geometry_frame` | Stored | Position in a map frame | After a trajectory correction |
+|---|---|---|---|
+| `body` | the measurement relative to the rig at `acquired_at` (a camera detection, a per-scan lidar cluster) | derived: the active trajectory's pose at `acquired_at` (v1's `pose_from_trajectory`) applied to the body geometry | re-derived exactly from the new revision. No row changes |
+| `map` | the measurement in one map revision's frame (a cluster or free-space region computed from the accumulated `map.pcd`) | stored, bound to that revision | **not transformed**. It stays in its revision. The pipeline re-extracts it from the new map revision as a new observation with `derived_from` pointing at the same raw recording |
+
+A trajectory correction is generally not rigid: the drift investigation measured local inconsistency of up to 8 cm / 1.7° along one walk (M14b). So a `map`-frame observation cannot be moved by one transform. This is room memory's relearn rule (`objects.cpp:736-760`): old-frame geometry is retired with its frame, not carried over. Pose fields on a `body` observation (v1's `pose_*`, `pose_bracket_s`, `pose_quality`) are derived per trajectory revision. The pose bracket check runs per revision, so a detection can be `valid` under one revision and `invalid` under another.
+
+### 2.4 Validated cross-session transforms
+
+[proposal] Sessions are never written into another session's map. v1's `UNIQUE map_id` stays true in spirit: a session's own observations stay in its own frames. "Many sessions per map" (northstar M3) comes from **alignment records** into a reference map revision:
+
+`alignments(alignment_id, from_frame, to_frame, transform (tx ty tz qx qy qz qw), method, method_version, params_sha256, inlier_frac, rms_m, observe_min_eig, basin_margin, holdout_residual_m, holdout_n, verdict, recorded_txn)`
+
+- `from_frame` is a session's map revision; `to_frame` is a revision of a designated reference map.
+- `verdict` is `validated` or `rejected`. As with v1's `pose_quality`, a row claiming `validated` whose metrics fail a gate raises `ValidationError`; it is not stored as `rejected` instead. A failed attempt is stored as `rejected`, so failures stay on record (the workplan's "failed attempts retained").
+- **Gates.** All are needed:
+  - fit: `inlier_frac`, `rms_m` and `observe_min_eig` within limits. Room memory's rig values (0.9 × baseline, 0.02 m, 0.02; `memory.hpp:304-327`) are placeholders only: they were set for a stationary rig against its own cloud, not for a cart against a building map [provisional];
+  - **basin uniqueness:** `basin_margin`, the score gap between the best solution and the best distinct solution from a seed grid. The drift investigation found the identity seed converged to a wrong basin (M1: 1.37 m / +22°, against 1.81 m / −15.2°). Only the 600-seed grid exposed it (M16). One seed is not evidence. Repeating rack aisles (northstar §6) make this the main failure mode;
+  - **held-out check:** residual at `holdout_n` points or landmarks not used in the fit (the Codex suggestion in the drift investigation).
+- **Star topology, no chaining** [proposal]. A session aligns only directly into a reference revision. Transforms are never composed through other sessions, so errors do not accumulate unseen. A new reference revision needs fresh alignments; old ones stay valid only for the revision they name.
+- An alignment can be retracted (§2.2), for example when a later walk shows it locked onto the wrong aisle. Comparisons that used it then become `not_comparable` for every `known_at` from the retraction on.
+
+### 2.5 Comparability: the rule behind "moved" and absence
+
+v2 compares positions only through one function [proposal]:
+
+`compare_positions(obs_a, obs_b, known_at) -> Comparison`, with fields `comparable`, `reason`, `frame`, `distance_m`, `sigma_m`, `revisions_used`.
+
+Two observations are comparable at `known_at` only when one of these holds:
+
+1. both are `body` observations of the **same session**, compared under that session's active trajectory revision (the map revision built from it); or
+2. both are `map` observations bound to the **same map revision**; or
+3. each is in a frame with a visible `validated` alignment into the **same reference revision**, and the positions are compared there.
+
+Anything else returns `comparable = False` with a reason (`different_frames`, `no_validated_alignment`, `alignment_retracted`, `superseded_revision`). It never returns a distance. In particular, a position from trajectory revision 1 is never compared with one from revision 2.
+
+`sigma_m` is `sqrt(σa² + σb²)`, plus each alignment's `rms_m` when case 3 applies.
+
+Uses:
+- **Absence.** v1's step 3 (`map_id = s.map_id`, DESIGN §6) becomes "comparable with s". The tightness test runs in the common frame. An AABB transformed by a rotation is re-boxed and grows, so it may fail tightness and not count. That is the conservative direction.
+- **Moved.** v2 does not detect changes (§4). A future detector may call something "moved" only when `compare_positions` is comparable and `distance_m > MOVED_SIGMA_K × sigma_m` [provisional: `MOVED_SIGMA_K = 3`], and the claim stores the `revisions_used` and `known_at`. When a later trajectory revision or a retracted alignment makes that comparison non-comparable, the claim is superseded, never silently kept.
+
+### 2.6 Immutable evidence
+
+- **Observation rows stay immutable**, as v1 (`store.py:368-372`). v2 adds nothing that updates them. Derived values (pose, map-frame position) are computed per revision, not stored back.
+- **Raw inputs are bound by hash** [proposal]: sessions gain `source_recording_sha256`, alongside v1's `trajectory_sha256` and `map_pcd_sha256`. Ingest refuses an observation whose `derived_from` names bytes that do not hash to the recorded value, the same pattern as `_check_map` (`wall_scoring.py:297-314`).
+- **Derivations name their code**: `method`, `method_version`, `params_sha256` on trajectory revisions, map revisions, alignments and re-extracted observations.
+- **The code contradicts strict immutability in one place:** the purge deletes camera rows under the 30-day retention policy (DESIGN §8, `store.py:1825` on). v2 keeps the purge, because the retention policy is Trevor's privacy rule, and records each deletion instead: `purged_observations(observation_id, kind, session_id, sensor_kind, acquired_at, recorded_txn, purged_txn, row_sha256)`. The tombstone holds no image data. A historical query that would have used a purged row returns `complete = False` and lists the purged ids. It never quietly gives a different answer.
+
+### 2.7 Unaligned sessions stay separate
+
+- A session with no visible `validated` alignment lives only in its own frames. That is exactly v1's behaviour: its absences cannot refute another session's sightings, and its places are never compared with another session's.
+- A `rejected` or retracted alignment counts as none.
+- `object_status` reports which frame its answer is in. A sighting in an unaligned session can still be `CURRENT` or `LAST_SEEN` in that session's frame. It is never reported in the reference frame.
+- `describe()` keeps v1's wording and appends `; not aligned to the building map` when the sighting's frame has no validated alignment [proposal].
+
+### 2.8 Query shape
+
+`object_status(object_id, now, known_at=None, frame=None) -> ObjectStatus` [proposal]:
+
+- `frame=None` means "the frame of the newest sighting". A reference frame may be named. Only aligned evidence takes part then.
+- The return adds `known_at` (the `txn_id` used), `frame`, `revisions_used`, `complete` and `purged_ids` to v1's fields. `measured` and `hypothesis` stay separate sub-records (v1 invariant I16).
+- A **report** is canonical JSON of statuses plus a fingerprint: `schema_version`, `constants_sha256` (a hash of every constant in DESIGN §5 and v2's new ones), `known_at`, `now`. Regenerating a report on a store whose `constants_sha256` differs raises `ReproducibilityError`. It never recomputes the answer under new thresholds.
+
+### 2.9 Migration from v1
+
+[proposal]
+- v1 refuses `user_version = 2` (invariant I23, `store.py:1026-1030`). So the migration copies into a new file and never upgrades in place.
+- Each v1 map becomes `map_revisions` revision 1. Each session's `trajectory_sha256` becomes trajectory revision 1. Every v1 observation becomes a `map`-frame observation bound to revision 1, because v1 stored map-frame poses.
+- Transactions are synthesized in `created_at` order (ties by table, then id). v1 `retracted_at` becomes a retraction row ordered the same way. Every synthesized transaction is flagged `knowledge_basis = 'migrated'`, because v1 wall times were never a knowledge record: `known_at` before the migration point is approximate.
+- `thumbnail_gc` may or may not exist (§1). The migration accepts both.
+
+## 3. Acceptance scenarios (future tests)
+
+These are written to become `spatio/memory/tests/test_v2_*.py`, one test per case. They use v1's notation (DESIGN §9): `t0 = 1.76e9`, a "valid detection of X" with `measurement_confidence = 0.9` and a model interpretation linking it to X at confidence 0.9, and "absence over X" with coverage 1.0 and a region equal to X's AABB. `K1 < K2 < …` are transaction ids in write order. One session S1 spans `[t0, t0 + 200]` unless stated.
+
+### V2-1. A late observation does not rewrite the past
+
+`test_V2_1_late_absence_visible_only_after_ingest`
+- Given a valid detection of X at `t0` (recorded K1), and an absence over X acquired at `t0 + 5` but ingested later (recorded K2).
+- At `now = t0 + 10, known_at = K1`: `CURRENT`, `measured.acquired_at == t0`, `absence is None`.
+- At `now = t0 + 10, known_at = K2`: `NOT_SEEN_ON_RECHECK`, `absence.acquired_at == t0 + 5`.
+- With `known_at=None`, the answer equals `known_at = K2` and reports `known_at == K2`.
+- The `known_at = K1` answer is identical (canonical JSON) before and after K2 is written.
+
+`test_V2_1b_late_observation_does_not_fulfil_earlier_request`
+- Given a look-again request for X created at wall time W.
+- An observation acquired at sensor time `W − 60` and ingested after W does not fulfil it (`ValidationError`). One acquired at `W + 1` does.
+
+### V2-2. A label correction keeps the old answer reproducible
+
+`test_V2_2_label_correction`
+- Given a valid detection D of X at `t0` with a model interpretation "chair" (conf 0.9, recorded K1).
+- The operator corrects it at K2 in one transaction: retract "chair" (reason "is a stool") and add an operator interpretation "stool" on D for X.
+- At `now = t0 + 10`: `known_at = K1` gives `hypothesis.label == "chair"`, `source_kind == model`; `known_at = K2` gives `"stool"`, `operator`. `measured` is the same row both times.
+- No `known_at` sees both labels active, or neither.
+- Retracting the retraction raises `ValidationError`.
+
+`test_V2_2b_identity_correction`
+- Given the same D, retracted at K2 with no replacement (it was object Y, not X).
+- X at `now = t0 + 10, known_at = K2` is `UNKNOWN / never_seen`. At `known_at = K1` it is `CURRENT`.
+
+`test_V2_2c_retracted_observation`
+- Given D retracted as an observation at K2 (sensor fault).
+- At `known_at = K2`, X is `UNKNOWN`. D still exists in `observations`, and an `UPDATE` on it still raises (I18).
+
+### V2-3. A historical report is reproducible ("as known at T")
+
+`test_V2_3_report_as_known_at_T`
+- Given objects X and Y, three sessions' worth of detections and absences, one validated alignment, recorded through K5. Report R = `report(now = t0 + 500, known_at = K5)`.
+- Then write K6–K9: a late absence, a label correction, a new trajectory revision for one session, and a retraction of the alignment.
+- `report(now = t0 + 500, known_at = K5)` is byte-identical to R, fingerprint included.
+- `report(now = t0 + 500, known_at = K9)` differs, and its `known_at` is K9.
+
+`test_V2_3b_purge_is_never_silent`
+- Given a camera detection of X used in R (recorded K1), then `purge_expired` at its `expires_at` (K2).
+- `report(..., known_at = K1)` returns X with `complete = False` and `purged_ids == [that id]`. It does not return X as `UNKNOWN / never_seen` without that flag.
+
+`test_V2_3c_constants_change_refuses`
+- Given R from a store whose constants hash is H. Opening a store with any changed constant and regenerating R raises `ReproducibilityError`.
+
+### V2-4. A trajectory correction makes no false "moved"
+
+The drift investigation's lesson in test form: a pose error must not read as an object moving.
+
+`test_V2_4_trajectory_correction_body_frame`
+- Given session S1 with trajectory revision T1. Body-frame detections of X at `t0 + 10` and `t0 + 100`, both σ = 0.03 m. Under T1 they project to (2.00, 0, 0.5) and (2.30, 0, 0.5). T1 drifts by +0.30 m in x after `t0 + 50`.
+- Under T1 (`known_at` before T2): `compare_positions` is comparable, `distance_m ≈ 0.30`, `sigma_m ≈ 0.042`. The 3σ predicate is true, so a detector would say "moved". The claim records `revisions_used = {T1}`.
+- Revision T2 is recorded (parent T1). It removes the 0.30 m drift after `t0 + 50`.
+- Under T2: both project within 1 mm of (2.00, 0, 0.5). `distance_m < 0.001`, and the predicate is false.
+- The T1 claim is reported superseded at `known_at ≥ T2's txn`. At `known_at` before T2 it is still reported, unchanged (V2-3).
+- No observation row changed (row hashes are equal before and after).
+
+`test_V2_4b_mixed_revisions_refuse`
+- With T1 and T2 both stored, comparing the first sighting under T1 with the second under T2 returns `comparable = False, reason = "superseded_revision"`, and `distance_m is None`.
+
+`test_V2_4c_map_frame_not_transformed`
+- Given a `map`-frame detection of X bound to map revision R1 (built from T1), and T2 recorded with map revision R2.
+- The R1 detection is not projected into R2. Comparing it with an R2 observation returns `comparable = False`.
+- X's status in frame R2 uses only observations re-extracted from R2. With none yet, X in R2 is `UNKNOWN`, and in R1 it is unchanged.
+
+### V2-5. Unaligned sessions stay separate
+
+`test_V2_5_unaligned_absence_does_not_refute`
+- Given a sighting of X in S1 and a later absence over the same coordinates in S2, with no alignment between S1, S2 and any reference.
+- X is `LAST_SEEN` (v1 I12, unchanged). `compare_positions` between them returns `no_validated_alignment`.
+
+`test_V2_5b_validated_alignment_enables_comparison`
+- Given S1 and S2 each with a `validated` alignment into reference revision B1.
+- The S2 absence, transformed to B1 and still tight around the transformed footprint, makes X `NOT_SEEN_ON_RECHECK` in frame B1.
+- Retracting S2's alignment at a later K returns X to `LAST_SEEN` for `known_at ≥ K` only.
+
+`test_V2_5c_alignment_gates`
+- A `validated` alignment with `basin_margin` below its gate, or `holdout_n = 0`, raises `ValidationError`, and nothing is written.
+- The same row as `rejected` is stored and enables no comparison.
+
+`test_V2_5d_no_chaining`
+- Given S1 → B1 validated and S2 → S1 validated (`to_frame` not a reference revision): the second insert raises `ValidationError`.
+
+### V2-6. Migration keeps v1's answers
+
+`test_V2_6_migrated_v1_equivalence`
+- Given a v1 database built by the v1 invariant fixtures (I1–I29), with and without `thumbnail_gc`.
+- After migration, for every object and every `now` the fixtures use, v2 `object_status(..., known_at=None)` equals v1's `ObjectStatus` field for field (v2's added fields aside). `describe()` text is identical.
+- The v1 file is unchanged (byte hash).
+
+## 4. Deferred, deliberately
+
+These are out of v2 and not designed here:
+
+- **Temporal occupancy and change detection.** Appeared, disappeared and moved regions from free-space evidence between walks (northstar layer 2, M4). v2 only fixes the rule they must obey (§2.5).
+- **Recheck relevance.** Ranking or prioritising look-again requests (northstar layer 6, M7). v2 keeps v1's request table and fulfilment rule unchanged.
+- **ConceptGraphs, GNN and GraphRAG.** Open-vocabulary scene graphs, learned graph models and graph-retrieval language answers (northstar layers 4–5). If they come, they write interpretations only.
+
+Also unchanged from v1: no object merge or split, no named places, a single local writer, no camera capture.
+
+## 5. Questions for Trevor
+
+1. Approve schema v2 at all (DESIGN §3 requires it), and the star topology (§2.4) over chained alignments.
+2. Set the alignment gates for a cart against a building map: fit, basin margin and held-out residual. The rig values are placeholders.
+3. Set `MOVED_SIGMA_K` (3 proposed) for the comparability predicate.
+4. Allow observation retraction (§2.2)? I recommend yes, operator-only.
+5. Retention against reproducibility: confirm that a purge may make an old report `complete = False`, rather than keeping images longer.
