@@ -65,7 +65,7 @@ if grep -q "name: /livox/lidar$" "$REC/bag/metadata.yaml"; then
   [[ -z $HIST_MAP ]] && HIST_MAP=map.pcd
 elif grep -q "name: /slam/points$" "$REC/bag/metadata.yaml"; then
   SENSOR="Hesai JT128 via jt128_slam_adapter output recorded in bag (/slam/points PointCloud2, /slam/imu)"
-  LIDAR=/slam/points IMU=/slam/imu TS_UNIT=3 HIST_PATH_TOPIC=/path
+  LIDAR=/slam/points IMU=/slam/imu TS_UNIT=0 HIST_PATH_TOPIC=/path  # point time measured in s
   [[ -z $HIST_MAP ]] && HIST_MAP=jt128_map.pcd
 else
   echo "unrecognised recording (no /livox/lidar or /slam/points in bag)" >&2; exit 2
@@ -91,7 +91,7 @@ dk() { docker --context "$DCTX" "$@"; }
 VOL="spatio-rec-$(basename "$REC" | tr -c 'A-Za-z0-9_.-\n' '_')"
 BAGFILE="$(cd "$REC/bag" && ls | grep -E '\.(mcap|db3)$' | head -1)"
 want_sha="$(shasum -a 256 "$REC/bag/$BAGFILE" | cut -d' ' -f1)"
-have_sha="$(dk run --rm --network none -v "$VOL:/rec:ro" "$IMAGE_TAG" cat /rec/.spatio_loaded 2>/dev/null || true)"
+have_sha="$(dk run --rm --name "spatio-check-$RUN_ID" --network none -v "$VOL:/rec:ro" "$IMAGE_TAG" cat /rec/.spatio_loaded 2>/dev/null || true)"
 if [[ $have_sha != "$want_sha" ]]; then
   echo "== loading $REC into volume $VOL"
   dk volume rm "$VOL" >/dev/null 2>&1 || true
@@ -99,9 +99,9 @@ if [[ $have_sha != "$want_sha" ]]; then
   dk create --name "spatio-load-$RUN_ID" --network none -v "$VOL:/rec" "$IMAGE_TAG" true >/dev/null
   dk cp "$REC/." "spatio-load-$RUN_ID:/rec/"
   dk rm "spatio-load-$RUN_ID" >/dev/null
-  got="$(dk run --rm --network none -v "$VOL:/rec:ro" "$IMAGE_TAG" sha256sum "/rec/bag/$BAGFILE" | cut -d' ' -f1)"
+  got="$(dk run --rm --name "spatio-verify-$RUN_ID" --network none -v "$VOL:/rec:ro" "$IMAGE_TAG" sha256sum "/rec/bag/$BAGFILE" | cut -d' ' -f1)"
   [[ $got == "$want_sha" ]] || { echo "bag sha256 mismatch in volume ($got != $want_sha)" >&2; exit 3; }
-  dk run --rm --network none -v "$VOL:/rec" "$IMAGE_TAG" sh -c "echo $want_sha > /rec/.spatio_loaded"
+  dk run --rm --name "spatio-mark-$RUN_ID" --network none -v "$VOL:/rec" "$IMAGE_TAG" sh -c "echo $want_sha > /rec/.spatio_loaded"
 fi
 
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/spatio-stage.XXXXXX")"
@@ -145,7 +145,7 @@ fi
 # Provenance and run details (outside the contract manifest).
 TOOL_REV="$(git -C "$HERE" rev-parse HEAD)"
 [[ -n $(git -C "$HERE" status --porcelain -- .) ]] && TOOL_REV="$TOOL_REV-dirty" || true
-dk run --rm --network none "$IMAGE_TAG" cat /opt/spatio/provenance.json > "$SESSION/logs/image_provenance.json"
+dk run --rm --name "spatio-prov-$RUN_ID" --network none "$IMAGE_TAG" cat /opt/spatio/provenance.json > "$SESSION/logs/image_provenance.json"
 python3 - "$SESSION/logs/run_params.json" <<EOF
 import json, sys
 json.dump({
