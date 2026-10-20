@@ -229,6 +229,10 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 
 These are written to become `spatio/memory/tests/test_v2_*.py`, one test per case. They use v1's notation (DESIGN §9): `t0 = 1.76e9`, a "valid detection of X" with `measurement_confidence = 0.9` and a model interpretation linking it to X at confidence 0.9, and "absence over X" with coverage 1.0 and a region equal to X's AABB. `K1 < K2 < …` are transaction ids in write order. One session S1 spans `[t0, t0 + 200]` unless stated. S1 has trajectory revision T1 and map revision R1 built from it. Unless stated, a detection is `body`-frame with an identity pose under T1 throughout, so its footprint is X's AABB in R1. An absence is bound to R1. V2-1 is therefore a body/map recheck, compared under rule 2 of §2.5.
 
+**Required tests.** Trevor made these required (§5). A v2 build is not complete until each one exists and passes:
+
+- `test_V2_6c_migrated_session_first_trajectory_correction` (V2-6): a migrated session's first new trajectory revision retires its migrated observations without retracting or changing them (§5 decision 6).
+
 ### V2-1. A late observation does not rewrite the past
 
 `test_V2_1_late_absence_visible_only_after_ingest`
@@ -370,6 +374,16 @@ The drift investigation's lesson in test form: a pose error must not read as an 
 `test_V2_6b_migrated_purge_stays_incomplete`
 - Given a v1 database after I27's purge, so X has `purged_sightings = 1` and no rows.
 - After migration, X at `known_at=None` is `UNKNOWN / no_retained_sightings`, `purged_sightings == 1`, `complete = False`, `purged_unattributed == 1`, `purged_ids == []`, as v1 reports it.
+
+`test_V2_6c_migrated_session_first_trajectory_correction` **(required, §5 decision 6)**
+- Given a v1 database with one session S and two valid detections of X in it, D at `t0` and E at `t0 + 5`. After migration at transaction KM, S has trajectory revision T1 and map revision R1 built from it, and D and E are `map`-frame observations bound to R1 (§2.9). Every query uses `now = t0 + 10`.
+- At `known_at = KM`: X is `CURRENT` with `measured.observation_id == E`, equal to v1's answer (V2-6). `compare_positions(D, E)` is comparable with `frame == R1` (rule 2 of §2.5).
+- At K2, S's first new trajectory revision T2 (parent T1) is recorded. No map revision is built from it yet.
+- At `known_at = K2`: R1 is not current (§2.3), so D and E support no status in any frame, R1 included, and X is `UNKNOWN`. `compare_positions(D, E)` returns `comparable = False, reason = "superseded_revision"` and `distance_m is None`.
+- At `known_at = KM`, the answer is byte-identical to the one before K2 (V2-3).
+- K2 added no row to `retractions`. D and E have no retraction rows, and their row hashes are unchanged.
+- At K3, map revision R2 built from T2 is recorded. D and E stay bound to R1 and are not moved into R2 (V2-4c), so X is still `UNKNOWN` at `known_at = K3`.
+- At K4, a detection D2 re-extracted from R2 at `t0 + 5`, with `derived_from` naming S's raw recording, is recorded. X is `CURRENT` in frame R2 with `measured.observation_id == D2` for `known_at ≥ K4`.
 
 ### V2-7. Retracting or correcting a source invalidates what was derived from it
 
