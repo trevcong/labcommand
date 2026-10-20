@@ -65,18 +65,27 @@ public struct TrailRaster: Equatable, Sendable {
 
         let cells = max(maxCells, 1)
         let cell = max(minCellSize, max(hi.x - lo.x, hi.y - lo.y) / Double(cells))
-        let width = max(1, min(cells, Int(((hi.x - lo.x) / cell).rounded(.up))))
-        let height = max(1, min(cells, Int(((hi.y - lo.y) / cell).rounded(.up))))
+        // A finite trail can still span more than Double holds (±1e308): the ratio is then
+        // inf / inf. Take the cap rather than convert NaN to Int.
+        func count(_ span: Double) -> Int {
+            let n = (span / cell).rounded(.up)
+            guard n.isFinite else { return cells }
+            return max(1, min(cells, Int(min(n, Double(cells)))))
+        }
+        let width = count(hi.x - lo.x)
+        let height = count(hi.y - lo.y)
 
         let (band, followsCart) = heightBand(map: map, poses: poses)
         var footprint = [UInt32](repeating: 0, count: width * height)
         var walls = [UInt32](repeating: 0, count: width * height)
         var binned = 0
         for p in map {
-            let cx = Int(((Double(p.x) - lo.x) / cell).rounded(.down))
-            let cy = Int(((hi.y - Double(p.y)) / cell).rounded(.down))
-            guard cx >= 0, cx < width, cy >= 0, cy < height else { continue }
-            let i = cy * width + cx
+            // Bounds-check in Double first: a finite return at 1e20 m is past Int.max as a cell
+            // index. The comparisons also fail for NaN, so only in-range values reach Int().
+            let fx = ((Double(p.x) - lo.x) / cell).rounded(.down)
+            let fy = ((hi.y - Double(p.y)) / cell).rounded(.down)
+            guard fx >= 0, fx < Double(width), fy >= 0, fy < Double(height) else { continue }
+            let i = Int(fy) * width + Int(fx)
             footprint[i] &+= 1
             if band.contains(Double(p.z)) { walls[i] &+= 1 }
             binned += 1

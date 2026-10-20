@@ -122,12 +122,24 @@ public struct TrailMapCloud: Equatable, Sendable {
             }
             fields.append(Field(name: names[i].lowercased(), size: sizes[i], type: type, count: counts[i],
                                 offset: offset, column: column))
-            offset += sizes[i] * counts[i]
-            column += counts[i]
+            // Checked: a garbage SIZE or COUNT must throw, not trap.
+            let (bytes, bytesOverflow) = sizes[i].multipliedReportingOverflow(by: counts[i])
+            let (nextOffset, offsetOverflow) = offset.addingReportingOverflow(bytes)
+            let (nextColumn, columnOverflow) = column.addingReportingOverflow(counts[i])
+            guard !bytesOverflow, !offsetOverflow, !columnOverflow else {
+                throw TrailError.pcd("SIZE × COUNT overflows at field \(names[i])")
+            }
+            offset = nextOffset
+            column = nextColumn
         }
-        let width = values["WIDTH"]?.first.flatMap(Int.init)
-        let height = values["HEIGHT"]?.first.flatMap(Int.init) ?? 1
-        guard let points = values["POINTS"]?.first.flatMap(Int.init) ?? width.map({ $0 * height }) else {
+        var points = values["POINTS"]?.first.flatMap(Int.init)
+        if points == nil, let width = values["WIDTH"]?.first.flatMap(Int.init) {
+            let height = values["HEIGHT"]?.first.flatMap(Int.init) ?? 1
+            let (product, overflow) = width.multipliedReportingOverflow(by: height)
+            guard !overflow else { throw TrailError.pcd("WIDTH × HEIGHT overflows") }
+            points = product
+        }
+        guard let points else {
             throw TrailError.pcd("no POINTS or WIDTH line")
         }
         guard points >= 0, points <= maxDeclared else {

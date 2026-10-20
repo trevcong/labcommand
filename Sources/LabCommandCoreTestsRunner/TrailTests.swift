@@ -227,6 +227,14 @@ func testTrailPCDRejects() {
                    contains: "different lengths", "SIZE too short")
     expectPCDError(Data("VERSION 0.7\nFIELDS x y z\nSIZE 2 2 2\nTYPE I I I\nCOUNT 1 1 1\nPOINTS 0\nDATA ascii\n".utf8),
                    contains: "TYPE F", "integer coordinates")
+    // Header arithmetic that would overflow Int is an error, not a trap.
+    let fields = "VERSION 0.7\nFIELDS x y z\nTYPE F F F\n"
+    expectPCDError(Data((fields + "SIZE 4 4 4\nCOUNT 2305843009213693952 1 1\nPOINTS 0\nDATA binary\n").utf8),
+                   contains: "overflow", "SIZE × COUNT overflows")
+    expectPCDError(Data((fields + "SIZE 1 1 1\nCOUNT 9223372036854775807 1 1\nPOINTS 0\nDATA ascii\n").utf8),
+                   contains: "overflow", "point size sum overflows")
+    expectPCDError(Data((fields + "SIZE 4 4 4\nCOUNT 1 1 1\nWIDTH 9223372036854775807\nHEIGHT 2\nDATA binary\n").utf8),
+                   contains: "overflow", "WIDTH × HEIGHT overflows")
 }
 
 // MARK: - Raster
@@ -296,6 +304,19 @@ func testTrailRasterMapOnlyAndEmpty() {
     noisy.append(Point3D(x: 400, y: -300, z: 50))
     let fitted = TrailRaster.build(map: noisy, trajectory: nil)
     expect(fitted.worldWidth < 10 && fitted.worldHeight < 8, "one far return does not stretch the view, got \(fitted.worldWidth) × \(fitted.worldHeight)")
+    // Finite returns far past Int's range fall outside the raster instead of trapping.
+    var huge = points
+    huge.append(contentsOf: [Point3D(x: 1e20, y: 0, z: 0), Point3D(x: 0, y: -1e20, z: 0),
+                             Point3D(x: .greatestFiniteMagnitude, y: -.greatestFiniteMagnitude, z: 0)])
+    let clean = TrailRaster.build(map: points, trajectory: nil)
+    let hugeFit = TrailRaster.build(map: huge, trajectory: nil)
+    expect(hugeFit.binned == clean.binned && hugeFit.width == clean.width && hugeFit.height == clean.height,
+           "1e20 and Float.max returns are skipped, got \(hugeFit.binned) binned vs \(clean.binned)")
+    // A trail whose extent overflows Double still gives a raster.
+    let wide = try! TrailTrajectory.parseTUM("0 -1e308 -1e308 0 0 0 0 1\n1 1e308 1e308 0 0 0 0 1\n")
+    let wideFit = TrailRaster.build(map: points, trajectory: wide)
+    expect(wideFit.width >= 1 && wideFit.height >= 1 && wideFit.footprint.count == wideFit.width * wideFit.height,
+           "a ±1e308 trail gives a raster, got \(wideFit.width) × \(wideFit.height)")
     let nothing = TrailRaster.build(map: [], trajectory: nil)
     expect(nothing.width >= 1 && nothing.binned == 0 && close(nothing.worldWidth, 11, 0.05), "an empty map is a 10 m square plus margin")
 }
