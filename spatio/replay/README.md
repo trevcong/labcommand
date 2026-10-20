@@ -2,7 +2,17 @@
 
 Re-runs the Spark's FAST_LIO_ROS2 (copied source, unmodified) on a copied
 recording inside a local colima container. It writes a session folder in the shared
-contract format: `trajectory.tum`, `map.pcd`, `manifest.json` and `logs/`.
+contract format: `trajectory.tum`, `map.pcd`, `manifest.json` and `logs/`,
+plus `map_display.pcd`.
+
+For new replays, **score `map.pcd`**: it contains all finite XYZ points from the
+registered clouds, preserving repeated observations before cosmetic downsampling.
+**View `map_display.pcd`** for the smaller voxel-downsampled map. `--map-voxel`
+affects only this display file. `logs/map_summary.json` names both paths and
+their point counts; the manifest and run parameters also describe their roles.
+This corrects the previous meaning of `map.pcd`, which was cosmetically filtered.
+Historical copy mode still copies the supplied map unchanged; its filtering
+provenance is unknown and it is not evidence of pre-downsampling wall accuracy.
 
 ```sh
 spatio/replay/build_image.sh                       # once; tags spatio/replay:<fastlio-rev>
@@ -62,11 +72,26 @@ capabilities dropped):
 3. `ros2 bag play` plays **only** the lidar and IMU topics. The bags also contain
    the original run's `/Odometry`, and that must not mix in.
 4. The runner waits until `/Odometry` has been quiet for 5 s, then stops the
-   recorder and FAST-LIO with SIGINT.
+   recorder and FAST-LIO with SIGINT. Playback, recorder, watcher, FAST-LIO and
+   exporter failures all fail the replay even if partial files are readable.
+   Child shutdown statuses are logged and the first nonzero step status is returned.
 5. `bag_to_tum.py` writes `trajectory.tum` from header stamps. `bag_to_map.py`
-   feeds the recorded clouds through the copied `map_saver.py` (`--map-voxel`,
-   default 0.03 m),
-   because this FAST-LIO port never writes a map itself.
+   streams registered points to `map.pcd` and feeds the same clouds through the
+   copied `map_saver.py` for `map_display.pcd` (`--map-voxel`, default 0.03 m).
+   This FAST-LIO port never writes a map itself.
+
+To export an existing registered-output bag inside the ROS environment:
+
+```sh
+python3 spatio/replay/bag_to_map.py OUTPUT_BAG map.pcd \
+    --display-out map_display.pcd --topic /cloud_registered --voxel 0.03 \
+    --summary map_summary.json
+```
+
+The topic and output paths are configurable. Without `--display-out`, the display
+path is the scoring path's stem plus `_display.pcd`. The scoring PCD streams to
+disk; it can be much larger than the display map. This retains FAST-LIO's published
+registered points, not raw sensor returns discarded internally by FAST-LIO.
 
 colima here shares no usable host folder, so a bind mount would silently be an
 empty VM directory. The recording is therefore copied once into a named volume
@@ -76,3 +101,5 @@ outputs are copied back out the same way.
 `tum.py`, `timing.py`, `manifest.py` and `compare_tum.py` use only the
 standard library and run on the Mac. `inspect_bag.py`, `bag_to_tum.py`,
 `bag_to_map.py` and `odom_watch.py` need ROS and run in the container.
+The local map-export tests also need NumPy; they substitute ROS/bag interfaces and
+the external display saver, while testing the actual exporter and binary PCDs.
