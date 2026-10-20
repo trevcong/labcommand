@@ -145,6 +145,14 @@ def make_session(root, run_id, offset=(0.05, 0.0, 0.0), xyz=None, gap=False, eva
             (s / "wallpatch" / "patches.json").write_text(json.dumps(doc))
         assert quiet(wallpatch_main, ["measure", str(s), "--patches", str(s / "wallpatch" / "patches.json"),
                                       "--out", str(s / "wallpatch")]) == 0
+    if (s / "wallpatch" / "patches.json").exists():
+        # Passing fixtures explicitly supply preselection evidence. The real
+        # CLI still defaults to auto_suggested; dedicated tests exercise that.
+        selected = json.loads((s / "wallpatch" / "patches.json").read_text())["patches"]
+        _, sha = write_spec(s / "test-spec.json", [p["name"] for p in selected],
+                            [p["box_map_frame"] for p in selected])
+        if reference is not None and "spec_sha256" not in reference:
+            (s / "physical_reference.json").write_text(json.dumps(dict(reference, spec_sha256=sha)))
     return s
 
 
@@ -157,7 +165,9 @@ def ref(start=0.004, end=0.006, heading="ok", spec_sha=None):
 
 
 def run(session, *extra):
-    return quiet(result.main, [str(session), *extra])
+    selected = [] if "--patch-origin" in extra or not (session / "test-spec.json").exists() else [
+        "--patch-origin", "preselected", "--spec", str(session / "test-spec.json")]
+    return quiet(result.main, [str(session), *selected, *extra])
 
 
 class ResultTest(unittest.TestCase):
@@ -206,15 +216,16 @@ class ResultTest(unittest.TestCase):
         # loop whose return error alone would pass.
         xyz = np.vstack([four_wall_room(), doubled_wall(separation_m=0.08)])
         box = {"center_m": [1.04, 1.5, 1.1], "normal_hint": [1.0, 0.0, 0.0], "half_extent_m": [0.5, 0.25, 0.5]}
-        s = make_session(self.tmp, "rdbl", xyz=xyz, boxes=[box])
+        clean = {"center_m": [5, 2, 1.2], "normal_hint": [1, 0, 0], "half_extent_m": [.25, 1, 1]}
+        s = make_session(self.tmp, "rdbl", xyz=xyz, boxes=[box, clean])
         self.assertEqual(run(s), 1)
         w = self.walk(s)
         self.assertEqual(w["status"], "FAIL")
         self.assertTrue(w["walls"]["doubled_wall_suspected"])
 
-    def test_solid_pillar_is_a_warning_not_a_failure(self):
+    def test_solid_pillar_keeps_the_stricter_shared_failure(self):
         # Since fd3cf19 the whole-map check reports the two faces of a 0.5 m pillar
-        # as a ~50 cm doubled wall. That stays visible as a WARNING; patches decide.
+        # as a ~50 cm doubled wall. Keep series adapt's stricter failure in both paths.
         rng = np.random.default_rng(2)
         pillar = [vertical_wall(2.25, "x", 1500, 1.75, 2.25, 0, 2.4, 0.004, rng),
                   vertical_wall(2.75, "x", 1500, 1.75, 2.25, 0, 2.4, 0.004, rng),
@@ -223,8 +234,9 @@ class ResultTest(unittest.TestCase):
         s = make_session(self.tmp, "rpillar", xyz=np.vstack([four_wall_room()] + pillar))
         wc = json.loads((s / "walkcheck.json").read_text())
         self.assertTrue(wc["walls"]["doubled_wall"])          # the whole-map flag fires
-        self.assertEqual(run(s), 0)
-        self.assertFalse(self.walk(s)["walls"]["doubled_wall_suspected"])
+        self.assertEqual(run(s), 1)
+        self.assertEqual(self.walk(s)["status"], "FAIL")
+        self.assertTrue(self.walk(s)["walls"]["doubled_wall_suspected"])
         report = json.loads((s / "walkday.json").read_text())
         self.assertTrue(report["walls"]["whole_map_doubled_flag"])
         self.assertTrue(any("cannot tell a ghost wall" in x for x in report["walls"]["warnings"]))
@@ -351,37 +363,37 @@ class ResultTest(unittest.TestCase):
 
     def test_auto_suggested_patches_never_count_through_series_sh(self):
         # Review P1 (result.py:204): three physically referenced 5 cm loops on
-        # auto-suggested patches. spatio.series alone says PASS; walk day must not.
+        # auto-suggested patches. Neither converter may give these runs PASS.
         runs = [make_session(self.tmp, f"auto{i}", evaluated=True, reference=ref()) for i in range(3)]
         for s in runs:
-            self.assertEqual(run(s), 0)
+            self.assertEqual(run(s, "--patch-origin", "auto_suggested"), 2)
             self.assertEqual(self.walk(s)["wall_patches"]["origin"], "auto_suggested")
+            self.assertEqual(self.walk(s)["wall_patches"]["verified"], [])
         rc, verdict, out = self.series_sh(runs, "auto")
         self.assertEqual(verdict, "FAIL", out)
         self.assertEqual(rc, VERDICT_EXIT["FAIL"])
         final, staged = self.final_and_staged("auto")
-        self.assertEqual(staged["verdict"], "PASS")
-        self.assertEqual(final["spatio_series_verdict"], "PASS")
+        self.assertEqual(staged["verdict"], "FAIL")
+        self.assertEqual(final["spatio_series_verdict"], "FAIL")
         self.assertEqual(final["counted_run_ids"], [])
         for r in final["runs"]:
             self.assertFalse(r["counts_toward_series"])
             self.assertTrue(any("auto_suggested" in b for b in r["count_blockers"]))
-        self.assertIn("spatio.series alone said PASS", (Path(self.tmp) / "series" / "auto" / "series.md").read_text())
+        self.assertIn("NOT_EVALUABLE", (Path(self.tmp) / "series" / "auto" / "series.md").read_text())
 
     def test_preselected_patch_not_verified_blocks_series(self):
-        # One spec patch missing from the measured set: the run itself still
-        # passes on the patches it has, but it cannot count.
+        # One spec patch missing from the measured set blocks the run itself.
         spec = write_spec(Path(self.tmp) / "spec.json")
         runs = [self.preselected(f"pv{i}", spec=spec)[0] for i in range(2)]
         s = make_session(self.tmp, "pv2", evaluated=True, reference=ref(spec_sha=spec[1]),
                          patch_names=[PATCH_NAMES[0], "some other wall"])
-        self.assertEqual(run(s, "--patch-origin", "preselected", "--spec", spec[0]), 0)
+        self.assertEqual(run(s, "--patch-origin", "preselected", "--spec", spec[0]), 2)
         wp = self.walk(s)["wall_patches"]
         self.assertEqual(wp["verified"], [PATCH_NAMES[0]])
         self.assertIn("not verified: north face", "; ".join(result.acceptance_blockers(wp)))
         rc, verdict, out = self.series_sh(runs + [s], "pv")
         self.assertEqual(verdict, "FAIL", out)
-        self.assertEqual(self.final_and_staged("pv")[1]["verdict"], "PASS")
+        self.assertEqual(self.final_and_staged("pv")[1]["verdict"], "FAIL")
 
     def test_patch_provenance_rules(self):
         good = {"status": "MEASURED", "doubled": "false", "gate_p95_pass": True, "gate_separation_pass": True,

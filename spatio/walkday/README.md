@@ -23,8 +23,8 @@ python3 -m unittest discover -s spatio/walkday/tests -t .
 6. **physical reference (g5):** only with `--placement-cm`. It is never applied for a recording that contains `SYNTHETIC.json`.
 7. **manifest (g2):** build plus validate. The replay's own manifest is kept as `logs/replay_manifest.json`.
 8. **walk check (B):** settings come from `walkday.conf`.
-9. **wall patches (g8):** `--patches FILE` holds the frozen spec's preselected patches (same names), boxed on this run's map. Without it, patches are auto-suggested and labelled NOT preselected. Such a run is still scored, but it never counts toward a series.
-10. **result:** `result.py` writes `walk_result.json` (the `spatio.series` input), `walkday.md` and `walkday.json`. The settings identity it writes is checked against what was actually used: the walk check's recorded parameters (`walkcheck.json`) and its own `--wall-gate-m`/`--wall-gate-state`. If any differs (for example, re-scoring with `--wall-gate-m 0.08`), the identity is recomputed from the used values and `walkday.md` lists each change. That run then starts a new series. Before scoring, `result.py` moves any earlier `walk_result.json` aside (`walk_result.json.retired`). If the inputs are rejected (exit 3) or the run stops early, no `walk_result.json` remains, so an old PASS can't be counted: `series.sh` refuses the run and `walkday.md` gives the reason. A run is scored only on a clean input gate: if `logs/input_gate.json` is missing, blocked (for example CLOCK_RESET) or contradictory, the run is NOT-EVALUABLE with its return error withheld, so it never counts.
+9. **wall patches (g8):** `--patches FILE` holds the frozen spec's preselected patches (same names), boxed on this run's map. Without it, patches are auto-suggested and labelled NOT preselected. Such a run gets diagnostic measurements but its result is NOT_EVALUABLE and it never counts toward a series.
+10. **result:** `result.py` writes `walk_result.json` (the `spatio.series` input), `walkday.md` and `walkday.json`. The settings identity it writes is checked against what was actually used: the walk check's recorded parameters (`walkcheck.json`) and its own `--wall-gate-m`/`--wall-gate-state`. If any differs (for example, re-scoring with `--wall-gate-m 0.08`), the identity is recomputed from the used values and `walkday.md` lists each change. That run then starts a new series. Before scoring, `result.py` moves any earlier `walk_result.json` aside (`walk_result.json.retired`). If the inputs are rejected (exit 3) or the run stops early, no `walk_result.json` remains, so an old PASS can't be counted: `series.sh` refuses the run and `walkday.md` gives the reason. A run is scored only on a clean input gate: if `logs/input_gate.json` is missing, blocked (for example CLOCK_RESET) or contradictory, the run is NOT-EVALUABLE with its return error withheld, so it never counts. Walls are scored by the shared `spatio.wall_scoring` rule (also used by `spatio.series adapt`); a wall-patch report measured on a different `map.pcd` is rejected (exit 3).
 
 `process.sh` exit codes: 0 PASS, 1 FAIL, 2 NOT-EVALUABLE, 3 usage.
 
@@ -35,7 +35,11 @@ python3 -m unittest discover -s spatio/walkday/tests -t .
 
 Running `spatio.series compare` directly skips G1 and G2, so walk day always uses `series.sh`. `series.sh` uses `spatio.series compare`'s exit codes: 0 PASS, 1 inputs rejected (for example missing or tied `recorded_at`), 2 unreadable input (a listed run was never scored) or usage error, 3 FAIL, 4 INCOMPLETE, 5 NOT_EVALUABLE, 6 REPLAY_ONLY. So 3 means usage error for `process.sh` but FAIL for `series.sh`.
 
-The run-status rule is in `result.py`'s docstring. It is stricter than the series parser's W1 rule: walls and patches must also pass.
+The wall rule is in `spatio/wall_scoring.py`, shared with `spatio.series adapt`.
+Both require the spec's verified preselected patches, whole-map p95 and patch
+gates, and no whole-map or patch doubled-wall suspicion. Zero verified patches
+is NOT_EVALUABLE. The whole-map flag remains conservatively decisive even
+though a solid pillar can trigger it; the report also warns about that limitation.
 
 Sessions go to `~/Developer/spatio-data/walkday/<run-id>/` (`--sessions-root` or `SPATIO_WALKDAY_ROOT`). g2 refuses to write under `spatio-data/sessions`, which holds the earlier replays of the test samples.
 

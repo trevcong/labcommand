@@ -66,6 +66,12 @@ def _parser() -> argparse.ArgumentParser:
     adapt.add_argument("walkcheck", help="spatio.walkcheck.v1 JSON report")
     adapt.add_argument("--metadata", required=True, help="Session metadata JSON (see series README)")
     adapt.add_argument("--out", required=True, help="Output walk_result.json")
+    adapt.add_argument("--wallpatch", help="Measured wallpatch.json report")
+    adapt.add_argument("--patches", help="Source patches.json (retained as a provenance hash)")
+    adapt.add_argument("--spec", help="Frozen spec naming the required preselected patches")
+    adapt.add_argument("--patch-origin", choices=("preselected", "auto_suggested"), default="auto_suggested")
+    adapt.add_argument("--wall-gate-m", type=float, default=0.05)
+    adapt.add_argument("--wall-gate-state", choices=("approved", "proposed"), default="proposed")
     return parser
 
 
@@ -111,7 +117,10 @@ def _adapt(args: argparse.Namespace) -> int:
     from spatio.series.adapter import adapt_walkcheck, read_json
 
     result = adapt_walkcheck(
-        read_json(args.walkcheck), read_json(args.metadata), args.walkcheck
+        read_json(args.walkcheck), read_json(args.metadata), args.walkcheck,
+        wallpatch=read_json(args.wallpatch) if args.wallpatch else None,
+        patches_file=args.patches, spec_path=args.spec, patch_origin=args.patch_origin,
+        gate_m=args.wall_gate_m, gate_state=args.wall_gate_state,
     )
     try:
         with open(args.out, "w", encoding="utf-8") as handle:

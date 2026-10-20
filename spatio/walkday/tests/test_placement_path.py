@@ -139,11 +139,11 @@ class PlacementPathTest(unittest.TestCase):
         runs = []
         for i in range(3):
             s, rc = self.scored_run(f"auto{i}", 0.003, 0.006)
-            self.assertEqual(rc, 0)
+            self.assertEqual(rc, 2)
             self.assertEqual(self.check_placement(s)["wall_patches"]["origin"], "auto_suggested")
             runs.append(s)
         self.assertEqual(self.series(runs, "auto"), "FAIL")
-        self.assertEqual(self.last["spatio_series_verdict"], "PASS")
+        self.assertEqual(self.last["spatio_series_verdict"], "FAIL")
 
     def test_one_placement_over_tolerance_blocks_series_pass(self):
         # Preselected patches, so only the placement can be what blocks the series.
