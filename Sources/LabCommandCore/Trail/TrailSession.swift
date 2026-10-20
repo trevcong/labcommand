@@ -57,14 +57,19 @@ public struct TrailSession: Equatable, Sendable {
     public var problems: [String]
     /// Optional `walkcheck.json`. Its verdict is shown; it never changes `accuracyLabel`.
     public var walkcheck: TrailWalkcheck?
-    /// Why the walkcheck may be for earlier files, or nil when it is current. A stale verdict
-    /// is still shown, marked stale and never green.
+    /// Why the verdict must not be shown as current, or nil when it may. A stale file, a
+    /// missing trajectory, and an unusable trajectory all set this. The verdict is still
+    /// shown, and never green.
     public var walkcheckStale: String?
+    /// True when the trajectory is missing or unusable, so the verdict cannot be checked.
+    /// The readout then says "unverifiable", not "stale".
+    public var walkcheckUnverifiable: Bool
     /// Optional `topdown.png` written by walkcheck.
     public var topdownPath: String?
 
     public init(directory: String, trajectory: TrailTrajectory?, map: TrailMapCloud?, manifest: TrailManifest?, problems: [String],
-                walkcheck: TrailWalkcheck? = nil, walkcheckStale: String? = nil, topdownPath: String? = nil) {
+                walkcheck: TrailWalkcheck? = nil, walkcheckStale: String? = nil, walkcheckUnverifiable: Bool = false,
+                topdownPath: String? = nil) {
         self.directory = directory
         self.trajectory = trajectory
         self.map = map
@@ -72,6 +77,7 @@ public struct TrailSession: Equatable, Sendable {
         self.problems = problems
         self.walkcheck = walkcheck
         self.walkcheckStale = walkcheckStale
+        self.walkcheckUnverifiable = walkcheckUnverifiable
         self.topdownPath = topdownPath
     }
 
@@ -141,11 +147,14 @@ public struct TrailSession: Equatable, Sendable {
         // Walkcheck is optional: absent is not a problem, unreadable is.
         var walkcheck: TrailWalkcheck?
         var walkcheckStale: String?
+        var walkcheckUnverifiable = false
         let walkcheckPath = root.appendingPathComponent(TrailWalkcheck.file).path
         if let data = fm.contents(atPath: walkcheckPath) {
             do {
                 walkcheck = try TrailWalkcheck.parse(data)
-                walkcheckStale = TrailWalkcheck.staleness(directory: directory)
+                let freshness = TrailWalkcheck.freshness(directory: directory)
+                walkcheckStale = freshness.reason
+                walkcheckUnverifiable = freshness.unverifiable
                 if let walkcheckStale { problems.append(walkcheckStale) }
             } catch {
                 problems.append("\(error)")
@@ -154,6 +163,7 @@ public struct TrailSession: Equatable, Sendable {
         let topdown = root.appendingPathComponent(TrailWalkcheck.topdownFile).path
         return TrailSession(directory: directory, trajectory: trajectory, map: map, manifest: manifest, problems: problems,
                             walkcheck: walkcheck, walkcheckStale: walkcheckStale,
+                            walkcheckUnverifiable: walkcheckUnverifiable,
                             topdownPath: fm.fileExists(atPath: topdown) ? topdown : nil)
     }
 
@@ -312,13 +322,15 @@ public enum TrailReadout {
     public enum VerdictTone: Equatable, Sendable { case good, bad, warn }
 
     /// The verdict as shown in the walk check block and the sessions list.
-    public static func verdictText(_ result: String, stale: Bool) -> String {
-        stale ? "\(result) · stale" : result
+    /// A missing or unusable trajectory is "unverifiable". An older file is "stale".
+    public static func verdictText(_ result: String, stale: Bool, unverifiable: Bool = false) -> String {
+        if unverifiable { return "\(result) · unverifiable" }
+        return stale ? "\(result) · stale" : result
     }
 
-    /// Green only for a current PASS. A stale verdict of any kind is a warning.
-    public static func verdictTone(_ result: String, stale: Bool) -> VerdictTone {
-        if stale { return .warn }
+    /// Green only for a current PASS. A stale or unverifiable verdict of any kind is a warning.
+    public static func verdictTone(_ result: String, stale: Bool, unverifiable: Bool = false) -> VerdictTone {
+        if unverifiable || stale { return .warn }
         switch result {
         case "PASS": return .good
         case "FAIL": return .bad
@@ -327,8 +339,8 @@ public enum TrailReadout {
     }
 
     /// Rows for `walkcheck.json`. Walkcheck reports centimetres; shown as it scored them.
-    public static func walkcheckRows(_ w: TrailWalkcheck, stale: Bool) -> [Row] {
-        var rows = [Row(label: "Verdict", value: verdictText(w.result, stale: stale))]
+    public static func walkcheckRows(_ w: TrailWalkcheck, stale: Bool, unverifiable: Bool = false) -> [Row] {
+        var rows = [Row(label: "Verdict", value: verdictText(w.result, stale: stale, unverifiable: unverifiable))]
         if let d3 = w.error3DCm {
             var value = metres(d3 / 100)
             if let threshold = w.thresholdM { value += " · need < \(metres(threshold))" }
@@ -350,9 +362,12 @@ public enum TrailReadout {
     }
 
     /// How walkcheck measured, and what its verdict is not.
-    public static func walkcheckNote(_ w: TrailWalkcheck, stale: String?, accuracyLabel: String?) -> String {
+    public static func walkcheckNote(_ w: TrailWalkcheck, stale: String?, accuracyLabel: String?, unverifiable: Bool = false) -> String {
         var parts: [String] = []
-        if let stale { parts.append("Stale: \(stale). Re-run walkcheck before trusting this verdict.") }
+        if let stale {
+            let lead = unverifiable ? "Unverifiable" : "Stale"
+            parts.append("\(lead): \(stale). Re-run walkcheck before trusting this verdict.")
+        }
         if let window = w.windowS {
             let sentence = String(format: "Return error: mean of the first %.0f s to mean of the last %.0f s, end not aligned onto start", window, window)
             let label = w.provisionalLabel.flatMap { $0.isEmpty ? nil : $0 } ?? "provisional"

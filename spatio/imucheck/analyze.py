@@ -33,21 +33,27 @@ in the window. Magnitudes only. A window is used when the odometry span
 covers at least half the window, the angle is between 0.15 and 2.5 rad
 (provisional; below π, so the quaternion short-arc can be the whole turn),
 the sum of the short-arc steps between consecutive odometry poses is also
-at most 2.5 rad (a wrapped revolution cannot hide in the endpoint angle),
-|∫ω dt| / ∫|ω| dt >= 0.70 (the body rate does not reverse), and the IMU
-samples inside that odometry interval actually cover it. Coverage means
-those samples span at least 80% of the interval and no step, including
-either uncovered end, is longer than the provisional 1 s gap. Median
-ratio 0.75–1.25 → rad/s. The same band times 180/π → deg/s (57.3 is that
-constant rounded). Otherwise undetermined. Nothing is inferred from a
-noise floor. /Odometry was produced by FAST-LIO using this IMU, so the
-ratio is support, not proof.
+at most 2.5 rad (a wrapped revolution cannot hide in the endpoint angle).
+That sum is the turn only when no longer angle (the short-arc plus whole
+turns) fits a unit band as closely as the short-arc does. When a longer
+angle fits as well or better, the poses do not show which turn happened
+and the window is refused. |∫ω dt| / ∫|ω| dt >= 0.70 (the body
+rate does not reverse), and the IMU samples inside that odometry interval
+actually cover it. Coverage means those samples span at least 80% of the
+interval and no step, including either uncovered end, is longer than the
+provisional 1 s gap. Median ratio 0.75–1.25 → rad/s. The same band times
+180/π → deg/s (57.3 is that constant rounded). Otherwise undetermined.
+Nothing is inferred from a noise floor. /Odometry was produced by FAST-LIO
+using this IMU, so the ratio is support, not proof.
 
 Clock epochs. Samples are ordered by header time only inside one clock
 run. A sustained rewind is a separate epoch whether or not its time range
-overlaps an earlier run, and it is not sorted onto that run. Epochs are
-paired with odometry in read order. One sample out of order stays on one
-timeline.
+overlaps an earlier run, and it is not sorted onto that run. Finite headers
+are split before non-finite vectors or quaternions are removed, so a NaN
+measurement cannot erase the rewind its stamp shows. Epochs are paired
+with odometry in read order. One sample out of order stays on one timeline.
+An epoch whose measurements are all non-finite is kept, so a later run
+does not slide onto the wrong odometry.
 
 Bias and noise are the per-axis mean and the sample standard deviation
 (ddof 1) on the stationary samples, in the message's native unit.
@@ -161,8 +167,10 @@ def characterize(
 
     rate, intervals, n_backward = _rate_and_intervals(t, header_finite)
 
-    if n and np.any(vector_finite):
-        epochs = _epoch_series(t[vector_finite], acc[vector_finite], gyr[vector_finite])
+    if n:
+        # Finite headers decide the epochs. Filtering NaN vectors first
+        # drops the stamps that show a rewind.
+        epochs = _epoch_series(t, acc, gyr)
     else:
         epochs = [(
             np.zeros(0, dtype=np.float64),
@@ -573,34 +581,83 @@ def _segment_bounds(t):
     return bounds
 
 
+def _empty_columns(columns):
+    empties = []
+    for col in columns:
+        arr = np.asarray(col)
+        if arr.ndim == 1:
+            empties.append(np.zeros(0, dtype=np.float64))
+        else:
+            empties.append(np.zeros((0,) + arr.shape[1:], dtype=np.float64))
+    return empties
+
+
+def _epochs_keeping_resets(times, columns, row_ok):
+    """Split finite headers into clock epochs, then apply `row_ok`.
+
+    Non-finite headers are not stamps, so they are removed before the
+    split. `row_ok` drops non-finite measurements inside an epoch. Doing
+    it the other way erases a rewind whose only stamps are on those rows.
+    An epoch that then has no rows is kept so later epochs stay paired.
+    Each returned epoch is `(times, [columns...])`, sorted by time.
+    """
+    times = np.asarray(times, dtype=np.float64)
+    columns = [np.asarray(col) for col in columns]
+    row_ok = np.asarray(row_ok, dtype=bool)
+    if times.size:
+        header_ok = np.isfinite(times)
+        if not np.all(header_ok):
+            times = times[header_ok]
+            columns = [col[header_ok] for col in columns]
+            row_ok = row_ok[header_ok]
+    n = int(times.shape[0])
+    if n == 0:
+        return []
+    bounds = _segment_bounds(times)
+    if len(bounds) <= 1:
+        bounds = [(0, n)]
+    epochs = []
+    for start, stop in bounds:
+        keep = row_ok[start:stop]
+        kept_t = times[start:stop][keep]
+        if kept_t.size == 0:
+            epochs.append((np.zeros(0, dtype=np.float64), _empty_columns(columns)))
+            continue
+        kept = [col[start:stop][keep] for col in columns]
+        order = np.argsort(kept_t, kind="mergesort")
+        epochs.append((kept_t[order], [col[order] for col in kept]))
+    return epochs
+
+
 def _epoch_series(t, acc, gyr):
     """Sorted (t, accel, gyro) epochs.
 
     A sustained rewind is its own epoch even when the time ranges do not
     overlap. Sorting a disjoint reset onto the earlier run lets one window
-    bridge an odometry origin change.
+    bridge an odometry origin change. Headers are split before NaN vectors
+    are removed.
     """
-    bounds = _segment_bounds(t)
-    if len(bounds) <= 1:
-        order = np.argsort(t, kind="mergesort")
-        return [(t[order], acc[order], gyr[order])]
-    epochs = []
-    for start, stop in bounds:
-        order = np.argsort(t[start:stop], kind="mergesort")
-        epochs.append((
-            t[start:stop][order],
-            acc[start:stop][order],
-            gyr[start:stop][order],
-        ))
-    return epochs
+    empty = (
+        np.zeros(0, dtype=np.float64),
+        np.zeros((0, 3), dtype=np.float64),
+        np.zeros((0, 3), dtype=np.float64),
+    )
+    if len(t) == 0:
+        return [empty]
+    row_ok = np.all(np.isfinite(acc), axis=1) & np.all(np.isfinite(gyr), axis=1)
+    raw = _epochs_keeping_resets(t, (acc, gyr), row_ok)
+    if not raw:
+        return [empty]
+    return [(kept_t, cols[0], cols[1]) for kept_t, cols in raw]
 
 
 def _odom_epochs(odom_t, odom_quat):
     """Sorted (t, xyzw) epochs, or None when there is no usable odometry.
 
-    Same sustained-rewind rule as the IMU series. Finite samples keep read
-    order until a run is sorted on its own. A disjoint reset stays its own
-    epoch.
+    Same sustained-rewind rule as the IMU series. Finite headers are split
+    before non-finite quaternions are removed. A disjoint reset stays its
+    own epoch. An epoch with no finite quaternion is kept when another
+    epoch still has poses, so pairing does not slide.
     """
     if odom_t is None or odom_quat is None:
         return None
@@ -614,20 +671,11 @@ def _odom_epochs(odom_t, odom_quat):
         raise ValueError("odom_t and odom_quat must have the same length")
     if len(ot) == 0:
         return None
-    finite = np.isfinite(ot) & np.all(np.isfinite(oq), axis=1)
-    if not np.any(finite):
+    row_ok = np.all(np.isfinite(oq), axis=1)
+    raw = _epochs_keeping_resets(ot, (oq,), row_ok)
+    if not raw or all(len(kept_t) == 0 for kept_t, _cols in raw):
         return None
-    ot = ot[finite]
-    oq = oq[finite]
-    bounds = _segment_bounds(ot)
-    if len(bounds) <= 1:
-        order = np.argsort(ot, kind="mergesort")
-        return [(ot[order], oq[order])]
-    epochs = []
-    for start, stop in bounds:
-        order = np.argsort(ot[start:stop], kind="mergesort")
-        epochs.append((ot[start:stop][order], oq[start:stop][order]))
-    return epochs
+    return [(kept_t, cols[0]) for kept_t, cols in raw]
 
 
 def _rotation_angle_rad(q_a, q_b) -> Optional[float]:
@@ -654,8 +702,9 @@ def _accumulated_turn_rad(quats) -> Optional[float]:
     """Sum of short-arc steps between consecutive xyzw poses.
 
     The endpoint short-arc hides whole revolutions. The sum does not,
-    as long as each step itself is below π. A sum above the provisional
-    2.5 rad cap is not a usable turn.
+    when each step is the whole turn. A step whose gyro path also matches
+    a longer angle is not that turn; the caller refuses the window.
+    A sum above the provisional 2.5 rad cap is not a usable turn.
     """
     total = 0.0
     count = len(quats)
@@ -765,6 +814,105 @@ def _integrate(t_s, gyro, t_a, t_b):
     return path, vec
 
 
+def _message_unit_path(t_s, gyro, t_a, t_b):
+    """∫|ω| dt in message units, or None when the interval is not covered.
+
+    A covered interval with no motion returns 0. That step cannot hide a
+    revolution. `_integrate` returns None in that case because a ratio
+    needs a positive path.
+    """
+    if _imu_interval_problem(t_s, t_a, t_b) is not None:
+        return None
+    integrated = _integrate(t_s, gyro, t_a, t_b)
+    if integrated is None:
+        return 0.0
+    return float(integrated[0])
+
+
+def _band_center_distance(ratio):
+    """|log(ratio / band center)| for a ratio that sits in a unit band.
+
+    None when the ratio is outside both bands. The centers are 1 and
+    180/π. Closeness uses that log distance, not a new cutoff.
+    """
+    if not math.isfinite(ratio) or ratio <= 0.0:
+        return None
+    lo = 1.0 - GYRO_RATIO_TOL
+    hi = 1.0 + GYRO_RATIO_TOL
+    best = None
+    if lo <= ratio <= hi:
+        best = abs(math.log(ratio))
+    if (DEG_PER_RAD * lo) <= ratio <= (DEG_PER_RAD * hi):
+        dist = abs(math.log(ratio / DEG_PER_RAD))
+        if best is None or dist < best:
+            best = dist
+    return best
+
+
+def _step_can_hide_a_revolution(path, theta):
+    """True when a longer angle fits a unit band as well as the short-arc.
+
+    The longer angles are the short-arc plus whole turns, either way.
+    They use the same rad/s and deg/s bands as the verdict. A longer fit
+    competes only when it is at least as close to its band center as the
+    short-arc is. A short-arc that is the closer fit is the turn.
+    """
+    if not math.isfinite(path) or not math.isfinite(theta) or theta < 0.0:
+        return True
+    if path <= 0.0:
+        return False
+    if theta > 0.0:
+        short_dist = _band_center_distance(path / theta)
+    else:
+        short_dist = None
+    # Largest angle still inside the rad/s band. The deg/s band only
+    # matches smaller angles, so it cannot extend this limit.
+    max_angle = path / (1.0 - GYRO_RATIO_TOL)
+    two_pi = 2.0 * math.pi
+    k = 1
+    while k < 10000:
+        base = two_pi * k
+        if base - theta > max_angle:
+            return False
+        for angle in (base - theta, base + theta):
+            if angle <= theta or angle > max_angle:
+                continue
+            dist = _band_center_distance(path / angle)
+            if dist is None:
+                continue
+            if short_dist is None or dist <= short_dist:
+                return True
+        k += 1
+    return True
+
+
+def _window_steps_hide_revolution(t_s, gyro, odom_t, odom_q):
+    """Whether the short-arc sum is not the turn.
+
+    True: some step's gyro path matches a longer angle, so a revolution
+    between those poses is not observable. False: every covered step is
+    only the short-arc. None: a step is not covered and none of the covered
+    steps hides a revolution; the window coverage check owns that.
+    """
+    deferred = False
+    last = len(odom_t) - 1
+    for index in range(last):
+        theta = _rotation_angle_rad(odom_q[index], odom_q[index + 1])
+        if theta is None:
+            return True
+        path = _message_unit_path(
+            t_s, gyro, float(odom_t[index]), float(odom_t[index + 1])
+        )
+        if path is None:
+            deferred = True
+            continue
+        if _step_can_hide_a_revolution(path, theta):
+            return True
+    if deferred:
+        return None
+    return False
+
+
 def _empty_gyro_stats():
     return {
         "max_angle": 0.0,
@@ -774,6 +922,7 @@ def _empty_gyro_stats():
         "n_gap_fail": 0,
         "n_coherence_fail": 0,
         "n_wrapped": 0,
+        "n_ambiguous": 0,
     }
 
 
@@ -808,6 +957,15 @@ def _collect_gyro_windows(t_srt, gyr_srt, odom_t, odom_q):
         if accumulated is None:
             continue
         stats["n_with_pair"] += 1
+        # A sparse pair can hide whole turns inside one short-arc. Refuse
+        # the window when a longer angle fits a unit band as closely as
+        # the short-arc does.
+        hidden = _window_steps_hide_revolution(
+            t_srt, gyr_srt, odom_t[j0:j1], odom_q[j0:j1]
+        )
+        if hidden is True:
+            stats["n_ambiguous"] += 1
+            continue
         # The path length is the rotation the cap is about. The endpoint
         # short-arc is only the denominator once that path is in range.
         if accumulated > stats["max_angle"]:
@@ -857,9 +1015,10 @@ def _ratios_to_verdict(ratios, stats, prefix):
                 "the odometry interval, no gap above {5:g} s). These limits "
                 "are {6}. Windows with a pose pair: {7}. Of those, {8} "
                 "had a rotation in range, {9} failed because intermediate "
-                "steps exceeded the rotation limit, {10} failed IMU coverage, "
-                "{11} failed the gap limit, and {12} failed coherence. Largest "
-                "1 s odometry rotation was {13:.4f} rad.".format(
+                "steps exceeded the rotation limit, {10} failed because a "
+                "turn step was not observable, {11} failed IMU coverage, "
+                "{12} failed the gap limit, and {13} failed coherence. Largest "
+                "1 s odometry rotation was {14:.4f} rad.".format(
                     MIN_MOTION_ANGLE_RAD,
                     MAX_MOTION_ANGLE_RAD,
                     MIN_COHERENCE,
@@ -870,6 +1029,7 @@ def _ratios_to_verdict(ratios, stats, prefix):
                     stats["n_with_pair"],
                     stats["n_angle_in_range"],
                     stats["n_wrapped"],
+                    stats["n_ambiguous"],
                     stats["n_coverage_fail"],
                     stats["n_gap_fail"],
                     stats["n_coherence_fail"],

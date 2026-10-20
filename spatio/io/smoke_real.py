@@ -2,9 +2,10 @@
 
 Pass ``--session`` (a directory with ``map.pcd`` and ``trajectory.tum``),
 ``--map``, and ``--trajectory``. Nothing is read unless it was named.
-A missing requested file, or a map or trajectory that does not parse,
-exits 1. ``check_trajectory`` issues are reported and do not change the
-exit code.
+A missing requested file, a map or trajectory that does not parse, or a
+map with no points exits 1. In those cases the report is still written,
+and the other named files are still checked. ``check_trajectory`` issues
+are reported and do not change the exit code.
 
 The JSON report is written to ``--out``. When ``--out`` is omitted it
 goes to ``~/Developer/spatio-data/derived/g1-io-fixtures/real_pcd_smoke.json``.
@@ -218,6 +219,29 @@ def _map_report(path: Path) -> dict:
         cloud = read_pcd(str(path))
     except PcdFormatError as exc:
         return {"path": str(path), "status": "PcdFormatError", "error": str(exc)}
+    # np.min/np.max raise ValueError on a zero-size array. A cloud this
+    # package accepts with POINTS 0 must not abort the rest of the report.
+    if any(cloud[key].size == 0 for key in ("x", "y", "z")):
+        t2 = time.perf_counter()
+        count = int(cloud["x"].shape[0])
+        del cloud
+        return {
+            "path": str(path),
+            "status": "empty",
+            "error": "point cloud has no points; bounding box is undefined",
+            "bytes": path.stat().st_size,
+            "points_header": int(header.points),
+            "points_read": count,
+            "width": int(header.width),
+            "height": int(header.height),
+            "data": header.data,
+            "fields": list(header.fields),
+            "bbox_min_m": [None, None, None],
+            "bbox_max_m": [None, None, None],
+            "nonfinite": {"x": 0, "y": 0, "z": 0},
+            "header_seconds": t1 - t0,
+            "read_and_bbox_seconds": t2 - t1,
+        }
     bbox = {}
     nonfinite = {}
     for key in ("x", "y", "z"):

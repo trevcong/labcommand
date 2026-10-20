@@ -21,6 +21,13 @@ from spatio.walkcheck.defaults import (
     SCHEMA,
     STATIONARY_WINDOW_S,
 )
+from spatio.walkcheck.holds import (
+    MIN_HOLD_S, MAX_HOLD_SPEED_M_S, MAX_ANGULAR_SPEED_DEG_S, SIGNIFICANT_MOTION_M,
+    SIGNIFICANT_ROTATION_DEG, MAX_IMU_GAP_S, MAX_ACCEL_DEVIATION_M_S2,
+    GRAVITY_M_S2, load_imu,
+)
+
+
 from spatio.walkcheck.pcd import PcdError, read_pcd_xyz
 from spatio.walkcheck.plot import write_topdown
 from spatio.walkcheck.report import plain, render_markdown, write_json
@@ -60,9 +67,26 @@ def evaluate_session(
     min_excursion_m: float = MIN_EXCURSION_M,
     max_endpoint_spread_m: float = MAX_ENDPOINT_SPREAD_M,
     max_endpoint_speed_m_s: float = MAX_ENDPOINT_SPEED_M_S,
+    min_hold_s: float = MIN_HOLD_S,
+    max_hold_speed_m_s: float = MAX_HOLD_SPEED_M_S,
+    max_angular_speed_deg_s: float = MAX_ANGULAR_SPEED_DEG_S,
+    significant_motion_m: float = SIGNIFICANT_MOTION_M,
+    significant_rotation_deg: float = SIGNIFICANT_ROTATION_DEG,
+    max_imu_gap_s: float = MAX_IMU_GAP_S,
+    max_accel_deviation_m_s2: float = MAX_ACCEL_DEVIATION_M_S2,
+    gravity_m_s2: float = GRAVITY_M_S2,
+    imu_file: Path | str | None = None,
     write: bool = True,
 ) -> dict:
     check_scoring_thresholds(
+        min_hold_s=min_hold_s,
+        max_hold_speed_m_s=max_hold_speed_m_s,
+        max_angular_speed_deg_s=max_angular_speed_deg_s,
+        significant_motion_m=significant_motion_m,
+        significant_rotation_deg=significant_rotation_deg,
+        max_imu_gap_s=max_imu_gap_s,
+        max_accel_deviation_m_s2=max_accel_deviation_m_s2,
+        gravity_m_s2=gravity_m_s2,
         window_s=stationary_window_s,
         max_gap_s=max_gap_s,
         min_path_length_m=min_path_length_m,
@@ -91,8 +115,18 @@ def evaluate_session(
             "xyz": np.zeros((0, 3)),
             "q": np.zeros((0, 4)),
         }
+    imu_path = Path(imu_file) if imu_file is not None else session / "imu.csv"
+    imu = load_imu(imu_path) if imu_file is not None or imu_path.exists() else None
     scored = score_trajectory(
-        loaded,
+        loaded, imu=imu,
+        min_hold_s=min_hold_s,
+        max_hold_speed_m_s=max_hold_speed_m_s,
+        max_angular_speed_deg_s=max_angular_speed_deg_s,
+        significant_motion_m=significant_motion_m,
+        significant_rotation_deg=significant_rotation_deg,
+        max_imu_gap_s=max_imu_gap_s,
+        max_accel_deviation_m_s2=max_accel_deviation_m_s2,
+        gravity_m_s2=gravity_m_s2,
         window_s=stationary_window_s,
         max_gap_s=max_gap_s,
         min_path_length_m=min_path_length_m,
@@ -168,6 +202,15 @@ def evaluate_session(
         sensor = manifest.get("sensor")
 
     notes = list(ASSUMPTIONS)
+    holds = scored.get("holds")
+    if holds:
+        notes.extend(holds["flags"])
+    notes.append(
+        f"Hold detection thresholds are PROVISIONAL: minimum {min_hold_s:g} s, "
+        f"hold speed {max_hold_speed_m_s:g} m/s, angular speed {max_angular_speed_deg_s:g} deg/s, significant motion "
+        f"{significant_motion_m:g} m / {significant_rotation_deg:g} deg. "
+        "Intermediate holds may be repositioning or intentional stops; the first hold stays the start."
+    )
     if physical_flag is not True:
         notes.insert(0, HISTORICAL_LABEL)
     else:
@@ -222,6 +265,15 @@ def evaluate_session(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "parameters": {
             "stationary_window_s": stationary_window_s,
+            "min_hold_s": min_hold_s,
+            "max_hold_speed_m_s": max_hold_speed_m_s,
+            "max_angular_speed_deg_s": max_angular_speed_deg_s,
+            "significant_motion_m": significant_motion_m,
+            "significant_rotation_deg": significant_rotation_deg,
+            "max_imu_gap_s": max_imu_gap_s,
+            "max_accel_deviation_m_s2": max_accel_deviation_m_s2,
+            "gravity_m_s2": gravity_m_s2,
+
             "max_gap_s": max_gap_s,
             "return_pass_m": RETURN_PASS_M,
             "return_comparison": "strictly_below",
@@ -238,6 +290,7 @@ def evaluate_session(
             "wall_gate_label": walls.get("proposed_gate_label"),
         },
         "inputs": {
+            "imu": str(imu_path) if imu is not None else None,
             "trajectory": "trajectory.tum",
             "trajectory_present": tum_path.is_file(),
             "map": "map.pcd",
@@ -259,6 +312,7 @@ def evaluate_session(
         "timestamps": scored["timestamps"],
         "return_to_start": returned,
         "endpoints": scored.get("endpoints"),
+        "holds": holds,
         "motion": scored["motion"],
         "drift": {
             "path_length_m": None if not scored["motion"] else scored["motion"]["path_length_m"],

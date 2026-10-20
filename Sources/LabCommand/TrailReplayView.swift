@@ -108,9 +108,9 @@ struct TrailReplayView: View {
                     .truncationMode(.middle)
                 Spacer(minLength: 4)
                 if let verdict = entry.walkcheckResult {
-                    Text(TrailReadout.verdictText(verdict, stale: entry.walkcheckStale))
+                    Text(TrailReadout.verdictText(verdict, stale: entry.walkcheckStale, unverifiable: entry.walkcheckUnverifiable))
                         .font(LabTheme.mono(10))
-                        .foregroundStyle(verdictTint(TrailReadout.verdictTone(verdict, stale: entry.walkcheckStale)))
+                        .foregroundStyle(verdictTint(TrailReadout.verdictTone(verdict, stale: entry.walkcheckStale, unverifiable: entry.walkcheckUnverifiable)))
                 }
                 Text(files)
                     .font(LabTheme.mono(10))
@@ -155,7 +155,7 @@ struct TrailReplayView: View {
             }
             InstrumentWell {
                 VStack(alignment: .leading, spacing: 5) {
-                    ForEach(TrailReadout.walkcheckRows(w, stale: session.walkcheckStale != nil)) { row in
+                    ForEach(TrailReadout.walkcheckRows(w, stale: session.walkcheckStale != nil, unverifiable: session.walkcheckUnverifiable)) { row in
                         if row.label == "Verdict" {
                             HStack {
                                 Text("Verdict").font(LabTheme.t(12)).foregroundStyle(LabTheme.dim)
@@ -163,13 +163,13 @@ struct TrailReplayView: View {
                                 Text(row.value)
                                     .font(LabTheme.mono(12))
                                     .fontWeight(.semibold)
-                                    .foregroundStyle(verdictTint(TrailReadout.verdictTone(w.result, stale: session.walkcheckStale != nil)))
+                                    .foregroundStyle(verdictTint(TrailReadout.verdictTone(w.result, stale: session.walkcheckStale != nil, unverifiable: session.walkcheckUnverifiable)))
                             }
                         } else {
                             readoutRow(row)
                         }
                     }
-                    Text(TrailReadout.walkcheckNote(w, stale: session.walkcheckStale, accuracyLabel: session.accuracyLabel))
+                    Text(TrailReadout.walkcheckNote(w, stale: session.walkcheckStale, accuracyLabel: session.accuracyLabel, unverifiable: session.walkcheckUnverifiable))
                         .font(LabTheme.t(10))
                         .foregroundStyle(LabTheme.faint)
                         .fixedSize(horizontal: false, vertical: true)

@@ -25,6 +25,13 @@ from spatio.walkcheck.defaults import (
 )
 
 
+from spatio.walkcheck.holds import (
+    MIN_HOLD_S, MAX_HOLD_SPEED_M_S, MAX_ANGULAR_SPEED_DEG_S, SIGNIFICANT_MOTION_M,
+    SIGNIFICANT_ROTATION_DEG, MAX_IMU_GAP_S, MAX_ACCEL_DEVIATION_M_S2,
+    GRAVITY_M_S2, detect_holds,
+)
+
+
 class ThresholdError(ValueError):
     """A scoring limit is not a usable finite number."""
 
@@ -37,15 +44,36 @@ def check_scoring_thresholds(
     min_excursion_m: float,
     max_endpoint_spread_m: float,
     max_endpoint_speed_m_s: float,
+    min_hold_s: float = MIN_HOLD_S,
+    max_hold_speed_m_s: float = MAX_HOLD_SPEED_M_S,
+    max_angular_speed_deg_s: float = MAX_ANGULAR_SPEED_DEG_S,
+    significant_motion_m: float = SIGNIFICANT_MOTION_M,
+    significant_rotation_deg: float = SIGNIFICANT_ROTATION_DEG,
+    max_imu_gap_s: float = MAX_IMU_GAP_S,
+    max_accel_deviation_m_s2: float = MAX_ACCEL_DEVIATION_M_S2,
+    gravity_m_s2: float = GRAVITY_M_S2,
 ) -> None:
     """Reject a scoring limit that is not a real, in-range number.
 
-    This is the one check for those six limits. A NaN gap compares false
+    This is the shared validation for scoring limits. A NaN gap compares false
     against every step, so the gap would pass. An infinite spread or
     speed compares true against every window, so a moving cart would
     pass. Pose timestamps are a different check and are not judged here.
     The numeric limits themselves stay provisional.
     """
+    for name, value in (
+        ("minimum hold", min_hold_s), ("IMU gap", max_imu_gap_s),
+        ("gravity", gravity_m_s2),
+    ):
+        _finite_limit(name, value, positive=True)
+    for name, value in (
+        ("hold speed", max_hold_speed_m_s),
+        ("angular speed", max_angular_speed_deg_s),
+        ("significant motion", significant_motion_m),
+        ("significant rotation", significant_rotation_deg),
+        ("acceleration deviation", max_accel_deviation_m_s2),
+    ):
+        _finite_limit(name, value, positive=False)
     _finite_limit("stationary window", window_s, positive=True)
     _finite_limit("max gap", max_gap_s, positive=True)
     _finite_limit("minimum path length", min_path_length_m, positive=False)
@@ -124,9 +152,26 @@ def score_trajectory(
     min_excursion_m: float = MIN_EXCURSION_M,
     max_endpoint_spread_m: float = MAX_ENDPOINT_SPREAD_M,
     max_endpoint_speed_m_s: float = MAX_ENDPOINT_SPEED_M_S,
+    min_hold_s: float = MIN_HOLD_S,
+    max_hold_speed_m_s: float = MAX_HOLD_SPEED_M_S,
+    max_angular_speed_deg_s: float = MAX_ANGULAR_SPEED_DEG_S,
+    significant_motion_m: float = SIGNIFICANT_MOTION_M,
+    significant_rotation_deg: float = SIGNIFICANT_ROTATION_DEG,
+    max_imu_gap_s: float = MAX_IMU_GAP_S,
+    max_accel_deviation_m_s2: float = MAX_ACCEL_DEVIATION_M_S2,
+    gravity_m_s2: float = GRAVITY_M_S2,
+    imu: dict | None = None,
 ) -> dict:
     """Score one parsed trajectory. Does not read the map."""
     check_scoring_thresholds(
+        min_hold_s=min_hold_s,
+        max_hold_speed_m_s=max_hold_speed_m_s,
+        max_angular_speed_deg_s=max_angular_speed_deg_s,
+        significant_motion_m=significant_motion_m,
+        significant_rotation_deg=significant_rotation_deg,
+        max_imu_gap_s=max_imu_gap_s,
+        max_accel_deviation_m_s2=max_accel_deviation_m_s2,
+        gravity_m_s2=gravity_m_s2,
         window_s=window_s,
         max_gap_s=max_gap_s,
         min_path_length_m=min_path_length_m,
@@ -173,7 +218,20 @@ def score_trajectory(
         reasons.append("timestamp_gap")
 
     windows = None
+    holds = None
     if not reasons:
+        holds = detect_holds(
+            t, xyz, quat, min_hold_s=max(min_hold_s, window_s),
+            max_speed_m_s=min(max_hold_speed_m_s, max_endpoint_speed_m_s),
+            max_spread_m=max_endpoint_spread_m,
+            max_angular_speed_deg_s=max_angular_speed_deg_s,
+            significant_motion_m=significant_motion_m,
+            significant_rotation_deg=significant_rotation_deg,
+            min_samples=MIN_WINDOW_SAMPLES, imu=imu,
+            max_imu_gap_s=max_imu_gap_s,
+            max_accel_deviation_m_s2=max_accel_deviation_m_s2,
+            gravity_m_s2=gravity_m_s2,
+        )
         windows = _windows(
             t,
             xyz,
@@ -181,9 +239,16 @@ def score_trajectory(
             window_s,
             max_endpoint_spread_m,
             max_endpoint_speed_m_s,
+            holds=holds,
         )
         if windows["reason"]:
             reasons.append(windows["reason"])
+        if holds.get("error"):
+            reasons = ["invalid_imu"]
+            windows["detail"] = holds["error"]
+        for flag in holds["flags"]:
+            if flag != "possible_repositioning":
+                reasons.append(flag)
     endpoints = None if windows is None else windows.get("endpoints")
 
     if reasons:
@@ -197,6 +262,7 @@ def score_trajectory(
             "motion": None,
             "timestamps": timestamps,
             "endpoints": endpoints,
+            "holds": holds,
         }
 
     assert windows is not None
@@ -212,8 +278,10 @@ def score_trajectory(
     # hair under 0.10 in binary floating point, and that must not pass.
     within = round(error_3d, 9) < RETURN_PASS_M
 
-    path_length = float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum())
-    excursion = float(np.linalg.norm(xyz - start_mean, axis=1).max())
+    # Motion outside the selected holds must not satisfy the walk gate.
+    route = xyz[holds["start"]["first_index"]:holds["end"]["last_index"] + 1]
+    path_length = float(np.linalg.norm(np.diff(route, axis=0), axis=1).sum())
+    excursion = float(np.linalg.norm(route - start_mean, axis=1).max())
     enough_motion = path_length >= min_path_length_m and excursion >= min_excursion_m
 
     verdict_reasons: list[str] = []
@@ -261,6 +329,7 @@ def score_trajectory(
         "motion": motion,
         "timestamps": timestamps,
         "endpoints": endpoints,
+        "holds": holds,
     }
 
 
@@ -389,6 +458,7 @@ def _windows(
     window_s: float,
     max_spread_m: float,
     max_speed_m_s: float,
+    *, holds: dict,
 ) -> dict:
     t0 = float(t[0])
     t1 = float(t[-1])
@@ -399,8 +469,18 @@ def _windows(
                 f"duration {t1 - t0:.3f} s is shorter than two {window_s:.3f} s windows"
             ),
         }
-    start = t <= (t0 + window_s)
-    end = (t >= (t1 - window_s)) & ~start
+    valid_holds = holds["start"] is not None and holds["end"] is not None
+    if valid_holds:
+        # A single full-recording hold still yields the existing stationary
+        # FAIL diagnostic. A lone interior hold cannot stand in for a walk.
+        if len(holds["intervals"]) == 1 and (
+            holds["start"]["first_index"] != 0 or holds["end"]["last_index"] != len(t) - 1
+        ):
+            valid_holds = False
+        else:
+            t0, t1 = holds["start"]["t_start"], holds["end"]["t_end"]
+    start = (t >= t0) & (t <= (t0 + window_s))
+    end = (t >= (t1 - window_s)) & (t <= t1) & ~start
     n_start = int(start.sum())
     n_end = int(end.sum())
     if n_start < MIN_WINDOW_SAMPLES or n_end < MIN_WINDOW_SAMPLES:
@@ -414,7 +494,8 @@ def _windows(
     end_mean, end_spread, end_speed = _window_motion(t[end], xyz[end])
     # At the limit still counts as parked. The wall gate uses the same idea.
     stationary = (
-        start_spread <= max_spread_m
+        valid_holds
+        and start_spread <= max_spread_m
         and end_spread <= max_spread_m
         and start_speed <= max_speed_m_s
         and end_speed <= max_speed_m_s
@@ -443,7 +524,8 @@ def _windows(
         return {
             "reason": "endpoint_not_stationary",
             "detail": (
-                "An endpoint window is still moving, so its mean is not a parked position. "
+                "No usable pair of sustained stationary holds, or an endpoint is moving. "
+                f"Required hold duration: {holds['minimum_duration_s']:g} s. "
                 f"Start spread {start_spread * 100.0:.2f} cm at {start_speed * 100.0:.2f} cm/s. "
                 f"End spread {end_spread * 100.0:.2f} cm at {end_speed * 100.0:.2f} cm/s. "
                 f"Limits are {max_spread_m * 100.0:.2f} cm and {max_speed_m_s * 100.0:.2f} cm/s."

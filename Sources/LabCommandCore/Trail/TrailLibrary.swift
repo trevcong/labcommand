@@ -96,19 +96,75 @@ public struct TrailWalkcheck: Equatable, Sendable {
         return d.isFinite ? d : nil
     }
 
-    /// Why the walkcheck in `directory` may be for earlier files, or nil when it is newer than
-    /// both inputs it scored. Modification times only: a copy that keeps an old time is missed.
-    public static func staleness(directory: String) -> String? {
+    /// Why a walkcheck must not be shown as a current verdict.
+    public struct Freshness: Equatable, Sendable {
+        /// Shown under Files and in the note. Nil when the verdict may be shown as current.
+        public var reason: String?
+        /// True when the trajectory the verdict scored is gone or cannot be read, so the verdict
+        /// cannot be checked. That is not the same as a file that is merely older.
+        public var unverifiable: Bool
+    }
+
+    /// Whether the walkcheck in `directory` is current.
+    ///
+    /// A missing `trajectory.tum` used to count as "not newer", so a scored PASS stayed green
+    /// on a map-only folder. It is unverifiable instead: the return verdict cannot be checked
+    /// without the trajectory it scored. A file that is present but empty, malformed, or
+    /// unreadable is the same: its modification time is not evidence. An unusable file is
+    /// unverifiable even when it is older than `walkcheck.json`, which is the case that used
+    /// to show a green PASS, and even when it is newer. A missing `map.pcd` is not
+    /// unverifiable. Walls can be unscored, so a trajectory-only PASS stays current; a missing
+    /// map is simply not a newer file.
+    ///
+    /// Modification times only, once the trajectory parses: a copy that keeps an old time is missed.
+    public static func freshness(directory: String) -> Freshness {
         let fm = FileManager.default
         func modified(_ name: String) -> Date? {
             (try? fm.attributesOfItem(atPath: (directory as NSString).appendingPathComponent(name)))?[.modificationDate] as? Date
         }
-        guard let scored = modified(file) else { return nil }
-        let newer = [TrailSession.trajectoryFile, TrailSession.mapFile].filter { name in
+        guard let scored = modified(file) else { return Freshness(reason: nil, unverifiable: false) }
+        let trajectory = TrailSession.trajectoryFile
+        if modified(trajectory) == nil {
+            return Freshness(
+                reason: "\(trajectory) is missing, so this verdict cannot be checked",
+                unverifiable: true)
+        }
+        if let unusable = unusableTrajectory(directory: directory) {
+            return Freshness(reason: unusable, unverifiable: true)
+        }
+        let newer = [trajectory, TrailSession.mapFile].filter { name in
+            // A missing map is not a newer file. The trajectory was checked above.
             modified(name).map { scored < $0 } ?? false
         }
-        guard !newer.isEmpty else { return nil }
-        return "\(file) is older than \(newer.joined(separator: " and ")); its verdict may be for earlier files"
+        guard !newer.isEmpty else { return Freshness(reason: nil, unverifiable: false) }
+        return Freshness(
+            reason: "\(file) is older than \(newer.joined(separator: " and ")); its verdict may be for earlier files",
+            unverifiable: false)
+    }
+
+    /// Why a present `trajectory.tum` cannot support the verdict, or nil when it parses.
+    /// Called only after the file is known to exist. The sessions list and the opened
+    /// readout both use this, so a bad file cannot show a current verdict in either place.
+    private static func unusableTrajectory(directory: String) -> String? {
+        let name = TrailSession.trajectoryFile
+        let path = (directory as NSString).appendingPathComponent(name)
+        guard let data = FileManager.default.contents(atPath: path),
+              let text = String(data: data, encoding: .utf8) else {
+            return "\(name) is unreadable, so this verdict cannot be checked"
+        }
+        do {
+            _ = try TrailTrajectory.parseTUM(text)
+            return nil
+        } catch let error as TrailError {
+            switch error {
+            case .tumEmpty:
+                return "\(name) is empty, so this verdict cannot be checked"
+            default:
+                return "\(name) is malformed, so this verdict cannot be checked"
+            }
+        } catch {
+            return "\(name) is unreadable, so this verdict cannot be checked"
+        }
     }
 }
 
@@ -120,8 +176,11 @@ public struct TrailSessionEntry: Equatable, Sendable, Identifiable {
     public var hasMap: Bool
     /// The walkcheck verdict, when `walkcheck.json` reads.
     public var walkcheckResult: String?
-    /// True when `walkcheck.json` is older than the trajectory or the map (`TrailWalkcheck.staleness`).
+    /// True when the verdict must not be shown as current (`TrailWalkcheck.freshness`).
+    /// Also true when `walkcheckUnverifiable` is true.
     public var walkcheckStale: Bool
+    /// True when `trajectory.tum` is missing or unusable, so the verdict cannot be checked. Never green.
+    public var walkcheckUnverifiable: Bool
     /// Newest of the trajectory and map modification times.
     public var modified: Date
     public var id: String { directory }
@@ -175,18 +234,49 @@ public enum TrailLibrary {
                 .max() ?? .distantPast
             let walkcheck = fm.contents(atPath: (directory as NSString).appendingPathComponent(TrailWalkcheck.file))
                 .flatMap { try? TrailWalkcheck.parse($0) }
+            let freshness = walkcheck == nil
+                ? TrailWalkcheck.Freshness(reason: nil, unverifiable: false)
+                : TrailWalkcheck.freshness(directory: directory)
             entries.append(TrailSessionEntry(
                 directory: directory,
                 name: name,
                 hasTrajectory: hasTrajectory,
                 hasMap: hasMap,
                 walkcheckResult: walkcheck?.result,
-                walkcheckStale: walkcheck != nil && TrailWalkcheck.staleness(directory: directory) != nil,
+                walkcheckStale: freshness.reason != nil,
+                walkcheckUnverifiable: freshness.unverifiable,
                 modified: modified
             ))
         }
         return entries.sorted { a, b in
             a.modified != b.modified ? a.modified > b.modified : a.name < b.name
         }
+    }
+
+    /// Modification times of the files an opened verdict was read from.
+    /// A nil date means the file was absent. Rescan uses this to notice a replacement,
+    /// a new report, or a deletion, and to leave playback alone when nothing changed.
+    public struct VerdictInputs: Equatable, Sendable {
+        public var trajectory: Date?
+        public var map: Date?
+        public var walkcheck: Date?
+
+        public static func read(directory: String) -> VerdictInputs {
+            func modified(_ name: String) -> Date? {
+                let path = (directory as NSString).appendingPathComponent(name)
+                return (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+            }
+            return VerdictInputs(
+                trajectory: modified(TrailSession.trajectoryFile),
+                map: modified(TrailSession.mapFile),
+                walkcheck: modified(TrailWalkcheck.file))
+        }
+    }
+
+    /// True when the session on screen was read from different verdict files than `now`.
+    /// Nil `opened` means nothing is on screen yet, or a load is already in flight.
+    public static func rescanShouldReload(opened: VerdictInputs?, now: VerdictInputs) -> Bool {
+        guard let opened else { return false }
+        return opened != now
     }
 }

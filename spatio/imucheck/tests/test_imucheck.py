@@ -467,6 +467,95 @@ class ImuCheckTests(unittest.TestCase):
         self.assertGreater(kept["gyro_unit"]["windows_used"], 0)
         self.assertIn("kept separate", kept["gyro_unit"]["evidence"].lower())
 
+    def test_gyro_unit_keeps_reset_hidden_by_invalid_samples(self):
+        # Headers 0–0.49, then 0–0.99. The first half of the second run has
+        # non-finite gyro, and the matching odometry quaternions are
+        # non-finite. The second run's yaw origin is offset by 0.53481 rad.
+        # Dropping those rows before the split erased the rewind and reported
+        # rad/s at ratio 1.000.
+        first = np.arange(50, dtype=np.float64) / 100.0
+        second = np.arange(100, dtype=np.float64) / 100.0
+        t = np.concatenate([first, second])
+        accel = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float64), (len(t), 1))
+        gyro = np.tile(
+            np.array([0.0, 0.0, 0.01 * DEG_PER_RAD], dtype=np.float64), (len(t), 1)
+        )
+        gyro[50:100] = np.nan
+        odom_t = np.concatenate([first[::5], second[::5]])
+        yaw = np.concatenate([
+            0.01 * first[::5],
+            0.53481 + 0.01 * second[::5],
+        ])
+        odom_q = np.zeros((len(odom_t), 4), dtype=np.float64)
+        odom_q[:, 2] = np.sin(yaw / 2.0)
+        odom_q[:, 3] = np.cos(yaw / 2.0)
+        odom_q[10:20] = np.nan
+        report = characterize(
+            t, accel, gyro, odom_t=odom_t, odom_quat=odom_q, topic="/test"
+        )
+        gyro_unit = report["gyro_unit"]
+        self.assertEqual(gyro_unit["verdict"], "undetermined")
+        self.assertIsNone(gyro_unit["ratio"])
+        self.assertEqual(gyro_unit["windows_used"], 0)
+        evidence = gyro_unit["evidence"].lower()
+        self.assertIn("kept separate", evidence)
+        self.assertNotIn("could not be paired", evidence)
+        self.assertIn("not guessed", evidence)
+        text = " ".join(report["findings"])
+        self.assertIn("1 consecutive header steps decreased", text)
+        self.assertIn("50 messages were left out of the physics", text)
+
+        # The same offset on two long runs, with that invalid prefix after
+        # the reset, stays deg/s. The boundary is kept and each turn is scored.
+        hz = 100.0
+        long = np.arange(int(4.0 * hz), dtype=np.float64) / hz
+        t_long = np.concatenate([long, long])
+        accel_long = np.zeros((len(t_long), 3), dtype=np.float64)
+        accel_long[:, 2] = 1.0
+        gyro_long = np.zeros((len(t_long), 3), dtype=np.float64)
+        gyro_long[:, 2] = 0.5 * DEG_PER_RAD
+        gyro_long[len(long):len(long) + 50] = np.nan
+        odom_long = long[::5]
+        odom_t_long = np.concatenate([odom_long, odom_long])
+        yaw_long = np.concatenate([
+            0.5 * odom_long,
+            0.53481 + 0.5 * odom_long,
+        ])
+        odom_q_long = np.zeros((len(odom_t_long), 4), dtype=np.float64)
+        odom_q_long[:, 2] = np.sin(yaw_long / 2.0)
+        odom_q_long[:, 3] = np.cos(yaw_long / 2.0)
+        odom_q_long[len(odom_long):len(odom_long) + 10] = np.nan
+        kept = characterize(
+            t_long,
+            accel_long,
+            gyro_long,
+            odom_t=odom_t_long,
+            odom_quat=odom_q_long,
+            topic="/test",
+        )
+        self.assertEqual(kept["gyro_unit"]["verdict"], "deg/s")
+        self.assertAlmostEqual(kept["gyro_unit"]["ratio"], DEG_PER_RAD, places=4)
+        self.assertGreater(kept["gyro_unit"]["windows_used"], 0)
+        self.assertIn("kept separate", kept["gyro_unit"]["evidence"].lower())
+
+        # One non-finite vector inside a single clock is not a second epoch.
+        plain_t, plain_accel, plain_gyro, plain_odom_t, plain_odom_q = _yaw_stream(
+            rate_rad_s=0.5, gyro_scale=1.0
+        )
+        plain_gyro = plain_gyro.copy()
+        plain_gyro[101] = np.nan
+        plain = characterize(
+            plain_t,
+            plain_accel,
+            plain_gyro,
+            odom_t=plain_odom_t,
+            odom_quat=plain_odom_q,
+            topic="/test",
+        )
+        self.assertEqual(plain["gyro_unit"]["verdict"], "rad/s")
+        self.assertAlmostEqual(plain["gyro_unit"]["ratio"], 1.0, places=4)
+        self.assertNotIn("kept separate", plain["gyro_unit"]["evidence"].lower())
+
     def test_gyro_unit_rejects_wrapped_odometry_turns(self):
         # Continuous 13.462727 rad/s, fully sampled IMU and matching odometry.
         # The endpoint short-arc is about 0.22 rad, so the old check reported
@@ -484,6 +573,40 @@ class ImuCheckTests(unittest.TestCase):
         self.assertIn("intermediate", evidence)
         self.assertIn("provisional", evidence)
         self.assertIn("not guessed", evidence)
+
+        # Same turn, keeping only the pose at each second's 0.00 and 0.95.
+        # The one short-arc step is about 0.22 rad, so the sum stays under
+        # 2.5 and the old guard reported deg/s at ratio 57.29589 on four
+        # windows. The revolution between those poses is not observable.
+        keep = np.isclose(odom_t % 1.0, 0.0) | np.isclose(odom_t % 1.0, 0.95)
+        self.assertGreater(int(np.count_nonzero(keep)), 4)
+        sparse = characterize(
+            t, accel, gyro, odom_t=odom_t[keep], odom_quat=odom_q[keep], topic="/test"
+        )
+        sparse_unit = sparse["gyro_unit"]
+        self.assertEqual(sparse_unit["verdict"], "undetermined")
+        self.assertIsNone(sparse_unit["ratio"])
+        self.assertEqual(sparse_unit["windows_used"], 0)
+        sparse_evidence = sparse_unit["evidence"].lower()
+        self.assertIn("not observable", sparse_evidence)
+        self.assertIn("not guessed", sparse_evidence)
+
+        # The same sparse poses on a 0.5 rad/s turn cannot hide a revolution.
+        t_slow, accel_slow, gyro_slow, odom_slow, odom_q_slow = _yaw_stream(
+            rate_rad_s=0.5, gyro_scale=1.0
+        )
+        keep_slow = np.isclose(odom_slow % 1.0, 0.0) | np.isclose(odom_slow % 1.0, 0.95)
+        slow = characterize(
+            t_slow,
+            accel_slow,
+            gyro_slow,
+            odom_t=odom_slow[keep_slow],
+            odom_quat=odom_q_slow[keep_slow],
+            topic="/test",
+        )
+        self.assertEqual(slow["gyro_unit"]["verdict"], "rad/s")
+        self.assertAlmostEqual(slow["gyro_unit"]["ratio"], 1.0, places=4)
+        self.assertGreater(slow["gyro_unit"]["windows_used"], 0)
 
         # A fast turn that stays under the provisional 2.5 rad cap is rad/s.
         t_ok, accel_ok, gyro_ok, odom_t_ok, odom_q_ok = _yaw_stream(
