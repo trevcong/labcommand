@@ -10,6 +10,7 @@ from spatio.walkcheck.defaults import (
     MAX_ENDPOINT_SPREAD_M,
     MAX_GAP_S,
     MIN_EXCURSION_M,
+    MIN_MAP_POINTS,
     MIN_PATH_LENGTH_M,
     STATIONARY_WINDOW_S,
 )
@@ -30,11 +31,17 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Score a session folder's trajectory.tum and map.pcd. "
             "Writes walkcheck.json, walkcheck.md, and topdown.png into that folder. "
-            "A missing or unreadable trajectory or map is NOT-EVALUABLE. "
+            "A missing or unreadable trajectory or map, or an undersized map, is NOT-EVALUABLE. "
             "The wall gate does not change the exit code."
         ),
     )
     parser.add_argument("session_dir", help="Session directory with trajectory.tum and map.pcd")
+    parser.add_argument(
+        "--min-map-points",
+        type=int,
+        default=MIN_MAP_POINTS,
+        help=f"PROVISIONAL: minimum finite XYZ map points (positive integer; default {MIN_MAP_POINTS})",
+    )
     parser.add_argument(
         "--stationary-window",
         type=float,
@@ -107,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
             max_gap_s=args.max_gap,
             min_path_length_m=args.min_path_length,
             min_excursion_m=args.min_excursion,
+            min_map_points=args.min_map_points,
             max_endpoint_spread_m=args.max_endpoint_spread,
             max_endpoint_speed_m_s=args.max_endpoint_speed,
         )

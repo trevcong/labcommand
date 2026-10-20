@@ -76,7 +76,8 @@ def test_missing_map_is_not_evaluable(tmp_path):
     assert (dest / "topdown.png").is_file()
 
 
-def test_readable_map_with_too_few_points_does_not_change_the_verdict(tmp_path):
+def test_readable_map_with_too_few_points_is_not_evaluable(tmp_path):
+    """P1 spec correction: a readable three-point map cannot support PASS."""
     dest = tmp_path / "session"
     write_session(
         dest,
@@ -84,7 +85,8 @@ def test_readable_map_with_too_few_points_does_not_change_the_verdict(tmp_path):
         xyz=[[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.1]],
     )
     report = evaluate_session(dest)
-    assert report["result"] == "PASS"
+    assert report["result"] == "NOT-EVALUABLE"
+    assert report["reasons"] == ["too_few_map_points"]
     assert report["walls"]["status"] == "NOT-EVALUABLE"
     assert report["walls"]["reason"] == "too_few_points"
     assert "missing_map" not in report["reasons"]
@@ -138,10 +140,10 @@ def test_cli_exit_codes(tmp_path):
     passing = tmp_path / "pass"
     failing = tmp_path / "fail"
     broken = tmp_path / "broken"
-    tiny = [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.1]]
-    write_session(passing, hold_and_square(offset=(0.05, 0.0, 0.0)), xyz=tiny)
-    write_session(failing, hold_and_square(offset=(0.15, 0.0, 0.0)), xyz=tiny)
-    write_session(broken, insert_time_gap(hold_and_square(), after_t=10.0, extra_s=2.0), xyz=tiny)
+    points = sharp_wall(count=32)
+    write_session(passing, hold_and_square(offset=(0.05, 0.0, 0.0)), xyz=points)
+    write_session(failing, hold_and_square(offset=(0.15, 0.0, 0.0)), xyz=points)
+    write_session(broken, insert_time_gap(hold_and_square(), after_t=10.0, extra_s=2.0), xyz=points)
 
     assert main([str(passing)]) == 0
     assert main([str(failing)]) == 1

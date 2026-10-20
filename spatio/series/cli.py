@@ -1,8 +1,12 @@
 """Command line for explain and compare.
 
-Exit 0: the report was written (any verdict).
+Exit 0: PASS (or adapter conversion completed).
 Exit 1: an input was rejected.
 Exit 2: an input or the output path was unreadable.
+Exit 3: FAIL.
+Exit 4: INCOMPLETE.
+Exit 5: NOT_EVALUABLE.
+Exit 6: REPLAY_ONLY.
 """
 
 from __future__ import annotations
@@ -15,6 +19,9 @@ import sys
 from spatio.series.report import build_series, default_series_id, explain_text, render_markdown
 from spatio.series.validate import InputRejected, Unreadable, load_walk_result
 
+VERDICT_EXIT = {"PASS": 0, "FAIL": 3, "INCOMPLETE": 4,
+                "NOT_EVALUABLE": 5, "REPLAY_ONLY": 6}
+
 
 def main(argv=None) -> int:
     parser = _parser()
@@ -24,6 +31,8 @@ def main(argv=None) -> int:
             return _explain(args)
         if args.command == "compare":
             return _compare(args)
+        if args.command == "adapt":
+            return _adapt(args)
     except Unreadable as exc:
         print("unreadable: %s" % exc, file=sys.stderr)
         return 2
@@ -49,10 +58,14 @@ def _parser() -> argparse.ArgumentParser:
     compare.add_argument(
         "walk_results",
         nargs="+",
-        help="walk_result.json files, in attempt order",
+        help="walk_result.json files; sorted by recorded_at, regardless of argument order",
     )
     compare.add_argument("--out", required=True, help="Directory for series.md and series.json")
     compare.add_argument("--series-id", help="Series name. Default uses the first and last run id")
+    adapt = sub.add_parser("adapt", help="Convert walkcheck.json using explicit session metadata")
+    adapt.add_argument("walkcheck", help="spatio.walkcheck.v1 JSON report")
+    adapt.add_argument("--metadata", required=True, help="Session metadata JSON (see series README)")
+    adapt.add_argument("--out", required=True, help="Output walk_result.json")
     return parser
 
 
@@ -67,7 +80,7 @@ def _explain(args: argparse.Namespace) -> int:
             print("unreadable: %s: %s" % (args.out, exc), file=sys.stderr)
             return 2
     sys.stdout.write(text)
-    return 0
+    return VERDICT_EXIT[walk.status]
 
 
 def _compare(args: argparse.Namespace) -> int:
@@ -91,4 +104,20 @@ def _compare(args: argparse.Namespace) -> int:
         print("unreadable: %s: %s" % (args.out, exc), file=sys.stderr)
         return 2
     print("%s %s" % (report["verdict"], os.path.join(args.out, "series.md")))
+    return VERDICT_EXIT[report["verdict"]]
+
+
+def _adapt(args: argparse.Namespace) -> int:
+    from spatio.series.adapter import adapt_walkcheck, read_json
+
+    result = adapt_walkcheck(
+        read_json(args.walkcheck), read_json(args.metadata), args.walkcheck
+    )
+    try:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump(result, handle, indent=2, allow_nan=False)
+            handle.write("\n")
+    except OSError as exc:
+        raise Unreadable(args.out, str(exc)) from exc
+    print("%s %s" % (result["status"], args.out))
     return 0

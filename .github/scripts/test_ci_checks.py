@@ -1,5 +1,7 @@
 """Regression tests for CI's fixture guard and report/skip accounting."""
 import tempfile
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -44,12 +46,51 @@ class GoldenTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
-    def report(self, xml, kind='pytest'):
+    def report(self, xml, kind='pytest', require_rosbags=False):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'report.xml'
             if xml is not None:
                 path.write_text(xml)
-            return ci_checks.summarize_report(path, kind)
+            return ci_checks.summarize_report(path, kind, require_rosbags)
+
+    def test_rosbags_missing_or_skipped_is_explicit_and_fails_when_required(self):
+        for cases in (
+            '<testcase name="other"/>',
+            '<testcase name="test_rosbags"><skipped message="No module named rosbags"/></testcase>',
+            '<testcase classname="tests.test_rosbags" name="one"/>'
+            '<testcase classname="tests.test_rosbags" name="two"><skipped/></testcase>',
+        ):
+            xml = '<testsuite>' + cases + '</testsuite>'
+            with self.subTest(cases=cases):
+                summary, ok = self.report(xml)
+                self.assertTrue(ok)
+                self.assertIn('rosbags independent CDR cross-check: **SKIPPED**', summary)
+                summary, ok = self.report(xml, require_rosbags=True)
+                self.assertFalse(ok)
+                self.assertIn('Required rosbags cross-check', summary)
+
+    def test_rosbags_pass_and_failure_are_reported(self):
+        for outcome, status in (('', 'PASS'), ('<failure/>', 'FAIL'), ('<error/>', 'FAIL')):
+            xml = ('<testsuite><testcase classname="room_memory.tests.test_rosbags" '
+                   f'name="roundtrip">{outcome}</testcase></testsuite>')
+            summary, ok = self.report(xml, require_rosbags=True)
+            self.assertEqual(ok, status == 'PASS')
+            self.assertIn(f'rosbags independent CDR cross-check: **{status}**', summary)
+
+    def test_cli_required_rosbags_skip_returns_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'pytest.xml').write_text(
+                '<testsuite><testcase name="test_rosbags"><skipped '
+                'message="No module named rosbags"/></testcase></testsuite>')
+            (root / 'ctest.xml').write_text(self.ctest_xml())
+            command = [sys.executable, str(Path(ci_checks.__file__)), 'summary', str(root)]
+            optional = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(optional.returncode, 0, optional.stdout + optional.stderr)
+            self.assertIn('**SKIPPED**', optional.stdout)
+            required = subprocess.run(command + ['--require-rosbags'], capture_output=True, text=True)
+            self.assertEqual(required.returncode, 1, required.stdout + required.stderr)
+            self.assertIn('Required rosbags cross-check', required.stdout)
 
     def test_nested_suites_failures_errors_and_skip_reasons(self):
         summary, ok = self.report('''<testsuites><testsuite tests="4">

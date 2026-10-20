@@ -8,7 +8,7 @@ import pytest
 from spatio.walkcheck.cli import main
 from spatio.walkcheck.evaluate import evaluate_session
 from spatio.walkcheck.holds import load_imu
-from spatio.walkcheck.synthetic import hold_and_square, write_session, yaw_quat
+from spatio.walkcheck.synthetic import hold_and_square, sharp_wall, write_session, yaw_quat
 from spatio.walkcheck.trajectory import ThresholdError, score_trajectory
 
 
@@ -212,7 +212,7 @@ def test_new_thresholds_must_be_finite_nonnegative(parameter):
 
 
 def test_cli_and_reports_expose_detection_and_override(tmp_path):
-    write_session(tmp_path, hold_and_square(hold=6), xyz=[[0, 0, 0]])
+    write_session(tmp_path, hold_and_square(hold=6), xyz=sharp_wall(count=32))
     assert main([str(tmp_path)]) == 2
     assert main([str(tmp_path), "--min-hold", "6"]) == 0
     saved = json.loads((tmp_path / "walkcheck.json").read_text())
@@ -227,7 +227,7 @@ def test_cli_and_reports_expose_detection_and_override(tmp_path):
 
 
 def test_cli_threads_all_detection_limits(tmp_path):
-    write_session(tmp_path, hold_and_square(), xyz=[[0, 0, 0]])
+    write_session(tmp_path, hold_and_square(), xyz=sharp_wall(count=32))
     options = {
         "--min-hold": ("min_hold_s", 9),
         "--max-hold-speed": ("max_hold_speed_m_s", .03),
@@ -260,7 +260,7 @@ def test_motion_before_holds_does_not_satisfy_route_gate():
 
 
 def test_session_uses_optional_imu_and_explicit_missing_file_fails(tmp_path):
-    write_session(tmp_path, hold_and_square(), xyz=[[0, 0, 0]])
+    write_session(tmp_path, hold_and_square(), xyz=sharp_wall(count=32))
     path, data = imu_file(tmp_path)
     assert evaluate_session(tmp_path, write=False)["holds"]["imu_used"]
     data[:, 3] = 1

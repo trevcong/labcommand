@@ -275,7 +275,8 @@ class ImuCheckTests(unittest.TestCase):
         self.assertIn("provisional", evidence)
         self.assertIn("not guessed", evidence)
 
-        # The same turn with IMU samples through the whole second is deg/s.
+        # Full IMU coverage alone cannot disambiguate these two sparse poses.
+        # Spec correction: a longer rad/s interpretation also fits the band.
         full_t = np.arange(100) / hz
         full_accel = np.zeros((len(full_t), 3), dtype=np.float64)
         full_accel[:, 2] = 1.0
@@ -289,8 +290,21 @@ class ImuCheckTests(unittest.TestCase):
             odom_quat=odom_q,
             topic="/test",
         )
-        self.assertEqual(full["gyro_unit"]["verdict"], "deg/s")
-        self.assertAlmostEqual(full["gyro_unit"]["ratio"], DEG_PER_RAD, places=3)
+        self.assertEqual(full["gyro_unit"]["verdict"], "undetermined")
+        self.assertIsNone(full["gyro_unit"]["ratio"])
+        self.assertEqual(full["gyro_unit"]["windows_used"], 0)
+        self.assertIn("not observable", full["gyro_unit"]["evidence"])
+
+        # Additional poses constrain each step; retain positive deg/s coverage.
+        dense_t = np.linspace(odom_t[0], odom_t[-1], 14)
+        dense_q = np.zeros((len(dense_t), 4))
+        dense_yaw = 0.5 * (dense_t - dense_t[0])
+        dense_q[:, 2] = np.sin(dense_yaw / 2)
+        dense_q[:, 3] = np.cos(dense_yaw / 2)
+        dense = characterize(full_t, full_accel, full_gyro,
+                             odom_t=dense_t, odom_quat=dense_q, topic="/test")
+        self.assertEqual(dense["gyro_unit"]["verdict"], "deg/s")
+        self.assertAlmostEqual(dense["gyro_unit"]["ratio"], DEG_PER_RAD, places=3)
 
         # Endpoints span the interval, but the hole is past the provisional 1 s.
         hole_t = np.array([0.0, MAX_IMU_GAP_S + 0.25], dtype=np.float64)
@@ -618,6 +632,39 @@ class ImuCheckTests(unittest.TestCase):
         self.assertEqual(ok["gyro_unit"]["verdict"], "rad/s")
         self.assertAlmostEqual(ok["gyro_unit"]["ratio"], 1.0, places=4)
         self.assertGreater(ok["gyro_unit"]["windows_used"], 0)
+
+    def test_sparse_turn_competing_units_are_not_resolved_by_band_center(self):
+        # Review repro: exact 13.43 rad/s, sparse poses, nine missing IMU
+        # samples per second. Previously called deg/s at ratio 60.114698.
+        rate = 13.43
+        t = np.arange(400) / 100.0
+        phase = np.arange(400) % 100
+        t = t[(phase < 4) | (phase >= 13)]
+        accel = np.zeros((len(t), 3))
+        accel[:, 2] = 1.0
+        gyro = np.zeros((len(t), 3))
+        gyro[:, 2] = rate
+        odom_t = np.array([i + x for i in range(4) for x in (0.04, 0.99)])
+        odom_q = np.zeros((len(odom_t), 4))
+        odom_q[:, 2] = np.sin(rate * odom_t / 2)
+        odom_q[:, 3] = np.cos(rate * odom_t / 2)
+        report = characterize(t, accel, gyro, odom_t=odom_t, odom_quat=odom_q)
+        unit = report["gyro_unit"]
+        self.assertEqual(unit["verdict"], "undetermined")
+        self.assertIsNone(unit["ratio"])
+        self.assertEqual(unit["windows_used"], 0)
+        self.assertIn("4 failed because a turn step was not observable", unit["evidence"])
+
+        # A genuine deg/s stream can also be ambiguous with sparse poses:
+        # a perfect band-center fit is not independent evidence of units.
+        t, accel, gyro, odom_t, odom_q = _yaw_stream(0.5, DEG_PER_RAD)
+        keep = np.isclose(odom_t % 1.0, 0.0) | np.isclose(odom_t % 1.0, 0.95)
+        sparse = characterize(t, accel, gyro, odom_t=odom_t[keep], odom_quat=odom_q[keep])
+        self.assertEqual(sparse["gyro_unit"]["verdict"], "undetermined")
+        self.assertEqual(sparse["gyro_unit"]["windows_used"], 0)
+        # Intermediate poses constrain each turn sufficiently at this rate.
+        dense = characterize(t, accel, gyro, odom_t=odom_t, odom_quat=odom_q)
+        self.assertEqual(dense["gyro_unit"]["verdict"], "deg/s")
 
     def test_gyro_bias_and_noise(self):
         n = 200

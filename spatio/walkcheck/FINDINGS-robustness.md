@@ -31,7 +31,7 @@ rows = walking_loop(
     drift=(0.15, 0, 0), drift_stretch=(0.4, 0.7),
 )
 write_session(
-    Path("/tmp/spatio-synthetic-robustness"), rows, xyz=[[0, 0, 0]],
+    Path("/tmp/spatio-synthetic-robustness"), rows, xyz=sharp_wall(count=32),
     manifest={"run_id": "synthetic-robustness", "sensor": "synthetic",
               "source_recording": None, "fastlio_revision": None,
               "config_file": None, "config_sha256": None, "image": None,
@@ -41,8 +41,9 @@ write_session(
 ```
 
 Then run `python3 -m spatio.walkcheck /tmp/spatio-synthetic-robustness`.
-This example should FAIL for 15 cm return error; its one-point map provides
-only a readable input and cannot establish wall quality.
+This example should FAIL for 15 cm return error (import `sharp_wall` from
+`spatio.walkcheck.synthetic`); the 32-point map only meets the map-point
+minimum and cannot establish wall quality.
 
 Exact local test results:
 

@@ -1,7 +1,7 @@
 """Synthetic walk-day cases; expected closure comes from explicit inputs.
 
 These are tests of observed trajectory scoring, not physical accuracy or
-featureless-scene performance. A readable one-point map isolates this gate;
+featureless-scene performance. A small map meeting the finite-point minimum isolates this gate;
 wall quality is deliberately not claimed.
 """
 
@@ -16,6 +16,7 @@ from spatio.walkcheck.evaluate import evaluate_session
 from spatio.walkcheck.synthetic import (
     insert_time_gap,
     jitter_timestamps,
+    sharp_wall,
     walking_loop,
     write_session,
 )
@@ -26,7 +27,7 @@ SPEEDS += [(0.2, 1.5, 0.4, 1.1)]
 
 
 def score(tmp_path, rows, **kwargs):
-    write_session(tmp_path, rows, xyz=[[0, 0, 0]])
+    write_session(tmp_path, rows, xyz=sharp_wall(count=32))
     return evaluate_session(tmp_path, write=False, **kwargs)
 
 
@@ -173,7 +174,7 @@ def test_generator_has_requested_speeds_and_continuous_drift():
 
 def test_stricter_provisional_cli_limits_apply_to_a_new_walk(tmp_path):
     rows = walking_loop(side=1.7, rate=7, holds=(10, 10), origin=123.4)
-    write_session(tmp_path, rows, xyz=[[0, 0, 0]])
+    write_session(tmp_path, rows, xyz=sharp_wall(count=32))
     assert main([str(tmp_path)]) == 0
     # Tighten, never relax, the hold limit on this independent synthetic walk.
     assert main([str(tmp_path), "--min-hold", "12"]) == 2
