@@ -356,11 +356,13 @@ struct TrailReplayView: View {
                 .buttonStyle(PrimaryButton(emphasized: true))
                 .frame(width: 96)
                 .disabled(!hasTrail)
+                .opacity(hasTrail ? 1 : LabTheme.disabledOpacity)
                 .accessibilityLabel(playTitle)
             Button("Start") { player.rewind() }
                 .font(LabTheme.t(12, .medium))
                 .buttonStyle(QuietButton())
                 .disabled(!hasTrail)
+                .opacity(hasTrail ? 1 : LabTheme.disabledOpacity)
             Text(TrailReadout.clock(elapsed))
                 .font(LabTheme.mono(11))
                 .monospacedDigit()
@@ -393,6 +395,7 @@ struct TrailReplayView: View {
             .labelsHidden()
             .frame(width: 250)
             .disabled(!hasTrail)
+            .opacity(hasTrail ? 1 : LabTheme.disabledOpacity)
             .accessibilityLabel("Playback speed")
         }
         .frame(height: 40)

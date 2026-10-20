@@ -313,6 +313,8 @@ final class AppState: ObservableObject {
 
     var scrubberCaption: String {
         if let localFailure { return localFailure }
+        // A trail launch loads no snapshot pair; the Rig scrubber has nothing to read.
+        if trail != nil { return TrailPlayer.localLine }
         guard let overlayTimeline else {
             return launch.isolates ? ChangeOverlay.readingLine : ""
         }
