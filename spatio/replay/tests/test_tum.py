@@ -108,5 +108,26 @@ class SummaryTests(unittest.TestCase):
             tum.summarize([])
 
 
+class WindowClosureTests(unittest.TestCase):
+    def test_means_of_head_and_tail_windows(self):
+        # Parked at x=0 (0..4 s, jittering ±1 cm), drive, parked at x=0.10 (16..20 s).
+        poses = [tum.make_pose(float(t), (0.01 * (-1) ** t, 0, 0), IDENTITY) for t in range(0, 5)]
+        poses += [tum.make_pose(float(t), (1.0, 2.0, 0), IDENTITY) for t in range(5, 16)]
+        poses += [tum.make_pose(float(t), (0.10, 0, 0.03), IDENTITY) for t in range(16, 21)]
+        c = tum.window_closure(poses, 4.0)
+        self.assertEqual((c["head_poses"], c["tail_poses"]), (5, 5))
+        self.assertAlmostEqual(c["closure_horizontal_m"], 0.10 - 0.002, places=9)
+        self.assertAlmostEqual(c["closure_vertical_m"], 0.03, places=9)
+        self.assertAlmostEqual(c["closure_3d_m"], math.hypot(0.098, 0.03), places=9)
+
+    def test_open_walk_is_not_hidden(self):
+        poses = [tum.make_pose(float(i), (i * 1.0, 0, 0), IDENTITY) for i in range(30)]
+        self.assertAlmostEqual(tum.window_closure(poses, 4.0)["closure_3d_m"], 25.0)
+
+    def test_empty_trajectory_fails(self):
+        with self.assertRaises(tum.TumError):
+            tum.window_closure([])
+
+
 if __name__ == "__main__":
     unittest.main()

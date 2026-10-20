@@ -164,3 +164,29 @@ def summarize(poses: Sequence[Pose], gap_threshold_s: float = 0.5) -> dict:
         "gaps_over_threshold": gaps,
         "gap_threshold_s": gap_threshold_s,
     }
+
+
+def window_closure(poses: Sequence[Pose], window_s: float = 4.0) -> dict:
+    """Mean position of the last ``window_s`` seconds minus that of the first.
+
+    Same rule as the Spark's odom_closure.py (STILL_S = 4.0). No alignment.
+    """
+    if not poses:
+        raise TumError("trajectory is empty")
+    t0, t1 = poses[0].t, poses[-1].t
+    head = [p for p in poses if p.t <= t0 + window_s]
+    tail = [p for p in poses if p.t >= t1 - window_s]
+
+    def mean(ps):
+        return [sum(getattr(p, a) for p in ps) / len(ps) for a in "xyz"]
+
+    a, b = mean(head), mean(tail)
+    dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+    return {
+        "window_s": window_s,
+        "head_poses": len(head),
+        "tail_poses": len(tail),
+        "closure_3d_m": math.sqrt(dx * dx + dy * dy + dz * dz),
+        "closure_horizontal_m": math.hypot(dx, dy),
+        "closure_vertical_m": dz,
+    }

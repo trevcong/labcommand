@@ -9,10 +9,26 @@ spatio/replay/build_image.sh                       # once; tags spatio/replay:<f
 spatio/replay/replay.sh session_20260808_211213 <run-id>             # Mid-360
 spatio/replay/replay.sh session_20260808_211213 <run-id> --historical
 spatio/replay/replay.sh 20260826T221936Z_JT128_room_walk <run-id> \
-    --config spatio/replay/configs/jt128_reconstructed.yaml \
-    --fastdds-profile spatio/replay/configs/fastdds_big_shm.xml
+    --config spatio/replay/configs/jt128_fastlio_desktop_2026-08-26.yaml \
+    --fastdds-profile spatio/replay/configs/fastdds_big_shm.xml --map-voxel 0.05
 python3 -m unittest discover -s spatio/replay/tests
+python3 spatio/replay/session_table.py ~/Developer/spatio-data/sessions/*   # results table
 ```
+
+JT128 configs:
+
+- `jt128_fastlio_desktop_2026-08-26.yaml` is a byte-identical copy of
+  `~/Desktop/researchfindings/scripts/jt128_fastlio.yaml` (sha256 `e9d6659d…`,
+  mtime 2026-08-26 18:21 CDT). That's the file the original post-process launch
+  (`post_jt128_launch.py`) loads as `/ws/jt128_fastlio.yaml`. The Spark's own
+  `~/hesai_ws` copy was not copied, so this is the closest available config. It is
+  not verified to be the one actually used.
+- `jt128_reconstructed.yaml` is the earlier guess (velodyne.yaml with only the
+  changes the data forced). Kept for comparison.
+
+The JT128 bag holds the adapter's *output* (`/slam/points`, `/slam/imu`), so the
+adapter is not re-run: FAST-LIO gets exactly what the adapter published in the
+original run.
 
 What a replay does, all in one container (`--network none`, private
 `ROS_DOMAIN_ID`, recording volume mounted read-only, CPU/memory/pids limits, all
@@ -27,7 +43,8 @@ capabilities dropped):
 4. The runner waits until `/Odometry` has been quiet for 5 s, then stops the
    recorder and FAST-LIO with SIGINT.
 5. `bag_to_tum.py` writes `trajectory.tum` from header stamps. `bag_to_map.py`
-   feeds the recorded clouds through the copied `map_saver.py` (0.03 m voxel),
+   feeds the recorded clouds through the copied `map_saver.py` (`--map-voxel`,
+   default 0.03 m),
    because this FAST-LIO port never writes a map itself.
 
 colima here shares no usable host folder, so a bind mount would silently be an
