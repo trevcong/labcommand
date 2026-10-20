@@ -19,22 +19,12 @@ deleted again when a new one is written). So after exit 3 or a stopped run the
 session has no walk_result.json and series.sh refuses it; walkday.md/json then
 say why (stopped at result: rejected ...).
 
-Run status (stricter than spatio.series W1, never looser):
-  PASS only if the walk checker says PASS (return error < 0.10 m with parked,
-  continuous, moving endpoints; no end-onto-start alignment), no measured wall
-  patch is doubled, the whole-map 95th-percentile point-to-plane residual is
-  within the wall gate, and every measured patch passes its p95 and separation
-  gates. Doubled walls are decided on the patches, as the workplan defines
-  them ("revisit wall separation <= 5 cm on the two preselected patches").
-  The walk checker's whole-map doubled-wall flag is shown as a WARNING, not
-  used: since fd3cf19 it has no upper separation cap and reports the two faces
-  of any solid object (a 0.5 m pillar reads as a 50 cm doubled wall), so it
-  cannot tell a ghost wall from furniture. Walkcheck itself never let walls
-  change its verdict; requiring that flag was this module's own extra rule.
-  NOT_EVALUABLE if the walk checker says NOT-EVALUABLE (its return error is then
-  withheld from walk_result.json and kept in walkday.json), or the wall evidence
-  is incomplete (a patch undetermined/not measurable, or no patch measured).
-  FAIL otherwise.
+Run status uses spatio.wall_scoring, also used by spatio.series adapt.
+PASS requires a passing trajectory, complete verified preselected patches,
+whole-map and patch gates, and no whole-map or patch doubled-wall suspicion.
+Zero verified patches and auto-suggested patches are NOT_EVALUABLE. The
+whole-map flag can mistake solid-object faces for doubled walls; it remains
+conservatively decisive in both paths, with that limitation shown as a warning.
 
 Acceptance provenance (extra walk_result.json keys; spatio.series ignores them,
 spatio.walkday.seriesgate enforces them):
@@ -56,13 +46,16 @@ spatio.walkday.seriesgate enforces them):
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
 import sys
 from datetime import datetime, timezone
 
+from spatio.wall_scoring import (
+    PATCH_ORIGINS, WallScoringError as ResultError, acceptance_blockers,
+    patch_provenance, score_walls, wall_verdict,
+)
 from spatio.replay.recording import RecordingError, recorded_at
 from spatio.walkday.provenance import WALKCHECK_PARAMS, check_identity, effective_identity
 from spatio.series.validate import (
@@ -76,14 +69,6 @@ from spatio.series.validate import (
 WALK_SCHEMA = "spatio.walk_result/1"
 REPORT_SCHEMA = "spatio.walkday.report/1"
 PROVISIONAL = "provisional (approved for now, revisit after real data)"
-PATCH_ORIGINS = ("preselected", "auto_suggested")
-# Workplan step 1/6: "two preselected patches". The milestone's rule, not a
-# property of any recording (expspec's MIN_PATCHES is the same number).
-REQUIRED_PATCHES = 2
-
-
-class ResultError(Exception):
-    pass
 
 
 def _load(path, required=True):
@@ -108,162 +93,6 @@ def _num(v):
 def _cm_to_m(v):
     v = _num(v)
     return None if v is None else round(v / 100.0, 9)
-
-
-def wall_evidence(walkcheck: dict, wallpatch, gate_m: float):
-    """Doubled walls from the measured patches; whole-map p95 as a gate; the
-    whole-map doubled flag as a warning only (see module docstring).
-
-    Returns (p95_m, doubled_suspected True/False/None, failures, notes, patches, warnings).
-    """
-    failures, notes, patches, warnings = [], [], [], []
-    whole = walkcheck.get("walls") or {}
-    p95 = None
-    doubled = []
-    if whole.get("status") == "OK":
-        p95 = _cm_to_m(whole.get("p95_point_to_plane_cm"))
-        if p95 is None:
-            doubled.append(None)
-            notes.append("whole-map p95 missing")
-        elif p95 > gate_m:
-            failures.append(f"whole-map wall p95 {p95 * 100:.1f} cm > gate {gate_m * 100:g} cm")
-        if whole.get("doubled_wall") is True:
-            warnings.append(
-                "whole-map check suspects a doubled wall (revisit separation "
-                f"{whole.get('revisit_separation_cm')} cm, largest {whole.get('max_revisit_separation_cm')} cm). "
-                "It cannot tell a ghost wall from two faces of a real object (pillar, crate, thin wall): "
-                "inspect topdown.png. Not used for PASS/FAIL; the patches decide.")
-    else:
-        doubled.append(None)
-        notes.append(f"whole-map wall check not evaluable: {whole.get('reason')}")
-    if wallpatch is None:
-        doubled.append(None)
-        notes.append("no wall-patch report")
-    else:
-        for p in wallpatch.get("patches", []):
-            item = {k: p.get(k) for k in ("name", "status", "doubled", "separation_m",
-                                          "gate_p95_pass", "gate_separation_pass", "reasons")}
-            item["p95_abs_m"] = (p.get("residuals") or {}).get("p95_abs_m")
-            patches.append(item)
-            if p.get("status") != "MEASURED":
-                doubled.append(None)
-                notes.append(f"patch {p.get('name')} not measurable: {p.get('reasons')}")
-                continue
-            d = {"true": True, "false": False}.get(p.get("doubled"))
-            doubled.append(d)
-            if d is None:
-                notes.append(f"patch {p.get('name')}: doubled wall undetermined "
-                             f"(split {p.get('separation_m')} m)")
-            if d is True:
-                failures.append(f"patch {p.get('name')}: doubled wall, separation {p.get('separation_m')} m")
-            if p.get("gate_p95_pass") is False:
-                failures.append(f"patch {p.get('name')}: p95 {item['p95_abs_m']} m over gate")
-            if p.get("gate_separation_pass") is False:
-                failures.append(f"patch {p.get('name')}: separation {p.get('separation_m')} m over gate")
-        if not patches:
-            doubled.append(None)
-            notes.append("wall-patch report has no patches")
-    if any(d is True for d in doubled):
-        suspected = True
-    elif any(d is None for d in doubled):
-        suspected = None
-    else:
-        suspected = False
-    return p95, suspected, failures, notes, patches, warnings
-
-
-def patch_provenance(origin, spec_path, raw_reference, wallpatch, patches_file):
-    """Which of the frozen spec's preselected patches this run verified."""
-    if origin not in PATCH_ORIGINS:
-        raise ResultError(f"patch origin must be one of {PATCH_ORIGINS}, got {origin!r}")
-    out = {"origin": origin, "spec_sha256": None, "required": [], "verified": [], "problems": [],
-           "patches_sha256": _sha_file(patches_file) if os.path.isfile(patches_file) else None}
-    if spec_path is None:
-        out["problems"].append("no frozen spec given, so there are no preselected patch names to check")
-        return out
-    try:
-        with open(spec_path, "rb") as f:
-            raw = f.read()
-        spec = json.loads(raw)
-    except (OSError, ValueError) as exc:
-        raise ResultError(f"cannot read spec {spec_path}: {exc}")
-    if not isinstance(spec, dict):
-        raise ResultError(f"spec {spec_path} is not a JSON object")
-    sha = hashlib.sha256(raw).hexdigest()
-    if raw_reference is not None and raw_reference.get("spec_sha256") != sha:
-        raise ResultError(f"spec {spec_path} (sha256 {sha}) is not the spec the physical reference names "
-                          f"({raw_reference.get('spec_sha256')})")
-    out["spec_sha256"] = sha
-    wanted = []
-    for p in spec.get("wall_patches") or []:
-        name = p.get("name") if isinstance(p, dict) else None
-        if not isinstance(name, str) or not name.strip():
-            out["problems"].append("the spec has a wall patch without a name")
-            continue
-        wanted.append((name.strip(), p.get("box_map_frame")))
-    out["required"] = [n for n, _ in wanted]
-    measured = (wallpatch or {}).get("patches") or []
-    for name, box in wanted:
-        hits = [p for p in measured if isinstance(p.get("name"), str) and p["name"].strip() == name]
-        if len(hits) != 1:
-            out["problems"].append(f"patch {name}: {len(hits)} measured patches have this name, need exactly 1")
-            continue
-        p, why = hits[0], []
-        if p.get("status") != "MEASURED":
-            why.append(f"status {p.get('status')}")
-        if p.get("doubled") != "false":
-            why.append(f"doubled={p.get('doubled')}")
-        if p.get("gate_p95_pass") is not True:
-            why.append(f"p95 gate {p.get('gate_p95_pass')}")
-        if p.get("gate_separation_pass") is not True:
-            why.append(f"separation gate {p.get('gate_separation_pass')}")
-        if box is not None and not _same_box(box, p.get("box_map_frame")):
-            why.append("box differs from the frozen spec's box")
-        if why:
-            out["problems"].append(f"patch {name}: " + ", ".join(why))
-        else:
-            out["verified"].append(name)
-    return out
-
-
-def acceptance_blockers(wall_patches):
-    """Why a run's wall patches cannot count toward acceptance. Empty = they can.
-
-    Re-derived from the lists, so a hand-edited summary cannot make a run count."""
-    wp = wall_patches
-    if not isinstance(wp, dict) or not isinstance(wp.get("required"), list) \
-            or not isinstance(wp.get("verified"), list):
-        return ["no wall-patch provenance in walk_result.json"]
-    why = []
-    if wp.get("origin") != "preselected":
-        why.append(f"wall patches were {wp.get('origin')}, not the spec's preselected patches")
-    if wp.get("spec_sha256") is None:
-        why.append("no frozen spec named the preselected patches")
-    required = set(wp["required"])
-    if len(required) < REQUIRED_PATCHES:
-        why.append(f"{len(required)} preselected patches named; {REQUIRED_PATCHES} are required")
-    missing = [n for n in wp["required"] if n not in wp["verified"]]
-    if missing:
-        why.append("preselected patches not verified: " + ", ".join(missing))
-    return why
-
-
-def _same_box(want, got, tol=1e-9):
-    def unit(v):
-        n = math.sqrt(sum(float(x) ** 2 for x in v))
-        return [float(x) / n for x in v]
-    try:
-        pairs = [(want["center_m"], got["center_m"]), (want["half_extent_m"], got["half_extent_m"]),
-                 (unit(want["normal_hint"]), unit(got["normal_hint"]))]
-        return all(len(a) == len(b) == 3 and all(abs(float(x) - float(y)) <= tol for x, y in zip(a, b))
-                   for a, b in pairs)
-    except (KeyError, TypeError, ValueError, ZeroDivisionError):
-        return False
-
-
-def _sha_file(path):
-    with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
 
 
 def _provenance(session, manifest=None):
@@ -345,26 +174,16 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str,
     if wc_result not in ("PASS", "FAIL", "NOT-EVALUABLE"):
         raise ResultError(f"walkcheck result {wc_result!r}")
     settings, settings_changed = _settings_used(prov, wc, gate_m, gate_state)
-    p95, doubled, wall_fail, wall_notes, patches, wall_warn = wall_evidence(wc, wp, gate_m)
+    p95, doubled, wall_fail, wall_notes, patches, wall_warn = score_walls(wc, wp, gate_m, wall_patches)
 
     d3 = _num(rts.get("error_3d_m"))
     horiz = _cm_to_m(rts.get("error_horizontal_cm"))
     vert = _cm_to_m(rts.get("error_vertical_cm"))
     raw_return = {"d3_m": d3, "horizontal_m": horiz, "vertical_m": vert,
                   "heading_deg": _num(rts.get("heading_error_deg"))}
-    reasons = list(wc.get("reasons") or [])
+    status, reasons = wall_verdict(wc_result, wc.get("reasons") or [], doubled, wall_fail, wall_notes)
     if wc_result == "NOT-EVALUABLE":
-        status = "NOT_EVALUABLE"
         d3 = horiz = vert = None   # an unparked/unreadable endpoint is not a measurement
-        reasons = reasons or ["walkcheck NOT-EVALUABLE"]
-    elif doubled is None:
-        status = "NOT_EVALUABLE"
-        reasons = reasons + ["wall evidence incomplete: " + "; ".join(wall_notes)]
-    else:
-        reasons = reasons + wall_fail
-        status = "PASS" if (wc_result == "PASS" and not wall_fail and doubled is False) else "FAIL"
-        if status == "FAIL" and not reasons:
-            reasons = ["walkcheck FAIL"]
     backward = ts.get("backward_steps")
     walk = {
         "schema": WALK_SCHEMA,

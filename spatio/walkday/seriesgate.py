@@ -34,7 +34,7 @@ from spatio.series.cli import VERDICT_EXIT
 from spatio.series.report import order_walks, render_markdown
 from spatio.series.validate import InputRejected, Unreadable, load_walk_result
 from spatio.walkday.provenance import check_identity
-from spatio.walkday.result import acceptance_blockers
+from spatio.wall_scoring import acceptance_blockers
 
 SETTINGS_CHANGE_REASON = "a changed walk-day setting or driver config starts a new series (walk-day rule G1)"
 RULES_MD = """## Walk-day checks (spatio.walkday.seriesgate)
