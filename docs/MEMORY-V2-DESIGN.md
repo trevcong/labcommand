@@ -1,8 +1,8 @@
 # Spatio memory v2: time, revisions and alignment (design only)
 
-Status: design only, written 2026-10-20 for job B3 of the solidity plan. No code, schema or test changes come with it. Schema v2 needs Trevor's approval before anyone builds it (DESIGN §3, northstar M3).
+Status: design only, written 2026-10-20 for job B3 of the solidity plan. No code, schema or test changes come with it. Schema v2 needed Trevor's approval before anyone builds it (DESIGN §3, northstar M3). He gave it on 2026-10-20, and §5 records his decisions (job M5).
 
-Tags, as in the northstar: **[measured]** is read in the code cited; **[proposal]** is my recommendation, not decided; **[provisional]** marks a number Trevor sets before it is used.
+Tags, as in the northstar: **[measured]** is read in the code cited; **[proposal]** is my recommendation, not decided; **[provisional]** marks a number Trevor sets before it is used. Where §5 records a decision, that decision governs, whatever the inline tag says.
 
 ## 0. What this is grounded in
 
@@ -410,14 +410,22 @@ These are out of v2 and not designed here:
 
 Also unchanged from v1: no object merge or split, no named places, a single local writer, no camera capture.
 
-## 5. Questions for Trevor
+## 5. Decisions (formerly questions for Trevor)
+
+Each item keeps its question's number. The question is kept as asked, and the decision follows it.
 
 1. Approve schema v2 at all (DESIGN §3 requires it), and the star topology (§2.4) over chained alignments.
+   - **Decision:** build v2, with the star topology. A session aligns only directly into a reference revision, and alignments are never chained. **Approved by Trevor, 2026-10-20.**
 2. Set the alignment gates for a cart against a building map: fit, basin margin and held-out residual. The rig values are placeholders.
+   - **Decision:** no numbers yet. Every gate (fit, basin margin, held-out residual) stays [provisional], with room memory's rig values as placeholders only. The gates are tuned after the first real cart walks. **Approved by Trevor, 2026-10-20.**
 3. Set `MOVED_SIGMA_K` (3 proposed) for the comparability predicate, and confirm that a `body` observation's pose adds 0 to `sigma_m` and to the absence containment growth (§2.5) until a pose σ is recorded.
+   - **Decision:** `MOVED_SIGMA_K = 3`. A `body` observation's pose adds 0 to `sigma_m` and to the absence containment growth until a pose σ is recorded. **Approved by Trevor, 2026-10-20.**
 4. Allow observation retraction (§2.2)? I recommend yes, operator-only.
+   - **Decision:** observation retraction is allowed, operator-only. A model writer can never retract an observation. **Approved by Trevor, 2026-10-20.**
 5. Retention against reproducibility: confirm that a purge may make an old report `complete = False`, rather than keeping images longer. Two parts of this conflict with the workplan's wording that "derived records are kept locally for 30 days" (v1 DESIGN §8), so they need your decision, not my assumption:
    - `purged_associations` keeps an object association, which is a derived record, past 30 days. It holds ids and transaction numbers only.
    - A retraction's free-text `reason` stays after its target is purged. That text may name what the image showed. The alternative is to blank `reason` in the purge, keeping the row.
    - A look-again closure keeps `fulfilled_by_observation_id` after that camera observation is purged (§2.1), where v1 nulls it. When the request names an object, that link is an object association kept past 30 days. It holds ids only. The alternative is v1's: drop the id at purge, which makes the closure row mutable.
+   - **Decision:** keep the purge. A report that depended on purged evidence is marked `complete = False`, and images are not kept longer. `purged_associations` and look-again closures' `fulfilled_by_observation_id` are kept past 30 days, holding ids and transaction numbers only. This overrides v1 DESIGN §8's wording for those two records. A retraction's free-text `reason` is blanked at purge, and the row is kept (§2.6). **Approved by Trevor, 2026-10-20.**
 6. Approve transitive invalidation (§2.2): retracting a session or trajectory revision invalidates everything derived from it, including child trajectory revisions, so a rebuild from raw data must be recorded with no parent. A trajectory correction supersedes the old revision's map frame, alignments and map-frame observations rather than keeping them usable. Two consequences follow. A new trajectory revision on the reference map's session makes B1 not current, so every alignment into it stops counting until the sessions are aligned again. And a migrated session's first new trajectory revision retires all its migrated observations, which are bound to revision 1 (§2.9).
+   - **Decision:** transitive invalidation is approved as described, both consequences included. The migrated-session first-correction case must have an acceptance test: `test_V2_6c_migrated_session_first_trajectory_correction` (V2-6) is on the required-tests list (§3). **Approved by Trevor, 2026-10-20.**
