@@ -59,8 +59,4 @@ No additional Trevor approval is needed for this local fix. Physical
 acceptance and freezing operational thresholds remain separate work.
 Independent review remains another team member's responsibility.
 
-Commit status: uncommitted. The local commit attempt stopped at `git add`:
-Git could not create
-`/Users/tconf/Developer/labcommand/.git/worktrees/spatio-fix-wcempty/index.lock`
-(`Operation not permitted`). Git metadata is outside this sandbox's writable
-roots. No push or GitHub operation was attempted.
+Commit status: Codex could not write Git metadata in its sandbox; the orchestrator committed this work (e62a26b). No push by Codex.
