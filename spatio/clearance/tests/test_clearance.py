@@ -61,7 +61,8 @@ def test_new_walk_transformed_geometry_origins_and_times():
 
 
 def test_complete_observation_passes():
-    result = evaluate(box(), scans((10, (-.15, .05, .05), [(1.25, .05, .05)])))
+    result = evaluate(box(), scans((10, (-.15, .05, .05),
+                                   [(1.25, .05, .05), (1.25, .06, .05)])))
     assert result["status"] == "PASS"
     assert result["free_only_cells"] == result["required_cells"] == 10
     assert result["min_clearance_m"] == 1.25
@@ -91,7 +92,8 @@ def test_point_cloud_endpoints_do_not_fill_between_rays():
     (1.03, .02, "PASS"), (1.0, 0, "PASS"),
 ])
 def test_margin_uncertainty_both_sides(hit, uncertainty, status):
-    result = evaluate(box(), scans((1, (-.15, .05, .05), [(hit, .05, .05)])),
+    result = evaluate(box(), scans((1, (-.15, .05, .05),
+                                   [(hit, .05, .05), (hit, .06, .05)])),
                       uncertainty=uncertainty)
     assert result["status"] == status
     assert result["decision_margin_m"] == pytest.approx(hit - 1)
@@ -330,4 +332,130 @@ def test_cli_rejects_mixed_modes_before_writing(tmp_path):
          "--voxel-size", ".1", "--uncertainty-m", ".02", "--output", str(output)],
         capture_output=True, text=True)
     assert result.returncode == 2
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("axis,direction", [(a, d) for a in range(3) for d in (-1, 1)])
+@pytest.mark.parametrize("tangent_index,side", [(t, s) for t in (0, 1) for s in (-1, 1)])
+def test_hit_5mm_sideways_outside_footprint_abstains(axis, direction, tangent_index, side):
+    high = [.1] * 3
+    high[axis] = 1
+    origin, clear_hit, nearby_hit = [.05] * 3, [.05] * 3, [.05] * 3
+    origin[axis] = -.15 if direction == 1 else 1.15
+    clear_hit[axis] = 1.25 if direction == 1 else -.25
+    nearby_hit[axis] = .5
+    tangent = [a for a in range(3) if a != axis][tangent_index]
+    nearby_hit[tangent] = -.005 if side == -1 else .105
+    clear_hit_2 = clear_hit.copy()
+    clear_hit_2[tangent] = .06
+    nearby_origin = nearby_hit.copy()
+    nearby_origin[axis] -= .2
+    observations = scans((1, origin, [clear_hit, clear_hit_2]),
+                         (2, nearby_origin, [nearby_hit]))
+    result = evaluate(box(high=high, axis=axis, direction=direction), observations)
+    assert result["status"] == "INDETERMINATE"
+    assert result["occupied_cells"] == result["insufficient_evidence_cells"] == 0
+    assert result["min_clearance_m"] == pytest.approx(.5)
+    assert result["evidence_time_range"] == [1, 2]
+
+
+@pytest.mark.parametrize("y,depth,uncertainty,status", [
+    (.12, .5, .02, "INDETERMINATE"),   # Inclusive outer sideways boundary.
+    (-.02, .5, .02, "INDETERMINATE"),
+    (.12001, .5, .02, "PASS"),
+    (-.02001, .5, .02, "PASS"),
+    (.105, 1.02, .02, "INDETERMINATE"),
+    (.105, 1.02001, .02, "PASS"),
+    (.105, .5, 0, "PASS"),
+])
+def test_sideways_band_boundaries(y, depth, uncertainty, status):
+    observations = scans((1, (-.15, .05, .05),
+                          [(1.25, .05, .05), (1.25, .06, .05)]),
+                         (2, (depth - .2, y, .05), [(depth, y, .05)]))
+    result = evaluate(box(), observations, uncertainty=uncertainty)
+    assert result["status"] == status
+    assert result["occupied_cells"] == 0
+
+
+@pytest.mark.parametrize("ray_count,status", [(1, "NOT_MEASURED"), (2, "PASS"), (3, "PASS")])
+@pytest.mark.parametrize("separate_scans", [False, True])
+def test_default_minimum_counts_rays_not_scan_timestamps(ray_count, status, separate_scans):
+    hits = [(1.25, .05 + i * .005, .05) for i in range(ray_count)]
+    observations = (scans(*[(i + 1, (-.15, .05, .05), [hit])
+                            for i, hit in enumerate(hits)]) if separate_scans else
+                    scans((1, (-.15, .05, .05), hits)))
+    result = evaluate(box(), observations)
+    assert result["status"] == status
+    assert result["min_free_rays"] == 2
+    assert result["insufficient_evidence_cells"] == (10 if ray_count == 1 else 0)
+    assert result["free_only_cells"] == 10
+    assert result["unknown_cells"] == 0
+
+
+def test_one_under_supported_cell_prevents_pass():
+    observations = scans((1, (-.15, .05, .05), [(1.25, .05, .05)]),
+                         (2, (.05, .05, .05), [(1.25, .06, .05)]))
+    result = evaluate(box(), observations)
+    assert result["status"] == "NOT_MEASURED"
+    assert result["insufficient_evidence_cells"] == 1
+    assert result["free_only_cells"] == 10
+
+
+def test_minimum_evidence_precedes_sideways_uncertainty():
+    result = evaluate(box(), scans((1, (-.15, .05, .05), [(1.25, .05, .05)]),
+                                   (2, (.3, .105, .05), [(.5, .105, .05)])))
+    assert result["status"] == "NOT_MEASURED"
+    assert result["insufficient_evidence_cells"] == 10
+
+
+@pytest.mark.parametrize("hit,status", [(.8, "FAIL"), (.99, "INDETERMINATE")])
+def test_occupied_precedence_survives_high_minimum(hit, status):
+    result = report(box(), scans((1, (-.15, .05, .05), [(hit, .05, .05)])),
+                    .1, [0, 0, 0], .02, min_free_rays=100)["zones"][0]
+    assert result["status"] == status
+    assert result["insufficient_evidence_cells"] > 0
+
+
+@pytest.mark.parametrize("minimum", [0, -1, 1.5, True, "2", None, float("inf")])
+def test_invalid_minimum_evidence_rejected_by_report_and_classifier(minimum):
+    zone = parse_zones(box())[1][0]
+    with pytest.raises(ValueError, match="min_free_rays"):
+        report(box(), scans(), .1, [0, 0, 0], .02, min_free_rays=minimum)
+    with pytest.raises(ValueError, match="min_free_rays"):
+        classify(zone, EvidenceGrid(.1), .02, min_free_rays=minimum)
+
+
+@pytest.mark.parametrize("minimum,status", [(None, "PASS"), (1, "PASS"), (3, "NOT_MEASURED")])
+def test_cli_minimum_evidence_with_fresh_transformed_scene(tmp_path, minimum, status):
+    zones = box(low=(4, 5, 6), high=(6, 5.2, 6.2))
+    observations = scans((300, (3.7, 5.1, 6.1),
+                          [(6.5, 5.1, 6.1), (6.5, 5.12, 6.1)]))
+    for name, data in [("zones", zones), ("scans", observations)]:
+        (tmp_path / f"{name}.json").write_text(json.dumps(data))
+    output = tmp_path / "result"
+    args = [sys.executable, "-m", "spatio.clearance", "--voxel-size", ".2",
+            "--grid-origin", "4", "5", "6", "--uncertainty-m", ".04",
+            "--zones", str(tmp_path / "zones.json"), "--scans", str(tmp_path / "scans.json"),
+            "--output", str(output)]
+    if minimum is not None:
+        args += ["--min-free-rays", str(minimum)]
+    completed = subprocess.run(args, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads((output / "report.json").read_text())
+    assert result["min_free_rays"] == (2 if minimum is None else minimum)
+    assert result["minimum_evidence_status"] == "PROVISIONAL"
+    assert result["zones"][0]["status"] == status
+    assert result["zones"][0]["insufficient_evidence_cells"] == (10 if minimum == 3 else 0)
+    assert completed.stdout == (output / "report.md").read_text()
+    assert f"minimum free rays per required cell: {result['min_free_rays']}" in completed.stdout
+
+
+@pytest.mark.parametrize("minimum", ["0", "-1", "1.5"])
+def test_cli_rejects_invalid_minimum_before_writing(tmp_path, minimum):
+    output = tmp_path / "result"
+    completed = subprocess.run(
+        [sys.executable, "-m", "spatio.clearance", "--synthetic",
+         "--voxel-size", ".1", "--uncertainty-m", ".02", "--min-free-rays", minimum,
+         "--output", str(output)], capture_output=True, text=True)
+    assert completed.returncode == 2
     assert not output.exists()

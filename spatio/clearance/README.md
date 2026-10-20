@@ -8,7 +8,7 @@ Run from the repository root, choosing a new output directory:
 
 ```sh
 python3 -m spatio.clearance --synthetic \
-  --voxel-size 0.1 --uncertainty-m 0.02 \
+  --voxel-size 0.1 --uncertainty-m 0.02 --min-free-rays 2 \
   --output /private/tmp/clearance-example
 python3 -m pytest -q spatio/clearance
 ```
@@ -124,7 +124,9 @@ free evidence on either side. There is no widening, filling between rays,
 interpolation through occluders or inference from missing map points.
 
 Each cell retains independent sets of free and occupied timestamps, plus
-occupied hit positions. Either observation order produces the same conflict.
+occupied hit positions and a free-ray count. A ray contributes once to each
+traversed cell; several rays in one scan count separately. Either observation
+order produces the same conflict.
 All conflicts are reported by index, both globally and within each zone;
 an occupied cell never becomes free-only. Unknown is implicit.
 
@@ -133,25 +135,40 @@ Decision precedence:
 1. An occupied required cell gives FAIL, regardless of unobserved cells.
    The explicit near-limit exception is INDETERMINATE when the absolute
    clearance-minus-required-depth margin is within the supplied uncertainty.
-2. Otherwise any unknown required cell gives NOT_MEASURED.
-3. Otherwise every required cell is free-only. A measured obstruction within
-   the uncertainty band gives INDETERMINATE; the remaining cases give PASS.
+2. Otherwise any required cell with fewer than `--min-free-rays` free
+   traversals gives NOT_MEASURED. The default is **2**, a provisional positive
+   integer that can be set explicitly; it is not fitted to a recording.
+3. Otherwise every required cell is free-only with sufficient ray evidence.
+   A hit inside the sideways-expanded footprint and at a positive clearance
+   no greater than required depth plus uncertainty gives INDETERMINATE;
+   the remaining cases give PASS.
 
 The uncertainty band is inclusive; zero disables it. The CLI requires an
 explicit value and always labels it provisional. It is not a calibrated
-sensor, localization, voxel or combined error bound.
+sensor, localization, voxel or combined error bound. Both lateral bounds are
+widened by that amount for hit checks. For example, a hit 5 mm outside a
+side face at 0.5 m depth blocks PASS with 0.02 m uncertainty and 1 m required
+depth. The nominal required cells and occupied-cell precedence do not change.
 
 `min_clearance_m` is the minimum **observed hit** distance strictly in front
-of the reference face and within the zone's lateral footprint, even beyond
-the required depth. Reference-face hits are not clearance measurements.
+of the reference face and within the uncertainty-expanded lateral footprint,
+even beyond the required depth. With zero uncertainty it uses the nominal
+half-open footprint. Reference-face hits are not clearance measurements.
 Null means no qualifying hit; a number does not establish full-volume
 coverage. `decision_margin_m` uses hits inside occupied required cells.
 For a partially intersecting occupied cell whose hits lie outside the
-volume, it conservatively uses the cell's near face. The separately reported
+volume, it conservatively uses the cell's near face. With no occupied required
+cells, the margin uses `min_clearance_m` minus required depth; a sideways hit
+can therefore yield a large negative margin and INDETERMINATE. The separately reported
 `occupied_voxel_clearance_lower_bound_m` always uses voxel near faces.
 These fields deliberately distinguish sampled geometry from cell bounds.
 The evidence time range covers required-cell observations and qualifying
 clearance hits. Scan time range also includes scans with no returns.
+`free_only_cells` and `free_coverage` still count cells with at least one free
+ray and no occupancy, and `unknown_cells` counts cells with no evidence.
+`insufficient_evidence_cells` counts unoccupied required cells below the
+configured minimum, including unknown cells. A 100% free coverage alone no
+longer suffices for PASS. JSON and Markdown report the provisional minimum.
 
 ## Limits
 
@@ -159,7 +176,10 @@ PASS means observed free **at the chosen voxel resolution**, not proof that
 every physical point is empty. Thin objects, sparse beams, bad poses, moving
 objects and incorrect first-return inputs can defeat that interpretation.
 Conflicts are retained indefinitely within this one input session; there is
-no aging or moving-object filter.
+no aging or moving-object filter. The minimum-ray count is only a provisional
+sampling gate: repeated or duplicate input rays count, independence and
+spatial diversity are not established, and even two rays can miss most of a
+voxel. It is not an operational clearance guarantee.
 
 Boundary cells can cause conservative false alarms, including a reference
 surface sharing a cell with the required volume. A panel at x=2 facing -x

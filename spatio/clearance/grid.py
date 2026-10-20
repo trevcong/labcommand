@@ -16,6 +16,7 @@ from .model import number, vector
 @dataclass
 class Cell:
     free_times: set = field(default_factory=set)
+    free_ray_count: int = 0
     occupied_times: set = field(default_factory=set)
     hits: list = field(default_factory=list)
 
@@ -92,7 +93,9 @@ class EvidenceGrid:
         # Accumulation is monotonic: a later ray never erases a prior hit.
         for hit in scan.hits:
             for index in self.ray_cells(scan.origin, hit):
-                self.cell(index).free_times.add(scan.timestamp)
+                cell = self.cell(index)
+                cell.free_times.add(scan.timestamp)
+                cell.free_ray_count += 1
             cell = self.cell(self.index(hit))
             cell.occupied_times.add(scan.timestamp)
             cell.hits.append((scan.timestamp, hit.copy()))
