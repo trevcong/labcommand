@@ -471,6 +471,12 @@ public:
     // references inside it; the epoch file is already written, by record_epoch). No-op without
     // state_dir.
     void save(const msg::Time& stamp);
+    // Non-rig runtime saves: failed writes leave the in-memory state usable and retry at the
+    // next close_window, even without new observations. Counts consecutive failed attempts;
+    // a successful retry clears the count, pending flag and error. Startup saves still throw.
+    bool save_pending() const { return save_pending_; }
+    std::int64_t save_failed() const { return save_failed_; }
+    const std::string& save_error() const { return save_error_; }
     // Feeds one CDR sensor_msgs/Imu received at `received` to the rig guard. False when the guard is
     // off or the frame does not decode (counted in imu_failed, never thrown).
     bool add_imu(std::span<const std::uint8_t> data, const msg::Time& received);
@@ -517,6 +523,7 @@ private:
     bool building() const;
     std::vector<std::filesystem::path> paths() const;
     void load(const msg::Time& start);
+    void save_runtime(const msg::Time& stamp);
     std::uint64_t next_id();
     msg::ChangeEvent event(const Channel& channel, msg::EventState state, const Candidate& candidate,
                            const msg::Time& stamp);
@@ -535,8 +542,8 @@ private:
     // file never falls behind an epoch in use, whatever else of a save fails. False when the write
     // fails (disk full, permissions; counted like a failed save): the caller holds what would take
     // the epoch (the build's end, a settle) and the next window tries again. Without the guard or
-    // state_dir it writes nothing and returns true: save writes the epoch file first and a failure
-    // throws, as before the guard.
+    // state_dir it writes nothing and returns true: save writes the epoch file first, with
+    // runtime failures counted and retried by save_runtime.
     bool record_epoch(std::uint64_t epoch);
     void save_rig();
     void set_pose(Channel& channel, const rig::Pose& pose);
@@ -571,6 +578,9 @@ private:
     // Closed windows that entered TRACKING, and whether a later settle pass still has counts.
     std::int64_t tracking_windows_ = 0;
     bool settle_pending_ = false;
+    bool save_pending_ = false;
+    std::int64_t save_failed_ = 0;
+    std::string save_error_;
     std::uint64_t map_epoch_ = 0;
     std::uint64_t event_seq_ = 0;
     std::uint64_t status_seq_ = 0;

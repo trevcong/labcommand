@@ -476,9 +476,13 @@ std::vector<msg::SeqRange> subtract_ranges(const std::vector<msg::SeqRange>& ran
 
 std::pair<msg::MapBricks, VoxelLayer> load_reference(const std::filesystem::path& path) {
     const msg::Bytes data = read_bytes(path);
-    msg::MapBricks message = msg::MapBricks::from_cdr(data);
-    VoxelLayer layer = VoxelLayer::from_bricks(message.bricks);
-    return {std::move(message), std::move(layer)};
+    try {
+        msg::MapBricks message = msg::MapBricks::from_cdr(data);
+        VoxelLayer layer = VoxelLayer::from_bricks(message.bricks);
+        return {std::move(message), std::move(layer)};
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument(path.string() + ": " + error.what());
+    }
 }
 
 // MARK: Candidates
@@ -783,6 +787,23 @@ void RoomMemory::save(const msg::Time& stamp) {
     }
 }
 
+void RoomMemory::save_runtime(const msg::Time& stamp) {
+    if (config_.rig_guard) {
+        save(stamp);  // the guard has its own ordered save and retry diagnostics
+        return;
+    }
+    try {
+        save(stamp);
+        save_pending_ = false;
+        save_failed_ = 0;
+        save_error_.clear();
+    } catch (const std::exception& error) {
+        save_pending_ = true;
+        ++save_failed_;
+        save_error_ = error.what();
+    }
+}
+
 void RoomMemory::add_points(const std::string& sensor, std::span<const float> xyz) {
     Channel& channel = find(sensor);
     if (xyz.size() % 3) throw std::invalid_argument("positions must hold 3 floats per point");
@@ -861,6 +882,8 @@ bool RoomMemory::building() const {
 }
 
 std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
+    // Retry only a previous window's failure, not a save that fails later in this window.
+    if (save_pending_) save_runtime(stamp);
     std::vector<msg::ChangeEvent> events;
     window_estimates_ = 0;
     window_estimate_ms_ = 0.0;
@@ -1031,7 +1054,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         }
         ++map_epoch_;
         if (guard) guard_built(now);
-        save(stamp);
+        save_runtime(stamp);
     } else if (guard && tracking) {
         guard_step(now, stamp, events);
     }
@@ -1123,7 +1146,7 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
     if (!changed && !keyframe_due) return std::nullopt;
     if (changed) {
         ++map_epoch_;
-        save(stamp);
+        save_runtime(stamp);
     }
     std::vector<msg::Brick> bricks = changed ? channels_[map_channel_].reference.to_bricks() : map_bricks_;
     if (!keyframe_due) {
