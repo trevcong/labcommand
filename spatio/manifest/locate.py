@@ -114,18 +114,27 @@ def locate_listed_file(name, session_dir, source_recording, config_file):
 
 
 def locate_bag_file(name, session_dir, source_recording):
+    """Resolve one bag named in ``source_fingerprint``.
+
+    Directory components are kept. ``archive/part.mcap`` is that relative
+    path under the recording, then under the session. It is not rewritten
+    to ``bag/<basename>``. A bare basename may still live in ``bag/``, and
+    that fallback is tried only after both exact paths.
+    """
     if not safe_relative_name(name):
         return None
     candidates = []
-    basename = Path(name).name
     if isinstance(source_recording, str) and source_recording:
-        source = Path(source_recording)
-        candidates.append(source / name)
-        candidates.append(source / "bag" / basename)
+        candidates.append(Path(source_recording) / name)
     if session_dir is not None:
-        session = Path(session_dir)
-        candidates.append(session / name)
-        candidates.append(session / "bag" / basename)
+        candidates.append(Path(session_dir) / name)
+    # A name that already names a directory must not collapse to the
+    # basename. Otherwise source/bag/part.mcap satisfies archive/part.mcap.
+    if Path(name).name == name:
+        if isinstance(source_recording, str) and source_recording:
+            candidates.append(Path(source_recording) / "bag" / name)
+        if session_dir is not None:
+            candidates.append(Path(session_dir) / "bag" / name)
     return _first_file(candidates)
 
 

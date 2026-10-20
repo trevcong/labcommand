@@ -253,7 +253,16 @@ def _check_one_bag(session, source, entry, index):
             )
         )
     if sha is not None:
-        digest, actual = hash_file(found)
+        try:
+            digest, actual = hash_file(found)
+        except OSError as exc:
+            findings.append(
+                warning(
+                    "M7",
+                    "%s: bag file not verifiable here (%s)" % (session, exc),
+                )
+            )
+            return findings
         if digest != sha or actual != nbytes:
             findings.append(
                 error(
@@ -298,15 +307,27 @@ def _check_fingerprint(data, session):
                 warning("M7", "%s: metadata.yaml not verifiable here" % session)
             )
         else:
-            digest, _nbytes = hash_file(metadata)
-            if digest != sha:
+            try:
+                digest, _nbytes = hash_file(metadata)
+            except OSError as exc:
+                # The path exists but cannot be read. Same class of result
+                # as a missing metadata.yaml: a warning, and later sessions
+                # still run.
                 findings.append(
-                    error(
+                    warning(
                         "M7",
-                        "%s: metadata.yaml sha256 mismatch (manifest %s, file %s)"
-                        % (session, sha, digest),
+                        "%s: metadata.yaml not verifiable here (%s)" % (session, exc),
                     )
                 )
+            else:
+                if digest != sha:
+                    findings.append(
+                        error(
+                            "M7",
+                            "%s: metadata.yaml sha256 mismatch (manifest %s, file %s)"
+                            % (session, sha, digest),
+                        )
+                    )
     bags = fingerprint.get("bag_files", None)
     if not isinstance(bags, list):
         findings.append(error("M7", "%s: bag_files must be a list" % session))

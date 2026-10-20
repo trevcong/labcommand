@@ -125,6 +125,16 @@ class ManifestTests(unittest.TestCase):
         )
         return path
 
+    def _marked_session(self, run_id):
+        """A second session with an unknown key, so JSON proves it was checked."""
+        source = self._make_source(name="%s-recording" % run_id)
+        config = self._make_config(name="%s.yaml" % run_id, text="lidar_type: 2\n")
+        session, _manifest = self._build(run_id=run_id, source=source, config=config)
+        data = self._load(session)
+        data["checked_after"] = True
+        self._save(session, data)
+        return session
+
     def test_build_minimal_valid_manifest(self):
         config = self._make_config()
         session, manifest = self._build(config=config)
@@ -586,6 +596,145 @@ class ManifestTests(unittest.TestCase):
                 ),
                 findings,
             )
+
+    def test_bag_relative_path_is_not_satisfied_by_bag_basename(self):
+        # archive/part.mcap must be that relative path. A file at
+        # source/bag/part.mcap that only shares the basename used to
+        # match and hide a different session/archive/part.mcap.
+        source = self._make_source(name="bag-collision")
+        decoy = source / "bag" / "part.mcap"
+        decoy.write_bytes(b"matching-decoy-bytes")
+        session, _manifest = self._build(source=source, hash_bag=True)
+        nested = session / "archive" / "part.mcap"
+        nested.parent.mkdir(parents=True, exist_ok=True)
+        nested.write_bytes(b"corrupted-session-bytes")
+        data = self._load(session)
+        data["source_fingerprint"]["bag_files"] = [
+            {
+                "name": "archive/part.mcap",
+                "bytes": decoy.stat().st_size,
+                "sha256": sha256_file(decoy),
+            }
+        ]
+        self._save(session, data)
+        findings = validate_session(session)
+        collisions = [
+            item
+            for item in _errors(findings)
+            if item.rule == "M7" and "archive/part.mcap" in item.message
+        ]
+        self.assertTrue(collisions, findings)
+
+        data = self._load(session)
+        data["source_fingerprint"]["bag_files"][0] = {
+            "name": "archive/part.mcap",
+            "bytes": nested.stat().st_size,
+            "sha256": sha256_file(nested),
+        }
+        self._save(session, data)
+        findings = validate_session(session)
+        self.assertFalse(
+            any(
+                item.rule == "M7" and "archive/part.mcap" in item.message
+                for item in findings
+            ),
+            findings,
+        )
+
+        nested.unlink()
+        data = self._load(session)
+        data["source_fingerprint"]["bag_files"][0] = {
+            "name": "archive/part.mcap",
+            "bytes": decoy.stat().st_size,
+            "sha256": sha256_file(decoy),
+        }
+        self._save(session, data)
+        findings = validate_session(session)
+        unverifiable = [
+            item
+            for item in _warnings(findings)
+            if item.rule == "M7"
+            and "archive/part.mcap" in item.message
+            and "not verifiable" in item.message
+        ]
+        self.assertTrue(unverifiable, findings)
+        self.assertEqual(
+            [
+                item
+                for item in _errors(findings)
+                if item.rule == "M7" and "archive/part.mcap" in item.message
+            ],
+            [],
+            findings,
+        )
+
+    def _assert_fingerprint_read_failure(self, session, other, needle):
+        findings = validate_session(session)
+        warnings = [
+            item
+            for item in _warnings(findings)
+            if item.rule == "M7"
+            and needle in item.message
+            and "not verifiable" in item.message
+            and "Permission denied" in item.message
+        ]
+        self.assertEqual(len(warnings), 1, findings)
+        self.assertFalse(
+            any(item.rule == "M7" and item.severity == "ERROR" for item in findings),
+            findings,
+        )
+        listed = self._run(["validate", "--json", str(session), str(other)])
+        self.assertNotIn("Traceback", listed.stderr)
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        payload = json.loads(listed.stdout)
+        self.assertTrue(
+            any(
+                row["rule"] == "M7"
+                and row["severity"] == "WARNING"
+                and needle in row["message"]
+                and "not verifiable" in row["message"]
+                and row["session"] == str(session)
+                for row in payload
+            ),
+            payload,
+        )
+        self.assertTrue(
+            any(
+                row["rule"] == "M2"
+                and row["session"] == str(other)
+                and "checked_after" in row["message"]
+                for row in payload
+            ),
+            payload,
+        )
+
+    def test_unreadable_metadata_fingerprint_does_not_abort(self):
+        session, manifest = self._build(hash_bag=False)
+        other = self._marked_session("run-after-metadata")
+        metadata = Path(manifest["source_recording"]) / "bag" / "metadata.yaml"
+        metadata.chmod(0)
+        try:
+            with self.assertRaises(PermissionError):
+                with open(metadata, "rb") as handle:
+                    handle.read(1)
+            self._assert_fingerprint_read_failure(session, other, "metadata.yaml")
+        finally:
+            metadata.chmod(0o644)
+
+    def test_unreadable_bag_fingerprint_does_not_abort(self):
+        session, manifest = self._build(hash_bag=True)
+        other = self._marked_session("run-after-bag")
+        entry = manifest["source_fingerprint"]["bag_files"][0]
+        self.assertIsNotNone(entry["sha256"])
+        bag = Path(manifest["source_recording"]) / entry["name"]
+        bag.chmod(0)
+        try:
+            with self.assertRaises(PermissionError):
+                with open(bag, "rb") as handle:
+                    handle.read(1)
+            self._assert_fingerprint_read_failure(session, other, "bag file")
+        finally:
+            bag.chmod(0o644)
 
     def test_run_id_must_equal_folder_name(self):
         session, _manifest = self._build(run_id="folder-name")
