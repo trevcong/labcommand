@@ -44,6 +44,9 @@ final class TrailPlayer: ObservableObject {
     private var restored = false
     /// Bumped per load, so a slow earlier read cannot replace a later pick.
     private var loadToken = 0
+    /// Verdict-file times for the session on screen. Nil until that load finishes, and cleared
+    /// when the next one starts, so a rescan during a load does not start another.
+    private var openedVerdictInputs: TrailLibrary.VerdictInputs?
     private var endTimer: Timer?
     private let defaults: UserDefaults
 
@@ -75,6 +78,7 @@ final class TrailPlayer: ObservableObject {
         let token = loadToken
         endTimer?.invalidate()
         endTimer = nil
+        openedVerdictInputs = nil
         // Drop the previous session so nothing (keys, readout) acts on it while this one reads.
         session = nil
         raster = nil
@@ -104,12 +108,30 @@ final class TrailPlayer: ObservableObject {
     }
 
     /// Re-lists the sessions root. Replays write new folders while the app is open.
+    /// Also reloads the session on screen when its trajectory, map or walkcheck has changed
+    /// since it was read, so a cached green PASS cannot outlive those files.
     func rescan() {
         let root = root
+        let open = directory
+        let opened = openedVerdictInputs
         Task.detached(priority: .utility) { [weak self] in
             let found = TrailLibrary.scan(root: root)
-            await self?.setEntries(found)
+            let reload: String?
+            if let open {
+                let now = TrailLibrary.VerdictInputs.read(directory: open)
+                reload = TrailLibrary.rescanShouldReload(opened: opened, now: now) ? open : nil
+            } else {
+                reload = nil
+            }
+            await self?.applyRescan(found, reload: reload)
         }
+    }
+
+    private func applyRescan(_ found: [TrailSessionEntry], reload: String?) {
+        setEntries(found)
+        // A pick made while the scan ran has a different directory. Leave it alone.
+        guard let reload, reload == directory else { return }
+        load(directory: reload)
     }
 
     private func setEntries(_ found: [TrailSessionEntry]) {
@@ -148,6 +170,8 @@ final class TrailPlayer: ObservableObject {
 
     private struct Loaded: Sendable {
         var session: TrailSession
+        /// Times taken before the session was read, so a later change still counts as new.
+        var verdictInputs: TrailLibrary.VerdictInputs
         var raster: TrailRaster
         var rgba: [UInt8]
         var mapLine: String?
@@ -156,13 +180,14 @@ final class TrailPlayer: ObservableObject {
 
     nonisolated private static func read(directory: String) -> Result<Loaded, TrailError> {
         do {
+            let verdictInputs = TrailLibrary.VerdictInputs.read(directory: directory)
             var session = try TrailSession.load(directory: directory)
             let raster = TrailRaster.build(map: session.map?.points ?? [], trajectory: session.trajectory)
             let mapLine = session.map.map { TrailReadout.mapLine($0, raster: raster) }
             // The raster holds everything the view draws. Let the points go.
             session.map?.points = []
-            return .success(Loaded(session: session, raster: raster, rgba: raster.rgba(), mapLine: mapLine,
-                                   bandLine: TrailReadout.bandLine(raster)))
+            return .success(Loaded(session: session, verdictInputs: verdictInputs, raster: raster, rgba: raster.rgba(),
+                                   mapLine: mapLine, bandLine: TrailReadout.bandLine(raster)))
         } catch let error as TrailError {
             return .failure(error)
         } catch {
@@ -178,6 +203,7 @@ final class TrailPlayer: ObservableObject {
             FileHandle.standardError.write(Data("trail: \(error)\n".utf8))
         case .success(let loaded):
             session = loaded.session
+            openedVerdictInputs = loaded.verdictInputs
             raster = loaded.raster
             mapImage = Self.image(loaded.raster, rgba: loaded.rgba)
             mapLine = loaded.mapLine

@@ -545,10 +545,10 @@ func testTrailViewContract() {
     expect(view.contains("TrailReadout.startToEndNote"), "the view says start → end is raw")
     expect(view.contains("TrailReadout.walkcheckRows") && view.contains("TrailReadout.walkcheckNote"),
            "the view shows the walkcheck verdict and how it was measured")
-    expect(view.contains("TrailReadout.walkcheckRows(w, stale: session.walkcheckStale != nil)")
-            && view.contains("TrailReadout.verdictTone(w.result, stale: session.walkcheckStale != nil)")
-            && view.contains("TrailReadout.verdictTone(verdict, stale: entry.walkcheckStale)"),
-           "the walk check block and the sessions list both mark stale and take their colour from verdictTone")
+    expect(view.contains("TrailReadout.walkcheckRows(w, stale: session.walkcheckStale != nil, unverifiable: session.walkcheckUnverifiable)")
+            && view.contains("TrailReadout.verdictTone(w.result, stale: session.walkcheckStale != nil, unverifiable: session.walkcheckUnverifiable)")
+            && view.contains("TrailReadout.verdictTone(verdict, stale: entry.walkcheckStale, unverifiable: entry.walkcheckUnverifiable)"),
+           "the walk check block and the sessions list both mark stale or unverifiable and take their colour from verdictTone")
     expect(!view.contains("case \"PASS\""), "the view does not pick green from the verdict string itself")
     expect(state.contains("case trail"), "Dest has a trail case")
     expect(state.contains("static var navCases: [Dest] { [.liveRoom, .settings, .workspace, .trail] }"),
@@ -559,6 +559,8 @@ func testTrailViewContract() {
     expect(state.contains("var dest: Dest = .liveRoom"), "a normal launch still opens on Room")
     expect(player.contains("NSOpenPanel") && player.contains("canChooseDirectories = true"), "the tab has a folder picker")
     expect(player.contains("TrailLibrary.lastSessionKey"), "the picked folder is remembered")
+    expect(player.contains("TrailLibrary.rescanShouldReload(opened:") && player.contains("load(directory: reload)"),
+           "rescan reloads the opened session when its verdict files change")
 }
 
 // MARK: - Walkcheck and the sessions folder
@@ -839,6 +841,131 @@ func testTrailLibraryScanAndReopen() {
     try? fm.removeItem(at: root)
 }
 
+/// Deleting trajectory.tum from a scored session must not leave a green PASS on the map.
+func testTrailDeletedTrajectoryIsUnverifiable() {
+    let fm = FileManager.default
+    let root = tempDirectory("deleted-trajectory")
+    let dir = root.appendingPathComponent("scored")
+    try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    let tum = dir.appendingPathComponent("trajectory.tum")
+    let map = dir.appendingPathComponent("map.pcd")
+    let walk = dir.appendingPathComponent("walkcheck.json")
+    try! Data(TrailFixture.tum().utf8).write(to: tum)
+    try! TrailFixture.binaryPCD(TrailFixture.mapPoints()).write(to: map)
+    try! walkcheckJSON(result: "PASS", returnError: 4).write(to: walk)
+
+    let opened = try! TrailSession.load(directory: dir.path)
+    expect(opened.walkcheck?.result == "PASS" && opened.walkcheckStale == nil && !opened.walkcheckUnverifiable,
+           "a scored PASS with its trajectory still there is current")
+    expect(TrailReadout.verdictTone("PASS", stale: false, unverifiable: false) == .good, "and it is green")
+    let inputs = TrailLibrary.VerdictInputs.read(directory: dir.path)
+
+    try! fm.removeItem(at: tum)
+    expect(TrailLibrary.rescanShouldReload(opened: inputs, now: TrailLibrary.VerdictInputs.read(directory: dir.path)),
+           "deleting the trajectory makes rescan reload the opened session")
+    let mapOnly = try! TrailSession.load(directory: dir.path)
+    expect(mapOnly.trajectory == nil && mapOnly.map != nil, "deleting the trajectory leaves a map-only session")
+    expect(mapOnly.problems.contains("trajectory.tum missing"), "the missing file is listed")
+    expect(mapOnly.walkcheck?.result == "PASS", "the walkcheck still parses")
+    expect(mapOnly.walkcheckUnverifiable, "a missing trajectory is unverifiable")
+    expect(mapOnly.walkcheckStale == "trajectory.tum is missing, so this verdict cannot be checked",
+           "reason, got \(mapOnly.walkcheckStale ?? "nil")")
+    expect(mapOnly.problems.contains(mapOnly.walkcheckStale ?? "-"), "and the reason is listed under Files")
+    let rows = TrailReadout.walkcheckRows(mapOnly.walkcheck!, stale: true, unverifiable: true)
+    expect(rows.first?.value == "PASS · unverifiable", "the opened readout says unverifiable, got \(rows.first?.value ?? "nil")")
+    expect(TrailReadout.verdictTone("PASS", stale: true, unverifiable: true) == .warn, "the opened PASS is not green")
+    let note = TrailReadout.walkcheckNote(mapOnly.walkcheck!, stale: mapOnly.walkcheckStale, accuracyLabel: nil, unverifiable: true)
+    expect(note.hasPrefix("Unverifiable: trajectory.tum is missing, so this verdict cannot be checked. Re-run walkcheck"),
+           "the note says unverifiable, got \(note)")
+
+    let entry = TrailLibrary.scan(root: root.path).first { $0.name == "scored" }
+    expect(entry?.hasTrajectory == false && entry?.hasMap == true && entry?.walkcheckStale == true, "the list row is map-only and not current")
+    expect(entry?.walkcheckResult == "PASS" && entry?.walkcheckUnverifiable == true, "the list keeps the verdict and marks it unverifiable")
+    expect(TrailReadout.verdictText(entry?.walkcheckResult ?? "", stale: entry?.walkcheckStale == true, unverifiable: entry?.walkcheckUnverifiable == true) == "PASS · unverifiable",
+           "the list says unverifiable")
+    expect(TrailReadout.verdictTone(entry?.walkcheckResult ?? "", stale: entry?.walkcheckStale == true, unverifiable: entry?.walkcheckUnverifiable == true) == .warn,
+           "the list is not green either")
+
+    // A newer map does not turn a missing trajectory back into "older than map.pcd".
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)], ofItemAtPath: walk.path)
+    try! fm.setAttributes([.modificationDate: Date()], ofItemAtPath: map.path)
+    let olderMap = try! TrailSession.load(directory: dir.path)
+    expect(olderMap.walkcheckUnverifiable && olderMap.walkcheckStale == "trajectory.tum is missing, so this verdict cannot be checked",
+           "missing trajectory wins over a newer map, got \(olderMap.walkcheckStale ?? "nil")")
+
+    // A trajectory-only PASS stays current. The return verdict does not need a map.
+    let only = tempDirectory("trajectory-only-pass")
+    try! Data("1 0 0 0 0 0 0 1\n2 1 0 0 0 0 0 1\n".utf8).write(to: only.appendingPathComponent("trajectory.tum"))
+    try! walkcheckJSON(result: "PASS", returnError: 4).write(to: only.appendingPathComponent("walkcheck.json"))
+    let noMap = try! TrailSession.load(directory: only.path)
+    expect(noMap.trajectory != nil && noMap.map == nil, "a trajectory-only folder opens")
+    expect(noMap.walkcheckStale == nil && !noMap.walkcheckUnverifiable, "a missing map does not make a PASS unverifiable")
+    expect(TrailReadout.verdictTone(noMap.walkcheck?.result ?? "", stale: false, unverifiable: noMap.walkcheckUnverifiable) == .good,
+           "a trajectory-only PASS stays green")
+    let onlyEntry = TrailLibrary.scan(root: only.deletingLastPathComponent().path).first { $0.name == "trajectory-only-pass" }
+    expect(onlyEntry?.walkcheckResult == "PASS" && onlyEntry?.walkcheckUnverifiable == false && onlyEntry?.walkcheckStale == false,
+           "the list agrees, got stale=\(onlyEntry?.walkcheckStale == true) unverifiable=\(onlyEntry?.walkcheckUnverifiable == true)")
+
+    try? fm.removeItem(at: root)
+    try? fm.removeItem(at: only)
+}
+
+/// Rescan must not leave the opened readout on a green PASS after the files change.
+func testTrailRescanReloadsOpenedVerdict() {
+    let fm = FileManager.default
+    let root = tempDirectory("rescan-pass")
+    let dir = root.appendingPathComponent("opened")
+    try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    let tum = dir.appendingPathComponent("trajectory.tum")
+    let map = dir.appendingPathComponent("map.pcd")
+    let walk = dir.appendingPathComponent("walkcheck.json")
+    try! Data("1 0 0 0 0 0 0 1\n2 1 0 0 0 0 0 1\n".utf8).write(to: tum)
+    try! Data("x".utf8).write(to: map)
+    try! walkcheckJSON(result: "PASS", returnError: 4).write(to: walk)
+
+    let cached = try! TrailSession.load(directory: dir.path)
+    expect(cached.walkcheck?.result == "PASS" && cached.walkcheckStale == nil && !cached.walkcheckUnverifiable,
+           "the opened session starts as a current PASS")
+    expect(TrailReadout.verdictTone("PASS", stale: false, unverifiable: false) == .good, "and the readout is green")
+    let inputs = TrailLibrary.VerdictInputs.read(directory: dir.path)
+    expect(!TrailLibrary.rescanShouldReload(opened: inputs, now: TrailLibrary.VerdictInputs.read(directory: dir.path)),
+           "rescan leaves the opened session alone when nothing changed")
+    expect(!TrailLibrary.rescanShouldReload(opened: nil, now: inputs), "rescan does not reload when no session is open")
+
+    // Replace the trajectory. The cached value stays the old PASS; a reload must not.
+    try! Data("5 0 0 0 0 0 0 1\n6 0 2 0 0 0 0 1\n".utf8).write(to: tum)
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: 30)], ofItemAtPath: tum.path)
+    let replaced = TrailLibrary.VerdictInputs.read(directory: dir.path)
+    expect(TrailLibrary.rescanShouldReload(opened: inputs, now: replaced),
+           "replacing the trajectory makes rescan reload the opened session")
+    expect(cached.walkcheck?.result == "PASS" && cached.walkcheckStale == nil, "the cached session is still the old green PASS")
+    let afterTrajectory = try! TrailSession.load(directory: dir.path)
+    expect(afterTrajectory.walkcheck?.result == "PASS" && afterTrajectory.walkcheckStale != nil && !afterTrajectory.walkcheckUnverifiable,
+           "the reload is stale, got \(afterTrajectory.walkcheckStale ?? "nil")")
+    expect(TrailReadout.verdictText("PASS", stale: true) == "PASS · stale", "it no longer reads as a plain PASS")
+    expect(TrailReadout.verdictTone("PASS", stale: true, unverifiable: false) == .warn, "and it is not green")
+    let listedStale = TrailLibrary.scan(root: root.path).first { $0.name == "opened" }
+    expect(listedStale?.walkcheckResult == "PASS" && listedStale?.walkcheckStale == true && listedStale?.walkcheckUnverifiable == false,
+           "the list updates to a stale PASS too")
+
+    // A new FAIL report, newer than the trajectory, replaces the cached PASS.
+    try! walkcheckJSON(result: "FAIL", returnError: 50).write(to: walk)
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: 60)], ofItemAtPath: walk.path)
+    let failedInputs = TrailLibrary.VerdictInputs.read(directory: dir.path)
+    expect(TrailLibrary.rescanShouldReload(opened: replaced, now: failedInputs),
+           "writing a FAIL report makes rescan reload the opened session")
+    let afterFail = try! TrailSession.load(directory: dir.path)
+    expect(afterFail.walkcheck?.result == "FAIL" && afterFail.walkcheckStale == nil && !afterFail.walkcheckUnverifiable,
+           "the reload reads the FAIL, got \(afterFail.walkcheck?.result ?? "nil") stale=\(afterFail.walkcheckStale ?? "nil")")
+    expect(TrailReadout.verdictTone("FAIL", stale: false, unverifiable: false) == .bad, "a current FAIL is red")
+    expect(TrailReadout.verdictTone(afterFail.walkcheck?.result ?? "", stale: afterFail.walkcheckStale != nil, unverifiable: afterFail.walkcheckUnverifiable) != .good,
+           "the opened verdict is no longer a green PASS")
+    let listedFail = TrailLibrary.scan(root: root.path).first { $0.name == "opened" }
+    expect(listedFail?.walkcheckResult == "FAIL" && listedFail?.walkcheckStale == false, "the list updates to the FAIL")
+
+    try? fm.removeItem(at: root)
+}
+
 func runTrailTests() {
     testTrailTUMFixtureNumbers()
     print("  trail: TUM fixture — 661 poses, 66 s, 11.98 m, start→end exactly 4.0 cm, epoch stamps keep 0.1 s"); passed()
@@ -880,6 +1007,10 @@ func runTrailTests() {
     print("  trail: only the session's own manifest true clears the label; a walkcheck PASS does not"); passed()
     testTrailLibraryScanAndReopen()
     print("  trail: sessions root lists newest first, skips empty folders; last folder reopens only if present"); passed()
+    testTrailDeletedTrajectoryIsUnverifiable()
+    print("  trail: deleting trajectory.tum makes a PASS unverifiable in the session and the list"); passed()
+    testTrailRescanReloadsOpenedVerdict()
+    print("  trail: rescan reloads the opened session when the trajectory or walkcheck changes"); passed()
     testTrailViewContract()
     print("  trail: view shows label, raw note and walkcheck; Trail is the 4th tab (Room, Settings, Rig, Trail)"); passed()
 }
