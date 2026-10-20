@@ -27,5 +27,5 @@ RUN . /opt/ros/jazzy/setup.sh \
 COPY tools/map_saver.py /opt/spatio/map_saver.py
 COPY provenance.json /opt/spatio/provenance.json
 
-ARG FASTLIO_REVISION=unknown
+ARG FASTLIO_REVISION
 LABEL spatio.fastlio_revision=$FASTLIO_REVISION
