@@ -645,9 +645,11 @@ def _check_absurd_numbers(
       after the start window ends. A shared instant counts as overlap;
     - a duration of exactly 0 cannot sit beside a moving claim, a positive
       path length, or endpoint windows that span a positive time;
-    - a measured duration cannot be shorter than the time those windows
-      cover. A duration equal to that span still fits. A null duration is
-      not measured.
+    - a measured duration cannot be shorter than one endpoint window, and
+      cannot be shorter than the span of both. Each present window is
+      checked on its own. A duration equal to that length still fits. A
+      null duration is not measured. A null window is skipped, not read
+      as zero.
     """
     if error is not None:
         _check_components(error, errors)
@@ -681,9 +683,10 @@ def _check_zero_duration(
     """Reject a measured duration of exactly 0 that contradicts the run.
 
     Called only from _check_absurd_numbers. Exact 0 is the cutoff for this
-    check. A positive duration that is shorter than the window span is
-    rejected by _check_duration_covers_span. Neither check is a minimum
-    duration. A null duration is not measured.
+    check. A positive duration that is shorter than one endpoint window,
+    or shorter than the span of both, is rejected by
+    _check_duration_covers_span. Neither check is a minimum duration. A
+    null duration is not measured.
     """
     if duration is None or duration != 0.0:
         return
@@ -708,19 +711,27 @@ def _check_duration_covers_span(
     error: Optional[ReturnError],
     errors: List[str],
 ) -> None:
-    """Reject a measured duration shorter than the endpoint-window span.
+    """Reject a measured duration shorter than a window or their paired span.
 
-    Called only from _check_absurd_numbers. The span is the end of the end
-    window minus the start of the start window, so the check compares two
-    lengths. It does not assume the clock starts at zero. A duration equal
-    to the span still fits. One missing window is not a span. A null
-    duration is not measured, and a duration of exactly 0 is left to
+    Called only from _check_absurd_numbers. Each present window is checked
+    on its own: its length is the end of that window minus its start. When
+    both windows are present, the paired span is also checked: the end of
+    the end window minus the start of the start window. Both comparisons
+    are lengths, so the clock does not have to start at zero. A duration
+    equal to a length still fits. A null window is skipped. A null duration
+    is not measured, and a duration of exactly 0 is left to
     _check_zero_duration. This is not a minimum duration.
     """
-    # Exact 0 is already rejected by _check_zero_duration when the span is
-    # positive. This check is the positive-duration case.
-    if duration is None or duration == 0.0:
+    # Exact 0 is already rejected by _check_zero_duration when the paired
+    # span is positive. This check is the positive-duration case.
+    if duration is None or duration == 0.0 or error is None:
         return
+    _check_one_window_duration(
+        duration, error.start_window_s, "return_error.start_window_s", errors
+    )
+    _check_one_window_duration(
+        duration, error.end_window_s, "return_error.end_window_s", errors
+    )
     span = _endpoint_span_s(error)
     if span is None or span <= 0.0:
         return
@@ -730,6 +741,24 @@ def _check_duration_covers_span(
             "duration_s is %s while the endpoint windows span %.6f s; "
             "a run cannot be shorter than the time its endpoint windows cover"
             % (duration, span)
+        )
+
+
+def _check_one_window_duration(
+    duration: float,
+    window: Optional[List[float]],
+    name: str,
+    errors: List[str],
+) -> None:
+    if window is None:
+        return
+    length = window[1] - window[0]
+    # _METRE_MATCH absorbs binary rounding so a duration equal to the window loads.
+    if length - duration > _METRE_MATCH:
+        errors.append(
+            "duration_s is %s while %s covers %.6f s; "
+            "a run cannot be shorter than one of its endpoint windows"
+            % (duration, name, length)
         )
 
 

@@ -1149,23 +1149,127 @@ class SeriesTest(unittest.TestCase):
         self.assertEqual(fitted.duration_s, 1.0)
         self.assertTrue(fitted.w1_supports_pass())
         self.assertTrue(counts_toward_series(fitted))
-        # One missing window is not a span, so a short duration is not rejected for it.
-        open_ended = self.load(
+        # A missing end window does not excuse the start window. The default
+        # start window is [0, 10], ten seconds, which cannot fit in one second.
+        # This used to be asserted as a pass. That assertion was wrong.
+        self.assert_rejected(
             make_walk(
                 "open-ended",
                 duration_s=1.0,
                 return_error={"end_window_s": None},
             ),
+            "return_error.start_window_s covers 10.000000 s",
             "open-ended.json",
         )
-        self.assertIsNone(open_ended.return_error.end_window_s)
-        self.assertTrue(counts_toward_series(open_ended))
         # A duration longer than a span that does not start at zero still loads.
         longer = self.load(
             make_walk("longer", duration_s=220.0, return_error=other_windows),
             "longer.json",
         )
         self.assertTrue(counts_toward_series(longer))
+
+    def test_single_window_longer_than_duration_cannot_pass(self):
+        from spatio.series.report import counts_toward_series
+
+        # Review: duration 1 s, start window [0, 10], end window null.
+        # Three otherwise-valid runs must not come out PASS.
+        with self.assertRaises(InputRejected) as null_end:
+            self.series_of(
+                [
+                    make_walk("e1", duration_s=1.0, return_error={"end_window_s": None}),
+                    make_walk("e2", duration_s=1.0, return_error={"end_window_s": None}),
+                    make_walk("e3", duration_s=1.0, return_error={"end_window_s": None}),
+                ],
+                "null-end-short",
+            )
+        null_end_text = str(null_end.exception)
+        self.assertIn("run-0.json", null_end_text)
+        self.assertIn("duration_s is 1.0", null_end_text)
+        self.assertIn("return_error.start_window_s covers 10.000000 s", null_end_text)
+        self.assertNotIn("span ", null_end_text)
+        # Swapped: start window null, default end window [200, 210].
+        with self.assertRaises(InputRejected) as null_start:
+            self.series_of(
+                [
+                    make_walk("s1", duration_s=1.0, return_error={"start_window_s": None}),
+                    make_walk("s2", duration_s=1.0, return_error={"start_window_s": None}),
+                    make_walk("s3", duration_s=1.0, return_error={"start_window_s": None}),
+                ],
+                "null-start-short",
+            )
+        null_start_text = str(null_start.exception)
+        self.assertIn("run-0.json", null_start_text)
+        self.assertIn("duration_s is 1.0", null_start_text)
+        self.assertIn("return_error.end_window_s covers 10.000000 s", null_start_text)
+        self.assertNotIn("span ", null_start_text)
+        # Status does not make one long window legal.
+        self.assert_rejected(
+            make_walk(
+                "fail-null-end",
+                status="FAIL",
+                reasons=["duration does not cover the start window"],
+                duration_s=1.0,
+                return_error={"end_window_s": None},
+            ),
+            "return_error.start_window_s covers 10.000000 s",
+            "fail-null-end.json",
+        )
+        self.assert_rejected(
+            make_walk(
+                "fail-null-start",
+                status="FAIL",
+                reasons=["duration does not cover the end window"],
+                duration_s=1.0,
+                return_error={"start_window_s": None},
+            ),
+            "return_error.end_window_s covers 10.000000 s",
+            "fail-null-start.json",
+        )
+        # A window whose own length equals the duration still fits.
+        # The other window stays null, so there is no paired span.
+        null_end_fit = self.series_of(
+            [
+                make_walk("f1", duration_s=10.0, return_error={"end_window_s": None}),
+                make_walk("f2", duration_s=10.0, return_error={"end_window_s": None}),
+                make_walk("f3", duration_s=10.0, return_error={"end_window_s": None}),
+            ],
+            "null-end-fits",
+        )
+        self.assertEqual(null_end_fit["verdict"], "PASS")
+        self.assertEqual(null_end_fit["counted_run_ids"], ["f1", "f2", "f3"])
+        null_start_fit = self.load(
+            make_walk("fit-end", duration_s=10.0, return_error={"start_window_s": None}),
+            "fit-end.json",
+        )
+        self.assertIsNone(null_start_fit.return_error.start_window_s)
+        self.assertEqual(null_start_fit.return_error.end_window_s, [200.0, 210.0])
+        self.assertTrue(counts_toward_series(null_start_fit))
+        # A shorter window on a clock that does not start at zero still loads.
+        shorter = self.load(
+            make_walk(
+                "shorter-window",
+                duration_s=10.0,
+                return_error={"start_window_s": [1000.0, 1004.0], "end_window_s": None},
+            ),
+            "shorter-window.json",
+        )
+        self.assertTrue(counts_toward_series(shorter))
+        # The same ten-second length is rejected when the clock does not start at zero.
+        self.assert_rejected(
+            make_walk(
+                "late-window",
+                duration_s=1.0,
+                return_error={"start_window_s": None, "end_window_s": [1000.0, 1010.0]},
+            ),
+            "return_error.end_window_s covers 10.000000 s",
+            "late-window.json",
+        )
+        # Each window can fit while the pair does not. The paired-span check stays.
+        with self.assertRaises(InputRejected) as pair_still:
+            self.load(make_walk("pair-still", duration_s=20.0), "pair-still.json")
+        pair_text = str(pair_still.exception)
+        self.assertIn("span 210.000000 s", pair_text)
+        self.assertNotIn("covers 10.000000 s", pair_text)
 
     def test_null_rendered_not_measured_not_zero(self):
         data = make_walk(
