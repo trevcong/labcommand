@@ -14,7 +14,7 @@ import unittest
 
 import numpy as np
 
-from spatio.wallpatch.doubled import _histogram, _smooth, analyze_distances
+from spatio.wallpatch.doubled import _histogram, _smooth, analyze_distances, reconcile_axes
 from spatio.wallpatch.errors import MapShaMismatch, WallpatchError
 from spatio.wallpatch.geometry import box_axes, crop_points, parse_box
 from spatio.wallpatch.measure import measure_map
@@ -843,6 +843,98 @@ class WallpatchTests(unittest.TestCase):
         self.assertEqual(len(cloud), 400)
         np.testing.assert_allclose(cloud[:200, 1], -0.03)
         np.testing.assert_allclose(cloud[200:, 1], 0.03)
+
+    def test_partial_overlap_pooled_tilt_does_not_pass_doubled_wall(self):
+        # Review repro. Two noiseless 40 by 20 grids, y = ±0.03 m.
+        # x ranges [-0.5, 0.2] and [-0.2, 0.5], z spans [-0.5, 0.5],
+        # hint (0, 1, 0). The pooled fit tilts 3.97 deg. Distances along
+        # that normal used to report a single wall, p95 4.14 cm, and both
+        # gates passed. The sheets are 6 cm apart along the hint.
+        points = _partial_overlap_grids(separation=0.06, overlap=0.2)
+        self.assertEqual(len(points), 1600)
+        self.assertEqual(int(np.count_nonzero(np.isclose(points[:, 1], -0.03))), 800)
+        self.assertEqual(int(np.count_nonzero(np.isclose(points[:, 1], 0.03))), 800)
+        box = [_box("overlap", (0, 0, 0), (0, 1, 0), (0.6, 0.2, 0.6))]
+        with tempfile.TemporaryDirectory() as directory:
+            report, _out = _measure(directory, points, box)
+        patch = report["patches"][0]
+        self.assertEqual(patch["n_cropped"], 1600)
+        self.assertEqual(patch["n_measured"], 1600)
+        self.assertEqual(patch["status"], "MEASURED")
+        self.assertAlmostEqual(patch["plane"]["angle_from_hint_deg"], 3.97, delta=0.02)
+        self.assertGreater(patch["residuals"]["p95_abs_m"], 0.04)
+        self.assertLess(patch["residuals"]["p95_abs_m"], 0.05)
+        self.assertTrue(patch["gate_p95_pass"])
+        self.assertEqual(patch["doubled"], "true")
+        self.assertEqual(patch["separation_axis"], "normal_hint")
+        # map.pcd stores float32. 0.03 m is not bit-exact after the round trip.
+        self.assertAlmostEqual(patch["separation_m"], 0.06, delta=1e-6)
+        self.assertFalse(patch["gate_separation_pass"])
+        self.assertFalse(
+            patch["gate_p95_pass"] is True and patch["gate_separation_pass"] is True
+        )
+
+    def test_partial_overlap_candidate_gap_is_not_evaluable(self):
+        # Same grids, 3 cm apart. The pooled fit reports a single wall.
+        # The hint reports an undetermined candidate. That disagreement
+        # must not pass either gate.
+        points = _partial_overlap_grids(separation=0.03, overlap=0.2)
+        self.assertEqual(len(points), 1600)
+        box = [_box("overlap", (0, 0, 0), (0, 1, 0), (0.6, 0.2, 0.6))]
+        with tempfile.TemporaryDirectory() as directory:
+            report, _out = _measure(directory, points, box)
+        patch = report["patches"][0]
+        self.assertEqual(patch["n_cropped"], 1600)
+        self.assertEqual(patch["status"], "NOT_EVALUABLE")
+        self.assertIsNone(patch["n_measured"])
+        self.assertIsNone(patch["doubled"])
+        self.assertIsNone(patch["separation_m"])
+        self.assertIsNone(patch["separation_axis"])
+        self.assertIsNone(patch["gate_p95_pass"])
+        self.assertIsNone(patch["gate_separation_pass"])
+        self.assertNotEqual(patch["gate_p95_pass"], True)
+        self.assertNotEqual(patch["gate_separation_pass"], True)
+        reason = patch["reasons"][0]
+        self.assertIn("doubled=false", reason)
+        self.assertIn("doubled=undetermined", reason)
+        self.assertIn("not evaluable", reason)
+
+    def test_splits_on_opposite_sides_of_the_gate_are_not_evaluable(self):
+        # Both axes see two surfaces, but one gap would pass 5 cm and the
+        # other would fail. Scoring the smaller gap would be a pass.
+        decision = reconcile_axes(
+            {"doubled": "true", "separation_m": 0.04},
+            {"doubled": "true", "separation_m": 0.06},
+            0.05,
+        )
+        self.assertEqual(decision["kind"], "not_evaluable")
+        self.assertIsNone(decision["stats"])
+        self.assertIn("opposite sides", decision["reason"])
+        self.assertIn("not evaluable", decision["reason"])
+        self.assertIn("0.05", decision["reason"])
+        agreed = reconcile_axes(
+            {"doubled": "true", "separation_m": 0.06},
+            {"doubled": "true", "separation_m": 0.08},
+            0.05,
+        )
+        self.assertEqual(agreed["kind"], "measured")
+        self.assertEqual(agreed["stats"]["separation_m"], 0.06)
+
+
+def _partial_overlap_grids(separation, overlap):
+    """Two noiseless 40 by 20 sheets. Left x ends at +overlap, right x starts at -overlap."""
+    sheets = []
+    half = 0.5 * separation
+    for side in (-1, 1):
+        if side < 0:
+            xs = np.linspace(-0.5, overlap, 40)
+        else:
+            xs = np.linspace(-overlap, 0.5, 40)
+        xx, zz = np.meshgrid(xs, np.linspace(-0.5, 0.5, 20))
+        sheets.append(
+            np.column_stack([xx.ravel(), np.full(xx.size, side * half), zz.ravel()])
+        )
+    return np.vstack(sheets)
 
 
 def _two_strips(z_half):

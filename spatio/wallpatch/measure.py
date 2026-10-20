@@ -19,6 +19,7 @@ from spatio.wallpatch.doubled import (
     UNCERTAIN_SEPARATION_M,
     VALLEY_HEIGHT_RATIO,
     analyze_distances,
+    reconcile_axes,
 )
 from spatio.wallpatch.errors import MapShaMismatch, WallpatchError
 from spatio.wallpatch.figures import write_note_figure, write_patch_figure
@@ -226,13 +227,25 @@ def _measure_one(name, points, spec, invalid_reason):
     normal = fitted["normal"]
     plane_point = fitted["point"]
     # Residuals use every cropped point. The inlier set is only the fit support.
+    # Separation is not taken from that normal alone. A few degrees of pooled
+    # tilt, from sheets that only partly overlap, merges the two peaks.
     signed = project(points - plane_point, normal)
-    stats = analyze_distances(signed)
-    if int(stats["n"]) != n_cropped:
+    fit_stats = analyze_distances(signed)
+    hint_unit = np.asarray(hint, dtype=np.float64)
+    hint_unit = hint_unit / np.linalg.norm(hint_unit)
+    hint_signed = project(points - points.mean(axis=0), hint_unit)
+    hint_stats = analyze_distances(hint_signed)
+    if int(fit_stats["n"]) != n_cropped or int(hint_stats["n"]) != n_cropped:
         raise WallpatchError("internal error: measured count != cropped count")
+    decision = reconcile_axes(fit_stats, hint_stats, SEPARATION_GATE_M)
+    if decision["kind"] != "measured":
+        return _blank(name, n_cropped, decision["reason"], spec)
+    stats = decision["stats"]
     doubled = stats["doubled"]
     separation = stats["separation_m"]
-    p95_pass = bool(stats["p95_abs_m"] <= P95_GATE_M)
+    separation_axis = "normal_hint" if stats is hint_stats else "fitted_plane"
+    # p95 stays the point-to-plane residual. The hint axis is only the gap.
+    p95_pass = bool(fit_stats["p95_abs_m"] <= P95_GATE_M)
     if doubled == "false":
         sep_pass = True
     elif doubled == "true":
@@ -240,6 +253,9 @@ def _measure_one(name, points, spec, invalid_reason):
     else:
         sep_pass = None
     across, vertical, mask = _slice_frame(points, plane_point, normal)
+    if separation_axis == "normal_hint":
+        # The histogram is the hint gap. The scatter uses that same axis.
+        across = hint_signed
     return {
         "name": name,
         "status": "MEASURED",
@@ -257,14 +273,15 @@ def _measure_one(name, points, spec, invalid_reason):
             "eigenvalue_ratio": float(fitted["eigenvalue_ratio"]),
         },
         "residuals": {
-            "p95_abs_m": stats["p95_abs_m"],
-            "thickness_m": stats["thickness_m"],
-            "p2_5_m": stats["p2_5_m"],
-            "p97_5_m": stats["p97_5_m"],
-            "bin_width_m": stats["bin_width_m"],
+            "p95_abs_m": fit_stats["p95_abs_m"],
+            "thickness_m": fit_stats["thickness_m"],
+            "p2_5_m": fit_stats["p2_5_m"],
+            "p97_5_m": fit_stats["p97_5_m"],
+            "bin_width_m": fit_stats["bin_width_m"],
         },
         "doubled": doubled,
         "separation_m": separation,
+        "separation_axis": separation_axis,
         "gate_p95_pass": p95_pass,
         "gate_separation_pass": sep_pass,
         "figure": None,
@@ -292,6 +309,7 @@ def _blank(name, n_cropped, reason, spec):
         "residuals": None,
         "doubled": None,
         "separation_m": None,
+        "separation_axis": None,
         "gate_p95_pass": None,
         "gate_separation_pass": None,
         "figure": None,
@@ -437,6 +455,8 @@ def _markdown(report):
             )
         lines.append("- Doubled: %s" % patch["doubled"])
         lines.append("- Separation: %s" % _metres(patch["separation_m"]))
+        axis = patch["separation_axis"]
+        lines.append("- Separation axis: %s" % (axis if axis else "null"))
         lines.append("- Gate p95: %s" % _flag(patch["gate_p95_pass"]))
         lines.append("- Gate separation: %s" % _flag(patch["gate_separation_pass"]))
         lines.append("- Figure: `%s`" % patch["figure"])
