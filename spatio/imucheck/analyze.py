@@ -35,8 +35,8 @@ covers at least half the window, the angle is between 0.15 and 2.5 rad
 the sum of the short-arc steps between consecutive odometry poses is also
 at most 2.5 rad (a wrapped revolution cannot hide in the endpoint angle).
 That sum is the turn only when no longer angle (the short-arc plus whole
-turns) fits a unit band as closely as the short-arc does. When a longer
-angle fits as well or better, the poses do not show which turn happened
+turns) fits either unit band. A closer band-center fit is not independent
+evidence: if any longer angle fits, the poses do not show which turn happened
 and the window is refused. |∫ω dt| / ∫|ω| dt >= 0.70 (the body
 rate does not reverse), and the IMU samples inside that odometry interval
 actually cover it. Coverage means those samples span at least 80% of the
@@ -829,42 +829,26 @@ def _message_unit_path(t_s, gyro, t_a, t_b):
     return float(integrated[0])
 
 
-def _band_center_distance(ratio):
-    """|log(ratio / band center)| for a ratio that sits in a unit band.
-
-    None when the ratio is outside both bands. The centers are 1 and
-    180/π. Closeness uses that log distance, not a new cutoff.
-    """
+def _ratio_in_unit_band(ratio):
+    """Whether either existing unit tolerance admits this interpretation."""
     if not math.isfinite(ratio) or ratio <= 0.0:
-        return None
+        return False
     lo = 1.0 - GYRO_RATIO_TOL
     hi = 1.0 + GYRO_RATIO_TOL
-    best = None
-    if lo <= ratio <= hi:
-        best = abs(math.log(ratio))
-    if (DEG_PER_RAD * lo) <= ratio <= (DEG_PER_RAD * hi):
-        dist = abs(math.log(ratio / DEG_PER_RAD))
-        if best is None or dist < best:
-            best = dist
-    return best
+    return lo <= ratio <= hi or (DEG_PER_RAD * lo) <= ratio <= (DEG_PER_RAD * hi)
 
 
 def _step_can_hide_a_revolution(path, theta):
-    """True when a longer angle fits a unit band as well as the short-arc.
+    """True when any longer angle fits either unit band.
 
     The longer angles are the short-arc plus whole turns, either way.
-    They use the same rad/s and deg/s bands as the verdict. A longer fit
-    competes only when it is at least as close to its band center as the
-    short-arc is. A short-arc that is the closer fit is the turn.
+    They use the same rad/s and deg/s bands as the verdict. Closeness to
+    a band center cannot resolve competing valid interpretations.
     """
     if not math.isfinite(path) or not math.isfinite(theta) or theta < 0.0:
         return True
     if path <= 0.0:
         return False
-    if theta > 0.0:
-        short_dist = _band_center_distance(path / theta)
-    else:
-        short_dist = None
     # Largest angle still inside the rad/s band. The deg/s band only
     # matches smaller angles, so it cannot extend this limit.
     max_angle = path / (1.0 - GYRO_RATIO_TOL)
@@ -877,10 +861,7 @@ def _step_can_hide_a_revolution(path, theta):
         for angle in (base - theta, base + theta):
             if angle <= theta or angle > max_angle:
                 continue
-            dist = _band_center_distance(path / angle)
-            if dist is None:
-                continue
-            if short_dist is None or dist <= short_dist:
+            if _ratio_in_unit_band(path / angle):
                 return True
         k += 1
     return True
@@ -958,8 +939,7 @@ def _collect_gyro_windows(t_srt, gyr_srt, odom_t, odom_q):
             continue
         stats["n_with_pair"] += 1
         # A sparse pair can hide whole turns inside one short-arc. Refuse
-        # the window when a longer angle fits a unit band as closely as
-        # the short-arc does.
+        # the window when any longer angle fits either unit band.
         hidden = _window_steps_hide_revolution(
             t_srt, gyr_srt, odom_t[j0:j1], odom_q[j0:j1]
         )
