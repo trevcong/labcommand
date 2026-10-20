@@ -4,22 +4,31 @@
 #   spatio/replay/replay.sh <recording> <run-id> [options]
 #
 #   <recording>  folder with bag/ (path, or a name under ~/Developer/spatio-data/recordings)
-#   <run-id>     session name; output goes to ~/Developer/spatio-data/sessions/<run-id>/
+#   <run-id>     session name; output goes to <sessions-root>/<run-id>/
+#
+# Nothing here is specific to one recording: the lidar/IMU topics come from the
+# FAST-LIO config (common.lid_topic / common.imu_topic), the sensor kind from the
+# message types in bag/metadata.yaml, and the copy check from the bag's own MCAP
+# summaries (recording.py).
 #
 # Options:
+#   --config FILE     FAST-LIO params file. Default: the one *.yaml with lid_topic
+#                     inside <recording>; anything else needs --config
+#   --sessions-root D output root (default $SPATIO_DATA/sessions)
+#   --sensor TEXT     manifest sensor text (default: derived from the bag's types)
 #   --rate R          playback rate (default 1.0)
 #   --duration S      play only the first S seconds (smoke tests)
-#   --config FILE     FAST-LIO params file (default: <recording>/mid360.yaml for Mid-360;
-#                     required for JT128, no copied JT128 config exists)
 #   --config-note T   provenance note for --config (goes into manifest notes)
-#   --historical      do not run FAST-LIO; export the bag's own /Odometry from the
+#   --historical      do not run FAST-LIO; export the bag's own odometry from the
 #                     original run, and copy the recording's historical map
-#   --historical-map FILE  map to copy for --historical (relative to <recording>)
+#   --historical-map FILE   map to copy for --historical (relative to <recording>; required)
+#   --historical-odom-topic T  odometry topic for --historical (default /Odometry,
+#                     FAST-LIO's own output name)
+#   --historical-path-topic T  optional nav_msgs/Path topic for --historical
 #   --max-seconds N   hard limit for the container run (default 3600)
 #   --fastdds-profile FILE  Fast DDS XML profile for every node in the container
 #                     (e.g. configs/fastdds_big_shm.xml for large PointCloud2)
-#   --map-voxel M     map.pcd voxel size in metres (default 0.03; the original
-#                     JT128 post-process used 0.05)
+#   --map-voxel M     map.pcd voxel size in metres (default 0.03)
 #
 # Isolation: --network none, private ROS_DOMAIN_ID, recording mounted read-only
 # (as a named volume copy), CPU/memory/pids limits, all capabilities dropped.
@@ -32,10 +41,11 @@ DOMAIN_ID=87
 CPUS=4
 MEM=8g
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [[ $# -ge 2 ]] || usage
 REC_ARG=$1 RUN_ID=$2; shift 2
 RATE=1.0 DURATION="" CONFIG="" CONFIG_NOTE="" MODE=replay HIST_MAP="" MAX_SECONDS=3600 DDS_PROFILE="" MAP_VOXEL=0.03
+SESSIONS_ROOT="$DATA/sessions" SENSOR="" HIST_ODOM_TOPIC=/Odometry HIST_PATH_TOPIC=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --rate) RATE=$2; shift 2 ;;
@@ -47,6 +57,10 @@ while [[ $# -gt 0 ]]; do
     --max-seconds) MAX_SECONDS=$2; shift 2 ;;
     --fastdds-profile) DDS_PROFILE=$2; shift 2 ;;
     --map-voxel) MAP_VOXEL=$2; shift 2 ;;
+    --sessions-root) SESSIONS_ROOT=$2; shift 2 ;;
+    --sensor) SENSOR=$2; shift 2 ;;
+    --historical-odom-topic) HIST_ODOM_TOPIC=$2; shift 2 ;;
+    --historical-path-topic) HIST_PATH_TOPIC=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -54,30 +68,29 @@ done
 [[ $RUN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo "run-id must match [A-Za-z0-9][A-Za-z0-9_.-]*" >&2; exit 2; }
 if [[ -d $REC_ARG ]]; then REC="$(cd "$REC_ARG" && pwd)"; else REC="$DATA/recordings/$REC_ARG"; fi
 [[ -f $REC/bag/metadata.yaml ]] || { echo "no bag/metadata.yaml in $REC" >&2; exit 2; }
-SESSION="$DATA/sessions/$RUN_ID"
-[[ -e $SESSION ]] && { echo "session exists, refusing to overwrite: $SESSION" >&2; exit 2; }
-grep -q "COPY_DONE 0" "$HOME/Developer/lc-tasks/spatio-copy.log" 2>/dev/null \
-  || { echo "recording copy not finished (no COPY_DONE 0)" >&2; exit 2; }
+mkdir -p "$SESSIONS_ROOT"
+SESSION="$(cd "$SESSIONS_ROOT" && pwd)/$RUN_ID"
+# A session folder may already hold logs/ from an earlier pipeline stage
+# (walk-day input check); outputs are never overwritten.
+for f in trajectory.tum map.pcd manifest.json logs/output_bag; do
+  [[ -e $SESSION/$f ]] && { echo "session already has $f, refusing to overwrite: $SESSION" >&2; exit 2; }
+done
+# The copy must be complete: every bag file present and its MCAP summary
+# matching metadata.yaml (an interrupted rsync fails this).
+python3 "$HERE/recording.py" complete "$REC" >/dev/null || { echo "recording copy incomplete or unreadable: $REC" >&2; exit 2; }
 
-# Sensor profile from the bag's topics.
-HIST_PATH_TOPIC=""
-if grep -q "name: /livox/lidar$" "$REC/bag/metadata.yaml"; then
-  SENSOR="Livox Mid-360 + built-in IMU (livox_ros_driver2 CustomMsg)"
-  LIDAR=/livox/lidar IMU=/livox/imu TS_UNIT=3
-  [[ -z $CONFIG && -f $REC/mid360.yaml ]] && CONFIG="$REC/mid360.yaml"
-  [[ -z $HIST_MAP ]] && HIST_MAP=map.pcd
-elif grep -q "name: /slam/points$" "$REC/bag/metadata.yaml"; then
-  SENSOR="Hesai JT128 via jt128_slam_adapter output recorded in bag (/slam/points PointCloud2, /slam/imu)"
-  LIDAR=/slam/points IMU=/slam/imu TS_UNIT=0 HIST_PATH_TOPIC=/path  # point time measured in s
-  [[ -z $HIST_MAP ]] && HIST_MAP=jt128_map.pcd
+# Topics from the config, sensor kind from the bag's message types.
+if [[ -z $CONFIG ]]; then CONFIG="$(python3 "$HERE/recording.py" find-config "$REC")" || exit 2; fi
+[[ -f $CONFIG ]] || { echo "config not found: $CONFIG" >&2; exit 2; }
+CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+PROFILE="$(python3 "$HERE/recording.py" profile "$REC" --config "$CONFIG")" || exit 2
+eval "$PROFILE"   # LIDAR IMU LIDAR_MSG_TYPE TS_UNIT SENSOR_KIND (shell-quoted)
+[[ -n $SENSOR ]] || SENSOR="$SENSOR_KIND"
+if [[ $MODE == historical ]]; then
+  [[ -n $HIST_MAP ]] || { echo "--historical needs --historical-map FILE" >&2; exit 2; }
+  grep -q "name: $HIST_ODOM_TOPIC\$" "$REC/bag/metadata.yaml" || { echo "no $HIST_ODOM_TOPIC in the bag" >&2; exit 2; }
 else
-  echo "unrecognised recording (no /livox/lidar or /slam/points in bag)" >&2; exit 2
-fi
-if [[ $MODE == replay ]]; then
-  [[ -n $CONFIG && -f $CONFIG ]] || { echo "need --config for this recording" >&2; exit 2; }
-  CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
-  # The timestamp unit for PointCloud2 'time' fields comes from the config.
-  u=$(sed -n 's/^ *timestamp_unit: *\([0-9]\).*/\1/p' "$CONFIG" | head -1); [[ -n $u ]] && TS_UNIT=$u
+  HIST_PATH_TOPIC=""
 fi
 
 IMAGE_TAG="spatio/replay:$(git -C "$DATA/spark-src/FAST_LIO_ROS2" rev-parse --short=7 HEAD)"
@@ -122,6 +135,17 @@ if [[ -n $DDS_PROFILE ]]; then
   DDS_ENV=(-e FASTRTPS_DEFAULT_PROFILES_FILE=/cfg/fastdds.xml -e FASTDDS_DEFAULT_PROFILES_FILE=/cfg/fastdds.xml)
 fi
 
+# One replay at a time on this machine: two would oversubscribe the VM and,
+# at playback rate 1, CPU contention can change FAST-LIO's result.
+LOCK="${TMPDIR:-/tmp}/spatio-replay.lock"
+until mkdir "$LOCK" 2>/dev/null; do
+  holder="$(command cat "$LOCK/owner" 2>/dev/null || true)"
+  if [[ -n $holder ]] && ! kill -0 "${holder%% *}" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
+  echo "== waiting for another replay to finish ($holder)"; sleep 15
+done
+echo "$$ $RUN_ID" > "$LOCK/owner"
+trap 'rm -rf "$STAGE"; rm -rf "$LOCK"' EXIT
+
 CONTAINER="spatio-replay-$RUN_ID"
 mkdir -p "$SESSION"
 echo "== $CONTAINER: $MODE $REC -> $SESSION"
@@ -130,7 +154,8 @@ dk create --name "$CONTAINER" \
   --pids-limit 1024 --cap-drop ALL --security-opt no-new-privileges \
   -e ROS_DOMAIN_ID=$DOMAIN_ID -e ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST -e ROS_LOG_DIR=/out/logs/ros \
   -e MODE="$MODE" -e LIDAR="$LIDAR" -e IMU="$IMU" -e RATE="$RATE" -e DURATION="$DURATION" \
-  -e TIMESTAMP_UNIT="$TS_UNIT" -e HIST_PATH_TOPIC="$HIST_PATH_TOPIC" -e MAP_VOXEL="$MAP_VOXEL" \
+  -e TIMESTAMP_UNIT="$TS_UNIT" -e HIST_PATH_TOPIC="$HIST_PATH_TOPIC" -e HIST_ODOM_TOPIC="$HIST_ODOM_TOPIC" \
+  -e MAP_VOXEL="$MAP_VOXEL" \
   ${DDS_ENV[@]+"${DDS_ENV[@]}"} -v "$VOL:/rec:ro" \
   "$IMAGE_TAG" timeout --signal=TERM --kill-after=60 "$MAX_SECONDS" \
   bash /opt/spatio/tools/run_in_container.sh >/dev/null
@@ -157,7 +182,8 @@ json.dump({
   "mode": "$MODE", "container": "$CONTAINER", "container_exit": $RC,
   "image_tag": "$IMAGE_TAG", "image_id": "$IMAGE_ID",
   "replay_tool_revision": "$TOOL_REV",
-  "playback_topics": ["$LIDAR", "$IMU"], "rate": $RATE,
+  "playback_topics": ["$LIDAR", "$IMU"], "lidar_msg_type": "$LIDAR_MSG_TYPE", "rate": $RATE,
+  "config_file": "$CONFIG",
   "duration_s": "${DURATION:-all}", "ros_domain_id": $DOMAIN_ID,
   "recording_volume": "$VOL", "bag_sha256": "$want_sha",
   "limits": {"cpus": $CPUS, "memory": "$MEM", "shm": "1g", "pids": 1024, "max_seconds": $MAX_SECONDS},
@@ -168,7 +194,7 @@ json.dump({
 EOF
 echo "$RC" > "$SESSION/logs/container_exit_code"
 
-# Contract manifest.
+# Contract manifest.  (SENSOR: --sensor, else derived from the bag's message types.)
 if [[ $MODE == replay ]]; then
   M_REV=$FL_REV M_IMAGE="$IMAGE_TAG@$IMAGE_ID" M_CONFIG=$CONFIG
   M_NOTES="Offline FAST-LIO re-run on the Mac (colima, aarch64) of the copied recording; played ${LIDAR} + ${IMU} only at rate ${RATE}${DURATION:+, first ${DURATION} s only}. trajectory.tum = recorded /Odometry header stamps. map.pcd = copied map_saver.py (${MAP_VOXEL} m voxel) over recorded /cloud_registered. Container exit ${RC}. ${CONFIG_NOTE}"
@@ -177,8 +203,8 @@ else
   M_REV="$(sed -n 's/^FAST_LIO_ROS2: *//p' "$REC/provenance.txt" 2>/dev/null | head -1 || true)"
   M_REV="${M_REV:-unknown (not recorded with this recording)}"
   M_IMAGE="original Spark run (image not recorded); exported with $IMAGE_TAG@$IMAGE_ID"
-  M_CONFIG="${CONFIG:-unknown (no config copied with this recording)}"
-  M_NOTES="Historical: trajectory.tum = /Odometry recorded in the bag by the original Spark FAST-LIO run (not re-run here). map.pcd = copy of the recording's $HIST_MAP, which may come from a different run than this trajectory. ${CONFIG_NOTE}"
+  M_CONFIG="$CONFIG"
+  M_NOTES="Historical: trajectory.tum = $HIST_ODOM_TOPIC recorded in the bag by the original Spark FAST-LIO run (not re-run here). map.pcd = copy of the recording's $HIST_MAP, which may come from a different run than this trajectory. ${CONFIG_NOTE}"
 fi
 python3 "$HERE/manifest.py" "$SESSION" --run-id "$RUN_ID" --source-recording "$REC" \
   --sensor "$SENSOR" --fastlio-revision "$M_REV" --config-file "$M_CONFIG" \

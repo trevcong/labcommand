@@ -126,8 +126,10 @@ def main():
     imu_sorted = sorted(imu_t)
     report["imu_header_not_monotonic"] = imu_sorted != imu_t
     report["imu_coverage_of_lidar_scans"] = timing.imu_coverage(scans, imu_sorted)
-    # First 200 IMU samples (~1 s at 200 Hz): rig assumed still at start.
-    report["imu_accel_units"] = timing.accel_units_guess(acc_norms[:200])
+    # First 1 s of IMU samples by header time, whatever the IMU rate: rig
+    # assumed still at start.
+    first_s = [n for t, n in zip(imu_t, acc_norms) if imu_t and t - imu_t[0] <= 1.0]
+    report["imu_accel_units"] = timing.accel_units_guess(first_s)
     report["imu_accel_norm_all"] = {"min": min(acc_norms), "max": max(acc_norms)} if acc_norms else None
     report["imu_gyro_norm_max"] = max(gyro_norms) if gyro_norms else None
     if scan_infos:

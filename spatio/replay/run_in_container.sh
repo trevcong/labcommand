@@ -4,7 +4,7 @@
 # Mounts: /rec (recording, read-only), /cfg/config.yaml (read-only),
 #         /opt/spatio/tools (this directory, read-only), /out (session dir).
 # Env:    MODE=replay|historical  LIDAR IMU  RATE  DURATION (s, empty = all)
-#         MAP_VOXEL  TIMESTAMP_UNIT  HIST_PATH_TOPIC
+#         MAP_VOXEL  TIMESTAMP_UNIT  HIST_ODOM_TOPIC  HIST_PATH_TOPIC
 source /opt/ros/jazzy/setup.bash   # ROS setup scripts are not set -u clean
 source /ws/install/setup.bash
 set -uo pipefail
@@ -24,8 +24,8 @@ python3 "$T/inspect_bag.py" "$BAG" --lidar "$LIDAR" --imu "$IMU" \
     >>"$LOGS/runner.log" 2>&1 || say "WARNING: timing inspection failed (see runner.log)"
 
 if [[ "$MODE" == historical ]]; then
-  say "exporting the bag's own /Odometry (original run)"
-  python3 "$T/bag_to_tum.py" "$BAG" "$OUT/trajectory.tum" --topic /Odometry \
+  say "exporting the bag's own ${HIST_ODOM_TOPIC:-/Odometry} (original run)"
+  python3 "$T/bag_to_tum.py" "$BAG" "$OUT/trajectory.tum" --topic "${HIST_ODOM_TOPIC:-/Odometry}" \
       ${HIST_PATH_TOPIC:+--path-topic "$HIST_PATH_TOPIC"} \
       --summary "$LOGS/trajectory_summary.json" 2>&1 | tee -a "$LOGS/runner.log"
   exit "${PIPESTATUS[0]}"

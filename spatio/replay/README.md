@@ -6,13 +6,34 @@ contract format: `trajectory.tum`, `map.pcd`, `manifest.json` and `logs/`.
 
 ```sh
 spatio/replay/build_image.sh                       # once; tags spatio/replay:<fastlio-rev>
-spatio/replay/replay.sh session_20260808_211213 <run-id>             # Mid-360
-spatio/replay/replay.sh session_20260808_211213 <run-id> --historical
-spatio/replay/replay.sh 20260826T221936Z_JT128_room_walk <run-id> \
-    --config spatio/replay/configs/jt128_fastlio_desktop_2026-08-26.yaml \
-    --fastdds-profile spatio/replay/configs/fastdds_big_shm.xml --map-voxel 0.05
+spatio/replay/replay.sh <recording-dir> <run-id> [--config FILE] [--sessions-root DIR]
+spatio/replay/replay.sh <recording-dir> <run-id> --historical --historical-map map.pcd
 python3 -m unittest discover -s spatio/replay/tests
 python3 spatio/replay/session_table.py ~/Developer/spatio-data/sessions/*   # results table
+```
+
+Nothing in the replay is specific to one recording (task I, Trevor's 22:31
+direction). `recording.py` reads the recording itself:
+
+- **Topics** come from the FAST-LIO config (`common.lid_topic`, `common.imu_topic`).
+  `--config` defaults to the single `*.yaml` containing `lid_topic` inside the
+  recording; anything else must be passed explicitly.
+- **Sensor kind** comes from the message types in `bag/metadata.yaml`. They must
+  agree with the config's `preprocess.lidar_type` (1 = Livox CustomMsg, 2–4 =
+  PointCloud2). The IMU must be `sensor_msgs/msg/Imu`.
+- **Copy completeness:** every bag file listed in `metadata.yaml` exists, and its
+  MCAP summary has the same per-topic counts. This replaced the old check of
+  the one-off copy log.
+- Only one replay runs at a time on this machine. A second one waits on
+  `$TMPDIR/spatio-replay.lock`.
+
+Examples with the two test samples (not defaults anywhere in code):
+
+```sh
+spatio/replay/replay.sh ~/Developer/spatio-data/recordings/session_20260808_211213 <run-id>   # its mid360.yaml is found
+spatio/replay/replay.sh ~/Developer/spatio-data/recordings/20260826T221936Z_JT128_room_walk <run-id> \
+    --config spatio/replay/configs/jt128_fastlio_desktop_2026-08-26.yaml \
+    --fastdds-profile spatio/replay/configs/fastdds_big_shm.xml --map-voxel 0.05
 ```
 
 JT128 configs:

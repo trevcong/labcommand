@@ -1,0 +1,16 @@
+{
+  "spec_id": "synthetic-marked-loop-dryrun",
+  "sensor": "SYNTHETIC Livox-style CustomMsg lidar + co-located IMU (spatio/walkday/synth); not a physical sensor",
+  "route": {
+    "description": "SYNTHETIC: one ellipse loop (6.4 m x 3.2 m) around a pillar in an 11 m x 9 m box room, parked 8 s at each end",
+    "duration_target_s": [60, 70],
+    "intermediate_stops": ["none (synthetic)", "none (synthetic)"]
+  },
+  "reference_point": "SYNTHETIC: the lidar/IMU origin itself",
+  "start_marks": "SYNTHETIC: exact start pose from the generator (SYNTHETIC.json ground_truth)",
+  "frames": {"cart_mount": "SYNTHETIC: identity, sensor 1.0 m above the floor"},
+  "wall_patches": [
+    {"name": "auto-1", "description": "SYNTHETIC: auto-suggested per map", "box_map_frame": null},
+    {"name": "auto-2", "description": "SYNTHETIC: auto-suggested per map", "box_map_frame": null}
+  ]
+}
