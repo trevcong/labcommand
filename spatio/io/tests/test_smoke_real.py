@@ -455,3 +455,98 @@ class SmokeRealTests(unittest.TestCase):
             self.assertEqual(east.read_bytes(), before_east)
             self.assertNotIn("{", proc.stdout)
             self.assertIn("same file", proc.stderr)
+
+    def test_smoke_empty_map_is_a_failed_input_and_other_files_are_still_checked(self):
+        # A zero-point PCD used to raise in np.min and skip every later file.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blank = root / "blank_lobby.pcd"
+            shelf = root / "shelf_scan.pcd"
+            south = root / "push_south.tum"
+            annex = root / "west_annex"
+            annex.mkdir()
+            _write_map(blank, 0)
+            _write_map(shelf, 3)
+            _write_traj(south, 4, 40.0)
+            _write_map(annex / "map.pcd", 0)
+            _write_traj(annex / "trajectory.tum", 2, 80.0)
+            out = root / "report.json"
+            args = [
+                "--map",
+                str(blank),
+                "--map",
+                str(shelf),
+                "--trajectory",
+                str(south),
+                "--session",
+                str(annex),
+                "--out",
+                str(out),
+            ]
+            code, report, text = _run(args)
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(out.read_text(encoding="utf-8")), report)
+            self.assertNotIn("status", report)
+            for token in _RECORDING_TOKENS:
+                self.assertNotIn(token, text)
+            self.assertEqual(
+                [(item["path"], item["status"], item["points_read"]) for item in report["maps"]],
+                [
+                    (str(blank), "empty", 0),
+                    (str(shelf), "read", 3),
+                    (str(annex / "map.pcd"), "empty", 0),
+                ],
+            )
+            blank_report = report["maps"][0]
+            self.assertEqual(blank_report["points_header"], 0)
+            self.assertEqual(blank_report["width"], 0)
+            self.assertEqual(blank_report["height"], 1)
+            self.assertEqual(blank_report["data"], "ascii")
+            self.assertGreater(blank_report["bytes"], 0)
+            self.assertEqual(blank_report["bbox_min_m"], [None, None, None])
+            self.assertEqual(blank_report["bbox_max_m"], [None, None, None])
+            self.assertEqual(blank_report["nonfinite"], {"x": 0, "y": 0, "z": 0})
+            self.assertIn("no points", blank_report["error"])
+            self.assertEqual(report["maps"][2]["bbox_min_m"], [None, None, None])
+            shelf_report = report["maps"][1]
+            self.assertEqual(shelf_report["bbox_min_m"], [0.0, 0.0, 1.0])
+            self.assertEqual(shelf_report["bbox_max_m"], [2.0, 0.0, 1.0])
+            self.assertEqual(shelf_report["nonfinite"], {"x": 0, "y": 0, "z": 0})
+            self.assertEqual(
+                [(item["path"], item["status"], item["n_poses"]) for item in report["trajectories"]],
+                [
+                    (str(south), "read", 4),
+                    (str(annex / "trajectory.tum"), "read", 2),
+                ],
+            )
+            self.assertEqual(report["trajectories"][0]["issues"], [])
+            self.assertLessEqual(abs(report["trajectories"][0]["duration_s"] - 0.3), 1e-9)
+            self.assertEqual(report["trajectories"][1]["issues"], [])
+            self.assertLessEqual(abs(report["trajectories"][1]["duration_s"] - 0.1), 1e-9)
+
+            proc = subprocess.run(
+                [sys.executable, "-m", "spatio.io.smoke_real", *args],
+                cwd=str(REPO),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + "\n" + proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
+            self.assertNotIn("zero-size array", proc.stderr)
+            cli = json.loads(proc.stdout)
+            self.assertEqual(json.loads(out.read_text(encoding="utf-8")), cli)
+            self.assertEqual(
+                [(item["path"], item["status"], item["points_read"]) for item in cli["maps"]],
+                [
+                    (str(blank), "empty", 0),
+                    (str(shelf), "read", 3),
+                    (str(annex / "map.pcd"), "empty", 0),
+                ],
+            )
+            self.assertEqual(
+                [(item["path"], item["status"], item["n_poses"]) for item in cli["trajectories"]],
+                [
+                    (str(south), "read", 4),
+                    (str(annex / "trajectory.tum"), "read", 2),
+                ],
+            )
