@@ -31,7 +31,9 @@ Gyro unit. On the same 1 s grid, compare trapezoidal ∑|ω|Δt with the
 geodesic rotation angle of /Odometry over the odometry samples that fall
 in the window. Magnitudes only. A window is used when the odometry span
 covers at least half the window, the angle is between 0.15 and 2.5 rad
-(below π, so the quaternion short-arc is the whole turn),
+(provisional; below π, so the quaternion short-arc can be the whole turn),
+the sum of the short-arc steps between consecutive odometry poses is also
+at most 2.5 rad (a wrapped revolution cannot hide in the endpoint angle),
 |∫ω dt| / ∫|ω| dt >= 0.70 (the body rate does not reverse), and the IMU
 samples inside that odometry interval actually cover it. Coverage means
 those samples span at least 80% of the interval and no step, including
@@ -40,6 +42,12 @@ ratio 0.75–1.25 → rad/s. The same band times 180/π → deg/s (57.3 is that
 constant rounded). Otherwise undetermined. Nothing is inferred from a
 noise floor. /Odometry was produced by FAST-LIO using this IMU, so the
 ratio is support, not proof.
+
+Clock epochs. Samples are ordered by header time only inside one clock
+run. A sustained rewind whose time range overlaps an earlier run is a
+separate epoch and is not sorted onto that run. Epochs are paired with
+odometry in read order. One sample out of order, or a rewind into a
+range that does not overlap, stays on one timeline.
 
 Bias and noise are the per-axis mean and the sample standard deviation
 (ddof 1) on the stationary samples, in the message's native unit.
@@ -75,6 +83,9 @@ ACCEL_MPS2_HI = 10.3
 GYRO_RATIO_TOL = 0.25
 DEG_PER_RAD = 180.0 / math.pi  # 57.2957..., the task's 57.3
 
+# Provisional (approved for now, revisit after real data). 2.5 rad is below
+# π, so a short-arc is the whole turn only when the path stays under this cap.
+# The cap applies to the endpoint and to the sum of intermediate steps.
 MIN_MOTION_ANGLE_RAD = 0.15
 MAX_MOTION_ANGLE_RAD = 2.5
 MIN_COHERENCE = 0.70
@@ -151,24 +162,21 @@ def characterize(
     rate, intervals, n_backward = _rate_and_intervals(t, header_finite)
 
     if n and np.any(vector_finite):
-        order = np.argsort(t[vector_finite], kind="mergesort")
-        t_srt = t[vector_finite][order]
-        acc_srt = acc[vector_finite][order]
-        gyr_srt = gyr[vector_finite][order]
+        epochs = _epoch_series(t[vector_finite], acc[vector_finite], gyr[vector_finite])
     else:
-        t_srt = np.zeros(0, dtype=np.float64)
-        acc_srt = np.zeros((0, 3), dtype=np.float64)
-        gyr_srt = np.zeros((0, 3), dtype=np.float64)
+        epochs = [(
+            np.zeros(0, dtype=np.float64),
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.float64),
+        )]
 
-    odom_time, odom_q = _as_odom(odom_t, odom_quat)
+    odom_epochs = _odom_epochs(odom_t, odom_quat)
     # Gyro unit does not use the stationary mask, so it can set the unit of
     # the stationary gyro gate without a circular argument.
-    gyro_unit = _gyro_unit(t_srt, gyr_srt, odom_time, odom_q)
+    gyro_unit = _gyro_from_epochs(epochs, odom_epochs)
     gyro_gate_scale = DEG_PER_RAD if gyro_unit["verdict"] == "deg/s" else 1.0
-    windows, diag = _stationary_windows(
-        t_srt,
-        acc_srt,
-        gyr_srt,
+    windows, diag, stat_acc, stat_gyr = _stationary_across(
+        epochs,
         gyro_std_max=GYRO_MAG_STD_MAX * gyro_gate_scale,
         gyro_median_max=GYRO_MAG_MEDIAN_MAX * gyro_gate_scale,
     )
@@ -179,11 +187,10 @@ def characterize(
     else:
         diag["t_first"] = None
         diag["t_last"] = None
-    stat_mask = _mask_windows(t_srt, windows)
-
-    accel_norm_stats, accel_unit = _accel_unit(acc_srt, stat_mask)
-    gravity = _gravity(acc_srt, stat_mask)
-    gyro_bias, gyro_noise, accel_noise = _bias_and_noise(acc_srt, gyr_srt, stat_mask)
+    stat_mask = np.ones(len(stat_acc), dtype=bool)
+    accel_norm_stats, accel_unit = _accel_unit(stat_acc, stat_mask)
+    gravity = _gravity(stat_acc, stat_mask)
+    gyro_bias, gyro_noise, accel_noise = _bias_and_noise(stat_acc, stat_gyr, stat_mask)
 
     covariance = {
         "orientation": _classify_covariance(orientation_covariance),
@@ -352,12 +359,6 @@ def _stationary_windows(t_srt, acc_srt, gyr_srt, gyro_std_max=GYRO_MAG_STD_MAX, 
                 n_fail_gyro_median += 1
 
     merged = _merge(passed)
-
-    def _pct(values, q):
-        if not values:
-            return None
-        return float(np.percentile(np.asarray(values, dtype=np.float64), q))
-
     diag = {
         "n_windows": n_windows,
         "n_pass": len(passed),
@@ -367,12 +368,77 @@ def _stationary_windows(t_srt, acc_srt, gyr_srt, gyro_std_max=GYRO_MAG_STD_MAX, 
         "n_too_short": n_too_short,
         "gyro_std_max": float(gyro_std_max),
         "gyro_median_max": float(gyro_median_max),
-        "gyro_mag_std_p10": _pct(gyro_stds, 10),
-        "gyro_mag_std_p50": _pct(gyro_stds, 50),
-        "accel_rel_std_p10": _pct(accel_rels, 10),
-        "accel_rel_std_p50": _pct(accel_rels, 50),
+        "gyro_mag_std_p10": _percentile(gyro_stds, 10),
+        "gyro_mag_std_p50": _percentile(gyro_stds, 50),
+        "accel_rel_std_p10": _percentile(accel_rels, 10),
+        "accel_rel_std_p50": _percentile(accel_rels, 50),
+        "_gyro_stds": gyro_stds,
+        "_accel_rels": accel_rels,
     }
     return merged, diag
+
+
+def _percentile(values, q):
+    if not values:
+        return None
+    return float(np.percentile(np.asarray(values, dtype=np.float64), q))
+
+
+def _combine_stationary_diags(diags):
+    """Sum window counts and recompute percentiles on the pooled windows."""
+    keys = (
+        "n_windows",
+        "n_pass",
+        "n_fail_accel",
+        "n_fail_gyro_std",
+        "n_fail_gyro_median",
+        "n_too_short",
+    )
+    gyro_stds: List[float] = []
+    accel_rels: List[float] = []
+    combined = {key: 0 for key in keys}
+    for diag in diags:
+        for key in keys:
+            combined[key] += diag[key]
+        gyro_stds.extend(diag["_gyro_stds"])
+        accel_rels.extend(diag["_accel_rels"])
+    first = diags[0]
+    combined["gyro_std_max"] = first["gyro_std_max"]
+    combined["gyro_median_max"] = first["gyro_median_max"]
+    combined["gyro_mag_std_p10"] = _percentile(gyro_stds, 10)
+    combined["gyro_mag_std_p50"] = _percentile(gyro_stds, 50)
+    combined["accel_rel_std_p10"] = _percentile(accel_rels, 10)
+    combined["accel_rel_std_p50"] = _percentile(accel_rels, 50)
+    return combined
+
+
+def _stationary_across(epochs, gyro_std_max, gyro_median_max):
+    """Stationary windows per clock epoch. Overlapping epochs are not merged."""
+    windows: List[Tuple[float, float]] = []
+    diags = []
+    acc_parts = []
+    gyr_parts = []
+    for t_srt, acc_srt, gyr_srt in epochs:
+        epoch_windows, diag = _stationary_windows(
+            t_srt,
+            acc_srt,
+            gyr_srt,
+            gyro_std_max=gyro_std_max,
+            gyro_median_max=gyro_median_max,
+        )
+        windows.extend(epoch_windows)
+        diags.append(diag)
+        mask = _mask_windows(t_srt, epoch_windows)
+        if np.any(mask):
+            acc_parts.append(acc_srt[mask])
+            gyr_parts.append(gyr_srt[mask])
+    if acc_parts:
+        stat_acc = np.concatenate(acc_parts, axis=0)
+        stat_gyr = np.concatenate(gyr_parts, axis=0)
+    else:
+        stat_acc = np.zeros((0, 3), dtype=np.float64)
+        stat_gyr = np.zeros((0, 3), dtype=np.float64)
+    return windows, _combine_stationary_diags(diags), stat_acc, stat_gyr
 
 
 def _merge(windows: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
@@ -482,9 +548,79 @@ def _bias_and_noise(acc_srt, gyr_srt, mask):
     return bias, gyro_noise, accel_noise
 
 
-def _as_odom(odom_t, odom_quat):
+def _segment_bounds(t):
+    """Read-order [start, end) runs of one clock.
+
+    A stamp that moves backward starts a new run, except when the next
+    stamp continues the time already reached (one sample out of order)
+    or the backward stamp is the last sample. Equal stamps stay together.
+    """
+    n = int(len(t))
+    if n == 0:
+        return []
+    bounds = []
+    start = 0
+    i = 1
+    while i < n:
+        if t[i] < t[i - 1]:
+            if i + 1 >= n or t[i + 1] >= t[i - 1]:
+                i += 1
+                continue
+            bounds.append((start, i))
+            start = i
+        i += 1
+    bounds.append((start, n))
+    return bounds
+
+
+def _segments_overlap(t, bounds):
+    """True when two runs cover the same header time."""
+    if len(bounds) < 2:
+        return False
+    spans = []
+    for start, stop in bounds:
+        chunk = t[start:stop]
+        spans.append((float(np.min(chunk)), float(np.max(chunk))))
+    spans.sort()
+    max_end = spans[0][1]
+    for start, end in spans[1:]:
+        if start < max_end:
+            return True
+        if end > max_end:
+            max_end = end
+    return False
+
+
+def _epoch_series(t, acc, gyr):
+    """Sorted (t, accel, gyro) epochs.
+
+    Overlapping rewinds are not sorted onto one timeline. A rewind into
+    a disjoint range is one timeline, which is what a global sort already
+    did.
+    """
+    bounds = _segment_bounds(t)
+    if len(bounds) <= 1 or not _segments_overlap(t, bounds):
+        order = np.argsort(t, kind="mergesort")
+        return [(t[order], acc[order], gyr[order])]
+    epochs = []
+    for start, stop in bounds:
+        order = np.argsort(t[start:stop], kind="mergesort")
+        epochs.append((
+            t[start:stop][order],
+            acc[start:stop][order],
+            gyr[start:stop][order],
+        ))
+    return epochs
+
+
+def _odom_epochs(odom_t, odom_quat):
+    """Sorted (t, xyzw) epochs, or None when there is no usable odometry.
+
+    Same overlap rule as the IMU series. Finite samples keep read order
+    until a run is sorted on its own.
+    """
     if odom_t is None or odom_quat is None:
-        return None, None
+        return None
     ot = np.asarray(odom_t, dtype=np.float64)
     oq = np.asarray(odom_quat, dtype=np.float64)
     if ot.ndim != 1:
@@ -494,12 +630,21 @@ def _as_odom(odom_t, odom_quat):
     if len(ot) != len(oq):
         raise ValueError("odom_t and odom_quat must have the same length")
     if len(ot) == 0:
-        return None, None
+        return None
     finite = np.isfinite(ot) & np.all(np.isfinite(oq), axis=1)
     if not np.any(finite):
-        return None, None
-    order = np.argsort(ot[finite], kind="mergesort")
-    return ot[finite][order], oq[finite][order]
+        return None
+    ot = ot[finite]
+    oq = oq[finite]
+    bounds = _segment_bounds(ot)
+    if len(bounds) <= 1 or not _segments_overlap(ot, bounds):
+        order = np.argsort(ot, kind="mergesort")
+        return [(ot[order], oq[order])]
+    epochs = []
+    for start, stop in bounds:
+        order = np.argsort(ot[start:stop], kind="mergesort")
+        epochs.append((ot[start:stop][order], oq[start:stop][order]))
+    return epochs
 
 
 def _rotation_angle_rad(q_a, q_b) -> Optional[float]:
@@ -520,6 +665,23 @@ def _rotation_angle_rad(q_a, q_b) -> Optional[float]:
     w = w2 * w1 - x2 * x1 - y2 * y1 - z2 * z1
     vnorm = math.sqrt(x * x + y * y + z * z)
     return 2.0 * math.atan2(vnorm, abs(w))
+
+
+def _accumulated_turn_rad(quats) -> Optional[float]:
+    """Sum of short-arc steps between consecutive xyzw poses.
+
+    The endpoint short-arc hides whole revolutions. The sum does not,
+    as long as each step itself is below π. A sum above the provisional
+    2.5 rad cap is not a usable turn.
+    """
+    total = 0.0
+    count = len(quats)
+    for index in range(count - 1):
+        step = _rotation_angle_rad(quats[index], quats[index + 1])
+        if step is None:
+            return None
+        total += step
+    return total
 
 
 def parse_positive_seconds(value, name):
@@ -620,27 +782,31 @@ def _integrate(t_s, gyro, t_a, t_b):
     return path, vec
 
 
-def _gyro_unit(t_srt, gyr_srt, odom_t, odom_q):
-    base = {
-        "verdict": "undetermined",
-        "ratio": None,
-        "windows_used": 0,
-        "evidence": "",
-        "caveat": CAVEAT,
+def _empty_gyro_stats():
+    return {
+        "max_angle": 0.0,
+        "n_with_pair": 0,
+        "n_angle_in_range": 0,
+        "n_coverage_fail": 0,
+        "n_gap_fail": 0,
+        "n_coherence_fail": 0,
+        "n_wrapped": 0,
     }
-    if odom_t is None or odom_q is None:
-        base["evidence"] = (
-            "No odometry was supplied. Gyro unit is undetermined; "
-            "it was not guessed from the noise level."
-        )
-        return base
+
+
+def _add_gyro_stats(total, part):
+    for key, value in part.items():
+        if key == "max_angle":
+            if value > total[key]:
+                total[key] = value
+        else:
+            total[key] += value
+
+
+def _collect_gyro_windows(t_srt, gyr_srt, odom_t, odom_q):
+    """Ratio samples for one IMU epoch against one odometry epoch."""
     ratios: List[float] = []
-    max_angle = 0.0
-    n_with_pair = 0
-    n_angle_in_range = 0
-    n_coverage_fail = 0
-    n_gap_fail = 0
-    n_coherence_fail = 0
+    stats = _empty_gyro_stats()
     for start, stop, _i0, _i1, long_enough in _window_bounds(t_srt):
         if not long_enough:
             continue
@@ -655,18 +821,26 @@ def _gyro_unit(t_srt, gyr_srt, odom_t, odom_q):
         angle = _rotation_angle_rad(odom_q[j0], odom_q[j1 - 1])
         if angle is None:
             continue
-        n_with_pair += 1
-        if angle > max_angle:
-            max_angle = angle
+        accumulated = _accumulated_turn_rad(odom_q[j0:j1])
+        if accumulated is None:
+            continue
+        stats["n_with_pair"] += 1
+        # The path length is the rotation the cap is about. The endpoint
+        # short-arc is only the denominator once that path is in range.
+        if accumulated > stats["max_angle"]:
+            stats["max_angle"] = accumulated
+        if accumulated > MAX_MOTION_ANGLE_RAD:
+            stats["n_wrapped"] += 1
+            continue
         if angle < MIN_MOTION_ANGLE_RAD or angle > MAX_MOTION_ANGLE_RAD:
             continue
-        n_angle_in_range += 1
+        stats["n_angle_in_range"] += 1
         reason = _imu_interval_problem(t_srt, t_a, t_b)
         if reason == "gap":
-            n_gap_fail += 1
+            stats["n_gap_fail"] += 1
             continue
         if reason is not None:
-            n_coverage_fail += 1
+            stats["n_coverage_fail"] += 1
             continue
         integrated = _integrate(t_srt, gyr_srt, t_a, t_b)
         if integrated is None:
@@ -674,23 +848,35 @@ def _gyro_unit(t_srt, gyr_srt, odom_t, odom_q):
         path, vec = integrated
         coherence = float(np.linalg.norm(vec) / path)
         if coherence < MIN_COHERENCE:
-            n_coherence_fail += 1
+            stats["n_coherence_fail"] += 1
             continue
         ratios.append(path / angle)
+    return ratios, stats
 
+
+def _ratios_to_verdict(ratios, stats, prefix):
+    base = {
+        "verdict": "undetermined",
+        "ratio": None,
+        "windows_used": 0,
+        "evidence": "",
+        "caveat": CAVEAT,
+    }
     if not ratios:
-        if n_with_pair == 0:
+        if stats["n_with_pair"] == 0:
             detail = "No 1 s window contained two usable odometry poses."
         else:
             detail = (
                 "No motion window met the gates (odometry rotation between "
-                "{0:.2f} and {1:.1f} rad, coherence >= {2:.2f}, odometry span "
+                "{0:.2f} and {1:.1f} rad, including the sum of intermediate "
+                "odometry steps, coherence >= {2:.2f}, odometry span "
                 ">= {3:.0%} of the window, IMU samples spanning >= {4:.0%} of "
-                "the odometry interval, no gap above {5:g} s). These coverage "
-                "limits are {6}. Windows with a pose pair: {7}. Of those, {8} "
-                "had a rotation in range, {9} failed IMU coverage, {10} failed "
-                "the gap limit, and {11} failed coherence. Largest 1 s "
-                "odometry rotation was {12:.4f} rad.".format(
+                "the odometry interval, no gap above {5:g} s). These limits "
+                "are {6}. Windows with a pose pair: {7}. Of those, {8} "
+                "had a rotation in range, {9} failed because intermediate "
+                "steps exceeded the rotation limit, {10} failed IMU coverage, "
+                "{11} failed the gap limit, and {12} failed coherence. Largest "
+                "1 s odometry rotation was {13:.4f} rad.".format(
                     MIN_MOTION_ANGLE_RAD,
                     MAX_MOTION_ANGLE_RAD,
                     MIN_COHERENCE,
@@ -698,16 +884,19 @@ def _gyro_unit(t_srt, gyr_srt, odom_t, odom_q):
                     MIN_IMU_COVERAGE_FRACTION,
                     MAX_IMU_GAP_S,
                     PROVISIONAL_LABEL,
-                    n_with_pair,
-                    n_angle_in_range,
-                    n_coverage_fail,
-                    n_gap_fail,
-                    n_coherence_fail,
-                    max_angle,
+                    stats["n_with_pair"],
+                    stats["n_angle_in_range"],
+                    stats["n_wrapped"],
+                    stats["n_coverage_fail"],
+                    stats["n_gap_fail"],
+                    stats["n_coherence_fail"],
+                    stats["max_angle"],
                 )
             )
         base["evidence"] = (
-            detail + " Gyro unit is undetermined; it was not guessed from the noise level."
+            prefix
+            + detail
+            + " Gyro unit is undetermined; it was not guessed from the noise level."
         )
         return base
 
@@ -750,9 +939,53 @@ def _gyro_unit(t_srt, gyr_srt, odom_t, odom_q):
         "verdict": verdict,
         "ratio": median,
         "windows_used": int(arr.size),
-        "evidence": evidence,
+        "evidence": prefix + evidence,
         "caveat": CAVEAT,
     }
+
+
+def _gyro_from_epochs(imu_epochs, odom_epochs):
+    """Gyro unit across clock epochs.
+
+    Overlapping epochs are paired in read order. They are not matched by
+    the shared timestamp numbers. A count mismatch is ambiguous.
+    """
+    base = {
+        "verdict": "undetermined",
+        "ratio": None,
+        "windows_used": 0,
+        "evidence": "",
+        "caveat": CAVEAT,
+    }
+    if odom_epochs is None:
+        base["evidence"] = (
+            "No odometry was supplied. Gyro unit is undetermined; "
+            "it was not guessed from the noise level."
+        )
+        return base
+    n_imu = len(imu_epochs)
+    n_odom = len(odom_epochs)
+    if n_imu != n_odom:
+        base["evidence"] = (
+            "Overlapping clock epochs could not be paired ({0} IMU epochs, "
+            "{1} odometry epochs). They were not placed on one timeline. "
+            "Gyro unit is undetermined; it was not guessed from the noise level."
+        ).format(n_imu, n_odom)
+        return base
+    prefix = ""
+    if n_imu > 1:
+        prefix = (
+            "Overlapping clock epochs were kept separate ({0} IMU, {1} odometry). "
+        ).format(n_imu, n_odom)
+    ratios: List[float] = []
+    stats = _empty_gyro_stats()
+    for (_t_srt, _acc_srt, gyr_srt), (odom_t, odom_q) in zip(imu_epochs, odom_epochs):
+        part_ratios, part_stats = _collect_gyro_windows(
+            _t_srt, gyr_srt, odom_t, odom_q
+        )
+        ratios.extend(part_ratios)
+        _add_gyro_stats(stats, part_stats)
+    return _ratios_to_verdict(ratios, stats, prefix)
 
 
 def _classify_covariance(values):

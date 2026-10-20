@@ -302,6 +302,122 @@ class ImuCheckTests(unittest.TestCase):
             _integrate(hole_t, np.ones((2, 3)), float(hole_t[0]), float(hole_t[1]))
         )
 
+    def test_gyro_unit_rejects_overlapping_clock_epochs(self):
+        # Two repeated 0–1.99 s epochs, a genuine deg/s stream of a 0.01 rad/s
+        # turn, and a 0.53481 rad odometry offset after the reset. Sorting
+        # the epochs together reported rad/s at ratio 1.000. The backward
+        # stamp was already counted, and that did not change the verdict.
+        hz = 100.0
+        epoch = np.arange(0.0, 2.0, 1.0 / hz)
+        self.assertAlmostEqual(float(epoch[-1]), 1.99, places=6)
+        t = np.concatenate([epoch, epoch])
+        accel = np.zeros((len(t), 3), dtype=np.float64)
+        accel[:, 2] = 1.0
+        gyro = np.zeros((len(t), 3), dtype=np.float64)
+        gyro[:, 2] = 0.01 * DEG_PER_RAD
+        odom = epoch[::5]
+        yaw = np.concatenate([0.01 * odom, 0.53481 + 0.01 * odom])
+        odom_t = np.concatenate([odom, odom])
+        odom_q = np.zeros((len(odom_t), 4), dtype=np.float64)
+        odom_q[:, 2] = np.sin(yaw / 2.0)
+        odom_q[:, 3] = np.cos(yaw / 2.0)
+        report = characterize(
+            t, accel, gyro, odom_t=odom_t, odom_quat=odom_q, topic="/test"
+        )
+        gyro_unit = report["gyro_unit"]
+        self.assertEqual(gyro_unit["verdict"], "undetermined")
+        self.assertIsNone(gyro_unit["ratio"])
+        self.assertEqual(gyro_unit["windows_used"], 0)
+        evidence = gyro_unit["evidence"].lower()
+        self.assertIn("kept separate", evidence)
+        self.assertIn("not guessed", evidence)
+        self.assertIn(
+            "1 consecutive header steps decreased", " ".join(report["findings"])
+        )
+
+        # The same offset on two epochs that each actually turn 0.5 rad/s
+        # stays deg/s. The epochs are scored apart, not refused outright.
+        long_epoch = np.arange(int(4.0 * hz), dtype=np.float64) / hz
+        t_long = np.concatenate([long_epoch, long_epoch])
+        accel_long = np.zeros((len(t_long), 3), dtype=np.float64)
+        accel_long[:, 2] = 1.0
+        gyro_long = np.zeros((len(t_long), 3), dtype=np.float64)
+        gyro_long[:, 2] = 0.5 * DEG_PER_RAD
+        odom_long = long_epoch[::5]
+        yaw_long = np.concatenate([0.5 * odom_long, 0.53481 + 0.5 * odom_long])
+        odom_t_long = np.concatenate([odom_long, odom_long])
+        odom_q_long = np.zeros((len(odom_t_long), 4), dtype=np.float64)
+        odom_q_long[:, 2] = np.sin(yaw_long / 2.0)
+        odom_q_long[:, 3] = np.cos(yaw_long / 2.0)
+        kept = characterize(
+            t_long,
+            accel_long,
+            gyro_long,
+            odom_t=odom_t_long,
+            odom_quat=odom_q_long,
+            topic="/test",
+        )
+        self.assertEqual(kept["gyro_unit"]["verdict"], "deg/s")
+        self.assertAlmostEqual(kept["gyro_unit"]["ratio"], DEG_PER_RAD, places=4)
+        self.assertGreater(kept["gyro_unit"]["windows_used"], 0)
+        self.assertIn("kept separate", kept["gyro_unit"]["evidence"].lower())
+
+        # One sample out of order is not a second clock.
+        swapped_t, swapped_accel, swapped_gyro, swapped_odom_t, swapped_odom_q = _yaw_stream(
+            rate_rad_s=0.5, gyro_scale=1.0
+        )
+        swapped_t = swapped_t.copy()
+        swapped_t[10], swapped_t[11] = swapped_t[11], swapped_t[10]
+        swapped = characterize(
+            swapped_t,
+            swapped_accel,
+            swapped_gyro,
+            odom_t=swapped_odom_t,
+            odom_quat=swapped_odom_q,
+            topic="/test",
+        )
+        self.assertEqual(swapped["gyro_unit"]["verdict"], "rad/s")
+        self.assertAlmostEqual(swapped["gyro_unit"]["ratio"], 1.0, places=4)
+        self.assertNotIn("kept separate", swapped["gyro_unit"]["evidence"].lower())
+
+        # IMU rewinds and odometry does not. Do not match them by timestamp.
+        mismatch = characterize(
+            t, accel, gyro, odom_t=odom, odom_quat=odom_q[: len(odom)], topic="/test"
+        )
+        self.assertEqual(mismatch["gyro_unit"]["verdict"], "undetermined")
+        self.assertIsNone(mismatch["gyro_unit"]["ratio"])
+        self.assertEqual(mismatch["gyro_unit"]["windows_used"], 0)
+        self.assertIn("could not be paired", mismatch["gyro_unit"]["evidence"].lower())
+
+    def test_gyro_unit_rejects_wrapped_odometry_turns(self):
+        # Continuous 13.462727 rad/s, fully sampled IMU and matching odometry.
+        # The endpoint short-arc is about 0.22 rad, so the old check reported
+        # deg/s at ratio 57.2958 across four windows.
+        rate = 13.462727
+        t, accel, gyro, odom_t, odom_q = _yaw_stream(rate_rad_s=rate, gyro_scale=1.0)
+        report = characterize(
+            t, accel, gyro, odom_t=odom_t, odom_quat=odom_q, topic="/test"
+        )
+        gyro_unit = report["gyro_unit"]
+        self.assertEqual(gyro_unit["verdict"], "undetermined")
+        self.assertIsNone(gyro_unit["ratio"])
+        self.assertEqual(gyro_unit["windows_used"], 0)
+        evidence = gyro_unit["evidence"].lower()
+        self.assertIn("intermediate", evidence)
+        self.assertIn("provisional", evidence)
+        self.assertIn("not guessed", evidence)
+
+        # A fast turn that stays under the provisional 2.5 rad cap is rad/s.
+        t_ok, accel_ok, gyro_ok, odom_t_ok, odom_q_ok = _yaw_stream(
+            rate_rad_s=2.0, gyro_scale=1.0
+        )
+        ok = characterize(
+            t_ok, accel_ok, gyro_ok, odom_t=odom_t_ok, odom_quat=odom_q_ok, topic="/test"
+        )
+        self.assertEqual(ok["gyro_unit"]["verdict"], "rad/s")
+        self.assertAlmostEqual(ok["gyro_unit"]["ratio"], 1.0, places=4)
+        self.assertGreater(ok["gyro_unit"]["windows_used"], 0)
+
     def test_gyro_bias_and_noise(self):
         n = 200
         t = np.arange(n, dtype=np.float64) / float(n)
