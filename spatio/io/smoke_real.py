@@ -8,6 +8,8 @@ exit code.
 
 The JSON report is written to ``--out``. When ``--out`` is omitted it
 goes to ``~/Developer/spatio-data/derived/g1-io-fixtures/real_pcd_smoke.json``.
+``--out`` must not be an input file. The same path, a symlink, and a hard
+link are rejected before any write, and the process exits 1.
 Recordings and sessions are not modified.
 """
 
@@ -16,8 +18,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import sys
 import time
 from pathlib import Path
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -35,6 +40,18 @@ def main(argv=None) -> int:
         root = Path(session)
         map_paths.append(root / "map.pcd")
         traj_paths.append(root / "trajectory.tum")
+    out = Path(args.out)
+    try:
+        clash = _aliased_input(out, map_paths + traj_paths)
+    except OSError as exc:
+        print("refusing to write %s: %s" % (out, exc), file=sys.stderr)
+        return 1
+    if clash is not None:
+        print(
+            "refusing to write %s: it is the same file as input %s" % (out, clash),
+            file=sys.stderr,
+        )
+        return 1
     report = {"maps": [], "trajectories": []}
     if not map_paths and not traj_paths:
         report["status"] = "missing required inputs"
@@ -44,7 +61,6 @@ def main(argv=None) -> int:
         for path in traj_paths:
             report["trajectories"].append(_trajectory_report(path))
     text = json.dumps(report, indent=2) + "\n"
-    out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")
     print(text, end="")
@@ -83,9 +99,99 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out",
         default=str(DEFAULT_OUT),
-        help="JSON report path (default: %(default)s).",
+        help=(
+            "JSON report path (default: %(default)s). "
+            "Must not be the same file as an input."
+        ),
     )
     return parser
+
+
+def _aliased_input(out: Path, inputs: Sequence[Path]) -> Optional[Path]:
+    """Return the first input that is the same file as ``out``.
+
+    ``resolve`` collapses symlinks, ``..``, and a report path that does not
+    exist yet. It does not collapse hard links, so those are compared by
+    device and inode. On a case-insensitive directory the resolved path is
+    compared case-folded, because ``resolve`` keeps the spelling it was given.
+    """
+
+    out_resolved = _resolve_output(out)
+    fold = _case_insensitive(out_resolved)
+    out_key = _path_key(out_resolved, fold)
+    for src in inputs:
+        src_resolved = _try_resolve(src)
+        if src_resolved is not None:
+            src_fold = fold or _case_insensitive(src_resolved)
+            if src_fold and not fold:
+                fold = True
+                out_key = _path_key(out_resolved, True)
+            if _path_key(src_resolved, src_fold) == out_key:
+                return src
+        try:
+            if os.path.samefile(out, src):
+                return src
+        except OSError:
+            pass
+    return None
+
+
+def _resolve_output(path: Path) -> Path:
+    resolved = _try_resolve(path)
+    if resolved is None:
+        raise OSError("cannot resolve output path %s" % path)
+    return resolved
+
+
+def _try_resolve(path: Path) -> Optional[Path]:
+    try:
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _path_key(resolved: Path, fold: bool) -> str:
+    text = os.path.normpath(os.fspath(resolved))
+    if fold:
+        return text.casefold()
+    return text
+
+
+def _case_insensitive(path: Path) -> bool:
+    """True when a directory on ``path`` treats ``A`` and ``a`` as one name."""
+
+    current = path if path.is_dir() else path.parent
+    for _ in range(64):
+        if current.is_dir():
+            flipped = _flip_case(current.name)
+            if flipped != current.name:
+                other = current.with_name(flipped)
+                try:
+                    return os.path.samefile(current, other)
+                except OSError:
+                    return False
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+    return False
+
+
+def _flip_case(name: str) -> str:
+    chars = []
+    changed = False
+    for char in name:
+        if char.islower():
+            chars.append(char.upper())
+            changed = True
+        elif char.isupper():
+            chars.append(char.lower())
+            changed = True
+        else:
+            chars.append(char)
+    if not changed:
+        return name
+    return "".join(chars)
 
 
 def _exit_code(report: dict) -> int:
