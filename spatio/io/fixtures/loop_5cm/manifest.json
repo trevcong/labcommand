@@ -1,0 +1,12 @@
+{
+  "run_id": "loop_5cm",
+  "source_recording": "synthetic://loop_5cm",
+  "sensor": "synthetic",
+  "fastlio_revision": "none",
+  "config_file": "spatio/io/synth.py",
+  "config_sha256": "0609d7592a42d7dcb4962bc813b2e2f9114fd71dfeb49bd9b6d4b2f1d7281c7e",
+  "image": "none",
+  "created_at": "2026-10-19T00:00:00Z",
+  "notes": "replay demonstrated; physical accuracy not evaluated. Synthetic fixture, not a FAST-LIO replay. square loop that stops 0.03 m east and 0.04 m north, a 0.050 m horizontal miss. config_sha256 is the SHA-256 of the canonical JSON of the synthetic parameters.",
+  "physical_accuracy_evaluated": false
+}

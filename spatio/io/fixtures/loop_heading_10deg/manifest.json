@@ -1,0 +1,12 @@
+{
+  "run_id": "loop_heading_10deg",
+  "source_recording": "synthetic://loop_heading_10deg",
+  "sensor": "synthetic",
+  "fastlio_revision": "none",
+  "config_file": "spatio/io/synth.py",
+  "config_sha256": "e2b85a3365fac23a772034181314ec4049214d8e455be92bcde58a468309481c",
+  "image": "none",
+  "created_at": "2026-10-19T00:00:00Z",
+  "notes": "replay demonstrated; physical accuracy not evaluated. Synthetic fixture, not a FAST-LIO replay. closed square loop whose final hold is yawed 10 degrees. config_sha256 is the SHA-256 of the canonical JSON of the synthetic parameters.",
+  "physical_accuracy_evaluated": false
+}

@@ -1,0 +1,16 @@
+{
+  "n_poses": 519,
+  "duration_s": 51.799999952316284,
+  "path_length_m": 15.881043674065008,
+  "monotonic": true,
+  "max_gap_s": 0.10000014305114746,
+  "resets": 0,
+  "return_error_d3_m": 0.1499999999999998,
+  "return_error_horizontal_m": 0.1499999999999998,
+  "return_error_vertical_m": 0.0,
+  "heading_error_deg": 0.0,
+  "stationary_window_s": 10.0,
+  "map_points": 8,
+  "wall_separation_m": null,
+  "notes": "Return error compares the mean position over the first stationary_window_s seconds with the mean over the last stationary_window_s seconds, including a 1e-6 s edge so float rounding cannot drop the boundary sample. There is no alignment. Horizontal error is the XY norm. Vertical error is signed Z, end minus start. Heading error is the signed yaw change in degrees, wrapped to (-180, 180]. Yaw is atan2(2*(w*z+x*y), 1-2*(y*y+z*z)) of the xyzw quaternion. wall_separation_m is the smallest gap from 0.01 m to 0.5 m between x-planes that each contain at least max(500, 5 percent of the points) after rounding x to 0.1 mm, or null when no such pair exists. The doubled wall is the +X face copied along +X. square loop that stops 0.09 m east and 0.12 m north, a 0.150 m horizontal miss"
+}
