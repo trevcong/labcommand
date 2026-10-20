@@ -24,6 +24,7 @@ PathLike = Union[str, Path]
 
 SCHEMA = "spatio.replaycompare/1"
 DIAGNOSTIC_LABEL = "diagnostic only (after SE(3) alignment)"
+_NO_PAIRS_REASON = "no pose pairs within max_dt"
 MANIFEST_KEYS = (
     "run_id",
     "source_recording",
@@ -142,7 +143,7 @@ def _compare_loaded(
     reasons.extend(gate_reasons)
 
     raw = _raw_trajectory(traj_a, traj_b, pairs, evaluable)
-    diagnostic = _diagnostic(traj_a, traj_b, pairs, evaluable)
+    diagnostic = _diagnostic(traj_a, traj_b, pairs, evaluable, gate_reasons)
     map_report, map_reasons = _compare_maps(loaded_a["points"], loaded_b["points"], voxel)
     reasons.extend(map_reasons)
 
@@ -230,10 +231,12 @@ def _associate_trajectories(
             )
             reasons.append("no automatic time shift was applied")
         else:
-            evaluable = True
+            # Spans can overlap while every sample is still farther than max_dt.
+            # Zero pairs is not a comparison.
             pairs = _pair_nearest(times_a, times_b_cmp, max_dt)
+            evaluable = bool(pairs)
             if not pairs:
-                reasons.append("no pose pairs within max_dt")
+                reasons.append(_NO_PAIRS_REASON)
 
     association = {
         "max_dt_s": float(max_dt),
@@ -336,13 +339,14 @@ def _diagnostic(
     traj_b: np.ndarray,
     pairs: Sequence[Tuple[int, int]],
     evaluable: bool,
+    gate_reasons: Sequence[str],
 ) -> dict:
     base = {"label": DIAGNOSTIC_LABEL, "computed": False}
-    if not evaluable:
-        base["reason"] = "not computed because trajectory time ranges do not overlap"
-        return base
-    if len(pairs) == 0:
-        base["reason"] = "no matched poses to align"
+    if not evaluable or len(pairs) == 0:
+        if _NO_PAIRS_REASON in gate_reasons:
+            base["reason"] = "no matched poses to align"
+        else:
+            base["reason"] = "not computed because trajectory time ranges do not overlap"
         return base
     src = np.array([traj_a[i, 1:4] for i, _j in pairs], dtype=np.float64)
     dst = np.array([traj_b[j, 1:4] for _i, j in pairs], dtype=np.float64)

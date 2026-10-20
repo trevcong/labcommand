@@ -213,6 +213,10 @@ class ReplayCompareTests(unittest.TestCase):
         diagnostic = result["trajectory"]["diagnostic_aligned"]
         self.assertFalse(diagnostic["computed"])
         self.assertNotIn("ate_rmse_m", diagnostic)
+        self.assertEqual(
+            diagnostic["reason"],
+            "not computed because trajectory time ranges do not overlap",
+        )
         association = result["trajectory"]["association"]
         self.assertEqual(association["matched"], 0)
         self.assertEqual(association["a_range_s"], [0.0, 2.0])
@@ -222,6 +226,42 @@ class ReplayCompareTests(unittest.TestCase):
         text = format_markdown(result)
         self.assertIn("NOT_EVALUABLE", text)
         self.assertIn("1000.000000", text)
+        self.assertNotIn("ATE RMSE", text)
+
+    def test_overlapping_spans_with_zero_matches_not_evaluable(self):
+        """Spans can overlap while every sample is still outside max_dt.
+
+        The disjoint-range test never reaches pairing. These stamps do, and
+        pairing returns nothing. That must not be reported as COMPARED.
+        """
+        poses_a = [(float(t), float(t), 0.0, 0.0, *IDENTITY) for t in (0, 1, 2)]
+        poses_b = [(t, 1.0, 0.0, 0.0, *IDENTITY) for t in (0.5, 1.5, 2.5)]
+        with tempfile.TemporaryDirectory() as tmp:
+            folder_a = _write_session(tmp, "run-a", poses_a, TINY_MAP)
+            folder_b = _write_session(tmp, "run-b", poses_b, TINY_MAP)
+            result, _series = compare_sessions(folder_a, folder_b)
+
+        self.assertEqual(result["status"], "NOT_EVALUABLE")
+        association = result["trajectory"]["association"]
+        self.assertEqual(association["matched"], 0)
+        self.assertEqual(association["unmatched_a"], 3)
+        self.assertEqual(association["unmatched_b"], 3)
+        self.assertEqual(association["range_gap_s"], 0.0)
+        self.assertAlmostEqual(association["overlap_duration_s"], 1.5, places=9)
+        self.assertEqual(association["max_dt_s"], 0.05)
+        self.assertIsNone(result["trajectory"]["raw"]["position_m"])
+        self.assertIsNone(result["trajectory"]["raw"]["rotation_deg"])
+        diagnostic = result["trajectory"]["diagnostic_aligned"]
+        self.assertFalse(diagnostic["computed"])
+        self.assertNotIn("ate_rmse_m", diagnostic)
+        self.assertEqual(diagnostic["reason"], "no matched poses to align")
+        self.assertIn("no pose pairs within max_dt", result["reasons"])
+        self.assertNotIn("trajectory time ranges do not overlap", result["reasons"])
+        self.assertIsNotNone(result["map"])
+        text = format_markdown(result)
+        self.assertIn("NOT_EVALUABLE", text)
+        self.assertIn("no matched poses to align", text)
+        self.assertNotIn("time ranges do not overlap", text)
         self.assertNotIn("ATE RMSE", text)
 
     def test_explicit_time_offset_is_reported(self):
