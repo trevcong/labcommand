@@ -73,6 +73,48 @@ Snapshot and Live connect straight to the Spark. `FoxgloveLiveClient` opens `ws:
 
 ## Tests
 
+Run the complete local non-ROS suite on macOS with one command. Set up a Python
+3.12 venv first; `requirements-local.txt` includes the hosted CI pins plus the
+Spatio MCAP/plotting dependencies and `rosbags`:
+
+```bash
+python3.12 -m venv spark/.venv-local < /dev/null
+spark/.venv-local/bin/python -m pip install -r requirements-local.txt < /dev/null
+scripts/test-all.sh < /dev/null
+```
+
+The runner executes CI helper unittests, committed-fixture checks, Spatio pytest
+(including `.github/scripts`), Spark pytest, C++ configure/build/CTest, the Swift
+core runner, the `change-detect` build, shared-golden comparison, and Spatio
+fixture regeneration in check-only mode, in that order. The two pytest runs stay
+separate because the trees contain duplicate test module names. Each test stage
+prints its native test counts (CTest is verbose, including nested pytest counts).
+The final summary names every stage as `PASS`, `FAIL`, or `SKIPPED`; the first
+failure stops execution and returns nonzero, with later stages marked not reached.
+Build stages report command success, not test counts.
+
+The default interpreter is `spark/.venv-local/bin/python`. Override `PYTHON` for
+another environment, or `SPATIO_PYTHON` for just Spatio pytest and its fixture
+check. Spatio continues to support system Python 3.9; moving it to 3.12 is not
+part of this runner. With Spatio's dependencies already installed for system
+Python, verify that compatibility separately:
+
+```bash
+python3 -m pytest -q spatio .github/scripts < /dev/null
+# Or exercise system Python for Spatio within the combined gate:
+SPATIO_PYTHON=python3 scripts/test-all.sh < /dev/null
+```
+
+The full runner requires the local C++ prerequisites described below and Swift.
+`ROOM_MEMORY_OPENMP=OFF scripts/test-all.sh` configures without OpenMP if libomp
+is unavailable. `SKIP_CPP=1 scripts/test-all.sh` visibly reports all three C++
+stages as `SKIPPED`, and is only a partial gate. The runner uses fresh absent
+recording paths for CTest, so the full-recording tests skip; ROS tests and the
+JT128 characterization test also skip without their external prerequisites.
+It does not use Docker, connect to hardware, or launch/install the app.
+An app release build, the optional Swift differential extension, and stricter
+`rosbags` skip enforcement are outside this command's scope.
+
 Mac, from the repo root:
 
 ```bash

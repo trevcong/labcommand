@@ -1,0 +1,5 @@
+# Local non-ROS gate. Reuse the hosted pins rather than maintaining a second copy.
+-r spark/requirements-ci.txt
+mcap-ros2-support
+matplotlib
+rosbags
