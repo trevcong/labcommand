@@ -470,9 +470,15 @@ def _kabsch(covariance: np.ndarray) -> np.ndarray:
 def _rotation_angles_deg(quat_a: np.ndarray, quat_b: np.ndarray) -> np.ndarray:
     unit_a = _unit_quaternions(quat_a)
     unit_b = _unit_quaternions(quat_b)
-    dots = np.abs(np.sum(unit_a * unit_b, axis=1))
-    np.clip(dots, 0.0, 1.0, out=dots)
-    return np.degrees(2.0 * np.arccos(dots))
+    # Choose the same quaternion hemisphere, then use chord lengths.
+    # Unlike acos(dot), atan2 retains tiny rotations and gives exact zero
+    # for identical (including opposite-sign) normalized quaternions.
+    dots = np.sum(unit_a * unit_b, axis=1)
+    unit_b = np.where((dots < 0.0)[:, None], -unit_b, unit_b)
+    return np.degrees(4.0 * np.arctan2(
+        np.linalg.norm(unit_a - unit_b, axis=1),
+        np.linalg.norm(unit_a + unit_b, axis=1),
+    ))
 
 
 def _unit_quaternions(quaternions: np.ndarray) -> np.ndarray:
@@ -529,7 +535,12 @@ def _rotmat_to_quat(rotation: np.ndarray) -> np.ndarray:
 def _rotation_angle_deg_from_matrix(rotation: np.ndarray) -> float:
     cosine = (float(np.trace(rotation)) - 1.0) * 0.5
     cosine = float(np.clip(cosine, -1.0, 1.0))
-    return float(np.degrees(np.arccos(cosine)))
+    sine = 0.5 * np.linalg.norm([
+        rotation[2, 1] - rotation[1, 2],
+        rotation[0, 2] - rotation[2, 0],
+        rotation[1, 0] - rotation[0, 1],
+    ])
+    return float(np.degrees(np.arctan2(sine, cosine)))
 
 
 def _pose(trajectory: np.ndarray, index: int) -> Optional[dict]:
