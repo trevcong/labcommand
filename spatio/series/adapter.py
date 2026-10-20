@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 
 from spatio.series.validate import (
     InputRejected, Unreadable, REPLAY_LABEL, WALK_SCHEMA, parse_walk_result,
 )
+from spatio.wall_scoring import WallScoringError, patch_provenance, score_walls, wall_verdict
 
 
 def read_json(path: str):
@@ -18,13 +20,15 @@ def read_json(path: str):
         raise Unreadable(path, str(exc)) from exc
 
 
-def adapt_walkcheck(report: dict, metadata: dict, source_path: str) -> dict:
+def adapt_walkcheck(report: dict, metadata: dict, source_path: str, *,
+                    wallpatch=None, patch_origin="auto_suggested", spec_path=None,
+                    patches_file=None, gate_m=0.05, gate_state="proposed") -> dict:
     """Map v1 fields, then apply the existing series validation rules.
 
     Metadata supplies the recording time, revision, configuration hash and
     physical reference that walkcheck does not carry. It must describe this run.
-    The original producer verdict is retained separately; series additionally
-    requires a measured, negative doubled-wall flag.
+    The original producer verdict is retained separately. Wall acceptance uses
+    exactly the same evidence and preselection checks as walk-day.
     """
     def reject(message):
         raise InputRejected(source_path, message)
@@ -77,7 +81,7 @@ def adapt_walkcheck(report: dict, metadata: dict, source_path: str) -> dict:
     returned = block("return_to_start", nullable=True)
     timestamps = block("timestamps", nullable=True)
     motion = block("motion", nullable=True)
-    walls = block("walls")
+    block("walls")
     drift = block("drift")
     backward = timestamps.get("backward_steps")
     if backward is not None and (
@@ -85,11 +89,24 @@ def adapt_walkcheck(report: dict, metadata: dict, source_path: str) -> dict:
     ):
         reject("timestamps.backward_steps must be a nonnegative integer or null")
 
+    try:
+        provenance = patch_provenance(
+            patch_origin, spec_path, metadata["physical_reference"], wallpatch, patches_file,
+            gate_m=gate_m,
+        )
+        p95, doubled, failures, notes, _, warnings = score_walls(
+            report, wallpatch, gate_m, provenance,
+            map_path=os.path.join(os.path.dirname(source_path), "map.pcd"),
+        )
+    except WallScoringError as exc:
+        reject(str(exc))
+    status, reasons = wall_verdict(producer_status, reasons, doubled, failures, notes)
+
     result = {
         "schema": WALK_SCHEMA,
         "run_id": metadata["run_id"],
         "recorded_at": metadata["recorded_at"],
-        "status": producer_status.replace("-", "_"),
+        "status": status,
         "reasons": reasons,
         "physical_accuracy_evaluated": physical,
         "physical_reference": metadata["physical_reference"],
@@ -115,28 +132,31 @@ def adapt_walkcheck(report: dict, metadata: dict, source_path: str) -> dict:
             "moving": motion.get("enough_motion"),
         },
         "walls": {
-            "p95_point_to_plane_m": number(walls.get("p95_point_to_plane_cm"), "wall p95", 0.01),
-            "doubled_wall_suspected": walls.get("doubled_wall"),
-            "gate_m": number(walls.get("proposed_gate_cm"), "wall gate", 0.01),
-            "gate_state": "proposed",
+            "p95_point_to_plane_m": p95,
+            "doubled_wall_suspected": doubled,
+            "gate_m": gate_m,
+            "gate_state": gate_state,
         },
+        "wall_patches": provenance,
+        "wall_warnings": warnings,
         "walkcheck_source": source_path,
         "walkcheck_result": producer_status,
     }
     if physical is False:
         result["accuracy_label"] = REPLAY_LABEL
 
-    # Walkcheck's trajectory PASS is not a series PASS when wall evidence is
-    # absent or doubled. Keep the stricter existing series contract.
+    if producer_status == "NOT-EVALUABLE":
+        for key in ("d3_m", "horizontal_m", "vertical_m"):
+            result["return_error"][key] = None
+        result["drift_pct_of_path"] = None
+
+    # Keep the series validation contract for non-wall missing evidence too.
     required = (result["return_error"]["d3_m"], result["return_error"]["threshold_m"],
                 result["validity"]["timestamps_monotonic"], backward,
-                result["validity"]["moving"], walls.get("doubled_wall"))
-    if any(value is None for value in required):
+                result["validity"]["moving"])
+    if any(value is None for value in required) and result["status"] != "NOT_EVALUABLE":
         result["status"] = "NOT_EVALUABLE"
-        reasons.append("series: required return, validity, or doubled-wall evidence is missing")
-    elif producer_status == "PASS" and walls.get("doubled_wall") is True:
-        result["status"] = "FAIL"
-        reasons.append("series: a doubled wall is suspected")
+        reasons.append("series: required return or validity evidence is missing")
 
     walk = parse_walk_result(result, source_path)
     if walk.recorded_at is None:

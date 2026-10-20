@@ -100,10 +100,13 @@ def test_legacy_explain_without_recorded_time_remains_available(tmp_path):
 
 def produced_walkcheck(tmp_path, *, offset=0.05, variant=0, physical=False,
                        map_kind="sharp", gap=False):
+    import numpy as np
     from spatio.walkcheck.evaluate import evaluate_session
     from spatio.walkcheck.synthetic import (
-        walking_loop, write_session, sharp_wall, doubled_wall, insert_time_gap,
+        walking_loop, write_session, four_wall_room, doubled_wall, insert_time_gap,
     )
+    from spatio.wallpatch.cli import main as wallpatch_main
+    from spatio.walkday.tests.test_result import quiet, write_spec
     metadata = timed(make_walk(f"synthetic-{variant}"), variant)
     metadata = {key: metadata[key] for key in (
         "run_id", "recorded_at", "fastlio_revision", "config_sha256",
@@ -119,9 +122,12 @@ def produced_walkcheck(tmp_path, *, offset=0.05, variant=0, physical=False,
     if gap:
         rows = insert_time_gap(rows, after_t=rows[0][0] + 12, extra_s=2)
     xyz = {
-        "sharp": lambda: sharp_wall(count=1500, seed=variant),
-        "doubled": lambda: doubled_wall(count_per_sheet=1500, seed=variant),
+        "sharp": lambda: four_wall_room(seed=variant),
+        "doubled": lambda: np.vstack([four_wall_room(seed=variant),
+                                      doubled_wall(count_per_sheet=1500, seed=variant)]),
         "tiny": lambda: [[0, 0, 0], [1, 0, 0]],
+        # Enough points for walkcheck's map minimum (#72) but no wall plane.
+        "planeless": lambda: np.random.default_rng(variant).uniform(-3, 3, (200, 3)).tolist(),
         "missing": lambda: None,
     }[map_kind]()
     session = tmp_path / metadata["run_id"]
@@ -129,9 +135,40 @@ def produced_walkcheck(tmp_path, *, offset=0.05, variant=0, physical=False,
     report = evaluate_session(session, write=False)
     report_path = session / "walkcheck.json"
     report_path.write_text(json.dumps(report), encoding="utf-8")
+    if map_kind in ("sharp", "doubled"):
+        # Supply actual measured patches and an explicit test spec, as the
+        # shared rule requires. Suggestions alone are tested separately.
+        patch_file = session / "patches.json"
+        assert quiet(wallpatch_main, ["suggest", str(session / "map.pcd"),
+                                      "--n", "2", "--out", str(patch_file)]) == 0
+        patches = json.loads(patch_file.read_text())["patches"]
+        _, sha = write_spec(session / "spec.json", [p["name"] for p in patches],
+                            [p["box_map_frame"] for p in patches])
+        assert quiet(wallpatch_main, ["measure", str(session), "--patches", str(patch_file),
+                                      "--out", str(session / "wallpatch")]) == 0
+        if physical:
+            metadata["physical_reference"]["spec_sha256"] = sha
     meta_path = session / "metadata.json"
     meta_path.write_text(json.dumps(metadata), encoding="utf-8")
     return report, metadata, report_path, meta_path
+
+
+def wall_args(report_path):
+    session = report_path.parent
+    if not (session / "spec.json").exists():
+        return []
+    return ["--wallpatch", str(session / "wallpatch" / "wallpatch.json"),
+            "--spec", str(session / "spec.json"), "--patches", str(session / "patches.json"),
+            "--patch-origin", "preselected"]
+
+
+def wall_kwargs(report_path):
+    session = report_path.parent
+    if not (session / "spec.json").exists():
+        return {}
+    return dict(wallpatch=json.loads((session / "wallpatch" / "wallpatch.json").read_text()),
+                spec_path=str(session / "spec.json"), patches_file=str(session / "patches.json"),
+                patch_origin="preselected")
 
 
 @pytest.mark.parametrize("offset,variant,status", [(0.05, 0, "PASS"), (0.15, 2, "FAIL")])
@@ -142,7 +179,8 @@ def test_adapter_consumes_real_walkcheck_output(tmp_path, offset, variant, statu
     assert report["schema"] == "spatio.walkcheck.v1"
     assert report["result"] == status
     out = tmp_path / "walk_result.json"
-    assert main(["adapt", str(report_path), "--metadata", str(meta_path), "--out", str(out)]) == 0
+    assert main(["adapt", str(report_path), "--metadata", str(meta_path), "--out", str(out),
+                 *wall_args(report_path)]) == 0
     walk = load_walk_result(str(out))
     assert walk.status == status
     assert walk.return_error.d3_m == pytest.approx(offset)
@@ -160,7 +198,11 @@ def test_adapter_consumes_real_walkcheck_output(tmp_path, offset, variant, statu
 @pytest.mark.parametrize("map_kind,gap,producer,adapted", [
     ("sharp", True, "NOT-EVALUABLE", "NOT_EVALUABLE"),
     ("missing", False, "NOT-EVALUABLE", "NOT_EVALUABLE"),
-    ("tiny", False, "PASS", "NOT_EVALUABLE"),
+    # Since #72 walkcheck itself says NOT-EVALUABLE for a 2-point map; this row
+    # was written against the pre-#72 producer (PASS). "planeless" keeps the
+    # real-output case of a producer PASS whose wall evidence is missing.
+    ("tiny", False, "NOT-EVALUABLE", "NOT_EVALUABLE"),
+    ("planeless", False, "PASS", "NOT_EVALUABLE"),
     ("doubled", False, "PASS", "FAIL"),
 ])
 def test_adapter_never_upgrades_missing_or_failed_evidence(tmp_path, map_kind, gap, producer, adapted):
@@ -168,7 +210,7 @@ def test_adapter_never_upgrades_missing_or_failed_evidence(tmp_path, map_kind, g
 
     report, metadata, path, _ = produced_walkcheck(tmp_path, map_kind=map_kind, gap=gap)
     assert report["result"] == producer
-    data = adapt_walkcheck(report, metadata, str(path))
+    data = adapt_walkcheck(report, metadata, str(path), **wall_kwargs(path))
     assert data["walkcheck_result"] == producer
     assert data["status"] == adapted
     walk = parse_walk_result(data, str(path))
@@ -176,7 +218,7 @@ def test_adapter_never_upgrades_missing_or_failed_evidence(tmp_path, map_kind, g
     if gap:
         assert walk.return_error.d3_m is None
         assert walk.validity.moving is None
-    if map_kind in ("tiny", "missing"):
+    if map_kind in ("tiny", "planeless", "missing"):
         assert walk.walls.doubled_wall_suspected is None
 
 
@@ -188,7 +230,8 @@ def test_adapter_end_to_end_three_varied_synthetic_walks(tmp_path):
             tmp_path, variant=i, offset=0.03 + 0.02 * i, physical=True
         )
         out = tmp_path / f"adapted-{i}.json"
-        assert main(["adapt", str(report_path), "--metadata", str(meta_path), "--out", str(out)]) == 0
+        assert main(["adapt", str(report_path), "--metadata", str(meta_path), "--out", str(out),
+                     *wall_args(report_path)]) == 0
         paths.append(str(out))
     outdir = tmp_path / "series"
     assert main(["compare", *reversed(paths), "--out", str(outdir)]) == 0

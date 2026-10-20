@@ -1089,6 +1089,27 @@ class SeriesTest(unittest.TestCase):
             "one-second.json",
         )
 
+    def test_epoch_duration_equal_to_span_loads(self):
+        # Walk-day dry run (task I): walkcheck rounds each epoch stamp to 1 us,
+        # so a duration equal to the span differs from it by float rounding at
+        # ~1.8e9 s. That must load; 10 ms shorter is still rejected.
+        windows = {
+            "start_window_s": [1800000000.399988, 1800000005.399988],
+            "end_window_s": [1800000060.999967, 1800000065.999967],
+        }
+        self.load(make_walk("epoch", duration_s=65.599979, return_error=windows), "epoch.json")
+        self.assert_rejected(
+            make_walk("epoch-short", duration_s=65.589979, return_error=windows),
+            "endpoint windows span",
+            "epoch-short.json",
+        )
+        # 6 us short is beyond 6-decimal rounding (~2 us worst case): rejected.
+        self.assert_rejected(
+            make_walk("epoch-6us", duration_s=65.599973, return_error=windows),
+            "endpoint windows span",
+            "epoch-6us.json",
+        )
+
     def test_duration_shorter_than_window_span_cannot_pass(self):
         from spatio.series.report import counts_toward_series
 

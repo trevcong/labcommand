@@ -29,6 +29,12 @@ REPLAY_LABEL = "replay demonstrated; physical accuracy not evaluated"
 WALK_SCHEMA = "spatio.walk_result/1"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _METRE_MATCH = 1e-9
+# Times are absolute epoch seconds (~1.8e9 s), where float64 resolves only
+# ~0.24 us, and walkcheck rounds every value to 6 decimals (+-0.5 us). A
+# duration equal to a window span therefore differs from it by at most
+# 3 x 0.5 us of rounding plus ~0.5 us of float error, about 2 us. 3 us is the
+# smallest round bound above that; main's 1e-9 rejects equal spans.
+_SECOND_MATCH = 3e-6
 
 _TOP_KEYS = (
     "schema",
@@ -752,8 +758,8 @@ def _check_duration_covers_span(
     span = _endpoint_span_s(error)
     if span is None or span <= 0.0:
         return
-    # _METRE_MATCH absorbs binary rounding so a duration equal to the span loads.
-    if span - duration > _METRE_MATCH:
+    # _SECOND_MATCH absorbs epoch-second rounding so a duration equal to the span loads.
+    if span - duration > _SECOND_MATCH:
         errors.append(
             "duration_s is %s while the endpoint windows span %.6f s; "
             "a run cannot be shorter than the time its endpoint windows cover"
@@ -770,8 +776,8 @@ def _check_one_window_duration(
     if window is None:
         return
     length = window[1] - window[0]
-    # _METRE_MATCH absorbs binary rounding so a duration equal to the window loads.
-    if length - duration > _METRE_MATCH:
+    # _SECOND_MATCH absorbs epoch-second rounding so a duration equal to the window loads.
+    if length - duration > _SECOND_MATCH:
         errors.append(
             "duration_s is %s while %s covers %.6f s; "
             "a run cannot be shorter than one of its endpoint windows"

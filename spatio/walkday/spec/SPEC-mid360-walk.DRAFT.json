@@ -1,0 +1,57 @@
+{
+  "schema": "spatio.experiment_spec/1",
+  "spec_id": "TODO(Trevor): e.g. mid360-walk-2026-10",
+  "sensor": "Livox Mid-360 with its built-in IMU (livox_ros_driver2 CustomMsg on /livox/lidar, sensor_msgs/Imu on /livox/imu)",
+  "fastlio_revision": "2fffc570a25d0df172720bac034fbdb6a13d2162",
+  "config_file": "spatio/walkday/configs/mid360_walk.yaml",
+  "config_sha256": "0fba8e5d317235b964b84813c9f6019dabd4267f29bedfa03595f29c0cf80aa1",
+  "route": {
+    "description": "TODO(Trevor)",
+    "duration_target_s": [
+      180,
+      300
+    ],
+    "intermediate_stops": [
+      "TODO(Trevor): stop A",
+      "TODO(Trevor): stop B"
+    ]
+  },
+  "reference_point": "TODO(Trevor)",
+  "start_marks": "TODO(Trevor)",
+  "frames": {
+    "map": "camera_init",
+    "body": "body",
+    "lidar_to_imu": "from the config: extrinsic_T [-0.011, -0.02329, 0.04412], extrinsic_R [1., 0., 0., 0., 1., 0., 0., 0., 1.], extrinsic_est_en true",
+    "cart_mount": "TODO(Trevor)"
+  },
+  "wall_patches": [
+    {
+      "name": "TODO(Trevor): patch A",
+      "description": "TODO(Trevor)",
+      "box_map_frame": null
+    },
+    {
+      "name": "TODO(Trevor): patch B",
+      "description": "TODO(Trevor)",
+      "box_map_frame": null
+    }
+  ],
+  "stationary_windows_s": {
+    "start": 15,
+    "end": 15
+  },
+  "acceptance": {
+    "return_error_threshold_m": 0.1,
+    "placement_tolerance_m": 0.01,
+    "wall_p95_gate_m": 0.05,
+    "revisit_separation_gate_m": 0.05,
+    "runs_required": 3,
+    "state": "proposed"
+  },
+  "forbidden": [
+    "end-onto-start alignment",
+    "post-hoc loop correction",
+    "smoothing away failures",
+    "sliding the stationary window to shrink the error"
+  ]
+}

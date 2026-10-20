@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Fast DDS transport profile for replaying large PointCloud2 messages.
+     The default shared-memory segment is 512 KB; a JT128 /slam/points cloud is
+     ~690 KB (28800 pts x 24 B), so it falls back to fragmented UDP, where a
+     best-effort subscriber (FAST-LIO's SensorDataQoS) can lose whole scans.
+     Transport only: no effect on message contents or timestamps. -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>spatio_shm</transport_id>
+      <type>SHM</type>
+      <segment_size>33554432</segment_size>
+    </transport_descriptor>
+    <transport_descriptor>
+      <transport_id>spatio_udp</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="spatio_participant" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>spatio_shm</transport_id>
+        <transport_id>spatio_udp</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

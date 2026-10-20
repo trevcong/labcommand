@@ -31,7 +31,7 @@ Walkcheck produces `spatio.walkcheck.v1`, which differs from the series input.
 Use the adapter; no edits to walkcheck are needed:
 
 ```sh
-python3 -m spatio.series adapt session/walkcheck.json --metadata session/series-metadata.json --out session/walk_result.json
+python3 -m spatio.series adapt session/walkcheck.json --metadata session/series-metadata.json --wallpatch session/wallpatch/wallpatch.json --patches session/wallpatch/patches.json --spec frozen-spec.json --patch-origin preselected --wall-gate-m 0.05 --wall-gate-state approved --out session/walk_result.json
 python3 -m spatio.series explain session/walk_result.json
 ```
 
@@ -57,7 +57,21 @@ For a physically evaluated run, `physical_reference` contains
 (`ok`, `off`, or `not_checked`), and `placement_tolerance_m` (`0.01`).
 Residuals must come from physical measurements; null means unmeasured and
 cannot count toward a series. Do not set the physical flag merely because
-the trajectory closes.
+the trajectory closes. When supplying a spec for a physically evaluated run,
+the reference must also contain its `spec_sha256`; it must match that spec.
+
+`spatio.wall_scoring` implements the wall rule for both this adapter and
+walk-day. Supply the measured patch report and the frozen spec explicitly;
+the adapter does not discover them from neighboring files. `--patches` retains
+the source patch-file hash. `--patch-origin` defaults to `auto_suggested`.
+When a patch report is supplied, its `map_sha256` must match the actual
+`map.pcd` beside the input walkcheck report. Keep these two run artifacts
+together, including when copying them elsewhere. A missing or malformed hash,
+unreadable map, or hash mismatch rejects conversion. Walk-day applies the same
+check against `SESSION/map.pcd`.
+Auto suggestions, no spec, zero verified patches, or an incomplete required
+patch set cannot PASS. At least two uniquely named preselected patches must
+match the spec (including boxes where fixed), be measured, and pass their gates.
 
 The adapter maps:
 
@@ -71,8 +85,8 @@ The adapter maps:
 | `timestamps.backward_steps` | Nonmonotonic-clock count in `validity.resets`; zero also means monotonic |
 | `motion.enough_motion`, `path_length_m` | Moving flag and path length |
 | `drift.return_error_pct_of_path` | Drift percentage |
-| `walls.p95_point_to_plane_cm`, `doubled_wall` | Wall residual in metres and doubled-wall flag |
-| `walls.proposed_gate_cm` | Gate in metres, always labelled proposed |
+| `walls.p95_point_to_plane_cm`, `doubled_wall` plus patch evidence | Shared wall residual and combined doubled-wall evidence |
+| `--wall-gate-m`, `--wall-gate-state` | Explicit gate (default 0.05 m) and state (default proposed) |
 
 `backward_steps` counts non-increasing timestamps; it is **not** an independent
 estimator pose-reset detector. The adapter cannot add evidence absent from
@@ -80,9 +94,15 @@ walkcheck. It retains the original verdict in `walkcheck_result` and the
 source path in `walkcheck_source`, preserves nulls and reasons, and validates
 the converted result using the existing series rules.
 
-Walkcheck's PASS does not gate on doubled walls. Series already does:
-a doubled wall converts a producer PASS to series FAIL; missing wall evidence
-converts it to NOT_EVALUABLE. Other missing required measurements also force
+Walkcheck's PASS does not gate on doubled walls. Both converters use the
+shared `spatio.wall_scoring` rule: doubled walls are decided on the scoring
+wall patches, and the whole-map doubled-wall flag is a warning only (Trevor,
+2026-10-20), because its detector cannot tell a solid pillar's faces from
+ghost walls. A patch that would pass needs p95 and both 80% bands at most the
+provisional 4.0 cm pass limit; between that and the 5 cm gate it is not
+checkable (NOT_EVALUABLE). Zero verified preselected patches forces
+NOT_EVALUABLE, with any diagnostic wall failures retained in the reasons.
+Other missing required measurements also force
 NOT_EVALUABLE. A producer failure is never upgraded to PASS. Contradictory or
 malformed inputs are rejected. The adapter does not rescore trajectories.
 Historical outputs retain the exact label:
