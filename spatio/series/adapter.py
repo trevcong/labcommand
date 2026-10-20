@@ -91,7 +91,8 @@ def adapt_walkcheck(report: dict, metadata: dict, source_path: str, *,
 
     try:
         provenance = patch_provenance(
-            patch_origin, spec_path, metadata["physical_reference"], wallpatch, patches_file
+            patch_origin, spec_path, metadata["physical_reference"], wallpatch, patches_file,
+            gate_m=gate_m,
         )
         p95, doubled, failures, notes, _, warnings = score_walls(
             report, wallpatch, gate_m, provenance,

@@ -39,6 +39,49 @@ def _patches(wallpatch):
     return patches
 
 
+def _tool_gate(wallpatch, key):
+    gates = wallpatch.get("gates") if isinstance(wallpatch, dict) else None
+    return _num(gates.get(key)) if isinstance(gates, dict) else None
+
+
+def effective_gate_check(p, wallpatch, gate_m):
+    """Re-check one MEASURED patch against the stricter of gate_m and the patch tool's gate.
+
+    The patch tool's pass flags were computed at its own gate, so a stricter
+    requested gate must be applied to the measured numbers here.
+    Returns ([(flag_key, failure)], not_evaluable_reasons).
+    """
+    name = p.get("name")
+    failures, unknown = [], []
+    residuals = p.get("residuals") if isinstance(p.get("residuals"), dict) else {}
+    p95_gate = min(g for g in (gate_m, _tool_gate(wallpatch, "p95_point_to_plane_max_m")) if g is not None)
+    sep_gate = min(g for g in (gate_m, _tool_gate(wallpatch, "revisit_separation_max_m")) if g is not None)
+    p95 = _num(residuals.get("p95_abs_m"))
+    if p95 is None:
+        unknown.append(f"patch {name}: measured p95 missing")
+    elif p95 > p95_gate:
+        failures.append(("gate_p95_pass",
+                         f"patch {name}: p95 {p95 * 100:.2f} cm > effective gate {p95_gate * 100:g} cm"))
+    if p.get("doubled") == "true":
+        sep = _num(p.get("separation_m"))
+        if sep is not None and sep > sep_gate:
+            failures.append(("gate_separation_pass",
+                             f"patch {name}: separation {sep * 100:.2f} cm > effective gate {sep_gate * 100:g} cm"))
+    elif p.get("doubled") == "false" and not failures \
+            and p.get("gate_p95_pass") is not False and p.get("gate_separation_pass") is not False:
+        # Same fail-safe as the patch tool, on would-be passes only (the tool
+        # leaves stepped_band_m null otherwise): a band at least as wide as the
+        # gate could hold two surfaces that far apart, so "not doubled" is unproven.
+        for key in ("core_band_m", "stepped_band_m"):
+            band = _num(residuals.get(key))
+            if band is None:
+                unknown.append(f"patch {name}: {key} missing, single surface unproven at the effective gate")
+            elif band >= sep_gate:
+                unknown.append(f"patch {name}: {key} {band * 100:.2f} cm >= effective gate "
+                               f"{sep_gate * 100:g} cm, single surface unproven")
+    return failures, unknown
+
+
 def wall_evidence(walkcheck: dict, wallpatch, gate_m: float):
     """Measure both whole-map and patch gates without accepting provenance.
 
@@ -94,9 +137,15 @@ def wall_evidence(walkcheck: dict, wallpatch, gate_m: float):
                              f"(split {p.get('separation_m')} m)")
             if d is True:
                 failures.append(f"patch {p.get('name')}: doubled wall, separation {p.get('separation_m')} m")
-            if p.get("gate_p95_pass") is False:
+            strict, unknown = effective_gate_check(p, wallpatch, gate_m)
+            failures.extend(msg for _, msg in strict)
+            if unknown:
+                notes.extend(unknown)
+                doubled.append(None)
+            caught = {key for key, _ in strict}
+            if p.get("gate_p95_pass") is False and "gate_p95_pass" not in caught:
                 failures.append(f"patch {p.get('name')}: p95 {item['p95_abs_m']} m over gate")
-            if p.get("gate_separation_pass") is False:
+            if p.get("gate_separation_pass") is False and "gate_separation_pass" not in caught:
                 failures.append(f"patch {p.get('name')}: separation {p.get('separation_m')} m over gate")
             for key in ("gate_p95_pass", "gate_separation_pass"):
                 if not isinstance(p.get(key), bool):
@@ -114,8 +163,12 @@ def wall_evidence(walkcheck: dict, wallpatch, gate_m: float):
     return p95, suspected, failures, notes, patches, warnings
 
 
-def patch_provenance(origin, spec_path, raw_reference, wallpatch, patches_file):
-    """Which of the frozen spec's preselected patches this run verified."""
+def patch_provenance(origin, spec_path, raw_reference, wallpatch, patches_file, *, gate_m):
+    """Which of the frozen spec's preselected patches this run verified.
+
+    gate_m is the requested wall gate; verification uses the stricter of it and
+    the patch tool's own gate."""
+    _check_gate(gate_m)
     if origin not in PATCH_ORIGINS:
         raise WallScoringError(f"patch origin must be one of {PATCH_ORIGINS}, got {origin!r}")
     measured = _patches(wallpatch)
@@ -164,6 +217,10 @@ def patch_provenance(origin, spec_path, raw_reference, wallpatch, patches_file):
             why.append(f"p95 gate {p.get('gate_p95_pass')}")
         if p.get("gate_separation_pass") is not True:
             why.append(f"separation gate {p.get('gate_separation_pass')}")
+        if p.get("status") == "MEASURED":
+            strict, unknown = effective_gate_check(p, wallpatch, gate_m)
+            why.extend(msg.removeprefix(f"patch {p.get('name')}: ") for _, msg in strict)
+            why.extend(msg.removeprefix(f"patch {p.get('name')}: ") for msg in unknown)
         if box is not None and not _same_box(box, p.get("box_map_frame")):
             why.append("box differs from the frozen spec's box")
         if why:
@@ -216,6 +273,11 @@ def _sha_file(path):
     return digest.hexdigest()
 
 
+def _check_gate(gate_m):
+    if _num(gate_m) is None or gate_m <= 0:
+        raise WallScoringError("wall gate must be a positive finite number")
+
+
 def _check_map(wallpatch, map_path):
     """Bind supplied patch measurements to the run's actual map bytes."""
     if wallpatch is None:
@@ -246,8 +308,7 @@ def score_walls(walkcheck, wallpatch, gate_m, provenance, *, map_path):
     With verified evidence, known failures remain
     FAIL; otherwise every required patch must be verified before PASS.
     """
-    if _num(gate_m) is None or gate_m <= 0:
-        raise WallScoringError("wall gate must be a positive finite number")
+    _check_gate(gate_m)
     _check_map(wallpatch, map_path)
     p95, doubled, failures, notes, patches, warnings = wall_evidence(walkcheck, wallpatch, gate_m)
     blockers = acceptance_blockers(provenance)

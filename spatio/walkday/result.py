@@ -191,7 +191,7 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str,
                                                        "heading_check", "placement_tolerance_m")})
         placement["applied"] = False
     wall_patches = patch_provenance(patch_origin, spec_path, ref, wp,
-                                    os.path.join(session, "wallpatch", "patches.json"))
+                                    os.path.join(session, "wallpatch", "patches.json"), gate_m=gate_m)
     driver = None if prov is None else prov.get("driver_config")
 
     rts = wc.get("return_to_start") or {}

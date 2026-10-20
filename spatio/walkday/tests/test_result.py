@@ -397,29 +397,30 @@ class ResultTest(unittest.TestCase):
 
     def test_patch_provenance_rules(self):
         good = {"status": "MEASURED", "doubled": "false", "gate_p95_pass": True, "gate_separation_pass": True,
+                "residuals": {"p95_abs_m": .01, "core_band_m": .01, "stepped_band_m": .01},
                 "box_map_frame": {"center_m": [1, 2, 1], "normal_hint": [1, 0, 0], "half_extent_m": [1, .2, 1]}}
         wp = {"patches": [dict(good, name="A"), dict(good, name="B")]}
         spec, sha = write_spec(Path(self.tmp) / "s.json", ["A", "B"])
-        out = result.patch_provenance("preselected", spec, {"spec_sha256": sha}, wp, "/none")
+        out = result.patch_provenance("preselected", spec, {"spec_sha256": sha}, wp, "/none", gate_m=.05)
         self.assertEqual(out["verified"], ["A", "B"])
         self.assertEqual(result.acceptance_blockers(out), [])
         # The same patches, declared auto-suggested, never count.
         self.assertTrue(result.acceptance_blockers(dict(out, origin="auto_suggested")))
         # A spec that is not the one the physical reference names is contradictory input.
         with self.assertRaisesRegex(result.ResultError, "not the spec the physical reference names"):
-            result.patch_provenance("preselected", spec, {"spec_sha256": "0" * 64}, wp, "/none")
+            result.patch_provenance("preselected", spec, {"spec_sha256": "0" * 64}, wp, "/none", gate_m=.05)
         # Two measured patches with one name cannot verify it.
         dup = {"patches": [dict(good, name="A"), dict(good, name="A"), dict(good, name="B")]}
-        self.assertEqual(result.patch_provenance("preselected", spec, None, dup, "/none")["verified"], ["B"])
+        self.assertEqual(result.patch_provenance("preselected", spec, None, dup, "/none", gate_m=.05)["verified"], ["B"])
         # A box frozen in the spec must be the box measured (same axis, other length: still equal).
         box = {"center_m": [1, 2, 1], "normal_hint": [2, 0, 0], "half_extent_m": [1, .2, 1]}
         spec2, _ = write_spec(Path(self.tmp) / "s2.json", ["A", "B"], [box, dict(box, center_m=[1, 2.5, 1])])
-        self.assertEqual(result.patch_provenance("preselected", spec2, None, wp, "/none")["verified"], ["A"])
+        self.assertEqual(result.patch_provenance("preselected", spec2, None, wp, "/none", gate_m=.05)["verified"], ["A"])
         # One named patch is not two; a doubled or gate-failing patch is not verified.
         spec1, _ = write_spec(Path(self.tmp) / "s1.json", ["A"])
-        self.assertTrue(result.acceptance_blockers(result.patch_provenance("preselected", spec1, None, wp, "/none")))
+        self.assertTrue(result.acceptance_blockers(result.patch_provenance("preselected", spec1, None, wp, "/none", gate_m=.05)))
         bad = {"patches": [dict(good, name="A", doubled="true"), dict(good, name="B", gate_p95_pass=False)]}
-        self.assertEqual(result.patch_provenance("preselected", spec, None, bad, "/none")["verified"], [])
+        self.assertEqual(result.patch_provenance("preselected", spec, None, bad, "/none", gate_m=.05)["verified"], [])
         # No provenance at all (an older walk_result) never counts.
         self.assertTrue(result.acceptance_blockers(None))
 

@@ -1,5 +1,6 @@
 """Both public converters score identical synthetic evidence identically."""
 
+import hashlib
 import json
 
 import numpy as np
@@ -10,13 +11,14 @@ from spatio.series.validate import load_walk_result
 from spatio.walkcheck.synthetic import four_wall_room, vertical_wall
 from spatio.walkday import result
 from spatio.walkday.tests.test_result import make_session, quiet
-from spatio.wall_scoring import WallScoringError, patch_provenance, score_walls
+from spatio.wall_scoring import WallScoringError, patch_provenance, score_walls, wall_verdict
+from spatio.walkday.tests.test_result import write_spec
 
 
 @pytest.mark.parametrize("report", [[], {"patches": None}, {"patches": [None]}])
 def test_malformed_patch_report_is_rejected(report):
     with pytest.raises(WallScoringError, match="wallpatch"):
-        patch_provenance("preselected", None, None, report, None)
+        patch_provenance("preselected", None, None, report, None, gate_m=.05)
 
 
 @pytest.mark.parametrize("gate", [0, -1, float("nan"), float("inf"), True])
@@ -38,6 +40,8 @@ def test_invalid_wall_gate_is_rejected(gate):
     ("whole_p95_fail", "FAIL"), ("patch_p95_fail", "FAIL"),
     ("patch_separation_fail", "FAIL"), ("patch_doubled", "FAIL"),
     ("gate_boundary", "PASS"), ("explicit_gate", "FAIL"),
+    ("strict_gate_patch_p95", "FAIL"), ("strict_gate_band", "NOT_EVALUABLE"),
+    ("strict_gate_clean", "PASS"),
 ])
 def test_converter_wall_parity(tmp_path, case, expected):
     xyz = four_wall_room(seed=17 if case == "other_walk" else 3)
@@ -96,6 +100,17 @@ def test_converter_wall_parity(tmp_path, case, expected):
     elif case == "patch_separation_fail":
         wp["patches"][1]["gate_separation_pass"] = False
         wp["patches"][1]["separation_m"] = .06
+    elif case.startswith("strict_gate"):
+        # At a requested 1 cm gate the tool's 5 cm flags stay True; only the
+        # measured numbers can show patch B is over the effective gate.
+        wc["walls"]["p95_point_to_plane_cm"] = .485
+        for p in wp["patches"]:
+            p["residuals"].update(p95_abs_m=.005, core_band_m=.004, stepped_band_m=.004)
+            assert p["gate_p95_pass"] is p["gate_separation_pass"] is True and p["doubled"] == "false"
+        if case == "strict_gate_patch_p95":
+            wp["patches"][1]["residuals"]["p95_abs_m"] = .01545
+        elif case == "strict_gate_band":
+            wp["patches"][1]["residuals"]["core_band_m"] = .012
     elif case == "patch_doubled":
         wp["patches"][1]["doubled"] = "true"
         wp["patches"][1]["separation_m"] = .08
@@ -103,7 +118,7 @@ def test_converter_wall_parity(tmp_path, case, expected):
     wp_path.write_text(json.dumps(wp))
     if case == "no_report":
         wp_path.unlink()
-    gate = .04 if case == "explicit_gate" else .05
+    gate = .04 if case == "explicit_gate" else .01 if case.startswith("strict_gate") else .05
     origin = "auto_suggested" if case == "auto" else "preselected"
     common = ["--patch-origin", origin, "--wall-gate-m", str(gate), "--wall-gate-state", "approved"]
     if case != "no_spec":
@@ -132,6 +147,12 @@ def test_converter_wall_parity(tmp_path, case, expected):
         assert adapted["walls"]["doubled_wall_suspected"] is None
     if case == "zero_verified_failed":
         assert any("doubled wall" in reason for reason in adapted["reasons"])
+    if case == "strict_gate_patch_p95":
+        assert any("p95 1.5" in r and "effective gate 1 cm" in r for r in adapted["reasons"])
+    if case.startswith("strict_gate"):
+        names = [p["name"] for p in wp["patches"]]
+        expect = names if case == "strict_gate_clean" else names[:1]
+        assert adapted["wall_patches"]["verified"] == expect
 
 
 @pytest.mark.parametrize("case", [
@@ -197,3 +218,62 @@ def test_converter_rejects_unbound_wall_report(tmp_path, capsys, case):
     ]) == 1
     assert capsys.readouterr().err.strip().endswith(walkday_error)
     assert not output.exists()
+
+
+def _strict_report(map_path, b_residuals, **b_fields):
+    """A hand-built report: flags as the patch tool sets them at its 5 cm gate."""
+    def patch(name, residuals, **extra):
+        return dict({"name": name, "status": "MEASURED", "doubled": "false", "separation_m": None,
+                     "gate_p95_pass": True, "gate_separation_pass": True, "reasons": [],
+                     "residuals": residuals}, **extra)
+    clean = {"p95_abs_m": .005, "core_band_m": .004, "stepped_band_m": .004}
+    return {"map_sha256": hashlib.sha256(map_path.read_bytes()).hexdigest(),
+            "gates": {"p95_point_to_plane_max_m": .05, "revisit_separation_max_m": .05},
+            "patches": [patch("A", clean), patch("B", b_residuals, **b_fields)]}
+
+
+def _strict_verdict(tmp_path, wallpatch, gate_m):
+    spec, _ = write_spec(tmp_path / "spec.json", ["A", "B"])
+    walkcheck = {"walls": {"status": "OK", "p95_point_to_plane_cm": .485, "doubled_wall": False}}
+    prov = patch_provenance("preselected", spec, None, wallpatch, None, gate_m=gate_m)
+    _, doubled, failures, notes, _, _ = score_walls(walkcheck, wallpatch, gate_m, prov,
+                                                    map_path=str(tmp_path / "map.pcd"))
+    status, reasons = wall_verdict("PASS", [], doubled, failures, notes)
+    return status, reasons, prov["verified"]
+
+
+def test_requested_gate_stricter_than_patch_tool_gate(tmp_path):
+    # Review repro: 1 cm gate, patch p95 1.545 cm, whole map 0.485 cm returned PASS.
+    (tmp_path / "map.pcd").write_bytes(b"synthetic map")
+    report = _strict_report(tmp_path / "map.pcd", {"p95_abs_m": .01545, "core_band_m": .004,
+                                                   "stepped_band_m": .004})
+    status, reasons, verified = _strict_verdict(tmp_path, report, .01)
+    assert status == "FAIL"
+    assert any("patch B: p95 1.5" in r and "effective gate 1 cm" in r for r in reasons)
+    assert verified == ["A"]
+    # The same patch at the tool's own 5 cm gate is a clean pass.
+    assert _strict_verdict(tmp_path, report, .05) == ("PASS", [], ["A", "B"])
+    # A looser requested gate never relaxes the tool's 5 cm gate.
+    loose = _strict_report(tmp_path / "map.pcd", {"p95_abs_m": .055, "core_band_m": .004,
+                                                  "stepped_band_m": .004})
+    assert _strict_verdict(tmp_path, loose, .08)[0] == "FAIL"
+
+
+def test_strict_gate_band_wider_than_gate_is_not_evaluable(tmp_path):
+    (tmp_path / "map.pcd").write_bytes(b"synthetic map")
+    report = _strict_report(tmp_path / "map.pcd", {"p95_abs_m": .008, "core_band_m": .012,
+                                                   "stepped_band_m": .004})
+    status, reasons, verified = _strict_verdict(tmp_path, report, .01)
+    assert status == "NOT_EVALUABLE"
+    assert any("core_band_m 1.20 cm >= effective gate 1 cm" in r for r in reasons)
+    assert verified == ["A"]
+
+
+def test_tool_fail_without_stepped_band_stays_fail(tmp_path):
+    # The patch tool leaves stepped_band_m null unless both its gates pass.
+    (tmp_path / "map.pcd").write_bytes(b"synthetic map")
+    report = _strict_report(tmp_path / "map.pcd", {"p95_abs_m": .06, "core_band_m": .03,
+                                                   "stepped_band_m": None}, gate_p95_pass=False)
+    status, reasons, verified = _strict_verdict(tmp_path, report, .05)
+    assert status == "FAIL", reasons
+    assert verified == ["A"]
