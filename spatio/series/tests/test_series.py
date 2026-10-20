@@ -554,6 +554,94 @@ class SeriesTest(unittest.TestCase):
         del missing["reasons"]
         self.assert_rejected(missing, "reasons", "missing.json")
 
+    def test_null_vertical_cannot_hide_horizontal_over_d3(self):
+        wide = {"d3_m": 0.05, "horizontal_m": 0.20, "vertical_m": None}
+        self.assert_rejected(
+            make_walk("wide-h", return_error=wide),
+            "horizontal_m",
+            "wide-h.json",
+        )
+        with self.assertRaises(InputRejected) as caught:
+            self.series_of(
+                [
+                    make_walk("h1", return_error=wide),
+                    make_walk("h2", return_error=wide),
+                    make_walk("h3", return_error=wide),
+                ],
+                "wide-horizontal",
+            )
+        self.assertIn("horizontal_m", str(caught.exception))
+        self.assertIn("exceeds", str(caught.exception))
+        # Under the 10 cm return gate, but still larger than this d3.
+        self.assert_rejected(
+            make_walk(
+                "under-gate",
+                return_error={"d3_m": 0.05, "horizontal_m": 0.09, "vertical_m": None},
+            ),
+            "horizontal_m",
+            "under-gate.json",
+        )
+        # Exactly 1 mm over d3 stays inside the component tolerance.
+        self.load(
+            make_walk(
+                "mm",
+                return_error={"d3_m": 0.05, "horizontal_m": 0.05 + 0.001, "vertical_m": None},
+            ),
+            "mm.json",
+        )
+        self.assert_rejected(
+            make_walk(
+                "past-mm",
+                return_error={"d3_m": 0.05, "horizontal_m": 0.052, "vertical_m": None},
+            ),
+            "horizontal_m",
+            "past-mm.json",
+        )
+        legal = self.series_of(
+            [
+                make_walk("n1", return_error={"horizontal_m": 0.03, "vertical_m": None}),
+                make_walk("n2", return_error={"horizontal_m": None, "vertical_m": 0.04}),
+                make_walk(
+                    "n3",
+                    return_error={"d3_m": 0.04, "horizontal_m": 0.0, "vertical_m": None},
+                ),
+            ],
+            "null-component-ok",
+        )
+        self.assertEqual(legal["verdict"], "PASS")
+        self.assertEqual(legal["counted_run_ids"], ["n1", "n2", "n3"])
+
+    def test_null_horizontal_cannot_hide_vertical_over_d3(self):
+        wide = {"d3_m": 0.05, "horizontal_m": None, "vertical_m": 0.20}
+        self.assert_rejected(
+            make_walk("wide-v", return_error=wide),
+            "vertical_m",
+            "wide-v.json",
+        )
+        with self.assertRaises(InputRejected) as caught:
+            self.series_of(
+                [
+                    make_walk("v1", return_error=wide),
+                    make_walk("v2", return_error=wide),
+                    make_walk("v3", return_error=wide),
+                ],
+                "wide-vertical",
+            )
+        self.assertIn("vertical_m", str(caught.exception))
+        self.assertIn("exceeds", str(caught.exception))
+        fitted = self.load(
+            make_walk(
+                "fit-v",
+                return_error={"d3_m": 0.05, "horizontal_m": None, "vertical_m": 0.05},
+            ),
+            "fit-v.json",
+        )
+        self.assertIsNone(fitted.return_error.horizontal_m)
+        self.assertEqual(fitted.return_error.vertical_m, 0.05)
+        from spatio.series.report import counts_toward_series
+
+        self.assertTrue(counts_toward_series(fitted))
+
     def test_null_rendered_not_measured_not_zero(self):
         data = make_walk(
             "missing-horizontal",
@@ -595,15 +683,25 @@ class SeriesTest(unittest.TestCase):
 
     def test_proposed_wall_gate_labelled(self):
         proposed = explain_text(self.load(make_walk("proposed"), "proposed.json"))
-        self.assertIn("proposed, not yet approved by Trevor", proposed)
+        self.assertIn("wall gate of 5.0 cm is provisional", proposed)
+        self.assertIn("placement tolerance is 1.0 cm (provisional)", proposed)
+        self.assertNotIn("not yet approved", proposed)
         approved = explain_text(
             self.load(
                 make_walk("approved", walls={"gate_state": "approved"}),
                 "approved.json",
             )
         )
-        self.assertNotIn("proposed, not yet approved", approved)
-        self.assertIn("approved by Trevor", approved)
+        self.assertIn("wall gate of 5.0 cm is provisional", approved)
+        self.assertNotIn("not yet approved", approved)
+        other = explain_text(
+            self.load(
+                make_walk("other", walls={"gate_m": 0.08, "gate_state": "proposed"}),
+                "other.json",
+            )
+        )
+        self.assertIn("proposed, not yet approved by Trevor", other)
+        self.assertNotIn("8.0 cm is provisional", other)
 
     def test_explain_golden_text(self):
         text = explain_text(self.load(golden_walks()[0], "golden.json"))

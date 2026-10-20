@@ -13,6 +13,7 @@ from spatio.series.validate import (
     PLACEMENT_TOLERANCE_M,
     REPLAY_LABEL,
     RETURN_THRESHOLD_M,
+    WALL_GATE_M,
     InputRejected,
     WalkResult,
 )
@@ -55,7 +56,7 @@ Precedence is input error (exit 1), then NOT_EVALUABLE, then REPLAY_ONLY, then P
 - R5. Fewer than 3 attempts, once the stronger verdicts above do not apply, is INCOMPLETE. A retained failure does not rule the series out before three attempts exist. Three or more attempts with no counting triple is FAIL.
 - Boundary. A 3D return error of exactly 0.10 m is not under 0.10 m, so that run fails.
 - Null. A null measurement is "not measured". It is never read as zero.
-- Gates. The return threshold is 0.10 m and the placement tolerance is 0.01 m. A looser number in the file is rejected. Wall p95 is shown and is not an acceptance gate. W1 uses the doubled-wall flag only. A proposed wall gate is not yet approved by Trevor.
+- Gates. The return threshold is 0.10 m and the placement tolerance is 0.01 m (provisional). A looser number in the file is rejected. Wall p95 is shown and is not an acceptance gate. W1 uses the doubled-wall flag only. The 5 cm wall gate is provisional.
 """
 
 
@@ -142,7 +143,10 @@ def render_markdown(report: dict) -> str:
     if TREVOR_LINE in report["reasons"]:
         lines.append(TREVOR_LINE)
         lines.append("")
-    if _any_proposed_gate(report):
+    if _any_provisional_wall_gate(report):
+        lines.append("The 5 cm wall gate is provisional.")
+        lines.append("")
+    elif _any_proposed_gate(report):
         lines.append("The wall gate is proposed, not yet approved by Trevor.")
         lines.append("")
     elif report["runs"] and _all_approved_gate(report):
@@ -441,11 +445,16 @@ def _wall_sentence(walk: WalkResult) -> str:
         doubled = "a doubled wall is not suspected"
     else:
         doubled = "a doubled wall was not measured"
-    gate = "the wall gate of %s is %s" % (_format_cm(walls.gate_m), _gate_phrase(walls.gate_state))
+    gate = "the wall gate of %s is %s" % (
+        _format_cm(walls.gate_m),
+        _gate_phrase(walls.gate_m, walls.gate_state),
+    )
     return "%s, %s, and %s." % (p95, doubled, gate)
 
 
-def _gate_phrase(gate_state: str) -> str:
+def _gate_phrase(gate_m: float, gate_state: str) -> str:
+    if abs(gate_m - WALL_GATE_M) <= 1e-9:
+        return "provisional"
     if gate_state == "proposed":
         return "proposed, not yet approved by Trevor"
     return "approved by Trevor"
@@ -461,7 +470,7 @@ def _physical_sentence(walk: WalkResult) -> str:
         return "Physical accuracy was evaluated, and the physical reference is missing."
     return (
         "Physical accuracy was evaluated: the start placement residual is %s, "
-        "the end placement residual is %s, the placement tolerance is %s, "
+        "the end placement residual is %s, the placement tolerance is %s (provisional), "
         "and the heading check is %s."
         % (
             _cm_or_not(reference.start_placement_residual_m),
@@ -601,6 +610,15 @@ def _cell(value: str) -> str:
 
 def _table_row(cells: Sequence[str]) -> str:
     return "| " + " | ".join(cells) + " |"
+
+
+def _any_provisional_wall_gate(report: dict) -> bool:
+    for run in report["runs"]:
+        gate = run["walls"]["gate_m"]
+        if isinstance(gate, (int, float)) and not isinstance(gate, bool):
+            if abs(float(gate) - WALL_GATE_M) <= 1e-9:
+                return True
+    return False
 
 
 def _any_proposed_gate(report: dict) -> bool:

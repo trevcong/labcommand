@@ -13,10 +13,15 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence
 
 # Milestone gates. A looser value in the file must not create a pass.
-# Trevor approves these; until he changes them, the tool accepts only these.
+# The 0.10 m return gate is the workplan rule.
+# The 1 cm placement tolerance and the 5 cm wall gate are provisional:
+# Trevor's delegate approved the numbers, and they are not a final freeze.
+# The wall gate is a label only. W1 does not accept or reject on wall p95.
 RETURN_THRESHOLD_M = 0.10
 PLACEMENT_TOLERANCE_M = 0.01
-# d3 must agree with the horizontal and vertical components when all three exist.
+WALL_GATE_M = 0.05
+# A measured horizontal or vertical component must fit inside d3.
+# When both components exist, d3 must also match their root sum square.
 COMPONENT_TOLERANCE_M = 0.001
 REPLAY_LABEL = "replay demonstrated; physical accuracy not evaluated"
 WALK_SCHEMA = "spatio.walk_result/1"
@@ -576,7 +581,7 @@ def _parse_reference(
     if not _same_metre(tolerance, PLACEMENT_TOLERANCE_M):
         errors.append(
             "physical_reference.placement_tolerance_m must be 0.01 "
-            "(proposed milestone tolerance); the file says %s" % tolerance
+            "(provisional placement tolerance); the file says %s" % tolerance
         )
         return None
     return PhysicalReference(
@@ -613,7 +618,17 @@ def _check_w3_w4(
 
 
 def _check_components(error: ReturnError, errors: List[str]) -> None:
-    if error.d3_m is None or error.horizontal_m is None or error.vertical_m is None:
+    """Reject a component that cannot fit inside the reported 3D return.
+
+    This is the one parser rule for an impossible return vector. A null axis
+    does not skip it: each measured component is checked on its own against
+    d3. When both components are present they must also match d3.
+    """
+    if error.d3_m is None:
+        return
+    _check_one_component(error.d3_m, error.horizontal_m, "horizontal_m", errors)
+    _check_one_component(error.d3_m, error.vertical_m, "vertical_m", errors)
+    if error.horizontal_m is None or error.vertical_m is None:
         return
     expected = math.sqrt(
         error.horizontal_m * error.horizontal_m + error.vertical_m * error.vertical_m
@@ -622,6 +637,24 @@ def _check_components(error: ReturnError, errors: List[str]) -> None:
         errors.append(
             "return_error.d3_m %s does not match sqrt(horizontal_m^2 + vertical_m^2) = %.6f "
             "(tolerance 0.001 m)" % (error.d3_m, expected)
+        )
+
+
+def _check_one_component(
+    d3_m: float,
+    component: Optional[float],
+    name: str,
+    errors: List[str],
+) -> None:
+    if component is None:
+        return
+    # COMPONENT_TOLERANCE_M is 1 mm. _METRE_MATCH absorbs binary rounding so
+    # a component of exactly d3 + 0.001 m is still inside the allowance.
+    if component - d3_m > COMPONENT_TOLERANCE_M + _METRE_MATCH:
+        errors.append(
+            "return_error.%s %s exceeds return_error.d3_m %s "
+            "(a measured component cannot exceed the 3D return; tolerance 0.001 m)"
+            % (name, component, d3_m)
         )
 
 
