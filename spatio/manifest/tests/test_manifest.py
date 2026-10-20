@@ -650,23 +650,39 @@ class ManifestTests(unittest.TestCase):
         }
         self._save(session, data)
         findings = validate_session(session)
-        unverifiable = [
+        missing = [
             item
-            for item in _warnings(findings)
+            for item in _errors(findings)
             if item.rule == "M7"
             and "archive/part.mcap" in item.message
-            and "not verifiable" in item.message
+            and "missing" in item.message
         ]
-        self.assertTrue(unverifiable, findings)
+        # Spec correction: a recorded hash makes this input required.
+        self.assertTrue(missing, findings)
         self.assertEqual(
             [
                 item
-                for item in _errors(findings)
+                for item in _warnings(findings)
                 if item.rule == "M7" and "archive/part.mcap" in item.message
             ],
             [],
             findings,
         )
+
+    def test_missing_hashed_bag_fails_validation_and_cli(self):
+        session, manifest = self._build(hash_bag=True)
+        entry = manifest["source_fingerprint"]["bag_files"][0]
+        self.assertIsNotNone(entry["sha256"])
+        self.assertEqual(_errors(validate_session(session)), [])
+        (Path(manifest["source_recording"]) / entry["name"]).unlink()
+        findings = _errors(validate_session(session))
+        self.assertEqual(len(findings), 1, findings)
+        self.assertEqual(findings[0].rule, "M7")
+        self.assertIn("missing", findings[0].message)
+        proc = self._run(["validate", "--json", str(session)])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertTrue(any(row["rule"] == "M7" and row["severity"] == "ERROR"
+                            for row in json.loads(proc.stdout)))
 
     def _assert_fingerprint_read_failure(self, session, other, needle):
         findings = validate_session(session)

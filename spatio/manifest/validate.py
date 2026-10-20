@@ -236,7 +236,7 @@ def _check_one_bag(session, source, entry, index):
         # A null hash means the bag was deliberately not hashed. Absence is OK.
         if sha is not None:
             findings.append(
-                warning("M7", "%s: bag file not verifiable here (%s)" % (session, name))
+                error("M7", "%s: hashed bag file is missing (%s)" % (session, name))
             )
         return findings
     try:
