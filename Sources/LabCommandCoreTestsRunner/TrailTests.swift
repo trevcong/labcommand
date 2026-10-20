@@ -541,6 +541,11 @@ func testTrailViewContract() {
     expect(view.contains("TrailReadout.startToEndNote"), "the view says start → end is raw")
     expect(view.contains("TrailReadout.walkcheckRows") && view.contains("TrailReadout.walkcheckNote"),
            "the view shows the walkcheck verdict and how it was measured")
+    expect(view.contains("TrailReadout.walkcheckRows(w, stale: session.walkcheckStale != nil)")
+            && view.contains("TrailReadout.verdictTone(w.result, stale: session.walkcheckStale != nil)")
+            && view.contains("TrailReadout.verdictTone(verdict, stale: entry.walkcheckStale)"),
+           "the walk check block and the sessions list both mark stale and take their colour from verdictTone")
+    expect(!view.contains("case \"PASS\""), "the view does not pick green from the verdict string itself")
     expect(state.contains("case trail"), "Dest has a trail case")
     expect(state.contains("static var navCases: [Dest] { [.liveRoom, .settings, .workspace, .trail] }"),
            "nav order is Room, Settings, Rig, Trail")
@@ -573,34 +578,104 @@ private func walkcheckJSON(result: String, returnError cm: Double?, manifestEval
     """.utf8)
 }
 
+/// A PASS with `return_to_start` built from `returned` (the object's body, raw JSON such as
+/// `null`, or nil to leave the key out).
+private func walkcheckPASS(returned: String?, parameters: String = #"{"return_pass_m": 0.1}"#, reasons: String = "[]") -> Data {
+    var body = #"{"schema": "spatio.walkcheck.v1", "result": "PASS", "reasons": \#(reasons), "parameters": \#(parameters)"#
+    if let returned {
+        body += returned == "null" ? #", "return_to_start": null"# : #", "return_to_start": {\#(returned)}"#
+    }
+    return Data((body + "}").utf8)
+}
+
 func testTrailWalkcheckParse() {
     let fail = try! TrailWalkcheck.parse(walkcheckJSON(result: "FAIL", returnError: 12.34))
     expect(fail.result == "FAIL" && fail.reasons == ["return_error_over_threshold"], "verdict and reasons")
     expect(close(fail.error3DCm ?? 0, 12.34) && close(fail.horizontalCm ?? 0, 3) && close(fail.verticalCm ?? 0, 1.5), "return error parts")
     expect(close(fail.thresholdM ?? 0, 0.1) && close(fail.windowS ?? 0, 5) && close(fail.pathLengthM ?? 0, 12.022997), "threshold, window, path")
     expect(fail.wallGate == "FAIL" && close(fail.wallP95Cm ?? 0, 5.06719), "proposed wall gate")
-    let rows = Dictionary(uniqueKeysWithValues: TrailReadout.walkcheckRows(fail).map { ($0.label, $0.value) })
+    let rows = Dictionary(uniqueKeysWithValues: TrailReadout.walkcheckRows(fail, stale: false).map { ($0.label, $0.value) })
     expect(rows["Verdict"] == "FAIL", "verdict row")
     expect(rows["Return error"] == "12.3 cm · need < 10.0 cm", "return error row, got \(rows["Return error"] ?? "nil")")
     expect(rows["  horizontal"] == "3.0 cm" && rows["  vertical"] == "1.5 cm" && rows["  heading"] == "0.8°", "parts rows")
     expect(rows["Wall gate"] == "FAIL · p95 5.1 cm", "wall row, got \(rows["Wall gate"] ?? "nil")")
-    let note = TrailReadout.walkcheckNote(fail, accuracyLabel: TrailSession.notEvaluatedLabel)
+    let note = TrailReadout.walkcheckNote(fail, stale: nil, accuracyLabel: TrailSession.notEvaluatedLabel)
     expect(note.contains("first 5 s") && note.contains("not aligned"), "the note says how the return error was measured")
     expect(note.contains("proposed, not yet approved by Trevor"), "the note says the wall gate is proposed")
     expect(note.contains("not a measured physical walk"), "an unevaluated session says the verdict scores the replay")
-    expect(!TrailReadout.walkcheckNote(fail, accuracyLabel: nil).contains("not a measured physical walk"),
+    expect(!TrailReadout.walkcheckNote(fail, stale: nil, accuracyLabel: nil).contains("not a measured physical walk"),
            "an evaluated session drops that sentence")
 
     let unscored = try! TrailWalkcheck.parse(walkcheckJSON(result: "NOT-EVALUABLE", returnError: nil))
     expect(unscored.error3DCm == nil && unscored.horizontalCm == nil, "null return_to_start reads as not scored")
-    expect(TrailReadout.walkcheckRows(unscored).contains { $0.label == "Return error" && $0.value == "not scored" }, "not scored row")
+    expect(TrailReadout.walkcheckRows(unscored, stale: false).contains { $0.label == "Return error" && $0.value == "not scored" }, "not scored row")
 
+    // Was a PASS with no scoring evidence; a PASS like that is now refused (below), so this
+    // case uses FAIL to keep checking the unscored wall section and the boolean.
     let skippedWalls = try! TrailWalkcheck.parse(Data("""
-    {"schema": "spatio.walkcheck.v1", "result": "PASS", "walls": {"status": "NO_MAP", "proposed_gate_result": "FAIL"},
+    {"schema": "spatio.walkcheck.v1", "result": "FAIL", "walls": {"status": "NO_MAP", "proposed_gate_result": "FAIL"},
      "return_to_start": {"error_3d_cm": true}}
     """.utf8))
     expect(skippedWalls.wallGate == nil, "an unscored wall section shows no gate")
     expect(skippedWalls.error3DCm == nil, "a boolean is not a number")
+
+    // A PASS carries what walkcheck always writes for one. A wall-gate FAIL does not
+    // contradict it (walkcheck's wall gate never sets the verdict).
+    let pass = try! TrailWalkcheck.parse(walkcheckJSON(result: "PASS", returnError: 4))
+    expect(pass.result == "PASS" && close(pass.error3DCm ?? 0, 4) && pass.wallGate == "FAIL", "a scored PASS with a wall FAIL reads")
+    expect(TrailReadout.verdictTone("PASS", stale: false) == .good, "a current PASS is green")
+    let justUnder = walkcheckPASS(returned: #""evaluated": true, "within_threshold": true, "error_3d_cm": 9.999999, "threshold_m": 0.1"#)
+    expect((try? TrailWalkcheck.parse(justUnder))?.result == "PASS", "9.999999 cm under a 0.1 m threshold passes")
+
+    // A PASS with missing, mistyped or contradictory evidence is refused, so the session
+    // lists it as a problem and nothing shows green.
+    let scored = #""evaluated": true, "within_threshold": true, "threshold_m": 0.1"#
+    for (data, needle, label) in [
+        (walkcheckPASS(returned: nil), "return_to_start is missing", "PASS with no return_to_start"),
+        (walkcheckPASS(returned: "null"), "return_to_start is missing", "PASS with return_to_start null"),
+        (Data(#"{"schema": "spatio.walkcheck.v1", "result": "PASS"}"#.utf8), "reasons", "PASS with nothing else"),
+        (Data(#"{"schema": "spatio.walkcheck.v1", "result": "PASS", "walls": {"status": "NO_MAP"}, "return_to_start": {"error_3d_cm": true}}"#.utf8),
+         "reasons", "the old evidence-free PASS fixture"),
+        (walkcheckPASS(returned: scored + #", "error_3d_cm": "4.0""#), "error_3d_cm", "error as a string"),
+        (walkcheckPASS(returned: scored + #", "error_3d_cm": true"#), "error_3d_cm", "error as a boolean"),
+        (walkcheckPASS(returned: scored), "error_3d_cm", "error missing"),
+        (walkcheckPASS(returned: scored + #", "error_3d_cm": -1.0"#), "error_3d_cm", "negative error"),
+        (walkcheckPASS(returned: #""evaluated": true, "within_threshold": true, "error_3d_cm": 4.0"#, parameters: "{}"),
+         "threshold_m", "no threshold anywhere"),
+        (walkcheckPASS(returned: #""evaluated": true, "within_threshold": true, "error_3d_cm": 4.0, "threshold_m": "0.1""#, parameters: "{}"),
+         "threshold_m", "threshold as a string"),
+        (walkcheckPASS(returned: #""evaluated": true, "within_threshold": true, "error_3d_cm": 4.0, "threshold_m": 0"#, parameters: "{}"),
+         "threshold_m", "zero threshold"),
+        (walkcheckPASS(returned: #""evaluated": true, "within_threshold": false, "error_3d_cm": 4.0, "threshold_m": 0.1"#),
+         "within_threshold", "within_threshold false"),
+        (walkcheckPASS(returned: #""evaluated": true, "within_threshold": 1, "error_3d_cm": 4.0, "threshold_m": 0.1"#),
+         "within_threshold", "within_threshold 1, not true"),
+        (walkcheckPASS(returned: #""within_threshold": true, "error_3d_cm": 4.0, "threshold_m": 0.1"#),
+         "evaluated", "evaluated missing"),
+        (walkcheckPASS(returned: scored + #", "error_3d_cm": 224.19"#), "is not below", "224 cm against 10 cm"),
+        (walkcheckPASS(returned: scored + #", "error_3d_cm": 10.0"#), "is not below", "exactly at the threshold"),
+        (walkcheckPASS(returned: scored + #", "error_3d_cm": 4.0"#, reasons: #"["return_error"]"#), "reasons", "PASS with a reason"),
+        (walkcheckPASS(returned: scored + #", "error_3d_cm": 4.0"#, reasons: #""none""#), "reasons", "reasons not a list"),
+    ] {
+        do {
+            _ = try TrailWalkcheck.parse(data)
+            expect(false, "\(label) should not parse")
+        } catch {
+            expect("\(error)".contains("result PASS but") && "\(error)".contains(needle), "\(label): '\(error)' should mention '\(needle)'")
+        }
+    }
+    // The same contradictions on a FAIL are shown as read: a FAIL never shows green.
+    _ = try! TrailWalkcheck.parse(Data(#"{"schema": "spatio.walkcheck.v1", "result": "FAIL", "reasons": ["stationary_trajectory"], "return_to_start": {"within_threshold": true}}"#.utf8))
+    expect(TrailReadout.verdictTone("FAIL", stale: false) == .bad && TrailReadout.verdictTone("NOT-EVALUABLE", stale: false) == .warn,
+           "FAIL is red, NOT-EVALUABLE amber")
+
+    // Walkcheck's provisional label rides on the window sentence.
+    let labelled = try! TrailWalkcheck.parse(walkcheckPASS(
+        returned: scored + #", "error_3d_cm": 4.0"#,
+        parameters: #"{"stationary_window_s": 5.0, "provisional_label": "provisional (approved for now, revisit after real data)"}"#))
+    expect(TrailReadout.walkcheckNote(labelled, stale: nil, accuracyLabel: nil)
+            .contains("first 5 s to mean of the last 5 s, end not aligned onto start; window provisional (approved for now"),
+           "the window is labelled provisional, got \(TrailReadout.walkcheckNote(labelled, stale: nil, accuracyLabel: nil))")
 
     for (data, needle, label) in [
         (walkcheckJSON(result: "PASS", returnError: 4, schema: "spatio.walkcheck.v2"), "schema", "another schema"),
@@ -628,6 +703,7 @@ func testTrailWalkcheckNeverClearsLabel() {
     try! walkcheckJSON(result: "PASS", returnError: 4, manifestEvaluated: true).write(to: dir.appendingPathComponent("walkcheck.json"))
     var session = try! TrailSession.load(directory: dir.path)
     expect(session.walkcheck?.result == "PASS", "the walkcheck verdict loads")
+    expect(session.walkcheckStale == nil, "a walkcheck newer than its inputs is current")
     expect(session.accuracyLabel == TrailSession.notEvaluatedLabel,
            "a walkcheck PASS that copies evaluated=true does not clear the label")
     expect(session.topdownPath == nil, "no topdown.png, no picture")
@@ -648,12 +724,50 @@ func testTrailWalkcheckNeverClearsLabel() {
     session = try! TrailSession.load(directory: dir.path)
     expect(session.problems.contains { $0.contains("walkcheck.json is older than trajectory.tum") }, "stale walkcheck is listed")
     expect(session.walkcheck != nil, "a stale walkcheck still shows")
+    // ...but marked stale beside the verdict, and never green.
+    func expectStalePASS(_ session: TrailSession, _ label: String) {
+        guard let w = session.walkcheck, let stale = session.walkcheckStale else {
+            return expect(false, "\(label): walkcheck should load and be stale")
+        }
+        let verdict = TrailReadout.walkcheckRows(w, stale: true).first
+        expect(verdict?.label == "Verdict" && verdict?.value == "PASS · stale", "\(label): the verdict row says stale")
+        expect(TrailReadout.verdictTone(w.result, stale: true) == .warn, "\(label): a stale PASS is not green")
+        expect(TrailReadout.walkcheckNote(w, stale: stale, accuracyLabel: nil).hasPrefix("Stale: \(stale). Re-run walkcheck"),
+               "\(label): the note leads with why")
+    }
+    expectStalePASS(session, "trajectory newer")
+    expect(TrailReadout.verdictTone("FAIL", stale: true) == .warn, "a stale FAIL is amber, not red")
+
+    // A map rewritten after scoring makes it stale too, with the trajectory still older.
+    let map = dir.appendingPathComponent("map.pcd")
+    try! TrailFixture.binaryPCD(TrailFixture.mapPoints()).write(to: map)
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -7200)], ofItemAtPath: tum.path)
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)],
+                          ofItemAtPath: dir.appendingPathComponent("walkcheck.json").path)
+    session = try! TrailSession.load(directory: dir.path)
+    expect(session.walkcheckStale == "walkcheck.json is older than map.pcd; its verdict may be for earlier files",
+           "map newer only, got \(session.walkcheckStale ?? "nil")")
+    expect(session.problems.contains(session.walkcheckStale ?? "-"), "and it is listed under Files")
+    expectStalePASS(session, "map newer")
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -60)], ofItemAtPath: tum.path)
+    session = try! TrailSession.load(directory: dir.path)
+    expect(session.walkcheckStale?.hasPrefix("walkcheck.json is older than trajectory.tum and map.pcd") == true,
+           "both newer are both named, got \(session.walkcheckStale ?? "nil")")
+    try! fm.setAttributes([.modificationDate: Date()], ofItemAtPath: dir.appendingPathComponent("walkcheck.json").path)
+    session = try! TrailSession.load(directory: dir.path)
+    expect(session.walkcheckStale == nil, "a re-run walkcheck is current again")
+    try! fm.removeItem(at: map)
 
     try! Data("{\"schema\": \"other\"}".utf8).write(to: dir.appendingPathComponent("walkcheck.json"))
     session = try! TrailSession.load(directory: dir.path)
     expect(session.walkcheck == nil && session.problems.contains { $0.contains("walkcheck.json: schema") },
            "an unreadable walkcheck is a listed problem, got \(session.problems)")
     expect(session.trajectory != nil, "and the session still opens")
+
+    try! walkcheckPASS(returned: nil).write(to: dir.appendingPathComponent("walkcheck.json"))
+    session = try! TrailSession.load(directory: dir.path)
+    expect(session.walkcheck == nil && session.problems.contains { $0.contains("result PASS but return_to_start is missing") },
+           "an evidence-free PASS is a listed problem, not a verdict, got \(session.problems)")
     try? fm.removeItem(at: dir)
 }
 
@@ -689,6 +803,17 @@ func testTrailLibraryScanAndReopen() {
     expect(entries[0].hasMap && !entries[0].hasTrajectory, "map-only flags")
     expect(entries[1].walkcheckResult == "FAIL" && entries[2].walkcheckResult == nil, "the list carries the walkcheck verdict")
     expect(entries[1].directory == root.appendingPathComponent("scored-run").path, "entries open by full path")
+    expect(!entries[1].walkcheckStale, "a walkcheck newer than its inputs is current in the list")
+    // The list uses the same freshness rule as the opened session.
+    let scoredWalkcheck = root.appendingPathComponent("scored-run/walkcheck.json").path
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -86_400 * 2)], ofItemAtPath: scoredWalkcheck)
+    let rescanned = TrailLibrary.scan(root: root.path).first { $0.name == "scored-run" }
+    expect(rescanned?.walkcheckStale == true && rescanned?.walkcheckResult == "FAIL", "an older walkcheck is stale in the list")
+    expect(TrailReadout.verdictText("FAIL", stale: true) == "FAIL · stale" && TrailReadout.verdictText("PASS", stale: false) == "PASS",
+           "the list marks stale beside the verdict")
+    try! walkcheckPASS(returned: nil).write(to: URL(fileURLWithPath: scoredWalkcheck))
+    let refused = TrailLibrary.scan(root: root.path).first { $0.name == "scored-run" }
+    expect(refused?.walkcheckResult == nil && refused?.walkcheckStale == false, "an evidence-free PASS shows no verdict in the list")
     expect(TrailLibrary.scan(root: root.appendingPathComponent("absent").path).isEmpty, "a missing root lists nothing")
 
     let saved = root.appendingPathComponent("scored-run").path

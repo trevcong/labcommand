@@ -25,6 +25,8 @@ public struct TrailWalkcheck: Equatable, Sendable {
     public var wallGate: String?
     public var wallP95Cm: Double?
     public var wallGateLabel: String?
+    /// Walkcheck's label for its window, gap and motion thresholds.
+    public var provisionalLabel: String?
 
     public static func parse(_ data: Data) throws -> TrailWalkcheck {
         guard let object = try? JSONSerialization.jsonObject(with: data), let dict = object as? [String: Any] else {
@@ -42,7 +44,7 @@ public struct TrailWalkcheck: Equatable, Sendable {
         let motion = dict["motion"] as? [String: Any]
         let walls = dict["walls"] as? [String: Any]
         let wallsScored = (walls?["status"] as? String) == "OK"
-        return TrailWalkcheck(
+        let checked = TrailWalkcheck(
             result: result,
             reasons: (dict["reasons"] as? [Any])?.compactMap { $0 as? String } ?? [],
             detail: dict["detail"] as? String,
@@ -55,8 +57,36 @@ public struct TrailWalkcheck: Equatable, Sendable {
             pathLengthM: number(motion?["path_length_m"]),
             wallGate: wallsScored ? walls?["proposed_gate_result"] as? String : nil,
             wallP95Cm: wallsScored ? number(walls?["p95_point_to_plane_cm"]) : nil,
-            wallGateLabel: parameters?["wall_gate_label"] as? String ?? walls?["proposed_gate_label"] as? String
+            wallGateLabel: parameters?["wall_gate_label"] as? String ?? walls?["proposed_gate_label"] as? String,
+            provisionalLabel: parameters?["provisional_label"] as? String
         )
+        if result == "PASS", let missing = passEvidenceProblem(checked, returned: returned, rawReasons: dict["reasons"]) {
+            throw TrailError.session("\(file): result PASS but \(missing)")
+        }
+        return checked
+    }
+
+    /// What a PASS lacks, or nil when it carries what walkcheck always writes for one: no
+    /// reasons, a scored return (`evaluated` and `within_threshold` JSON true) and a 3D error
+    /// strictly under the threshold. The wall gate is not part of the verdict, so a PASS with
+    /// a wall FAIL is fine. FAIL and NOT-EVALUABLE are shown as read; neither shows green.
+    private static func passEvidenceProblem(_ w: TrailWalkcheck, returned: [String: Any]?, rawReasons: Any?) -> String? {
+        guard (rawReasons as? [Any])?.isEmpty == true else { return "reasons is not an empty list" }
+        guard let returned else { return "return_to_start is missing or null" }
+        guard isTrue(returned["evaluated"]) else { return "return_to_start.evaluated is not true" }
+        guard isTrue(returned["within_threshold"]) else { return "return_to_start.within_threshold is not true" }
+        guard let error = w.error3DCm, error >= 0 else { return "return_to_start.error_3d_cm is not a number ≥ 0" }
+        guard let threshold = w.thresholdM, threshold > 0 else { return "threshold_m is not a number > 0" }
+        guard error < threshold * 100 else {
+            return "error_3d_cm \(error) is not below threshold_m \(threshold) (\(threshold * 100) cm)"
+        }
+        return nil
+    }
+
+    /// JSON `true` only; NSNumber bridges 1 to true as well.
+    private static func isTrue(_ value: Any?) -> Bool {
+        guard let n = value as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() else { return false }
+        return n.boolValue
     }
 
     /// A finite JSON number. A boolean is not a number here.
@@ -64,6 +94,21 @@ public struct TrailWalkcheck: Equatable, Sendable {
         guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
         let d = n.doubleValue
         return d.isFinite ? d : nil
+    }
+
+    /// Why the walkcheck in `directory` may be for earlier files, or nil when it is newer than
+    /// both inputs it scored. Modification times only: a copy that keeps an old time is missed.
+    public static func staleness(directory: String) -> String? {
+        let fm = FileManager.default
+        func modified(_ name: String) -> Date? {
+            (try? fm.attributesOfItem(atPath: (directory as NSString).appendingPathComponent(name)))?[.modificationDate] as? Date
+        }
+        guard let scored = modified(file) else { return nil }
+        let newer = [TrailSession.trajectoryFile, TrailSession.mapFile].filter { name in
+            modified(name).map { scored < $0 } ?? false
+        }
+        guard !newer.isEmpty else { return nil }
+        return "\(file) is older than \(newer.joined(separator: " and ")); its verdict may be for earlier files"
     }
 }
 
@@ -75,6 +120,8 @@ public struct TrailSessionEntry: Equatable, Sendable, Identifiable {
     public var hasMap: Bool
     /// The walkcheck verdict, when `walkcheck.json` reads.
     public var walkcheckResult: String?
+    /// True when `walkcheck.json` is older than the trajectory or the map (`TrailWalkcheck.staleness`).
+    public var walkcheckStale: Bool
     /// Newest of the trajectory and map modification times.
     public var modified: Date
     public var id: String { directory }
@@ -134,6 +181,7 @@ public enum TrailLibrary {
                 hasTrajectory: hasTrajectory,
                 hasMap: hasMap,
                 walkcheckResult: walkcheck?.result,
+                walkcheckStale: walkcheck != nil && TrailWalkcheck.staleness(directory: directory) != nil,
                 modified: modified
             ))
         }

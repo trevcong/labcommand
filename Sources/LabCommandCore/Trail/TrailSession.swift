@@ -57,17 +57,21 @@ public struct TrailSession: Equatable, Sendable {
     public var problems: [String]
     /// Optional `walkcheck.json`. Its verdict is shown; it never changes `accuracyLabel`.
     public var walkcheck: TrailWalkcheck?
+    /// Why the walkcheck may be for earlier files, or nil when it is current. A stale verdict
+    /// is still shown, marked stale and never green.
+    public var walkcheckStale: String?
     /// Optional `topdown.png` written by walkcheck.
     public var topdownPath: String?
 
     public init(directory: String, trajectory: TrailTrajectory?, map: TrailMapCloud?, manifest: TrailManifest?, problems: [String],
-                walkcheck: TrailWalkcheck? = nil, topdownPath: String? = nil) {
+                walkcheck: TrailWalkcheck? = nil, walkcheckStale: String? = nil, topdownPath: String? = nil) {
         self.directory = directory
         self.trajectory = trajectory
         self.map = map
         self.manifest = manifest
         self.problems = problems
         self.walkcheck = walkcheck
+        self.walkcheckStale = walkcheckStale
         self.topdownPath = topdownPath
     }
 
@@ -136,23 +140,21 @@ public struct TrailSession: Equatable, Sendable {
 
         // Walkcheck is optional: absent is not a problem, unreadable is.
         var walkcheck: TrailWalkcheck?
+        var walkcheckStale: String?
         let walkcheckPath = root.appendingPathComponent(TrailWalkcheck.file).path
         if let data = fm.contents(atPath: walkcheckPath) {
             do {
                 walkcheck = try TrailWalkcheck.parse(data)
-                func modified(_ path: String) -> Date? {
-                    (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
-                }
-                if let scored = modified(walkcheckPath), let tum = modified(tumPath), scored < tum {
-                    problems.append("\(TrailWalkcheck.file) is older than \(trajectoryFile); its verdict may be for an earlier trajectory")
-                }
+                walkcheckStale = TrailWalkcheck.staleness(directory: directory)
+                if let walkcheckStale { problems.append(walkcheckStale) }
             } catch {
                 problems.append("\(error)")
             }
         }
         let topdown = root.appendingPathComponent(TrailWalkcheck.topdownFile).path
         return TrailSession(directory: directory, trajectory: trajectory, map: map, manifest: manifest, problems: problems,
-                            walkcheck: walkcheck, topdownPath: fm.fileExists(atPath: topdown) ? topdown : nil)
+                            walkcheck: walkcheck, walkcheckStale: walkcheckStale,
+                            topdownPath: fm.fileExists(atPath: topdown) ? topdown : nil)
     }
 
     /// The folder named by `LABCOMMAND_TRAIL_SESSION`. `fixture` is the synthetic loop:
@@ -307,9 +309,26 @@ public enum TrailReadout {
         return rows
     }
 
+    public enum VerdictTone: Equatable, Sendable { case good, bad, warn }
+
+    /// The verdict as shown in the walk check block and the sessions list.
+    public static func verdictText(_ result: String, stale: Bool) -> String {
+        stale ? "\(result) · stale" : result
+    }
+
+    /// Green only for a current PASS. A stale verdict of any kind is a warning.
+    public static func verdictTone(_ result: String, stale: Bool) -> VerdictTone {
+        if stale { return .warn }
+        switch result {
+        case "PASS": return .good
+        case "FAIL": return .bad
+        default: return .warn
+        }
+    }
+
     /// Rows for `walkcheck.json`. Walkcheck reports centimetres; shown as it scored them.
-    public static func walkcheckRows(_ w: TrailWalkcheck) -> [Row] {
-        var rows = [Row(label: "Verdict", value: w.result)]
+    public static func walkcheckRows(_ w: TrailWalkcheck, stale: Bool) -> [Row] {
+        var rows = [Row(label: "Verdict", value: verdictText(w.result, stale: stale))]
         if let d3 = w.error3DCm {
             var value = metres(d3 / 100)
             if let threshold = w.thresholdM { value += " · need < \(metres(threshold))" }
@@ -331,10 +350,13 @@ public enum TrailReadout {
     }
 
     /// How walkcheck measured, and what its verdict is not.
-    public static func walkcheckNote(_ w: TrailWalkcheck, accuracyLabel: String?) -> String {
+    public static func walkcheckNote(_ w: TrailWalkcheck, stale: String?, accuracyLabel: String?) -> String {
         var parts: [String] = []
+        if let stale { parts.append("Stale: \(stale). Re-run walkcheck before trusting this verdict.") }
         if let window = w.windowS {
-            parts.append(String(format: "Return error: mean of the first %.0f s to mean of the last %.0f s, end not aligned onto start.", window, window))
+            var sentence = String(format: "Return error: mean of the first %.0f s to mean of the last %.0f s, end not aligned onto start", window, window)
+            if let label = w.provisionalLabel, !label.isEmpty { sentence += "; window \(label)" }
+            parts.append(sentence + ".")
         }
         if !w.reasons.isEmpty { parts.append("Reasons: " + w.reasons.joined(separator: ", ") + ".") }
         if let detail = w.detail, !detail.isEmpty { parts.append(detail) }
