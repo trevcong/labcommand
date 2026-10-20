@@ -112,7 +112,7 @@ This job leaves the sink nil.
 
 ## What the screen is
 
-Room is the first destination (`Dest.liveRoom`, label `Room`, shortcut `1`). Settings stays `2`. Rig is `3`, and it stays the diagnostics tab: the lidar canvas and the recording controls are unchanged. `Dest.navCases` is Room, Settings, Rig. A normal launch opens Room. A snapshot pair stays on Rig unless that launch also asks for Room. `opensRoom` is not the tab; it still skips probes.
+Room is the first destination (`Dest.liveRoom`, label `Room`, shortcut `1`). Settings stays `2`. Rig is `3`, and it stays the diagnostics tab: the lidar canvas and the recording controls are unchanged. `Dest.navCases` is Room, Settings, Rig, Trail (Trail, `4`, was added for Spatio trajectory replay). A normal launch opens Room. A snapshot pair stays on Rig unless that launch also asks for Room. `opensRoom` is not the tab; it still skips probes.
 
 Same chrome as the rest of the app (`design-refs/DESIGN-VISION.md`, `LabTheme`):
 

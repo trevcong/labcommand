@@ -25,6 +25,11 @@ if CommandLine.arguments.dropFirst().first == "generate-room-fixtures" {
     exit(0)
 }
 
+if CommandLine.arguments.dropFirst().first == "generate-trail-fixture" {
+    generateTrailFixture(arguments: Array(CommandLine.arguments.dropFirst(2)))
+    exit(0)
+}
+
 print("Running LabCommandCore tests…")
 runFixtureTests()
 runPointCloudTests()
@@ -120,4 +125,5 @@ runLiveRoomViewTests()
 runStatusDotsTests()
 print("  status dots: a fresh room link drives the chips; a stale or down link leaves the probe"); passed()
 runRoomTabModelTests()
+runTrailTests()
 print("PASS LabCommandCoreTestsRunner (\(passCount) groups)")

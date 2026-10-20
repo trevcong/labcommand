@@ -1,0 +1,12 @@
+{
+  "config_file" : null,
+  "config_sha256" : null,
+  "created_at" : "2026-10-19T00:00:00Z",
+  "fastlio_revision" : null,
+  "image" : null,
+  "notes" : "Synthetic 4 x 2 m loop for tests and screenshots. Ends 4.0 cm from the start by construction.",
+  "physical_accuracy_evaluated" : false,
+  "run_id" : "synthetic-loop",
+  "sensor" : "synthetic",
+  "source_recording" : "synthetic (generate-trail-fixture); not a recording"
+}
