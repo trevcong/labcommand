@@ -39,6 +39,12 @@ WALL_MIN_CELL_POINTS = 25
 WALL_GATE_CM = 5.0
 WALL_DOUBLE_MIN_M = 0.05
 WALL_DOUBLE_MAX_M = 0.40
+# When a wall runs along the voxel diagonal, one cell is about as deep as
+# it is wide, so its own normal is noise and the two sheets are dropped
+# before pairing. The second look fits the normal on points out to this
+# radius. It has to reach the farther sheet still called a double, and it
+# has to see past that one cell. Sum of those two lengths. Not a new gate.
+WALL_NORMAL_SUPPORT_M = WALL_VOXEL_M + WALL_DOUBLE_MAX_M
 WALL_LATERAL_MAX_M = 0.20
 WALL_LAYER_P95_MAX_M = 0.02
 WALL_LAYER_MIN_FRACTION = 0.20

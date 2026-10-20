@@ -66,6 +66,57 @@ def test_shifted_doubled_sheet_cannot_pass():
     assert room["proposed_gate_result"] == "PASS"
 
 
+def _yaw(points: np.ndarray, deg: float) -> np.ndarray:
+    """Rotate a cloud about Z. Element-wise, so it does not use matmul."""
+    theta = np.deg2rad(deg)
+    cosine = float(np.cos(theta))
+    sine = float(np.sin(theta))
+    rotated = np.empty_like(points)
+    rotated[:, 0] = cosine * points[:, 0] - sine * points[:, 1]
+    rotated[:, 1] = sine * points[:, 0] + cosine * points[:, 1]
+    rotated[:, 2] = points[:, 2]
+    return rotated
+
+
+def test_rotated_doubled_sheet_cannot_pass():
+    """Codex P2. A 20 cm double wall at 45 degrees about Z used to pass.
+
+    Unrotated, the gate failed. Rotated onto the voxel diagonal, the
+    headline kept 2,595 of 8,000 points, p95 was 3.86 cm, and
+    doubled_wall was false. The cell normal was noise, so the thick
+    cells were dropped and pairing never saw the sheets. A heading
+    change must not turn that wall into a pass. Nearby headings and a
+    5 cm shift are the same hole. A sharp wall and a clean room at
+    that heading still pass.
+    """
+    cloud = doubled_wall(separation_m=0.20)
+    for deg in (43.5, 45.0, 45.5, 49.0):
+        scored = wall_sharpness(_yaw(cloud, deg))
+        assert scored["status"] == "OK", deg
+        assert scored["doubled_wall"] is True, deg
+        assert scored["proposed_gate_result"] == "FAIL", deg
+        assert scored["p95_point_to_plane_cm"] > 5.0, deg
+        assert scored["revisit_separation_cm"] is not None, deg
+        assert scored["revisit_separation_cm"] > 10.0, deg
+    exact = wall_sharpness(_yaw(cloud, 45.0))
+    # The bug's headline was a 2,595-point sliver at 3.86 cm.
+    assert exact["planar_point_count"] > 4000
+    assert exact["p95_point_to_plane_cm"] > 5.0
+    shifted = wall_sharpness(_yaw(cloud, 45.0) + np.array([0.05, 0.0, 0.0]))
+    assert shifted["doubled_wall"] is True
+    assert shifted["proposed_gate_result"] == "FAIL"
+    assert shifted["p95_point_to_plane_cm"] > 5.0
+    assert shifted["revisit_separation_cm"] > 10.0
+    sharp = wall_sharpness(_yaw(sharp_wall(), 45.0))
+    assert sharp["doubled_wall"] is False
+    assert sharp["proposed_gate_result"] == "PASS"
+    assert sharp["p95_point_to_plane_cm"] < 2.0
+    room = wall_sharpness(_yaw(four_wall_room(), 45.0))
+    assert room["doubled_wall"] is False
+    assert room["proposed_gate_result"] == "PASS"
+    assert room["p95_point_to_plane_cm"] < 2.0
+
+
 def test_too_few_points_is_not_evaluable():
     tiny = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64)
     scored = wall_sharpness(tiny)
