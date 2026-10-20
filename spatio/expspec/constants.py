@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from spatio.thresholds import RETURN_GATE_M, WALL_GATE_M
+
 SPEC_SCHEMA = "spatio.experiment_spec/1"
 REFERENCE_SCHEMA = "spatio.physical_reference/1"
 
@@ -11,10 +13,10 @@ REFERENCE_SCHEMA = "spatio.physical_reference/1"
 # revisit after real data): the 1 cm placement tolerance and the 5 cm
 # wall gates. The 5 s window minimum below is provisional on the same terms.
 PROPOSED_THRESHOLDS = {
-    "return_error_threshold_m": 0.10,
+    "return_error_threshold_m": RETURN_GATE_M,
     "placement_tolerance_m": 0.01,
-    "wall_p95_gate_m": 0.05,
-    "revisit_separation_gate_m": 0.05,
+    "wall_p95_gate_m": WALL_GATE_M,
+    "revisit_separation_gate_m": WALL_GATE_M,
 }
 
 PROVISIONAL_LABEL = "provisional (approved for now, revisit after real data)"

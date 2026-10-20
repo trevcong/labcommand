@@ -22,6 +22,7 @@ from spatio.walkcheck.defaults import (
     MIN_WINDOW_SAMPLES,
     RETURN_PASS_M,
     STATIONARY_WINDOW_S,
+    WALL_GATE_M,
 )
 
 
@@ -52,6 +53,7 @@ def check_scoring_thresholds(
     max_imu_gap_s: float = MAX_IMU_GAP_S,
     max_accel_deviation_m_s2: float = MAX_ACCEL_DEVIATION_M_S2,
     gravity_m_s2: float = GRAVITY_M_S2,
+    wall_gate_m: float = WALL_GATE_M,
 ) -> None:
     """Reject a scoring limit that is not a real, in-range number.
 
@@ -80,6 +82,7 @@ def check_scoring_thresholds(
     _finite_limit("minimum excursion", min_excursion_m, positive=False)
     _finite_limit("endpoint spread", max_endpoint_spread_m, positive=False)
     _finite_limit("endpoint speed", max_endpoint_speed_m_s, positive=False)
+    _finite_limit("wall gate", wall_gate_m, positive=True)
 
 
 def _finite_limit(name: str, value, *, positive: bool) -> None:

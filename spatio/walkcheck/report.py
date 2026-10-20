@@ -226,7 +226,7 @@ def render_markdown(report: dict) -> str:
                 "It is not a count of walls."
             )
         lines.append(
-            f"Proposed gate: residual ≤ {walls['proposed_gate_cm']:.0f} cm and no doubled wall "
+            f"Proposed gate: residual ≤ {walls['proposed_gate_cm']:g} cm and no doubled wall "
             f"over 5 cm. Result: {walls['proposed_gate_result']}."
         )
     lines.append(

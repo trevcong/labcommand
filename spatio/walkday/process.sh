@@ -218,7 +218,7 @@ say "[6/9] walk check (B)"
 python3 -m spatio.walkcheck "$SESSION" --stationary-window "$STATIONARY_WINDOW_S" --max-gap "$MAX_GAP_S" \
   --min-path-length "$MIN_PATH_LENGTH_M" --min-excursion "$MIN_EXCURSION_M" \
   --max-endpoint-spread "$MAX_ENDPOINT_SPREAD_M" --max-endpoint-speed "$MAX_ENDPOINT_SPEED_M_S" \
-  --max-hold-speed "$MAX_HOLD_SPEED_M_S" --min-hold "$MIN_HOLD_S"
+  --max-hold-speed "$MAX_HOLD_SPEED_M_S" --min-hold "$MIN_HOLD_S" --wall-gate-m "$WALL_GATE_M"
 rc=$?
 case $rc in 0|1|2) say "walk checker exit $rc" ;; *) stop walk-check "walkcheck could not use the session (exit $rc)" ;; esac
 
@@ -244,7 +244,7 @@ if [[ -f $SESSION/wallpatch/patches.json ]]; then
   [[ ${#REF_ARGS[@]} -gt 0 ]] && ACC_LABEL="physical reference recorded (see physical_reference.json)"
   [[ $SYNTHETIC == 1 ]] && ACC_LABEL="SYNTHETIC recording; $ACC_LABEL"
   python3 -m spatio.wallpatch measure "$SESSION" --patches "$SESSION/wallpatch/patches.json" \
-    --out "$SESSION/wallpatch" --accuracy-label "$ACC_LABEL; patches: $PATCH_SOURCE" \
+    --out "$SESSION/wallpatch" --wall-gate-m "$WALL_GATE_M" --accuracy-label "$ACC_LABEL; patches: $PATCH_SOURCE" \
     || say "WARNING: wall-patch measurement failed; walls will be not evaluable"
 fi
 

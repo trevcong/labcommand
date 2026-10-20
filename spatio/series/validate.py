@@ -13,14 +13,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, List, Optional, Sequence
 
+from spatio.thresholds import RETURN_GATE_M, WALL_GATE_M as _WALL_GATE_M
+
 # Milestone gates. A looser value in the file must not create a pass.
 # The 0.10 m return gate is the workplan rule.
 # The 1 cm placement tolerance and the 5 cm wall gate are provisional:
 # Trevor's delegate approved the numbers, and they are not a final freeze.
 # The wall gate is a label only. W1 does not accept or reject on wall p95.
-RETURN_THRESHOLD_M = 0.10
+# The return and wall gates live in spatio.thresholds.
+RETURN_THRESHOLD_M = RETURN_GATE_M
 PLACEMENT_TOLERANCE_M = 0.01
-WALL_GATE_M = 0.05
+WALL_GATE_M = _WALL_GATE_M
 # A measured horizontal or vertical component must fit inside d3.
 # When both components exist, d3 must also match their root sum square.
 # That 1 mm allowance is consistency only. It does not move the 0.10 m gate.

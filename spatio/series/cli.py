@@ -18,6 +18,7 @@ import sys
 
 from spatio.series.report import build_series, default_series_id, explain_text, render_markdown
 from spatio.series.validate import InputRejected, Unreadable, load_walk_result
+from spatio.thresholds import WALL_GATE_M
 
 VERDICT_EXIT = {"PASS": 0, "FAIL": 3, "INCOMPLETE": 4,
                 "NOT_EVALUABLE": 5, "REPLAY_ONLY": 6}
@@ -70,7 +71,7 @@ def _parser() -> argparse.ArgumentParser:
     adapt.add_argument("--patches", help="Source patches.json (retained as a provenance hash)")
     adapt.add_argument("--spec", help="Frozen spec naming the required preselected patches")
     adapt.add_argument("--patch-origin", choices=("preselected", "auto_suggested"), default="auto_suggested")
-    adapt.add_argument("--wall-gate-m", type=float, default=0.05)
+    adapt.add_argument("--wall-gate-m", type=float, default=WALL_GATE_M)
     adapt.add_argument("--wall-gate-state", choices=("approved", "proposed"), default="proposed")
     return parser
 
