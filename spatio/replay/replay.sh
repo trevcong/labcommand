@@ -160,7 +160,7 @@ if [[ $MODE == replay ]]; then
   M_NOTES="Offline FAST-LIO re-run on the Mac (colima, aarch64) of the copied recording; played ${LIDAR} + ${IMU} only at rate ${RATE}${DURATION:+, first ${DURATION} s only}. trajectory.tum = recorded /Odometry header stamps. map.pcd = copied map_saver.py (0.03 m voxel) over recorded /cloud_registered. Container exit ${RC}. ${CONFIG_NOTE}"
 else
   # Original Spark run: revision only known if the recording says so.
-  M_REV="$(sed -n 's/^FAST_LIO_ROS2: *//p' "$REC/provenance.txt" 2>/dev/null | head -1)"
+  M_REV="$(sed -n 's/^FAST_LIO_ROS2: *//p' "$REC/provenance.txt" 2>/dev/null | head -1 || true)"
   M_REV="${M_REV:-unknown (not recorded with this recording)}"
   M_IMAGE="original Spark run (image not recorded); exported with $IMAGE_TAG@$IMAGE_ID"
   M_CONFIG="${CONFIG:-unknown (no config copied with this recording)}"
