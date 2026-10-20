@@ -117,6 +117,38 @@ def test_rotated_doubled_sheet_cannot_pass():
     assert room["p95_point_to_plane_cm"] < 2.0
 
 
+def test_wide_doubled_sheet_cannot_pass():
+    """Codex P2. A doubled wall wider than 40 cm used to pass.
+
+    wall_sharpness(doubled_wall(separation_m=0.45)) was PASS, doubled_wall
+    was false, and p95 was 0.57 cm. The neighbor loop had measured the
+    pair and the 40 cm cap then threw it away. Each sheet is a thin plane,
+    so the residual stays under 5 cm and the gate used to pass. A wider
+    gap, a shift, and a change of heading are the same hole. A sharp wall
+    and a clean room still pass.
+    """
+    for separation_m in (0.45, 0.70, 1.20):
+        for deg in (0.0, 45.0, 90.0):
+            scored = wall_sharpness(_yaw(doubled_wall(separation_m=separation_m), deg))
+            assert scored["status"] == "OK", (separation_m, deg)
+            assert scored["doubled_wall"] is True, (separation_m, deg)
+            assert scored["proposed_gate_result"] == "FAIL", (separation_m, deg)
+            assert scored["revisit_separation_cm"] is not None, (separation_m, deg)
+            assert scored["revisit_separation_cm"] > 40.0, (separation_m, deg)
+    cloud = doubled_wall(separation_m=0.45)
+    for shift_m in (0.05, 0.15, 0.30):
+        scored = wall_sharpness(cloud + np.array([shift_m, 0.0, 0.0]))
+        assert scored["doubled_wall"] is True, shift_m
+        assert scored["proposed_gate_result"] == "FAIL", shift_m
+        assert scored["revisit_separation_cm"] > 40.0, shift_m
+    sharp = wall_sharpness(sharp_wall())
+    assert sharp["doubled_wall"] is False
+    assert sharp["proposed_gate_result"] == "PASS"
+    room = wall_sharpness(four_wall_room())
+    assert room["doubled_wall"] is False
+    assert room["proposed_gate_result"] == "PASS"
+
+
 def test_too_few_points_is_not_evaluable():
     tiny = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64)
     scored = wall_sharpness(tiny)

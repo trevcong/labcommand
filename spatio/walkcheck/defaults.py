@@ -38,12 +38,18 @@ WALL_MAX_ABS_NZ = 0.35
 WALL_MIN_CELL_POINTS = 25
 WALL_GATE_CM = 5.0
 WALL_DOUBLE_MIN_M = 0.05
+# Kept as one term of the normal-fit distance below. It is not a cap on
+# doubled sheets. Capping them at 40 cm threw away a gap the checker had
+# already measured, and the wall gate passed.
 WALL_DOUBLE_MAX_M = 0.40
 # When a wall runs along the voxel diagonal, one cell is about as deep as
 # it is wide, so its own normal is noise and the two sheets are dropped
 # before pairing. The second look fits the normal on points out to this
-# radius. It has to reach the farther sheet still called a double, and it
-# has to see past that one cell. Sum of those two lengths. Not a new gate.
+# radius: one cell plus the old 40 cm figure. Pairing looks one cell past
+# that. A stacked pair inside the search and over 5 cm is a double.
+# Farther than the search, the checker is not looking, and two sharp
+# sheets can still be one wall seen twice. Provisional, like the 5 cm
+# gate. Not fitted to a recording.
 WALL_NORMAL_SUPPORT_M = WALL_VOXEL_M + WALL_DOUBLE_MAX_M
 WALL_LATERAL_MAX_M = 0.20
 WALL_LAYER_P95_MAX_M = 0.02

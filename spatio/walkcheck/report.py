@@ -200,7 +200,8 @@ def render_markdown(report: dict) -> str:
                 f"Separations over 5 cm: smallest {_cm(walls['revisit_separation_cm'])} cm, "
                 f"largest {_cm(walls['max_revisit_separation_cm'])} cm, "
                 f"{walls['parallel_pair_count']} detections across the two grids. "
-                "A detection is one cell with two sheets, or one pair of neighboring cells. "
+                "A detection is one cell with two sheets, or one pair of cells "
+                "within the search radius. "
                 "It is not a count of walls."
             )
         lines.append(

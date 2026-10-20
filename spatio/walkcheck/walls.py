@@ -17,6 +17,12 @@ keeps a thin sliver of one sheet. Those cells are measured again with a
 normal fit on a wider neighborhood. Cells that already have a reliable
 normal are left as they were.
 
+A gap wider than 40 cm used to be thrown away after it was measured.
+Each sheet is then a thin plane, the residual looks sharp, and the gate
+passes. Pairing now keeps that gap. The search goes one cell past the
+wider normal fit, so a gap that has just left that ball is still seen.
+A pair farther out than the search is not scored.
+
 This is a geometric estimate. Two real parallel surfaces look the same as
 drift. The number does not change the walk verdict.
 """
@@ -29,7 +35,6 @@ import numpy as np
 
 from spatio.walkcheck.defaults import (
     PROPOSED_WALL_LABEL,
-    WALL_DOUBLE_MAX_M,
     WALL_DOUBLE_MIN_M,
     WALL_GATE_CM,
     WALL_LATERAL_MAX_M,
@@ -70,7 +75,9 @@ def wall_sharpness(
             f"voxel PCA, {voxel_m:.2f} m cells, two grids half a cell apart, "
             "vertical patches only, no downsampling. "
             "A cell with two thin sheets is kept even when one plane does not fit. "
-            "A cell whose own normal is noise is measured again on a wider neighborhood."
+            "A cell whose own normal is noise is measured again on a wider neighborhood. "
+            "A stacked pair the search can see is a double even when the gap "
+            "is wider than 40 cm."
         ),
     }
     if len(finite) < min_cell_points:
@@ -224,11 +231,12 @@ def _phase(points, voxel, origin, planarity_min, max_abs_nz, min_cell_points) ->
         patches.append((cell, centroid.astype(np.float64, copy=True), normal))
 
     by_cell = {cell: (centroid, normal) for cell, centroid, normal in patches}
+    pair_radius = _pair_radius(voxel)
     for cell, centroid, normal in patches:
         i, j, k = cell
-        for di in (-1, 0, 1):
-            for dj in (-1, 0, 1):
-                for dk in (-1, 0, 1):
+        for di in range(-pair_radius, pair_radius + 1):
+            for dj in range(-pair_radius, pair_radius + 1):
+                for dk in range(-pair_radius, pair_radius + 1):
                     if di == 0 and dj == 0 and dk == 0:
                         continue
                     other_key = (i + di, j + dj, k + dk)
@@ -247,12 +255,11 @@ def _phase(points, voxel, origin, planarity_min, max_abs_nz, min_cell_points) ->
                     along = float(np.dot(delta, normal))
                     lateral = float(np.linalg.norm(delta - along * normal))
                     separation = abs(along)
-                    # In-plane offsets past one cell are the same sheet, seen
-                    # from a slightly tilted normal. Only stacked sheets count.
-                    if (
-                        lateral < WALL_LATERAL_MAX_M
-                        and WALL_LAYER_P95_MAX_M < separation <= WALL_DOUBLE_MAX_M
-                    ):
+                    # In-plane offsets are the same sheet, seen from a
+                    # slightly tilted normal. Only stacked sheets count.
+                    # There is no upper cap: a wider gap is still two sheets.
+                    # The loop radius is what limits how far this looks.
+                    if lateral < WALL_LATERAL_MAX_M and separation > WALL_LAYER_P95_MAX_M:
                         separations.append(separation)
 
     if not residuals:
@@ -273,6 +280,19 @@ def _phase(points, voxel, origin, planarity_min, max_abs_nz, min_cell_points) ->
         "planar_points": int(all_residuals.size),
         "separations_m": separations,
     }
+
+
+def _pair_radius(voxel: float) -> int:
+    """How many cells away the other sheet of the same wall can sit.
+
+    One cell is 30 cm. The old 40 cm cap sat inside that one step, so a
+    45 cm gap was in the neighbor loop and was then discarded. Pairing
+    looks one cell past the wider normal fit, so a gap that has just
+    left that ball is still seen.
+    """
+    if voxel <= 0.0:
+        return 1
+    return max(1, int(math.ceil((WALL_NORMAL_SUPPORT_M + voxel) / voxel)))
 
 
 def _support_offsets(voxel: float, support_m: float) -> list[tuple[int, int, int]]:
@@ -371,7 +391,9 @@ def _layer_separation(signed: np.ndarray, min_points: int) -> float | None:
         center_a, center_b = center_b, center_a
         mask = ~mask
     separation = center_b - center_a
-    if not (WALL_LAYER_P95_MAX_M < separation <= WALL_DOUBLE_MAX_M):
+    # No upper cap. Two thin sheets inside this point set are a double
+    # however far apart they sit. A 40 cm ceiling used to drop them.
+    if separation <= WALL_LAYER_P95_MAX_M:
         return None
     fraction = float(mask.mean())
     if fraction < WALL_LAYER_MIN_FRACTION or fraction > 1.0 - WALL_LAYER_MIN_FRACTION:

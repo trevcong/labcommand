@@ -6,7 +6,7 @@ The return error is the 3D gap between the mean pose of a fixed time window at t
 
 `trajectory.tum` and `map.pcd` are both required. A missing or unreadable one is `NOT-EVALUABLE`. A map that opens but has no wall score does not change the walk result.
 
-The wall number is a gate (95th-percentile point-to-plane residual ≤ 5 cm, and no doubled sheet over 5 cm). The report labels it "provisional (approved for now, revisit after real data)". The same phrase covers the 5 s window, the 1 s gap, and the must-move minimums. The 5 cm / 10 cm/s endpoint limits are a separate provisional choice and the report says they were not in that approved list. The wall gate does not change `PASS` / `FAIL` / `NOT-EVALUABLE`.
+The wall number is a gate (95th-percentile point-to-plane residual ≤ 5 cm, and no doubled sheet over 5 cm). A stacked pair the checker can see counts, including a gap wider than 40 cm. The search goes one cell past the wider normal fit. A pair farther away than that search can still look like two sharp walls. The report labels the gate "provisional (approved for now, revisit after real data)". The same phrase covers the 5 s window, the 1 s gap, and the must-move minimums. The 5 cm / 10 cm/s endpoint limits are a separate provisional choice and the report says they were not in that approved list. The wall gate does not change `PASS` / `FAIL` / `NOT-EVALUABLE`.
 
 Horizontal and vertical splits assume Z is up. The 3D error does not.
 
