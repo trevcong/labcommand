@@ -135,3 +135,82 @@ The environment cannot make either requested local commit. No push, gh, PR, Acti
 - Classified point origin/unit/stride/ring/header provenance conservatively; zero-relative time and plausible cloud sizes cannot prove raw mapping.
 - Paired IMU stamps as integer nanoseconds, globally reserving exact matches before nearest matching. Reported rates for both streams, ratios only for nonzero raw components, residuals for all finite components, and signed-permutation ambiguity.
 - Followed the specified fallback after actual sandbox refusals. Plan: `_out/codex-spatio-x2-plan.md`; findings: this file. Real-data outputs are absent because the shared lock failed. Synthetic outputs and logs are ignored; top-level `_out/*.md` files are eligible for the future commit.
+
+## Review fixes
+
+Both findings in `sp-rv-x2-final.md`, reviewed at `e2394d5`, are accepted and fixed.
+The earlier UNCOMMITTED and permission-denial paragraphs describe the initial
+implementation session, not this review-fix run. The initial work was committed
+by the orchestrator at `e2394d5`; this section records the subsequent fixes.
+
+- **P1 — sequential MCAP reading:** explicitly pass `NonSeekingReader` with the
+  ROS2 decoder to `read_ros2_messages`, keeping physical file order. A synthetic
+  14-chunk recording with six clouds reproduced the bug: the old path read all
+  14 chunks before processing the first cloud; the fixed path reads one. All six
+  clouds and four IMU pairs are still processed. A second regression verifies
+  half-open receipt-time filtering across chunks whose timestamps are out of
+  physical order: a 10 ms window includes two clouds and two IMU pairs.
+- **P2 — conservative IMU verdicts:** consistency now requires all inspected raw
+  and adapted samples to pair, finite residuals within the unchanged 1e-12 bound,
+  and nonzero raw evidence on every axis. All-zero data, one unexcited axis, or
+  one matching pair among four samples now yield “not determinable from this
+  bag.” Unmatched samples in either stream prevent a positive verdict. An
+  observed matched contradiction still yields “inconsistent (evidence)” even
+  with incomplete coverage. Reports retain per-axis measurements and explain
+  the evidence rule. This deliberately avoids inventing a match-rate threshold.
+
+Run the full package suite, serially with numerical worker limits:
+
+```sh
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python3 -m unittest discover -s spatio/jt128adapter/tests -t . -v
+```
+
+**35 tests ran: 34 passed, 0 failed, 1 existing skip** for the unavailable
+`jt128_one_frame.pcap`. Six regression tests were added. Before the fixes, the
+new cases reproduced both findings (six failing assertions including subtests).
+No existing tests, vendor bytes, skips, or tolerances were weakened. Full output
+is in `spatio/jt128adapter/_out/review-fixes-tests.log` (ignored by Git).
+`git diff --check` passed. Swift tests/build were not run: only this Python
+package and its findings changed.
+
+CLI usage is unchanged: `python3 -m spatio.jt128adapter.bagcheck RECORDING
+--out OUTPUT [--max-seconds SECONDS]`. The real-data command and shared lock in
+section 2 still apply. No historical bag decoding or FAST-LIO replay was run
+for these fixes; the numbers above are synthetic regression measurements.
+
+Memory remains proportional to chunk size plus the decoded cloud and retained
+compact IMU/scan records; this is not a fixed-RAM guarantee. A time window
+limits decoded messages, not disk reads: the sequential reader traverses the
+whole file to avoid dropping out-of-order timestamps. Complete numeric pairing
+is not calibration, provenance, physical-unit, or accuracy evidence. The
+milestone wall/window/gap/motion/memory/placement numbers remain **provisional**
+as approved; this package does not implement or change those acceptance gates.
+No new numeric option or scattered numeric guard was introduced.
+
+No additional Trevor approval is needed for these local fixes. Physical runs
+and Spark operations still need separate authorization. The tracked findings
+copy in this package contains this same section so the evidence is included
+in the local commit; the requested external findings path is also updated.
+
+### Local commit blocked
+
+After validation, both `git add` and `git commit` were attempted in the assigned
+worktree. Both failed before staging with:
+
+```text
+fatal: Unable to create '/Users/tconf/Developer/labcommand/.git/worktrees/spatio-x2-jt128-adapter/index.lock': Operation not permitted
+```
+
+**These review fixes are uncommitted.** HEAD remains `e2394d5`. Five owned files
+are modified; the requested external findings file was successfully updated.
+No permission bypass or escalation was attempted (approval policy is never).
+The orchestrator must perform the already-authorized local commit in an
+environment permitting worktree Git metadata writes. Suggested commit text:
+
+```text
+Fix x2 MCAP streaming and conservative IMU verdicts [skip ci]
+
+Spec correction: whole-scope IMU consistency requires complete pairing and
+nonzero evidence on every axis; matched contradictions still take precedence.
+Full package suite: 35 ran, 34 passed, one existing missing-PCAP skip. [skip ci]
+```

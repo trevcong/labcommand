@@ -13,7 +13,8 @@ from pathlib import Path
 import sys
 
 import numpy as np
-from mcap.reader import make_reader
+from mcap.reader import NonSeekingReader, make_reader
+from mcap_ros2.decoder import DecoderFactory
 from mcap_ros2.reader import read_ros2_messages
 
 VENDOR = Path(__file__).parent / "vendor/jt128_slam_adapter.py"
@@ -174,11 +175,26 @@ def verdicts(points, imu, raw_points_present=False):
         axes = imu[key]["axes"]
         finite = axes and all(x["max_abs_expected_residual"] is not None and x["nonfinite_pair_count"] == 0 for x in axes.values())
         ok = finite and all(x["max_abs_expected_residual"] <= 1e-12 for x in axes.values())
-        add(prop, (consistent if ok else inconsistent) if axes else unknown,
-            "{} matched pairs; per-axis ratios/residuals {}. Physical input units remain unverified; expected scale {}.".format(imu["matched"], axes, math.pi / 180 if key == "gyro" else 1))
+        complete = 0 < imu["matched"] == imu["raw_count"] == imu["adapted_count"]
+        excited = axes and all(x["ratio_slam_over_raw"]["count"] > 0 for x in axes.values())
+        status = inconsistent if axes and not ok else consistent if ok and complete and excited else unknown
+        add(prop, status,
+            "{} matched pairs of {} raw / {} adapted; per-axis ratios/residuals {}. "
+            "Consistency requires complete pairing and nonzero raw evidence on every axis; "
+            "contradictory matched values take precedence. Physical input units remain unverified; "
+            "expected scale {}.".format(imu["matched"], imu["raw_count"], imu["adapted_count"],
+                                       axes, math.pi / 180 if key == "gyro" else 1))
     add("header stamp source", unknown,
         "IMU: {} exact matches, {} nearest, delta ns {}; source copies header. Points: header-minus-receipt seconds {}; raw cloud header absent. Receipt time is not acquisition/firing time.".format(imu["exact"], imu["nearest_within_1ms"], imu["stamp_delta_slam_minus_raw_ns"], points["header_minus_receipt_s"]))
     return rows
+
+
+def stream_messages(path, start, end):
+    """Decode in physical order without the seeking reader's whole-bag queue."""
+    with path.open("rb") as stream:
+        reader = NonSeekingReader(stream, decoder_factories=[DecoderFactory()])
+        yield from read_ros2_messages(reader, topics=TOPICS, start_time=start,
+                                      end_time=end, log_time_order=False)
 
 
 def inspect_bag(recording, max_seconds=None):
@@ -205,7 +221,7 @@ def inspect_bag(recording, max_seconds=None):
     raw, adapted, scans, layouts = [], [], [], {}
     rings, frames, counts = Counter(), Counter(), Counter()
     for path in files:
-        for record in read_ros2_messages(path, topics=TOPICS, start_time=start, end_time=end, log_time_order=False):
+        for record in stream_messages(path, start, end):
             msg, topic = record.ros_msg, record.channel.topic
             counts[topic] += 1
             if topic != "/slam/points":
@@ -259,7 +275,7 @@ def inspect_bag(recording, max_seconds=None):
     imu = imu_report(raw, adapted)
     return {"vendor_sha256": hashlib.sha256(VENDOR.read_bytes()).hexdigest(),
             "provenance": "not verified to be the version that produced the 20260826T221936Z bag",
-            "reader": {"api": "mcap_ros2.reader.read_ros2_messages(log_time_order=False)",
+            "reader": {"api": "mcap_ros2.reader.read_ros2_messages(NonSeekingReader, log_time_order=False)",
                        "mcap": version("mcap"), "mcap_ros2": version("mcap-ros2-support"),
                        "python": sys.version, "ros_runtime": False},
             "sources": sources, "inventory_whole_bag": dict(inventory), "decoded_counts": dict(counts),

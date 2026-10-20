@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+from mcap.records import Chunk
 from spatio.jt128adapter import bagcheck
 from spatio.jt128adapter.tests.fixtures import make_mcap
 
@@ -256,6 +257,68 @@ class Bagcheck(unittest.TestCase):
         md = (self.root / "report/adaptercheck.md").read_text()
         self.assertIn("not verified to be the version", md)
         self.assertIn("Receipt timestamps", md)
+
+    def test_multichunk_reader_consumes_cloud_before_reading_later_chunks(self):
+        path = self.fixture(chunk_size=1, cloud_count=6)
+        with path.open("rb") as stream:
+            chunk_count = len(bagcheck.make_reader(stream).get_summary().chunk_indexes)
+        self.assertGreaterEqual(chunk_count, 6)
+        reads_at_cloud = []
+        original = bagcheck.cloud_arrays
+        with patch.object(Chunk, "read", wraps=Chunk.read) as read_chunk:
+            def observe(msg):
+                reads_at_cloud.append(read_chunk.call_count)
+                return original(msg)
+            with patch.object(bagcheck, "cloud_arrays", side_effect=observe):
+                report = bagcheck.inspect_bag(path)
+            self.assertEqual(read_chunk.call_count, chunk_count)
+        self.assertEqual(reads_at_cloud[0], 1)
+        self.assertEqual(len(reads_at_cloud), 6)
+        self.assertEqual(report["points"]["messages"], 6)
+        self.assertEqual(report["imu"]["matched"], 4)
+
+    def test_multichunk_window_filters_receipt_time_without_assuming_order(self):
+        # Later physical chunks contain clouds earlier than the last IMU stamp.
+        report = bagcheck.inspect_bag(self.fixture(chunk_size=1, cloud_count=6), .01)
+        self.assertEqual(report["points"]["messages"], 2)
+        self.assertEqual(report["imu"]["matched"], 2)
+        self.assertEqual(report["inventory_whole_bag"]["/slam/points"], 6)
+
+    def imu_verdicts(self, raw, adapted):
+        points = bagcheck.inspect_bag(self.fixture())["points"]
+        return {v["property"]: v["verdict"]
+                for v in bagcheck.verdicts(points, bagcheck.imu_report(raw, adapted))}
+
+    def test_zero_imu_pairs_do_not_establish_conversion(self):
+        zero = [(0, [0., 0., 0.], [0., 0., 0.], "hesai_lidar")]
+        result = self.imu_verdicts(zero, zero)
+        for prop in ("gyro conversion", "accel handling"):
+            self.assertEqual(result[prop], "not determinable from this bag")
+
+    def test_unexcited_axis_does_not_establish_conversion(self):
+        raw = [(0, [1., 2., 0.], [1., 2., 0.], "hesai_lidar")]
+        adapted = [(0, [math.pi / 180, math.pi / 90, 0.], [1., 2., 0.], "hesai_lidar")]
+        result = self.imu_verdicts(raw, adapted)
+        for prop in ("gyro conversion", "accel handling"):
+            self.assertEqual(result[prop], "not determinable from this bag")
+
+    def test_partial_pairing_does_not_establish_bag_conversion(self):
+        raw = [(k * 10_000_000, [1., 2., 3.], [.1, .2, .3], "hesai_lidar") for k in range(4)]
+        adapted = [(0, [v * math.pi / 180 for v in raw[0][1]], raw[0][2], "hesai_lidar")]
+        # Wrongly scaled samples sit outside the 1 ms matching tolerance.
+        adapted += [(r[0] + 2_000_000, r[1], [v * 9.81 for v in r[2]], r[3]) for r in raw[1:]]
+        for inputs in ((raw, adapted), (raw, adapted[:1]), (raw[:1], adapted)):
+            with self.subTest(counts=tuple(map(len, inputs))):
+                result = self.imu_verdicts(*inputs)
+                for prop in ("gyro conversion", "accel handling"):
+                    self.assertEqual(result[prop], "not determinable from this bag")
+
+    def test_matched_contradiction_wins_over_incomplete_coverage(self):
+        raw = [(k * 10_000_000, [1., 2., 3.], [.1, .2, .3], "hesai_lidar") for k in range(4)]
+        adapted = [(0, [1., 2., 3.], [1., 2., 3.], "hesai_lidar")]
+        result = self.imu_verdicts(raw, adapted)
+        for prop in ("gyro conversion", "accel handling"):
+            self.assertEqual(result[prop], "inconsistent (evidence)")
 
     def test_inconsistent_values_are_reported(self):
         report = bagcheck.inspect_bag(self.fixture(gyro_scale=1., accel_scale=9.81, first_time=.02))

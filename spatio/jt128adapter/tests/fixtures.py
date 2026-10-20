@@ -29,7 +29,8 @@ def imu(ns, gyro, accel):
             "linear_acceleration": dict(zip("xyz", accel)), "linear_acceleration_covariance": [0.] * 9}
 
 
-def make_mcap(path, fields, gyro_scale=math.pi / 180, accel_scale=1., first_time=0., stamp_offset=0):
+def make_mcap(path, fields, gyro_scale=math.pi / 180, accel_scale=1., first_time=0., stamp_offset=0,
+              chunk_size=1048576, cloud_count=1):
     epoch = 1_787_700_000_000_000_000
     receipt = epoch + 1000 * 10**9
     data = b"".join(struct.pack("<fffffHxx", float(i), 2., 3., 10., t, ring)
@@ -37,7 +38,7 @@ def make_mcap(path, fields, gyro_scale=math.pi / 180, accel_scale=1., first_time
     cloud = dict(header=header(epoch), height=1, width=3, fields=fields, is_bigendian=False,
                  point_step=24, row_step=72, data=data, is_dense=True)
     with path.open("wb") as f:
-        with Writer(f) as writer:
+        with Writer(f, chunk_size=chunk_size) as writer:
             im = writer.register_msgdef("sensor_msgs/msg/Imu", IMU_SCHEMA)
             pc = writer.register_msgdef("sensor_msgs/msg/PointCloud2", CLOUD_SCHEMA)
             writer.write_message("/slam/points", pc, cloud, log_time=receipt)
@@ -48,4 +49,6 @@ def make_mcap(path, fields, gyro_scale=math.pi / 180, accel_scale=1., first_time
                 writer.write_message("/lidar_imu", im, imu(ns, gyro, accel), log_time=receipt + k * 5_000_000 + 1)
                 writer.write_message("/slam/imu", im, imu(ns + stamp_offset, [x * gyro_scale for x in gyro],
                                                          [x * accel_scale for x in accel]), log_time=receipt + k * 5_000_000 + 2)
+            for k in range(1, cloud_count):
+                writer.write_message("/slam/points", pc, cloud, log_time=receipt + k * 5_000_000)
     return path

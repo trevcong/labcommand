@@ -41,17 +41,24 @@ per-scan data, aggregate distributions, IMU matching and eight verdicts.
 vendored seconds interpretation; that naming does not prove the bag's units.
 Receipt time is never labelled acquisition or firing time.
 
-The reader streams in physical file order, keeping one cloud plus compact
-per-scan/IMU records in memory. A time limit selects a half-open window relative
-to the earliest MCAP receipt timestamp. The current implementation requires
-MCAP summaries/statistics. Matching consumes each IMU sample once: all exact
+The reader explicitly uses `NonSeekingReader` in physical file order. Payload
+memory scales with MCAP chunk size and the current decoded cloud, rather than
+all clouds in the bag; compact per-scan/IMU records still grow with the recording.
+A time limit selects a half-open window relative to the earliest MCAP receipt
+timestamp. It limits decoded messages, not bytes read: the sequential reader
+scans the whole file so out-of-order receipt timestamps are not lost. The current
+implementation requires MCAP summaries/statistics. Matching consumes each IMU sample once: all exact
 integer-nanosecond matches first, then chronological greedy nearest within
 1 ms. It reports both topic match rates, unmatched timestamps and their positions
 relative to the other topic's range. It cannot identify recorder/subscriber
 loss from a count difference alone. Ratios exclude exactly zero raw components;
 residuals include them. Signed-axis permutations are compared by RMS residual,
 with uniqueness reported. Numerical consistency uses a 1e-12 absolute residual
-bound; physical unit/calibration correctness remains a separate unknown.
+bound and requires complete pairing of both inspected IMU streams plus at least
+one finite nonzero raw component on every axis. Zero-only axes or incomplete
+pairing produce "not determinable from this bag" unless a matched contradiction
+already establishes inconsistency. This is a conservative evidence rule, not
+a statistical confidence or calibration test; physical units remain unknown.
 
 Raw `/lidar_points` is absent from the supplied recording's metadata. Without
 it, adapted clouds cannot establish input stride, ring preservation, time
