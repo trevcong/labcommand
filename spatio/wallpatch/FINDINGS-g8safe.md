@@ -78,7 +78,8 @@ The 6 cm review fixture is 40×20 noiseless grids per sheet, at y = ±3 cm, over
 
 Larger sweep, run with a scratch script outside the repo:
 - **Noiseless and σ 5 mm sheets.** 8,232 cases in all: 2 noise levels, 7 join directions 0–90° in 15° steps, 7 join positions from 20% to 80% of the patch width, 4 layouts, gaps of 5.2 / 6 / 7 cm, and 7 hints.
-- **No pass with both sheets ≥ 20% of the points, except one noisy case.** The only passes left with both sheets at ≥ 20% are one noisy configuration: σ 5 mm, a 5.2 cm gap, a 10 cm overlap, the join at +0.1 m, and a ±4° hint. It passed for join directions 0°, 15° and 90°. Its stepped band reads just under 5 cm, 2 mm from the gate.
+- **No pass with both sheets ≥ 20% of the points, except one noisy case.** The only passes left with both sheets at ≥ 20% are one noisy configuration: σ 5 mm, a 5.2 cm gap, a 10 cm overlap, the join at +0.1 m, and the hint at −4° about z or about x. It passed for join directions 0°, 15° and 90°. Measured on that case: 80% band 4.89 cm, stepped band 4.96 cm, both just under the 5 cm gate.
+- **Noisier sheets, σ 1 cm and 1.5 cm.** 4,116 cases each: gaps of 5.5 / 6 / 7 cm, the same layouts, positions, directions and hints. No case passes with both sheets at ≥ 20%. At σ 1 cm, 15 cases pass, all with one sheet under 20%; at σ 1.5 cm, none pass at all. Above σ ≈ 1.95 cm, the 80% band alone already refuses every would-be pass.
 - **The other passes all have a sheet under 20%.** That is below the split rule's own floor, so the exact-hint rule cannot see that sheet either.
 
 Clean walls (6,000 points, exact hint unless stated). All pass; values are the 80% band and the stepped band:
@@ -93,7 +94,7 @@ Clean walls (6,000 points, exact hint unless stated). All pass; values are the 8
 | 2 cm bow over 1 m, σ 5 mm | 2.00 cm | 2.31 cm |
 
 ## Known limits
-- **Near the gate under noise.** A 5.2 cm offset with 5 mm noise can still pass in a few layouts, because the stepped band reads about 4.9–5.0 cm. That is measured. My guess, not tested: this margin shrinks as the noise grows.
+- **Near the gate under noise.** A 5.2 cm offset with 5 mm noise can still pass in one layout: its stepped band measured 4.96 cm. Offsets of 5.5 cm and more did not pass at σ 1 or 1.5 cm in the sweep above. 5.2 cm was not swept at those noise levels.
 - **A sheet under 20% of the patch is not seen**, with or without a hint. This floor is the same as the split rule's (MIN_PEAK_MASS).
 - **Stricter in effect.** A single Gaussian wall passes only if its 80% band is under 5 cm, which means σ ≲ 1.95 cm (p95 ≲ 3.8 cm). Walls with p95 between about 3.8 and 5 cm used to pass and are now NOT_EVALUABLE. Measured on a synthetic σ = 2 cm wall: 80% band 5.10 cm, so NOT_EVALUABLE. The stepped band adds little on top of this for smooth walls (see the table above). A wall with a real ≥ 5 cm feature over at least 20% of the patch, such as a shelf or deep trim, will now be NOT_EVALUABLE instead of a pass. That is intended, but it means patch boxes must avoid such features.
 - **No angle check.** A clean wall whose hint is 10° off stays MEASURED, because an existing test requires that.
