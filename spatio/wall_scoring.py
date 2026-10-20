@@ -12,14 +12,14 @@ import json
 import math
 import os
 
+from spatio.thresholds import GUARD_BAND_LABEL, GUARD_BAND_M
+
 PATCH_ORIGINS = ("preselected", "auto_suggested")
 REQUIRED_PATCHES = 2
-# Provisional (Trevor, 2026-10-20): guard band under the 5 cm wall gate. On a
-# patch that would otherwise pass, p95 and both 80% bands must be at most this.
-# Above it and up to the gate the patch is not checkable (never a pass); p95
-# or separation over the gate still fails. Revisit after real walks.
-PASS_MAX_M = 0.040
-PASS_MAX_LABEL = "provisional guard band (Trevor 2026-10-20, revisit after real walks)"
+# The guard band under the wall gate (spatio.thresholds). On a patch that
+# would otherwise pass, p95 and both 80% bands must be at most this.
+PASS_MAX_M = GUARD_BAND_M
+PASS_MAX_LABEL = GUARD_BAND_LABEL
 
 
 class WallScoringError(Exception):

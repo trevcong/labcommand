@@ -7,10 +7,12 @@ map.pcd has no per-point time or visit id, so the gap is not a revisit.
 from __future__ import annotations
 
 import datetime
+import math
 import os
 
 import numpy as np
 
+from spatio.thresholds import WALL_GATE_M
 from spatio.wall_scoring import PASS_MAX_LABEL, PASS_MAX_M
 from spatio.wallpatch.doubled import (
     CONFIDENT_SEPARATION_M,
@@ -42,11 +44,13 @@ from spatio.wallpatch.pcd import iter_xyz, sha256_file
 from spatio.wallpatch.util import write_json
 
 # Provisional: approved for now, revisit after a taped walk.
-# The 0.05 m numbers are the workplan gates. They did not change.
-# PASS_MAX_M (0.04 m, shared with spatio.wall_scoring) is the guard band's
-# lower edge: a would-be single-wall pass needs p95 and both bands at most it.
-P95_GATE_M = 0.05
-SEPARATION_GATE_M = 0.05
+# The default gates are the workplan wall gate (spatio.thresholds); measure_map
+# takes another one with gate_m (CLI --wall-gate-m, walkday.conf WALL_GATE_M).
+# PASS_MAX_M (shared with spatio.wall_scoring) is the guard band's lower edge:
+# a would-be single-wall pass needs p95 and both bands at most it, or at most
+# the gate when the gate is stricter.
+P95_GATE_M = WALL_GATE_M
+SEPARATION_GATE_M = WALL_GATE_M
 GATE_LABEL = "provisional (approved for now, revisit after real data)"
 MIN_POINTS = 200
 REVISIT_NOTE = (
@@ -58,11 +62,14 @@ REPORT_SCHEMA = "spatio.wallpatch_report/1"
 PATCH_SCHEMA = "spatio.wall_patches/1"
 
 
-def measure_map(map_path, patches_path, out_dir, accuracy_label=None, verbose=False):
+def measure_map(map_path, patches_path, out_dir, accuracy_label=None, verbose=False,
+                gate_m=WALL_GATE_M):
     """Crop each box, fit a plane, and write wallpatch.json, wallpatch.md, and PNGs.
 
+    gate_m is the p95 and separation gate (metres, finite and > 0).
     Refuses a patch file whose map_sha256 is not the sha256 of this map file.
     """
+    gate_m = check_gate(gate_m)
     map_path = os.path.abspath(map_path)
     patches_path = os.path.abspath(patches_path)
     out_dir = os.path.abspath(out_dir)
@@ -88,7 +95,7 @@ def measure_map(map_path, patches_path, out_dir, accuracy_label=None, verbose=Fa
 
     measured = []
     for name, points, spec, reason in zip(names, cropped, specs, invalid):
-        measured.append(_measure_one(name, points, spec, reason))
+        measured.append(_measure_one(name, points, spec, reason, gate_m))
 
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
@@ -112,8 +119,8 @@ def measure_map(map_path, patches_path, out_dir, accuracy_label=None, verbose=Fa
         "physical_accuracy_evaluated": False if accuracy_label else None,
         "downsampled_before_measure": False,
         "gates": {
-            "p95_point_to_plane_max_m": P95_GATE_M,
-            "revisit_separation_max_m": SEPARATION_GATE_M,
+            "p95_point_to_plane_max_m": gate_m,
+            "revisit_separation_max_m": gate_m,
             "label": GATE_LABEL,
             "pass_max_m": PASS_MAX_M,
             "pass_max_label": PASS_MAX_LABEL,
@@ -126,7 +133,7 @@ def measure_map(map_path, patches_path, out_dir, accuracy_label=None, verbose=Fa
             "peak_merge_m": PEAK_MERGE_M,
             "confident_separation_m": CONFIDENT_SEPARATION_M,
             "undetermined_separation_m": UNCERTAIN_SEPARATION_M,
-            "pass_needs_band_under_m": SEPARATION_GATE_M,
+            "pass_needs_band_under_m": gate_m,
             "core_band_fraction": 1.0 - MIN_PEAK_MASS,
             "stepped_band_split_step": SPLIT_STEP,
             "stepped_band_turn_deg": SPLIT_TURN_DEG,
@@ -139,6 +146,16 @@ def measure_map(map_path, patches_path, out_dir, accuracy_label=None, verbose=Fa
     if verbose:
         _print_summary(report, out_dir)
     return report
+
+
+def check_gate(gate_m):
+    """gate_m as a float, or WallpatchError when it is not a finite number > 0."""
+    if isinstance(gate_m, bool) or not isinstance(gate_m, (int, float)):
+        raise WallpatchError("wall gate must be a finite number > 0 (metres)")
+    gate_m = float(gate_m)
+    if not (math.isfinite(gate_m) and gate_m > 0):
+        raise WallpatchError("wall gate must be a finite number > 0 (metres)")
+    return gate_m
 
 
 def _load_patches(path):
@@ -209,7 +226,7 @@ def _crop_all(map_path, specs):
     return arrays, n_map
 
 
-def _measure_one(name, points, spec, invalid_reason):
+def _measure_one(name, points, spec, invalid_reason, gate_m=WALL_GATE_M):
     n_cropped = int(len(points))
     if invalid_reason is not None:
         return _blank(name, n_cropped, invalid_reason, spec)
@@ -251,7 +268,7 @@ def _measure_one(name, points, spec, invalid_reason):
     hint_stats = analyze_distances(hint_signed)
     if int(fit_stats["n"]) != n_cropped or int(hint_stats["n"]) != n_cropped:
         raise WallpatchError("internal error: measured count != cropped count")
-    decision = reconcile_axes(fit_stats, hint_stats, SEPARATION_GATE_M)
+    decision = reconcile_axes(fit_stats, hint_stats, gate_m)
     if decision["kind"] != "measured":
         return _blank(name, n_cropped, decision["reason"], spec)
     stats = decision["stats"]
@@ -259,17 +276,17 @@ def _measure_one(name, points, spec, invalid_reason):
     separation = stats["separation_m"]
     separation_axis = "normal_hint" if stats is hint_stats else "fitted_plane"
     # p95 stays the point-to-plane residual. The hint axis is only the gap.
-    p95_pass = bool(fit_stats["p95_abs_m"] <= P95_GATE_M)
+    p95_pass = bool(fit_stats["p95_abs_m"] <= gate_m)
     if doubled == "false":
         sep_pass = True
     elif doubled == "true":
-        sep_pass = bool(separation is not None and separation <= SEPARATION_GATE_M)
+        sep_pass = bool(separation is not None and separation <= gate_m)
     else:
         sep_pass = None
     if p95_pass is True and sep_pass is True:
         # Fail safe. The hint is only approximate and the pooled fit can tilt.
         # A pass needs a band too thin to hold two surfaces at the gate.
-        thick = thick_band_reason(fit_stats["core_band_m"], SEPARATION_GATE_M)
+        thick = thick_band_reason(fit_stats["core_band_m"], gate_m)
         if thick is not None:
             return _blank(name, n_cropped, thick, spec)
         # Sheets that only partly overlap tilt the fit and thin the band.
@@ -285,14 +302,15 @@ def _measure_one(name, points, spec, invalid_reason):
         stepped = stepped_band(
             signed, [np.cos(t) * along + np.sin(t) * vertical for t in turns]
         )
-        step_reason = stepped_band_reason(stepped, SEPARATION_GATE_M)
+        step_reason = stepped_band_reason(stepped, gate_m)
         if step_reason is not None:
             return _blank(name, n_cropped, step_reason, spec)
         # Provisional guard band. A single wall passes only at or under
-        # PASS_MAX_M. A doubled=true patch is left alone: it is never a pass
-        # downstream, and blanking it would hide its doubled-wall failure.
+        # PASS_MAX_M (or the gate, when stricter). A doubled=true patch is
+        # left alone: it is never a pass downstream, and blanking it would
+        # hide its doubled-wall failure.
         if doubled == "false":
-            guard = _guard_band_reason(fit_stats["p95_abs_m"], fit_stats["core_band_m"], stepped)
+            guard = _guard_band_reason(fit_stats["p95_abs_m"], fit_stats["core_band_m"], stepped, gate_m)
             if guard is not None:
                 return _blank(name, n_cropped, guard, spec)
     else:
@@ -343,19 +361,20 @@ def _measure_one(name, points, spec, invalid_reason):
     }
 
 
-def _guard_band_reason(p95, core, stepped):
+def _guard_band_reason(p95, core, stepped, gate_m=WALL_GATE_M):
     """Why a would-be single-wall pass is not checkable, or None when it passes."""
+    limit = min(PASS_MAX_M, gate_m)
     over = [
         "%s %.4f m" % (label, value)
         for label, value in (("p95", p95), ("80% band", core), ("stepped 80% band", stepped))
-        if float(value) > PASS_MAX_M
+        if float(value) > limit
     ]
     if not over:
         return None
     return (
         "%s above the provisional %.3f m pass limit and within the %.2f m gate; "
         "inside the guard band the patch is not checkable, so it is not evaluable"
-        % (", ".join(over), PASS_MAX_M, SEPARATION_GATE_M)
+        % (", ".join(over), limit, gate_m)
     )
 
 
@@ -470,7 +489,7 @@ def _markdown(report):
         report["revisit_note"],
         "",
         'Gates (labelled "%s"): 95th-percentile point-to-plane residual '
-        "<= %.2f m, and separation between the two surfaces <= %.2f m."
+        "<= %g m, and separation between the two surfaces <= %g m."
         % (
             gates["label"],
             gates["p95_point_to_plane_max_m"],

@@ -13,6 +13,7 @@ from spatio.walkcheck.defaults import (
     MIN_MAP_POINTS,
     MIN_PATH_LENGTH_M,
     STATIONARY_WINDOW_S,
+    WALL_GATE_M,
 )
 from spatio.walkcheck.evaluate import SessionDirError, evaluate_session
 from spatio.walkcheck.trajectory import ThresholdError
@@ -84,6 +85,15 @@ def main(argv: list[str] | None = None) -> int:
             "Over this, the walk is NOT-EVALUABLE (default 0.10)"
         ),
     )
+    parser.add_argument(
+        "--wall-gate-m",
+        type=float,
+        default=WALL_GATE_M,
+        help=(
+            "PROVISIONAL: wall p95 gate in metres, reported only; it does not change "
+            f"the exit code (default {WALL_GATE_M:g}, spatio.thresholds)"
+        ),
+    )
     parser.add_argument("--imu-file", help="Optional CSV in trajectory clock: t,gx,gy,gz,ax,ay,az; rad/s and m/s² including gravity. Defaults to session/imu.csv if present.")
     for option, default, help_text in (
         ("max-hold-speed", MAX_HOLD_SPEED_M_S, "Maximum trajectory step speed for holds, m/s"),
@@ -117,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
             min_map_points=args.min_map_points,
             max_endpoint_spread_m=args.max_endpoint_spread,
             max_endpoint_speed_m_s=args.max_endpoint_speed,
+            wall_gate_m=args.wall_gate_m,
         )
     except ThresholdError as exc:
         parser.error(str(exc))

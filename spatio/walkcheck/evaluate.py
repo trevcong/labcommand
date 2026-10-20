@@ -21,6 +21,7 @@ from spatio.walkcheck.defaults import (
     RETURN_PASS_M,
     SCHEMA,
     STATIONARY_WINDOW_S,
+    WALL_GATE_M,
 )
 from spatio.walkcheck.holds import (
     MIN_HOLD_S, MAX_HOLD_SPEED_M_S, MAX_ANGULAR_SPEED_DEG_S, SIGNIFICANT_MOTION_M,
@@ -79,6 +80,7 @@ def evaluate_session(
     max_accel_deviation_m_s2: float = MAX_ACCEL_DEVIATION_M_S2,
     gravity_m_s2: float = GRAVITY_M_S2,
     imu_file: Path | str | None = None,
+    wall_gate_m: float = WALL_GATE_M,
     write: bool = True,
 ) -> dict:
     if isinstance(min_map_points, bool) or not isinstance(min_map_points, int) or min_map_points < 1:
@@ -98,7 +100,9 @@ def evaluate_session(
         min_excursion_m=min_excursion_m,
         max_endpoint_spread_m=max_endpoint_spread_m,
         max_endpoint_speed_m_s=max_endpoint_speed_m_s,
+        wall_gate_m=wall_gate_m,
     )
+    wall_gate_cm = round(float(wall_gate_m) * 100.0, 9)
     session = Path(session_dir)
     if not session.is_dir():
         raise SessionDirError(f"session directory not found: {session}")
@@ -144,7 +148,7 @@ def evaluate_session(
     map_problem = None
     map_detail = None
     if not map_path.is_file():
-        walls = wall_sharpness(np.zeros((0, 3)))
+        walls = wall_sharpness(np.zeros((0, 3)), gate_cm=wall_gate_cm)
         walls["reason"] = "missing_map"
         walls["status"] = "NOT-EVALUABLE"
         walls["proposed_gate_result"] = "NOT-EVALUABLE"
@@ -153,7 +157,7 @@ def evaluate_session(
     else:
         try:
             map_xyz = read_pcd_xyz(map_path)
-            walls = wall_sharpness(map_xyz)
+            walls = wall_sharpness(map_xyz, gate_cm=wall_gate_cm)
             if walls["finite_point_count"] < min_map_points:
                 map_problem = "too_few_map_points"
                 map_detail = (
@@ -162,7 +166,7 @@ def evaluate_session(
                 )
         except (OSError, PcdError, ValueError) as exc:
             map_xyz = None
-            walls = wall_sharpness(np.zeros((0, 3)))
+            walls = wall_sharpness(np.zeros((0, 3)), gate_cm=wall_gate_cm)
             walls["reason"] = f"unreadable_map: {exc}"
             walls["status"] = "NOT-EVALUABLE"
             walls["proposed_gate_result"] = "NOT-EVALUABLE"
@@ -308,6 +312,7 @@ def evaluate_session(
             "alignment": "none",
             "provisional_label": PROVISIONAL_LABEL,
             "wall_voxel_m": walls.get("voxel_m"),
+            "wall_gate_m": wall_gate_m,
             "wall_gate_cm": walls.get("proposed_gate_cm"),
             "wall_gate_label": walls.get("proposed_gate_label"),
         },
