@@ -128,8 +128,19 @@ Anything else returns `comparable = False` with a reason (`different_frames`, `n
 `sigma_m` is `sqrt(σa² + σb²)`, plus each alignment's `rms_m` when case 3 applies.
 
 Uses:
-- **Absence.** v1's step 3 (`map_id = s.map_id`, DESIGN §6) becomes "comparable with s". The tightness test runs in the common frame. An AABB transformed by a rotation is re-boxed and grows, so it may fail tightness and not count. That is the conservative direction.
+- **Absence.** v1's step 3 (`map_id = s.map_id`, DESIGN §6) becomes "comparable with s", tested in the absence's own frame (below).
 - **Moved.** v2 does not detect changes (§4). A future detector may call something "moved" only when `compare_positions` is comparable and `distance_m > MOVED_SIGMA_K × sigma_m` [provisional: `MOVED_SIGMA_K = 3`], and the claim stores the `revisions_used` and `known_at`. When a later trajectory revision or a retracted alignment makes that comparison non-comparable, the claim is superseded, never silently kept.
+
+**Absence across frames** [proposal]. An absence region and its one coverage number are exact only in the frame where the region was measured, its *native* frame. v2 never re-boxes that region in another frame. Re-boxing a rotated region adds corners nobody measured, and v1's tightness test can still accept a footprint sitting in one of them (V2-5e: the 45° re-box of `[-0.03, 0.03]²` passes `_region_is_tight` for a footprint at `[0.033, 0.039]²`, which lies wholly outside the measured square). Instead, s's footprint is brought into the absence's native frame and v1's step 3 runs there:
+
+1. **Map the footprint.** Take the 8 corners of s's footprint (DESIGN §6: its AABB, else its centroid) into the absence's native frame. For two frames with alignments, the path is s's validated alignment into reference revision B, then the inverse of the absence frame's validated alignment into the same B. These are two star edges into one reference, not a chain (§2.4). In the same frame, it is the identity.
+2. **Containment.** Grow the AABB of the mapped corners on every side by the sum of the alignments' `rms_m`. That box must lie inside the region (inclusive). It is a superset of the true footprint, so passing it implies the real footprint is inside the measured region.
+3. **Margin.** Map the region's 8 corners the other way, into s's frame. They must lie inside s's footprint grown by `ABSENCE_MAX_MARGIN_M` per side. This is measured against the true footprint, not the grown box from step 2, so the margin never loosens.
+4. **Coverage** is the absence's recorded number, for its region as recorded. It is never rescaled or reused for a derived region.
+
+With the identity transform and `rms_m = 0`, steps 2 and 3 are exactly v1's `_region_is_tight`. I checked this on 20,000 random box pairs against 90ae03e's function and found no disagreement. Under a rotation, a region counts only if it holds the whole rotated footprint and still fits within footprint + margin. Otherwise it does not count, and s stays `LAST_SEEN`.
+
+Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame) free-space region would turn with the pose, which is the same re-boxing problem with no alignment involved. Ingest refuses one with `ValidationError`, until it is designed with this test run per trajectory revision.
 
 ### 2.6 Immutable evidence
 
@@ -238,7 +249,7 @@ The drift investigation's lesson in test form: a pose error must not read as an 
 
 `test_V2_5b_validated_alignment_enables_comparison`
 - Given S1 and S2 each with a `validated` alignment into reference revision B1.
-- The S2 absence, transformed to B1 and still tight around the transformed footprint, makes X `NOT_SEEN_ON_RECHECK` in frame B1.
+- The S2 absence, which passes the native-frame test (§2.5) against X's S1 footprint, makes X `NOT_SEEN_ON_RECHECK` in frame B1.
 - Retracting S2's alignment at a later K returns X to `LAST_SEEN` for `known_at ≥ K` only.
 
 `test_V2_5c_alignment_gates`
@@ -247,6 +258,16 @@ The drift investigation's lesson in test form: a pose error must not read as an 
 
 `test_V2_5d_no_chaining`
 - Given S1 → B1 validated and S2 → S1 validated (`to_frame` not a reference revision): the second insert raises `ValidationError`.
+
+`test_V2_5e_rotated_absence_unmeasured_corner`
+- Given S1 → B1 validated as the identity, and S2 → B1 validated as a 45° rotation about z. Both have `rms_m = 0.002`, so the containment growth is 0.004 m.
+- The S2 absence has native region `[-0.03, 0.03]² × [-0.02, 0.12]` and coverage 1.0, acquired after X's sighting.
+- X's S1 sighting has footprint `[0.033, 0.039]² × [0, 0.1]`. The 45° re-box of the region into B1 passes v1's `_region_is_tight` for it; assert that as a precondition, so the test shows the trap it guards against. The footprint mapped into S2's frame spans x ∈ [0.0467, 0.0552], outside the region. So the absence does not count, and X stays `LAST_SEEN` in frame B1 with `absence is None`.
+- Control: with footprint `[-0.01, 0.01]² × [0, 0.1]` instead, the mapped footprint grown by 0.004 m spans ±0.0181 m and lies inside the region. The region's corners in S1's frame stay within the footprint + 0.10 m. X is `NOT_SEEN_ON_RECHECK` in frame B1.
+- With both alignments the identity, the result equals v1's `_region_is_tight` on the same boxes.
+
+`test_V2_5f_body_frame_absence_refused`
+- A `lidar_free_space` observation with `geometry_frame = 'body'` raises `ValidationError`, and nothing is written.
 
 ### V2-6. Migration keeps v1's answers
 
