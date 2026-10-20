@@ -120,11 +120,32 @@ def build_report(results, zones_data, walk_id):
                     times[0] < results["scan_time_range"][0] or
                     times[1] > results["scan_time_range"][1]):
                 raise ValueError("zone evidence time lies outside scan range")
+            measured = record["min_clearance_m"]
+            lower = record["occupied_voxel_clearance_lower_bound_m"]
+            margin = record["decision_margin_m"]
+            uncertainty = record["uncertainty_m"]
+            # Match the classifier's positive-uncertainty boundary tolerance.
+            pass_margin = uncertainty + (1e-12 if uncertainty > 0 else 0)
             if record["status"] == "PASS" and (
                     counts["free_only_cells"] != required or
                     counts["insufficient_evidence_cells"] != 0 or
-                    record["conflicting_cells"] or times is None or scan_count == 0):
+                    record["conflicting_cells"] or times is None or scan_count == 0 or
+                    lower is not None or
+                    (margin is not None and margin <= pass_margin)):
                 raise ValueError(f"{definition.id}: PASS lacks full free evidence")
+            if not counts["occupied_cells"]:
+                expected_margin = None if measured is None else measured - definition.depth
+                if lower is not None or margin != expected_margin:
+                    raise ValueError(f"{definition.id}: clearance and decision margin disagree")
+            else:
+                # Occupied decisions use in-volume hits or conservative voxel
+                # bounds, not necessarily the expanded-footprint measured hit.
+                # Only bounds are recoverable from this summary.
+                if (lower is None or margin is None or
+                        not 0 <= lower <= definition.depth or
+                        not lower - definition.depth <= margin <= 0 or
+                        (measured is None and margin != lower - definition.depth)):
+                    raise ValueError(f"{definition.id}: occupied clearance and decision margin disagree")
             # Divide before summing to avoid overflowing large finite bounds.
             position = (definition.low / 2 + definition.high / 2).tolist()
             if not all(math.isfinite(x) for x in position):

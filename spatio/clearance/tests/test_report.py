@@ -145,6 +145,140 @@ def test_pass_without_summary_evidence_is_rejected(change):
         build_report(source, zones, "bad")
 
 
+def all_free_zone(hit=1.25, sideways=False, ray_count=2):
+    zones, _ = four_statuses()
+    zones["zones"] = zones["zones"][:1]
+    scans = {"schema_version": 1, "frame_id": zones["frame_id"], "scans": [{
+        "timestamp": 42, "origin": [-.15, .05, .05],
+        "hits": [[1.25 if sideways else hit, y, .05]
+                 for y in (.05, .06)[:ray_count]]}]}
+    if sideways:
+        scans["scans"].append({
+            "timestamp": 43, "origin": [hit - .2, .105, .05],
+            "hits": [[hit, .105, .05]]})
+    return zones, report(zones, scans, .1, [0, 0, 0], .02)
+
+
+@pytest.mark.parametrize("hit,sideways", [
+    (.5, True), (1.01, False), (1.02, False), (1.02 + 5e-13, False),
+])
+def test_all_free_indeterminate_relabelled_pass_is_rejected(hit, sideways):
+    zones, source = all_free_zone(hit, sideways)
+    record, = source["zones"]
+    assert record["status"] == "INDETERMINATE"
+    assert record["free_only_cells"] == record["required_cells"]
+    assert record["occupied_cells"] == record["insufficient_evidence_cells"] == 0
+    assert record["occupied_voxel_clearance_lower_bound_m"] is None
+    assert record["conflicting_cells"] == []
+    assert build_report(source, zones, "original")["counts"]["INDETERMINATE"] == 1
+    record["status"] = "PASS"
+    with pytest.raises(ValueError, match="PASS lacks"):
+        build_report(source, zones, "relabelled")
+
+
+@pytest.mark.parametrize("change", [
+    {"min_clearance_m": .5},
+    {"min_clearance_m": .5, "decision_margin_m": -.5},
+    {"min_clearance_m": 1.0, "decision_margin_m": 0},
+    {"occupied_voxel_clearance_lower_bound_m": 0},
+    {"decision_margin_m": .3},
+    {"decision_margin_m": None},
+    {"min_clearance_m": None},
+])
+def test_pass_with_inconsistent_clearance_evidence_is_rejected(change):
+    zones, source = all_free_zone()
+    source["zones"][0].update(change)
+    with pytest.raises(ValueError):
+        build_report(source, zones, "bad")
+
+
+@pytest.mark.parametrize("hit,sideways,ray_count,status", [
+    (1.25, False, 1, "NOT_MEASURED"),
+    (.5, True, 2, "INDETERMINATE"),
+])
+@pytest.mark.parametrize("change", [
+    {"decision_margin_m": .3},
+    {"decision_margin_m": None},
+    {"min_clearance_m": None},
+    {"occupied_voxel_clearance_lower_bound_m": 0},
+])
+def test_nonpass_unoccupied_margin_consistency(hit, sideways, ray_count, status, change):
+    zones, source = all_free_zone(hit, sideways, ray_count)
+    assert source["zones"][0]["status"] == status
+    assert build_report(source, zones, "original")["counts"][status] == 1
+    source["zones"][0].update(change)
+    with pytest.raises(ValueError):
+        build_report(source, zones, "bad")
+
+
+@pytest.mark.parametrize("change", [
+    {"decision_margin_m": None},
+    {"decision_margin_m": -2},
+    {"decision_margin_m": 1},
+    {"occupied_voxel_clearance_lower_bound_m": None},
+])
+def test_occupied_margin_consistency(change):
+    zones, source = four_statuses()
+    source["zones"][1].update(change)
+    with pytest.raises(ValueError):
+        build_report(source, zones, "bad")
+
+
+def test_pass_without_hit_measurement_preserves_null_margin():
+    zones, _ = all_free_zone()
+    scans = {"schema_version": 1, "frame_id": zones["frame_id"], "scans": [{
+        "timestamp": 42, "origin": [-.15, .05, .05],
+        "hits": [[10.25, .25, .05], [10.25, .26, .05]]}]}
+    source = report(zones, scans, .1, [0, 0, 0], .02)
+    record, = source["zones"]
+    assert record["status"] == "PASS"
+    assert record["min_clearance_m"] is record["decision_margin_m"] is None
+    assert build_report(source, zones, "no-hit")["counts"]["PASS"] == 1
+
+
+@pytest.mark.parametrize("clearance,uncertainty,accepted", [
+    (1.02001, .02, True), (1.0, 0, False), (1.00001, 0, True),
+])
+def test_pass_requires_margin_strictly_beyond_uncertainty(clearance, uncertainty, accepted):
+    zones, source = all_free_zone()
+    source["uncertainty_m"] = uncertainty
+    source["zones"][0].update(
+        min_clearance_m=clearance, decision_margin_m=clearance - 1,
+        uncertainty_m=uncertainty)
+    if accepted:
+        assert build_report(source, zones, "beyond")["counts"]["PASS"] == 1
+    else:
+        with pytest.raises(ValueError, match="PASS lacks"):
+            build_report(source, zones, "boundary")
+
+
+def test_occupied_margin_uses_volume_evidence_not_sideways_measurement():
+    zones, _ = all_free_zone()
+    scans = {"schema_version": 1, "frame_id": zones["frame_id"], "scans": [
+        {"timestamp": 42, "origin": [-.15, .05, .05],
+         "hits": [[.8, .05, .05]]},
+        {"timestamp": 43, "origin": [.3, .105, .05],
+         "hits": [[.5, .105, .05]]},
+    ]}
+    source = report(zones, scans, .1, [0, 0, 0], .02)
+    record, = source["zones"]
+    assert record["status"] == "FAIL"
+    assert record["min_clearance_m"] == .5
+    assert record["decision_margin_m"] == pytest.approx(-.2)
+    assert build_report(source, zones, "occupied")["failures"][0]["evidence"] == record
+
+
+def test_cli_all_free_relabelled_pass_rejected_before_writing(tmp_path):
+    zones, source = all_free_zone(.5, sideways=True)
+    assert source["zones"][0]["status"] == "INDETERMINATE"
+    source["zones"][0]["status"] = "PASS"
+    output = tmp_path / "bad-sideways"
+    result = run_cli(tmp_path, source, zones, output)
+    assert result.returncode == 2
+    assert "PASS lacks" in result.stderr
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("change", [
     lambda r: r.update(frame_id="wrong"),
     lambda r: r.update(schema_version=True),

@@ -25,12 +25,30 @@ distinct. Null measured clearance stays unmeasured. Unsupported PASS summaries
 are rejected instead of silently changed. Empty lists give no conclusions.
 No runtime clocks or output paths enter the report; output is UTF-8 with LF.
 
-Measured local validation: baseline **136 passed, 0 failed, 0 skipped**.
-Final full clearance suite: **171 passed, 0 failed, 0 skipped**, including
-**35 new report cases**. Existing tests were not changed. Tests cover all four
+Fix round 1: PASS now requires a null occupied-voxel bound and a consistent
+measured-hit margin strictly above uncertainty (including the classifier's
+1e-12 m boundary tolerance when uncertainty is positive). With no occupied
+cells, every status must have a null margin exactly when measured clearance is
+null; otherwise the margin must equal measured clearance minus required depth.
+Occupied records use a different classifier calculation: in-volume hits or
+conservative voxel bounds. Their margins must lie between the voxel lower
+bound minus depth and zero; without a measured hit, the margin must equal the
+voxel lower bound minus depth. Applying the measured-hit formula to those
+records would incorrectly reject valid partial-cell obstructions.
+
+Measured local validation for fix round 1: the new regression subset initially
+gave **24 failed, 1 passed, 35 deselected**, reproducing acceptance of altered
+evidence before the fix. Final full clearance suite:
+**200 passed, 0 failed, 0 skipped** (136 classifier/input cases and 64 report
+cases, including 29 added in this round). Existing tests were not changed or
+loosened. Tests cover all four
 statuses, exact upstream-record fidelity, empty lists, recheck ordering,
 translated/scaled geometry, malformed records, evidence-free PASS rejection,
 literal Markdown text, CLI failure before writing, and overwrite refusal.
+New coverage includes all-free INDETERMINATE zones relabelled PASS, sideways
+and end-face uncertainty hits, inconsistent/null margins in PASS and non-PASS
+records, occupied-bound rejection, valid null measurements, and occupied
+decisions that differ from the expanded-footprint measured hit.
 Two separate CLI processes with hash seeds 1 and 789 produced byte-identical
 JSON and Markdown. Input list/key reordering also produced identical outputs.
 `git diff --check` passed; status confirmed all changes are in `spatio/clearance`
@@ -45,9 +63,17 @@ the four statuses and reported approximately 1.6 m against 2.0 m at
 [11, 0.1, 6.1] m. A partial-cell obstruction test retained FAIL with no
 measured hit clearance and a separately labelled 0 m voxel lower bound.
 These are synthetic software results, not real-walk or physical measurements.
+The new sideways-hit regression has all 10 required cells free, zero occupied
+or insufficient-evidence cells, a 0.5 m measured clearance, 1.0 m required
+depth and 0.02 m uncertainty. Its -0.5 m margin retains INDETERMINATE; changing
+only its status to PASS is rejected, including by the CLI before output exists.
 
 Limits: summary validation cannot independently verify rays or physical
-clearance. Matching zone geometry is the caller's responsibility: upstream
+clearance, or reconstruct the exact occupied-cell decision from aggregate
+records. A self-consistently fabricated summary still requires upstream evidence
+verification. The report requires a strictly positive margin even when
+uncertainty is zero, so it rejects an exact-depth PASS emitted by the classifier
+at that boundary. Matching zone geometry is the caller's responsibility: upstream
 results lack geometry/hash provenance, so translation cannot be detected from
 IDs/rules/depth alone. Markdown is a compact one-page-style report, not fixed
 pagination; large exception lists grow instead of omitting items. Latency,
@@ -55,8 +81,10 @@ regulatory compliance and physical accuracy were not evaluated.
 
 No Swift files changed; Swift tests and app build were not run because this
 is an isolated Python output stage. No recordings, Spark, containers, apps,
-other workstreams, network operations or Git writes were used. Trevor still
+other workstreams or network operations were used in this fix round. Trevor still
 needs to approve real zone/rule applicability and operational settings before
 physical use; no new approval is needed for this local output-stage work.
 
-Changes are intentionally uncommitted for the orchestrator.
+The original report implementation was committed by the orchestrator as
+`60f7d01`. Fix-round-1 changes are left uncommitted as Trevor requested; no
+commit or other Git write was performed in this round.
