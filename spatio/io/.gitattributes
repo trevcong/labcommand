@@ -1,0 +1,4 @@
+*.pcd binary
+*.tum text eol=lf
+*.json text eol=lf
+*.py text eol=lf

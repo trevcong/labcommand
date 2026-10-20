@@ -1,0 +1,12 @@
+{
+  "run_id": "loop_vertical_8cm",
+  "source_recording": "synthetic://loop_vertical_8cm",
+  "sensor": "synthetic",
+  "fastlio_revision": "none",
+  "config_file": "spatio/io/synth.py",
+  "config_sha256": "c6ed7c14bd03139d55759f134f591d6a3e7b6394f072188ab0959995a2052932",
+  "image": "none",
+  "created_at": "2026-10-19T00:00:00Z",
+  "notes": "replay demonstrated; physical accuracy not evaluated. Synthetic fixture, not a FAST-LIO replay. square loop that stops 0.080 m above the start. config_sha256 is the SHA-256 of the canonical JSON of the synthetic parameters.",
+  "physical_accuracy_evaluated": false
+}
