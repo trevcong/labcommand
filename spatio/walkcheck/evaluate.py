@@ -15,6 +15,7 @@ from spatio.walkcheck.defaults import (
     MAX_ENDPOINT_SPREAD_M,
     MAX_GAP_S,
     MIN_EXCURSION_M,
+    MIN_MAP_POINTS,
     MIN_PATH_LENGTH_M,
     PROVISIONAL_LABEL,
     RETURN_PASS_M,
@@ -32,6 +33,7 @@ from spatio.walkcheck.pcd import PcdError, read_pcd_xyz
 from spatio.walkcheck.plot import write_topdown
 from spatio.walkcheck.report import plain, render_markdown, write_json
 from spatio.walkcheck.trajectory import (
+    ThresholdError,
     check_scoring_thresholds,
     load_tum,
     score_stops,
@@ -65,6 +67,7 @@ def evaluate_session(
     max_gap_s: float = MAX_GAP_S,
     min_path_length_m: float = MIN_PATH_LENGTH_M,
     min_excursion_m: float = MIN_EXCURSION_M,
+    min_map_points: int = MIN_MAP_POINTS,
     max_endpoint_spread_m: float = MAX_ENDPOINT_SPREAD_M,
     max_endpoint_speed_m_s: float = MAX_ENDPOINT_SPEED_M_S,
     min_hold_s: float = MIN_HOLD_S,
@@ -78,6 +81,8 @@ def evaluate_session(
     imu_file: Path | str | None = None,
     write: bool = True,
 ) -> dict:
+    if isinstance(min_map_points, bool) or not isinstance(min_map_points, int) or min_map_points < 1:
+        raise ThresholdError("min_map_points must be a positive integer")
     check_scoring_thresholds(
         min_hold_s=min_hold_s,
         max_hold_speed_m_s=max_hold_speed_m_s,
@@ -149,6 +154,12 @@ def evaluate_session(
         try:
             map_xyz = read_pcd_xyz(map_path)
             walls = wall_sharpness(map_xyz)
+            if walls["finite_point_count"] < min_map_points:
+                map_problem = "too_few_map_points"
+                map_detail = (
+                    f"map.pcd has {walls['finite_point_count']} finite XYZ points; "
+                    f"at least {min_map_points} are required (PROVISIONAL)."
+                )
         except (OSError, PcdError, ValueError) as exc:
             map_xyz = None
             walls = wall_sharpness(np.zeros((0, 3)))
@@ -158,8 +169,8 @@ def evaluate_session(
             map_problem = "unreadable_map"
             map_detail = f"map.pcd could not be read: {exc}"
 
-    # A missing or unreadable map is an input failure. It is not the wall
-    # gate. The wall gate never changes this result.
+    # A missing, unreadable, or undersized map is an input failure.
+    # This is separate from the wall-quality gate.
     reasons = list(scored["result_reasons"])
     if map_problem:
         reasons.append(map_problem)
@@ -202,6 +213,11 @@ def evaluate_session(
         sensor = manifest.get("sensor")
 
     notes = list(ASSUMPTIONS)
+    notes.append(
+        f"Map input requires at least {min_map_points} finite XYZ points "
+        "(PROVISIONAL, not calibrated to recordings). "
+        "This count does not establish room coverage or wall quality."
+    )
     holds = scored.get("holds")
     if holds:
         notes.extend(holds["flags"])
@@ -246,6 +262,11 @@ def evaluate_session(
             "map.pcd could not be read. An unreadable required input is not evaluable. "
             "The wall gate is a separate check and did not make this decision."
         )
+    elif map_problem == "too_few_map_points":
+        notes.append(
+            f"{map_detail} An undersized required input is not evaluable. "
+            "The wall gate is a separate check and did not make this decision."
+        )
 
     returned = scored["return_to_start"]
     title = result
@@ -279,6 +300,7 @@ def evaluate_session(
             "return_comparison": "strictly_below",
             "min_path_length_m": min_path_length_m,
             "min_excursion_m": min_excursion_m,
+            "min_map_points": min_map_points,
             "min_window_samples": 3,
             "max_endpoint_spread_m": max_endpoint_spread_m,
             "max_endpoint_speed_m_s": max_endpoint_speed_m_s,

@@ -13,8 +13,8 @@ from spatio.walkcheck.synthetic import (
 from spatio.walkcheck.trajectory import ThresholdError, parse_tum, score_trajectory
 
 
-# A readable cloud so trajectory tests are not tripped by the missing-map rule.
-_TINY_MAP = [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.1]]
+# Enough finite points for the input gate; no wall-quality claim.
+_TINY_MAP = [[float(x), float(y), 0.0] for x in range(8) for y in range(4)]
 
 
 def _score(tmp_path, rows, **kwargs):
