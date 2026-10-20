@@ -55,20 +55,28 @@ public struct TrailSession: Equatable, Sendable {
     public var manifest: TrailManifest?
     /// Files that were missing or unreadable. Shown in the side column, never hidden.
     public var problems: [String]
+    /// Optional `walkcheck.json`. Its verdict is shown; it never changes `accuracyLabel`.
+    public var walkcheck: TrailWalkcheck?
+    /// Optional `topdown.png` written by walkcheck.
+    public var topdownPath: String?
 
-    public init(directory: String, trajectory: TrailTrajectory?, map: TrailMapCloud?, manifest: TrailManifest?, problems: [String]) {
+    public init(directory: String, trajectory: TrailTrajectory?, map: TrailMapCloud?, manifest: TrailManifest?, problems: [String],
+                walkcheck: TrailWalkcheck? = nil, topdownPath: String? = nil) {
         self.directory = directory
         self.trajectory = trajectory
         self.map = map
         self.manifest = manifest
         self.problems = problems
+        self.walkcheck = walkcheck
+        self.topdownPath = topdownPath
     }
 
     public var name: String {
         manifest?.runID ?? URL(fileURLWithPath: directory).lastPathComponent
     }
 
-    /// Nil only when the manifest says `physical_accuracy_evaluated: true`.
+    /// Nil only when this session's own manifest says `physical_accuracy_evaluated: true`.
+    /// A walkcheck PASS, or walkcheck's copy of the manifest, does not count.
     public var accuracyLabel: String? {
         manifest?.physicalAccuracyEvaluated == true ? nil : Self.notEvaluatedLabel
     }
@@ -125,7 +133,26 @@ public struct TrailSession: Equatable, Sendable {
         guard trajectory != nil || map != nil else {
             throw TrailError.session("Nothing to show in \(directory): " + problems.joined(separator: "; "))
         }
-        return TrailSession(directory: directory, trajectory: trajectory, map: map, manifest: manifest, problems: problems)
+
+        // Walkcheck is optional: absent is not a problem, unreadable is.
+        var walkcheck: TrailWalkcheck?
+        let walkcheckPath = root.appendingPathComponent(TrailWalkcheck.file).path
+        if let data = fm.contents(atPath: walkcheckPath) {
+            do {
+                walkcheck = try TrailWalkcheck.parse(data)
+                func modified(_ path: String) -> Date? {
+                    (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+                }
+                if let scored = modified(walkcheckPath), let tum = modified(tumPath), scored < tum {
+                    problems.append("\(TrailWalkcheck.file) is older than \(trajectoryFile); its verdict may be for an earlier trajectory")
+                }
+            } catch {
+                problems.append("\(error)")
+            }
+        }
+        let topdown = root.appendingPathComponent(TrailWalkcheck.topdownFile).path
+        return TrailSession(directory: directory, trajectory: trajectory, map: map, manifest: manifest, problems: problems,
+                            walkcheck: walkcheck, topdownPath: fm.fileExists(atPath: topdown) ? topdown : nil)
     }
 
     /// The folder named by `LABCOMMAND_TRAIL_SESSION`. `fixture` is the synthetic loop:
@@ -278,6 +305,41 @@ public enum TrailReadout {
         rows.append(Row(label: "Poses", value: poses))
         rows.append(Row(label: "Largest gap", value: String(format: "%.2f s", summary.largestGap)))
         return rows
+    }
+
+    /// Rows for `walkcheck.json`. Walkcheck reports centimetres; shown as it scored them.
+    public static func walkcheckRows(_ w: TrailWalkcheck) -> [Row] {
+        var rows = [Row(label: "Verdict", value: w.result)]
+        if let d3 = w.error3DCm {
+            var value = metres(d3 / 100)
+            if let threshold = w.thresholdM { value += " · need < \(metres(threshold))" }
+            rows.append(Row(label: "Return error", value: value))
+            if let h = w.horizontalCm { rows.append(Row(label: "  horizontal", value: metres(h / 100))) }
+            if let v = w.verticalCm { rows.append(Row(label: "  vertical", value: metres(v / 100))) }
+            if let heading = w.headingDeg { rows.append(Row(label: "  heading", value: String(format: "%.1f°", heading))) }
+        } else {
+            rows.append(Row(label: "Return error", value: "not scored"))
+        }
+        if let path = w.pathLengthM { rows.append(Row(label: "Path (walkcheck)", value: metres(path))) }
+        if let gate = w.wallGate {
+            var value = gate
+            if let p95 = w.wallP95Cm { value += " · p95 \(metres(p95 / 100))" }
+            rows.append(Row(label: "Walls (proposed)", value: value))
+        }
+        return rows
+    }
+
+    /// How walkcheck measured, and what its verdict is not.
+    public static func walkcheckNote(_ w: TrailWalkcheck, accuracyLabel: String?) -> String {
+        var parts: [String] = []
+        if let window = w.windowS {
+            parts.append(String(format: "Return error: mean of the first %.0f s to mean of the last %.0f s, end not aligned onto start.", window, window))
+        }
+        if !w.reasons.isEmpty { parts.append("Reasons: " + w.reasons.joined(separator: ", ") + ".") }
+        if let detail = w.detail, !detail.isEmpty { parts.append(detail) }
+        if w.wallGate != nil { parts.append("Wall gate is \(w.wallGateLabel ?? "proposed").") }
+        if accuracyLabel != nil { parts.append("This verdict scores the replay, not a measured physical walk.") }
+        return parts.joined(separator: " ")
     }
 
     /// One line about the map layer.

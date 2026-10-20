@@ -452,16 +452,179 @@ func testTrailFixtureIsCurrent() {
     }
 }
 
-/// The app reads the label from Core and the trail tab stays out of the pinned nav order.
+/// The app reads the label from Core. Trail is the fourth permanent tab (spec change in E2,
+/// approved: Room, Settings, Rig, Trail), and only a trail launch opens on it.
 func testTrailViewContract() {
     let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     let view = (try? String(contentsOf: root.appendingPathComponent("Sources/LabCommand/TrailReplayView.swift"), encoding: .utf8)) ?? ""
     let state = (try? String(contentsOf: root.appendingPathComponent("Sources/LabCommand/AppState.swift"), encoding: .utf8)) ?? ""
-    expect(!view.isEmpty, "TrailReplayView.swift exists")
+    let chrome = (try? String(contentsOf: root.appendingPathComponent("Sources/LabCommand/CommandCenterView.swift"), encoding: .utf8)) ?? ""
+    let player = (try? String(contentsOf: root.appendingPathComponent("Sources/LabCommand/TrailPlayer.swift"), encoding: .utf8)) ?? ""
+    expect(!view.isEmpty && !player.isEmpty, "TrailReplayView.swift and TrailPlayer.swift exist")
     expect(view.contains("accuracyLabel"), "the view shows the session's accuracy label")
     expect(view.contains("TrailReadout.startToEndNote"), "the view says start → end is raw")
+    expect(view.contains("TrailReadout.walkcheckRows") && view.contains("TrailReadout.walkcheckNote"),
+           "the view shows the walkcheck verdict and how it was measured")
     expect(state.contains("case trail"), "Dest has a trail case")
-    expect(state.contains("static var navCases: [Dest] { [.liveRoom, .settings, .workspace] }"), "nav order is unchanged")
+    expect(state.contains("static var navCases: [Dest] { [.liveRoom, .settings, .workspace, .trail] }"),
+           "nav order is Room, Settings, Rig, Trail")
+    expect(!chrome.contains("navItem(.trail)"), "Trail is drawn once, from navCases")
+    expect(state.components(separatedBy: "dest = .trail").count == 2, "one place assigns dest = .trail")
+    expect(state.contains("if isTrailLaunch {\n            dest = .trail"), "only a trail launch opens on Trail")
+    expect(state.contains("var dest: Dest = .liveRoom"), "a normal launch still opens on Room")
+    expect(player.contains("NSOpenPanel") && player.contains("canChooseDirectories = true"), "the tab has a folder picker")
+    expect(player.contains("TrailLibrary.lastSessionKey"), "the picked folder is remembered")
+}
+
+// MARK: - Walkcheck and the sessions folder
+
+/// The shape `python -m spatio.walkcheck` writes (schema spatio.walkcheck.v1), trimmed.
+private func walkcheckJSON(result: String, returnError cm: Double?, manifestEvaluated: Bool = false,
+                           schema: String = "spatio.walkcheck.v1") -> Data {
+    let returned = cm.map { """
+    {"evaluated": true, "error_3d_m": \($0 / 100), "error_3d_cm": \($0), "error_horizontal_cm": 3.0,
+     "error_vertical_cm": 1.5, "heading_error_deg": 0.8, "threshold_m": 0.1, "within_threshold": \($0 < 10)}
+    """ } ?? "null"
+    return Data("""
+    {"schema": "\(schema)", "result": "\(result)", "reasons": \(result == "PASS" ? "[]" : "[\"return_error_over_threshold\"]"),
+     "detail": null,
+     "parameters": {"stationary_window_s": 5.0, "return_pass_m": 0.1, "wall_gate_label": "proposed, not yet approved by Trevor"},
+     "manifest": {"present": true, "physical_accuracy_evaluated": \(manifestEvaluated)},
+     "return_to_start": \(returned),
+     "motion": {"path_length_m": 12.022997},
+     "walls": {"status": "OK", "p95_point_to_plane_cm": 5.06719, "proposed_gate_result": "FAIL",
+               "proposed_gate_label": "proposed, not yet approved by Trevor"}}
+    """.utf8)
+}
+
+func testTrailWalkcheckParse() {
+    let fail = try! TrailWalkcheck.parse(walkcheckJSON(result: "FAIL", returnError: 12.34))
+    expect(fail.result == "FAIL" && fail.reasons == ["return_error_over_threshold"], "verdict and reasons")
+    expect(close(fail.error3DCm ?? 0, 12.34) && close(fail.horizontalCm ?? 0, 3) && close(fail.verticalCm ?? 0, 1.5), "return error parts")
+    expect(close(fail.thresholdM ?? 0, 0.1) && close(fail.windowS ?? 0, 5) && close(fail.pathLengthM ?? 0, 12.022997), "threshold, window, path")
+    expect(fail.wallGate == "FAIL" && close(fail.wallP95Cm ?? 0, 5.06719), "proposed wall gate")
+    let rows = Dictionary(uniqueKeysWithValues: TrailReadout.walkcheckRows(fail).map { ($0.label, $0.value) })
+    expect(rows["Verdict"] == "FAIL", "verdict row")
+    expect(rows["Return error"] == "12.3 cm · need < 10.0 cm", "return error row, got \(rows["Return error"] ?? "nil")")
+    expect(rows["  horizontal"] == "3.0 cm" && rows["  vertical"] == "1.5 cm" && rows["  heading"] == "0.8°", "parts rows")
+    expect(rows["Walls (proposed)"] == "FAIL · p95 5.1 cm", "wall row, got \(rows["Walls (proposed)"] ?? "nil")")
+    let note = TrailReadout.walkcheckNote(fail, accuracyLabel: TrailSession.notEvaluatedLabel)
+    expect(note.contains("first 5 s") && note.contains("not aligned"), "the note says how the return error was measured")
+    expect(note.contains("proposed, not yet approved by Trevor"), "the note says the wall gate is proposed")
+    expect(note.contains("not a measured physical walk"), "an unevaluated session says the verdict scores the replay")
+    expect(!TrailReadout.walkcheckNote(fail, accuracyLabel: nil).contains("not a measured physical walk"),
+           "an evaluated session drops that sentence")
+
+    let unscored = try! TrailWalkcheck.parse(walkcheckJSON(result: "NOT-EVALUABLE", returnError: nil))
+    expect(unscored.error3DCm == nil && unscored.horizontalCm == nil, "null return_to_start reads as not scored")
+    expect(TrailReadout.walkcheckRows(unscored).contains { $0.label == "Return error" && $0.value == "not scored" }, "not scored row")
+
+    let skippedWalls = try! TrailWalkcheck.parse(Data("""
+    {"schema": "spatio.walkcheck.v1", "result": "PASS", "walls": {"status": "NO_MAP", "proposed_gate_result": "FAIL"},
+     "return_to_start": {"error_3d_cm": true}}
+    """.utf8))
+    expect(skippedWalls.wallGate == nil, "an unscored wall section shows no gate")
+    expect(skippedWalls.error3DCm == nil, "a boolean is not a number")
+
+    for (data, needle, label) in [
+        (walkcheckJSON(result: "PASS", returnError: 4, schema: "spatio.walkcheck.v2"), "schema", "another schema"),
+        (walkcheckJSON(result: "MAYBE", returnError: 4), "result", "an unknown result"),
+        (Data("[1]".utf8), "not a JSON object", "not an object"),
+        (Data("{nope".utf8), "not a JSON object", "malformed"),
+    ] {
+        do {
+            _ = try TrailWalkcheck.parse(data)
+            expect(false, "\(label) should not parse")
+        } catch {
+            expect("\(error)".contains(needle), "\(label): '\(error)' should mention '\(needle)'")
+        }
+    }
+}
+
+/// Requirement: only the session's own manifest `physical_accuracy_evaluated: true` clears the label.
+func testTrailWalkcheckNeverClearsLabel() {
+    let fm = FileManager.default
+    let dir = tempDirectory("walkcheck-pass")
+    let tum = dir.appendingPathComponent("trajectory.tum")
+    try! Data(TrailFixture.tum().utf8).write(to: tum)
+    try! Data("{\"run_id\": \"walkcheck-pass\", \"physical_accuracy_evaluated\": false}".utf8)
+        .write(to: dir.appendingPathComponent("manifest.json"))
+    try! walkcheckJSON(result: "PASS", returnError: 4, manifestEvaluated: true).write(to: dir.appendingPathComponent("walkcheck.json"))
+    var session = try! TrailSession.load(directory: dir.path)
+    expect(session.walkcheck?.result == "PASS", "the walkcheck verdict loads")
+    expect(session.accuracyLabel == TrailSession.notEvaluatedLabel,
+           "a walkcheck PASS that copies evaluated=true does not clear the label")
+    expect(session.topdownPath == nil, "no topdown.png, no picture")
+
+    try! fm.removeItem(at: dir.appendingPathComponent("manifest.json"))
+    session = try! TrailSession.load(directory: dir.path)
+    expect(session.accuracyLabel == TrailSession.notEvaluatedLabel, "no manifest plus a walkcheck PASS keeps the label")
+
+    try! Data("{\"physical_accuracy_evaluated\": true}".utf8).write(to: dir.appendingPathComponent("manifest.json"))
+    try! Data([0x89, 0x50, 0x4E, 0x47]).write(to: dir.appendingPathComponent("topdown.png"))
+    session = try! TrailSession.load(directory: dir.path)
+    expect(session.accuracyLabel == nil, "the session's own manifest true clears it")
+    expect(session.topdownPath == dir.appendingPathComponent("topdown.png").path, "topdown.png is found")
+
+    // A walkcheck scored before the trajectory was rewritten is flagged, not hidden.
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)],
+                          ofItemAtPath: dir.appendingPathComponent("walkcheck.json").path)
+    session = try! TrailSession.load(directory: dir.path)
+    expect(session.problems.contains { $0.contains("walkcheck.json is older than trajectory.tum") }, "stale walkcheck is listed")
+    expect(session.walkcheck != nil, "a stale walkcheck still shows")
+
+    try! Data("{\"schema\": \"other\"}".utf8).write(to: dir.appendingPathComponent("walkcheck.json"))
+    session = try! TrailSession.load(directory: dir.path)
+    expect(session.walkcheck == nil && session.problems.contains { $0.contains("walkcheck.json: schema") },
+           "an unreadable walkcheck is a listed problem, got \(session.problems)")
+    expect(session.trajectory != nil, "and the session still opens")
+    try? fm.removeItem(at: dir)
+}
+
+func testTrailLibraryScanAndReopen() {
+    let fm = FileManager.default
+    let root = tempDirectory("sessions-root")
+    func make(_ name: String, tum: Bool, map: Bool, age: TimeInterval, walkcheck: String? = nil) {
+        let dir = root.appendingPathComponent(name)
+        try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stamp = Date(timeIntervalSinceNow: -age)
+        if tum {
+            try! Data("1 0 0 0 0 0 0 1\n".utf8).write(to: dir.appendingPathComponent("trajectory.tum"))
+            try! fm.setAttributes([.modificationDate: stamp], ofItemAtPath: dir.appendingPathComponent("trajectory.tum").path)
+        }
+        if map {
+            try! Data("x".utf8).write(to: dir.appendingPathComponent("map.pcd"))
+            try! fm.setAttributes([.modificationDate: stamp], ofItemAtPath: dir.appendingPathComponent("map.pcd").path)
+        }
+        if let walkcheck {
+            try! walkcheckJSON(result: walkcheck, returnError: 12).write(to: dir.appendingPathComponent("walkcheck.json"))
+        }
+    }
+    make("old-run", tum: true, map: false, age: 86_400 * 30)
+    make("new-run", tum: false, map: true, age: 10)
+    make("scored-run", tum: true, map: true, age: 86_400, walkcheck: "FAIL")
+    make("still-starting", tum: false, map: false, age: 0)
+    make(".hidden-run", tum: true, map: true, age: 0)
+    try! Data("x".utf8).write(to: root.appendingPathComponent("notes.txt"))
+
+    let entries = TrailLibrary.scan(root: root.path)
+    expect(entries.map(\.name) == ["new-run", "scored-run", "old-run"],
+           "sessions newest first; empty, hidden and plain files skipped, got \(entries.map(\.name))")
+    expect(entries[0].hasMap && !entries[0].hasTrajectory, "map-only flags")
+    expect(entries[1].walkcheckResult == "FAIL" && entries[2].walkcheckResult == nil, "the list carries the walkcheck verdict")
+    expect(entries[1].directory == root.appendingPathComponent("scored-run").path, "entries open by full path")
+    expect(TrailLibrary.scan(root: root.appendingPathComponent("absent").path).isEmpty, "a missing root lists nothing")
+
+    let saved = root.appendingPathComponent("scored-run").path
+    expect(TrailLibrary.reopenTarget(saved: saved) == saved, "a remembered folder that exists reopens")
+    expect(TrailLibrary.reopenTarget(saved: root.appendingPathComponent("gone").path) == nil, "a removed folder does not")
+    expect(TrailLibrary.reopenTarget(saved: nil) == nil && TrailLibrary.reopenTarget(saved: "") == nil, "nothing saved, nothing reopened")
+    expect(TrailLibrary.reopenTarget(saved: root.appendingPathComponent("notes.txt").path) == nil, "a file is not a session folder")
+    expect(TrailLibrary.pickerStart(saved: saved, root: "/nonexistent") == root.path, "the picker starts beside the last session")
+    expect(TrailLibrary.pickerStart(saved: nil, root: root.path) == root.path, "else in the sessions root")
+    expect(TrailLibrary.pickerStart(saved: "/gone/run", root: "/nonexistent") == nil, "else wherever the panel likes")
+    expect(TrailLibrary.defaultRoot == NSHomeDirectory() + "/Developer/spatio-data/sessions", "the shared-contract root")
+    try? fm.removeItem(at: root)
 }
 
 func runTrailTests() {
@@ -497,6 +660,12 @@ func runTrailTests() {
     print("  trail: readout rows and units"); passed()
     testTrailFixtureIsCurrent()
     print("  trail: committed synthetic-loop fixture matches the generator"); passed()
+    testTrailWalkcheckParse()
+    print("  trail: walkcheck.json verdict, return error, proposed wall gate; null, foreign schema and junk handled"); passed()
+    testTrailWalkcheckNeverClearsLabel()
+    print("  trail: only the session's own manifest true clears the label; a walkcheck PASS does not"); passed()
+    testTrailLibraryScanAndReopen()
+    print("  trail: sessions root lists newest first, skips empty folders; last folder reopens only if present"); passed()
     testTrailViewContract()
-    print("  trail: view shows the label and the raw note; nav order unchanged"); passed()
+    print("  trail: view shows label, raw note and walkcheck; Trail is the 4th tab (Room, Settings, Rig, Trail)"); passed()
 }

@@ -120,7 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     private func consumeOverlayKey(keyCode: UInt16, flags: UInt, windowNumber: Int?, textView: Bool) -> Bool {
-        guard appState.isolatesNetwork, let window, window.isKeyWindow, window.windowNumber == windowNumber else {
+        guard let window, window.isKeyWindow, window.windowNumber == windowNumber else {
             return false
         }
         let mask = NSEvent.ModifierFlags(rawValue: flags)
@@ -128,8 +128,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return false
         }
         if textView { return false }
-        // Trail replay: left/right step one second, space plays or pauses.
-        if appState.dest == .trail, let trail = appState.trail {
+        // Trail replay, in any launch: left/right step one second, space plays or pauses.
+        // Only on the Trail tab with a trajectory open; other tabs keep their keys.
+        if appState.dest == .trail {
+            let trail = appState.trail
+            guard trail.trajectory != nil else { return false }
             switch keyCode {
             case 123: trail.step(-1)
             case 124: trail.step(1)
@@ -138,6 +141,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             }
             return true
         }
+        // The snapshot scrubber steps only in an isolated launch.
+        guard appState.isolatesNetwork else { return false }
         switch keyCode {
         case 123:
             appState.stepOverlay(-1)

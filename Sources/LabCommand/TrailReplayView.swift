@@ -10,33 +10,198 @@ struct TrailReplayView: View {
     @State private var pinch: CGFloat = 1
     @State private var pan: CGSize = .zero
     @State private var drag: CGSize = .zero
+    @State private var showsTopdown = false
 
     var body: some View {
-        switch player.phase {
-        case .loading(let directory):
-            message("Reading \(directory)…", tint: LabTheme.dim)
-        case .failed(let text):
-            message(text, tint: LabTheme.warn)
-        case .ready:
-            TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !player.clock.isPlaying)) { _ in
-                page(now: TrailPlayer.now)
+        Group {
+            switch player.phase {
+            case .empty:
+                message(nil, tint: LabTheme.dim)
+            case .loading(let directory):
+                message("Reading \(directory)…", tint: LabTheme.dim)
+            case .failed(let text):
+                message(text, tint: LabTheme.warn)
+            case .ready:
+                TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !player.clock.isPlaying)) { _ in
+                    page(now: TrailPlayer.now)
+                }
+            }
+        }
+        .onAppear { player.appeared() }
+        // A new session opens fitted.
+        .onChange(of: player.directory) { _, _ in
+            zoom = 1
+            pan = .zero
+            showsTopdown = false
+        }
+        .sheet(isPresented: $showsTopdown) { topdownSheet }
+    }
+
+    /// No session yet, a load in progress, or a failure: the picker and the sessions list.
+    private func message(_ text: String?, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: LabTheme.sectionGap) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Trail replay")
+                    .font(LabTheme.t(LabTheme.titleSize, .semibold))
+                    .foregroundStyle(LabTheme.text)
+                Text(text ?? "Open a session folder (trajectory.tum, map.pcd, manifest.json). Local files only; no rig contact.")
+                    .font(LabTheme.t(13))
+                    .foregroundStyle(tint)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            sessionsSection(limit: nil)
+                .frame(maxWidth: 520, alignment: .leading)
+        }
+        .padding(LabTheme.pad)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    // MARK: - Sessions
+
+    private func sessionsSection(limit: Int?) -> some View {
+        let shown = limit.map { Array(player.entries.prefix($0)) } ?? player.entries
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                SectionLabel(text: "Sessions")
+                Spacer(minLength: 4)
+                Button("Rescan") { player.rescan() }
+                Button("Fixture") { player.openFixture() }
+                Button("Open folder…") { player.chooseFolder() }
+            }
+            .font(LabTheme.t(11, .medium))
+            .buttonStyle(QuietButton())
+            if shown.isEmpty {
+                Text("No sessions with trajectory.tum or map.pcd in \(abbreviated(player.root)).")
+                    .font(LabTheme.t(11))
+                    .foregroundStyle(LabTheme.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(abbreviated(player.root))
+                    .font(LabTheme.mono(10))
+                    .foregroundStyle(LabTheme.faint)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                ForEach(shown) { entry in
+                    sessionRow(entry)
+                }
+                if shown.count < player.entries.count {
+                    Text("+\(player.entries.count - shown.count) more · Open folder… to pick another")
+                        .font(LabTheme.t(10))
+                        .foregroundStyle(LabTheme.faint)
+                }
             }
         }
     }
 
-    private func message(_ text: String, tint: Color) -> some View {
+    private func sessionRow(_ entry: TrailSessionEntry) -> some View {
+        let current = player.directory == entry.directory
+        let files = [entry.hasTrajectory ? "trail" : nil, entry.hasMap ? "map" : nil].compactMap { $0 }.joined(separator: "+")
+        return Button {
+            player.open(directory: entry.directory)
+        } label: {
+            HStack(spacing: 6) {
+                Text(entry.name)
+                    .font(LabTheme.mono(11))
+                    .foregroundStyle(current ? LabTheme.text : LabTheme.dim)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                if let verdict = entry.walkcheckResult {
+                    Text(verdict)
+                        .font(LabTheme.mono(10))
+                        .foregroundStyle(verdictTint(verdict))
+                }
+                Text(files)
+                    .font(LabTheme.mono(10))
+                    .foregroundStyle(LabTheme.faint)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: LabTheme.controlRadius, style: .continuous)
+                    .fill(current ? LabTheme.accentMuted : LabTheme.well)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Open session \(entry.name)")
+    }
+
+    private func verdictTint(_ verdict: String) -> Color {
+        switch verdict {
+        case "PASS": return LabTheme.good
+        case "FAIL": return LabTheme.bad
+        default: return LabTheme.warn
+        }
+    }
+
+    private func abbreviated(_ path: String) -> String {
+        (path as NSString).abbreviatingWithTildeInPath
+    }
+
+    // MARK: - Walk check
+
+    private func walkcheckSection(_ w: TrailWalkcheck, session: TrailSession) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Trail replay")
-                .font(LabTheme.t(LabTheme.titleSize, .semibold))
-                .foregroundStyle(LabTheme.text)
-            Text(text)
-                .font(LabTheme.t(13))
-                .foregroundStyle(tint)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                SectionLabel(text: "Walk check")
+                Spacer(minLength: 4)
+                if session.topdownPath != nil {
+                    Button("topdown.png") { showsTopdown = true }
+                        .font(LabTheme.t(11, .medium))
+                        .buttonStyle(QuietButton())
+                }
+            }
+            InstrumentWell {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(TrailReadout.walkcheckRows(w)) { row in
+                        if row.label == "Verdict" {
+                            HStack {
+                                Text("Verdict").font(LabTheme.t(12)).foregroundStyle(LabTheme.dim)
+                                Spacer(minLength: 8)
+                                Text(row.value)
+                                    .font(LabTheme.mono(12))
+                                    .fontWeight(.semibold)
+                                    .foregroundStyle(verdictTint(row.value))
+                            }
+                        } else {
+                            readoutRow(row)
+                        }
+                    }
+                    Text(TrailReadout.walkcheckNote(w, accuracyLabel: session.accuracyLabel))
+                        .font(LabTheme.t(10))
+                        .foregroundStyle(LabTheme.faint)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 2)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var topdownSheet: some View {
+        VStack(alignment: .trailing, spacing: 10) {
+            if let path = player.session?.topdownPath, let image = NSImage(contentsOfFile: path) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(minWidth: 520, idealWidth: 820, minHeight: 420, idealHeight: 640)
+                Text(path)
+                    .font(LabTheme.mono(10))
+                    .foregroundStyle(LabTheme.faint)
+                    .textSelection(.enabled)
+            } else {
+                Text("topdown.png could not be read.")
+                    .foregroundStyle(LabTheme.warn)
+                    .frame(width: 320, height: 120)
+            }
+            Button("Close") { showsTopdown = false }
+                .keyboardShortcut(.cancelAction)
         }
         .padding(LabTheme.pad)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(LabTheme.bg)
     }
 
     private func page(now: Double) -> some View {
@@ -67,7 +232,9 @@ struct TrailReplayView: View {
 
     private func sideColumn(sample: TrailSample?) -> some View {
         let session = player.session
-        return VStack(alignment: .leading, spacing: LabTheme.sectionGap) {
+        // Scrolls when the walk check, files and sessions do not all fit beside the map.
+        return ScrollView(.vertical, showsIndicators: false) {
+        VStack(alignment: .leading, spacing: LabTheme.sectionGap) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Trail replay")
                     .font(LabTheme.t(LabTheme.titleSize, .semibold))
@@ -87,6 +254,10 @@ struct TrailReplayView: View {
                     accuracyBadge(label)
                         .padding(.top, 2)
                 }
+            }
+
+            if let session, let walkcheck = session.walkcheck {
+                walkcheckSection(walkcheck, session: session)
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -137,7 +308,7 @@ struct TrailReplayView: View {
                 }
             }
 
-            Spacer(minLength: 0)
+            sessionsSection(limit: 6)
 
             if let directory = session?.directory {
                 Text(directory)
@@ -147,6 +318,8 @@ struct TrailReplayView: View {
                     .truncationMode(.middle)
                     .textSelection(.enabled)
             }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .frame(maxHeight: .infinity, alignment: .topLeading)
     }
@@ -548,10 +721,15 @@ struct TrailDrawing {
             link.addLine(to: end)
             context.stroke(link, with: .color(LabTheme.text.opacity(0.7)), style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
             let distance = first.position.distance(to: last.position)
-            let label = Text("start → end \(TrailReadout.metres(distance)) raw")
+            // On a plate, so the label stays readable over dense map points.
+            let label = context.resolve(Text("start → end \(TrailReadout.metres(distance)) raw")
                 .font(LabTheme.mono(11))
-                .foregroundStyle(LabTheme.text)
-            context.draw(label, at: CGPoint(x: max(start.x, end.x) + 16, y: min(start.y, end.y) - 18), anchor: .leading)
+                .foregroundStyle(LabTheme.text))
+            let size = label.measure(in: CGSize(width: 400, height: 40))
+            let origin = CGPoint(x: max(start.x, end.x) + 16, y: min(start.y, end.y) - 18 - size.height / 2)
+            let plate = CGRect(origin: origin, size: size).insetBy(dx: -5, dy: -3)
+            context.fill(Path(roundedRect: plate, cornerRadius: 4), with: .color(LabTheme.bg.opacity(0.85)))
+            context.draw(label, at: origin, anchor: .topLeading)
         }
 
         let ring = CGRect(x: start.x - 7, y: start.y - 7, width: 14, height: 14)
