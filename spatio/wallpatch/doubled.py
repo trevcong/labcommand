@@ -31,7 +31,15 @@ RULE_TEXT = (
     "distances of the two sides. At least 40 mm is doubled=true. At least 20 mm "
     "and under 40 mm is doubled=undetermined. If no split is kept, "
     "doubled=false and separation_m is null, because there is no second "
-    "surface centre. This is not a visit-to-visit measurement."
+    "surface centre. This is not a visit-to-visit measurement. "
+    "The same rule is run on distances along the fitted plane and along "
+    "normal_hint. A confident split the fitted plane misses is kept when "
+    "normal_hint still shows it, so a small rotation of the pooled fit cannot "
+    "erase it. A confident split the hint misses is kept when the fitted plane "
+    "still shows it. If both confident splits fall on opposite sides of the "
+    "separation gate, or one axis reports a candidate the other does not "
+    "confirm, the patch is not evaluable. A false result on both axes is a "
+    "single surface."
 )
 
 
@@ -181,6 +189,74 @@ def _evaluate_pair(values, smooth, centers, index_a, index_b):
         "mark_m": [float(left.mean()), float(right.mean())],
         "shorter": shorter,
     }
+
+
+def reconcile_axes(fit_stats, hint_stats, separation_gate_m):
+    """One doubled-wall decision from the plane normal and the hint.
+
+    Partial overlap shears the pooled cloud. The fitted normal then tilts a
+    few degrees, and distances along that normal can merge two parallel
+    sheets into one peak. Distances along normal_hint still separate those
+    sheets. A confident split on either axis is kept. Any other disagreement
+    is not a score: the caller leaves the gates unevaluated.
+
+    Returns kind "measured" with the stats that support doubled and
+    separation_m, or kind "not_evaluable" with a reason. Point-to-plane
+    residuals stay with the caller.
+    """
+    fit_d = fit_stats["doubled"]
+    hint_d = hint_stats["doubled"]
+    fit_s = fit_stats["separation_m"]
+    hint_s = hint_stats["separation_m"]
+
+    if fit_d == "false" and hint_d == "false":
+        return _measured(fit_stats)
+    if fit_d == "undetermined" and hint_d == "undetermined":
+        return _measured(fit_stats)
+    if fit_d == "true" and hint_d == "true":
+        if fit_s is None or hint_s is None:
+            return _refused(_disagree(fit_d, hint_d))
+        fit_fails = float(fit_s) > float(separation_gate_m)
+        hint_fails = float(hint_s) > float(separation_gate_m)
+        if fit_fails != hint_fails:
+            return _refused(
+                "fitted plane separation %.4f m and normal_hint separation %.4f m "
+                "are on opposite sides of the %.2f m separation gate; "
+                "the patch is not evaluable"
+                % (fit_s, hint_s, separation_gate_m)
+            )
+        # Both sides of the gate agree. Keep the plane-normal gap. The hint
+        # cannot shrink it under the gate, because that case was refused above.
+        return _measured(fit_stats)
+    if fit_d == "false" and hint_d == "true":
+        return _measured(hint_stats)
+    if fit_d == "true" and hint_d == "false":
+        return _measured(fit_stats)
+    # A confident split that already fails the gate is still reported.
+    # A confident split that would pass, next to an unconfirmed candidate,
+    # is not a pass.
+    if fit_d == "true" and hint_d == "undetermined" and fit_s is not None:
+        if float(fit_s) > float(separation_gate_m):
+            return _measured(fit_stats)
+    if hint_d == "true" and fit_d == "undetermined" and hint_s is not None:
+        if float(hint_s) > float(separation_gate_m):
+            return _measured(hint_stats)
+    return _refused(_disagree(fit_d, hint_d))
+
+
+def _measured(stats):
+    return {"kind": "measured", "stats": stats, "reason": None}
+
+
+def _refused(reason):
+    return {"kind": "not_evaluable", "stats": None, "reason": reason}
+
+
+def _disagree(fit_d, hint_d):
+    return (
+        "fitted plane reports doubled=%s and normal_hint reports doubled=%s; "
+        "the axes disagree, so the patch is not evaluable" % (fit_d, hint_d)
+    )
 
 
 def _prefer_pair(candidate, incumbent):

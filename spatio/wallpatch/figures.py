@@ -9,6 +9,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import textwrap
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -45,7 +47,10 @@ def write_note_figure(path, title, status, reason):
     fig, ax = plt.subplots(figsize=(6.4, 3.2), constrained_layout=True)
     ax.set_axis_off()
     ax.set_title("%s — %s" % (title, status))
-    ax.text(0.5, 0.5, reason, ha="center", va="center", fontsize=12)
+    # A long reason is one line. Unwrapped, it collapses the layout and
+    # matplotlib warns instead of drawing the note.
+    note = "\n".join(textwrap.wrap(reason, width=42)) or reason
+    ax.text(0.5, 0.5, note, ha="center", va="center", fontsize=11)
     fig.savefig(path, dpi=120)
     plt.close(fig)
 

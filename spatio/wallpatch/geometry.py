@@ -51,6 +51,12 @@ _MIN_KEEP_FRACTION = 0.5
 _MAD_K = 3.0
 _MAD_TO_SIGMA = 1.4826
 _MAX_EIGEN_RATIO = 0.5
+# The fitted normal is flipped toward normal_hint, so this angle is in
+# [0, 90]. At 45 degrees the normal is as close to the wall plane as to
+# the hint. A larger angle means the thinnest axis is not the hinted wall,
+# and point-to-plane stats along it can hide a second sheet. This is the
+# boundary between those two directions. It is not fit to a recording.
+MAX_HINT_ANGLE_DEG = 45.0
 
 
 def box_axes(normal_hint):
@@ -150,6 +156,10 @@ def fit_plane(points, normal_hint):
     Returns None when the cloud is not a plane. Residuals for the report are
     computed by the caller on every cropped point, not on the inliers only.
     The normal is flipped so it points the same way as normal_hint.
+
+    orientation_supported is false when the normal is more than
+    MAX_HINT_ANGLE_DEG from the hint. That fit is not a measurement of the
+    hinted wall. The caller must leave the gates unevaluated.
     """
     pts = np.asarray(points, dtype=np.float64)
     hint = np.asarray(normal_hint, dtype=np.float64)
@@ -185,6 +195,7 @@ def fit_plane(points, normal_hint):
         return None
     signed = project(chosen - centroid, normal)
     rms = float(np.sqrt(np.mean(signed * signed)))
+    hint_angle = angle_deg(normal, hint)
     return {
         "point": centroid,
         "normal": normal,
@@ -192,6 +203,8 @@ def fit_plane(points, normal_hint):
         "eigenvalue_ratio": ratio,
         "n_inliers": int(len(chosen)),
         "rms_inlier_m": rms,
+        "angle_from_hint_deg": hint_angle,
+        "orientation_supported": bool(hint_angle <= MAX_HINT_ANGLE_DEG),
     }
 
 
