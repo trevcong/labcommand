@@ -288,6 +288,10 @@ func testTrailBoundsRejectAbsurdValues() {
     expect(ascii.points == kept && ascii.dropped == 3, "ascii drops the same three, got \(ascii.points)")
     let line = TrailReadout.mapLine(binary, raster: TrailRaster.build(map: binary.points, trajectory: nil))
     expect(line.contains("3 NaN or out-of-range dropped"), "the map line counts them, got \(line)")
+    // The bounds are approved as provisional, and every message quoting one says so.
+    expect(line.contains("(±10 km bound, provisional)"), "the map line says the bound is provisional, got \(line)")
+    expectTUMError(ok + "\(tMax.nextUp) 0 0 0 0 0 0 1\n", line: 2, contains: "(year 2100, provisional bound)", "time bound labelled")
+    expectTUMError(ok + "2 0 1e20 0 0 0 0 1\n", line: 2, contains: "m (provisional bound)", "position bound labelled")
 
     // The view shows the parser's error: a bad trail opens map-only with it listed.
     let fm = FileManager.default
@@ -676,6 +680,13 @@ func testTrailWalkcheckParse() {
     expect(TrailReadout.walkcheckNote(labelled, stale: nil, accuracyLabel: nil)
             .contains("first 5 s to mean of the last 5 s, end not aligned onto start; window provisional (approved for now"),
            "the window is labelled provisional, got \(TrailReadout.walkcheckNote(labelled, stale: nil, accuracyLabel: nil))")
+    // Without walkcheck's labels, the window and the wall gate still read provisional.
+    var unlabelled = fail
+    unlabelled.wallGateLabel = nil
+    unlabelled.provisionalLabel = nil
+    let plain = TrailReadout.walkcheckNote(unlabelled, stale: nil, accuracyLabel: nil)
+    expect(plain.contains("end not aligned onto start; window provisional.") && plain.contains("Wall gate is provisional."),
+           "provisional is the fallback label, got \(plain)")
 
     for (data, needle, label) in [
         (walkcheckJSON(result: "PASS", returnError: 4, schema: "spatio.walkcheck.v2"), "schema", "another schema"),

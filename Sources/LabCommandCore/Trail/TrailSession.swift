@@ -354,13 +354,13 @@ public enum TrailReadout {
         var parts: [String] = []
         if let stale { parts.append("Stale: \(stale). Re-run walkcheck before trusting this verdict.") }
         if let window = w.windowS {
-            var sentence = String(format: "Return error: mean of the first %.0f s to mean of the last %.0f s, end not aligned onto start", window, window)
-            if let label = w.provisionalLabel, !label.isEmpty { sentence += "; window \(label)" }
-            parts.append(sentence + ".")
+            let sentence = String(format: "Return error: mean of the first %.0f s to mean of the last %.0f s, end not aligned onto start", window, window)
+            let label = w.provisionalLabel.flatMap { $0.isEmpty ? nil : $0 } ?? "provisional"
+            parts.append(sentence + "; window \(label).")
         }
         if !w.reasons.isEmpty { parts.append("Reasons: " + w.reasons.joined(separator: ", ") + ".") }
         if let detail = w.detail, !detail.isEmpty { parts.append(detail) }
-        if w.wallGate != nil { parts.append("Wall gate is \(w.wallGateLabel ?? "proposed").") }
+        if w.wallGate != nil { parts.append("Wall gate is \(w.wallGateLabel ?? "provisional").") }
         if accuracyLabel != nil { parts.append("This verdict scores the replay, not a measured physical walk.") }
         return parts.joined(separator: " ")
     }
@@ -369,7 +369,9 @@ public enum TrailReadout {
     public static func mapLine(_ map: TrailMapCloud, raster: TrailRaster) -> String {
         var line = "\(map.points.count) pts \(map.format.rawValue)"
         if map.stride > 1 { line += " (1 in \(map.stride) of \(map.declared))" }
-        if map.dropped > 0 { line += " · \(map.dropped) NaN or out-of-range dropped" }
+        if map.dropped > 0 {
+            line += " · \(map.dropped) NaN or out-of-range dropped (±\(Int(TrailBounds.maxAbsCoordinate / 1000)) km bound, provisional)"
+        }
         line += String(format: " · %.0f cm cells", raster.cellSize * 100)
         return line
     }
