@@ -24,7 +24,7 @@ import numpy as np
 from spatio.walkcheck.synthetic import (doubled_wall, four_wall_room, hold_and_square, insert_time_gap,
                                       vertical_wall, write_pcd_binary, write_tum)
 from spatio.wallpatch.cli import main as wallpatch_main
-from spatio.walkday import result
+from spatio.walkday import provenance, result, seriesgate
 
 CONFIG_SHA = "ab" * 32
 REPO = Path(__file__).resolve().parents[3]
@@ -33,6 +33,41 @@ SERIES_SH = REPO / "spatio" / "walkday" / "series.sh"
 # recording starts 10 minutes after the previous one, in creation order.
 BASE_NS = 1_900_000_000 * 10**9
 _NEXT = itertools.count()
+# Arbitrary walk-day settings for these tests: not walkday.conf's values and not
+# fitted to any recording. Only their identity matters here.
+TEST_SETTINGS = {"STATIONARY_WINDOW_S": "4", "MAX_GAP_S": "0.8", "MIN_PATH_LENGTH_M": "1.5",
+                 "MIN_EXCURSION_M": "0.4", "MAX_ENDPOINT_SPREAD_M": "0.05", "MAX_ENDPOINT_SPEED_M_S": "0.1",
+                 "MAX_HOLD_SPEED_M_S": "0.1", "MIN_HOLD_S": "6", "WALL_GATE_M": "0.05",
+                 "WALL_GATE_STATE": "approved", "SUGGEST_PATCHES": "2", "BAGTIMING_SAMPLE_EVERY": "2",
+                 "MAP_VOXEL_M": "0.04", "PLAYBACK_RATE": "0.5"}
+PATCH_NAMES = ["east face", "north face"]      # a test spec's preselected patch names
+# The walk checker flags process.sh stage 6 passes for each setting.
+WALKCHECK_FLAGS = {"STATIONARY_WINDOW_S": "--stationary-window", "MAX_GAP_S": "--max-gap",
+                   "MIN_PATH_LENGTH_M": "--min-path-length", "MIN_EXCURSION_M": "--min-excursion",
+                   "MAX_ENDPOINT_SPREAD_M": "--max-endpoint-spread", "MAX_ENDPOINT_SPEED_M_S": "--max-endpoint-speed",
+                   "MAX_HOLD_SPEED_M_S": "--max-hold-speed", "MIN_HOLD_S": "--min-hold"}
+
+
+def walkcheck_args(settings):
+    """walkcheck arguments for these settings, as process.sh stage 6 passes them."""
+    return [x for k, flag in WALKCHECK_FLAGS.items() for x in (flag, str(settings[k]))]
+
+
+def write_provenance(session, settings=TEST_SETTINGS, driver_sha=None, config_sha=CONFIG_SHA):
+    """logs/provenance.json as process.sh stage 1 writes it."""
+    driver = None if driver_sha is None else {"file": "/drv.yaml", "sha256": driver_sha,
+                                              "topics_in_bag": ["/t"], "note": provenance.DRIVER_NOTE}
+    (Path(session) / "logs" / "provenance.json").write_text(json.dumps({
+        "schema": provenance.SCHEMA, "settings": provenance.settings_identity(settings),
+        "fastlio_config": {"file": "/x.yaml", "sha256": config_sha}, "driver_config": driver}))
+
+
+def write_spec(path, names=PATCH_NAMES, boxes=None):
+    """A spec holding only what result.py reads: wall_patches. Returns (path, sha256)."""
+    boxes = boxes or [None] * len(names)
+    Path(path).write_text(json.dumps({"spec_id": "test", "wall_patches": [
+        {"name": n, "description": "test", "box_map_frame": b} for n, b in zip(names, boxes)]}))
+    return str(path), hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def write_recording(rec, starting_ns=None):
@@ -54,9 +89,12 @@ def quiet(fn, *a):
 
 
 def make_session(root, run_id, offset=(0.05, 0.0, 0.0), xyz=None, gap=False, evaluated=False,
-                 reference=None, source=None, patches=True, boxes=None):
+                 reference=None, source=None, patches=True, boxes=None, patch_names=None,
+                 settings=TEST_SETTINGS, driver_sha=None):
     s = Path(root) / run_id
     (s / "logs").mkdir(parents=True)
+    if settings is not None:
+        write_provenance(s, settings, driver_sha)
     rows = hold_and_square(offset=offset)
     if gap:
         rows = insert_time_gap(rows, after_t=20.0, extra_s=3.0)
@@ -71,7 +109,8 @@ def make_session(root, run_id, offset=(0.05, 0.0, 0.0), xyz=None, gap=False, eva
     (s / "manifest.json").write_text(json.dumps(manifest))
     if reference is not None:
         (s / "physical_reference.json").write_text(json.dumps(reference))
-    assert quiet(walkcheck_main, [str(s)]) in (0, 1, 2)
+    # The walk check uses the settings provenance.json records, as in process.sh.
+    assert quiet(walkcheck_main, [str(s), *([] if settings is None else walkcheck_args(settings))]) in (0, 1, 2)
     if boxes is not None:              # explicit patch boxes, as with process.sh --patches
         (s / "wallpatch").mkdir()
         digest = hashlib.sha256((s / "map.pcd").read_bytes()).hexdigest()
@@ -84,18 +123,26 @@ def make_session(root, run_id, offset=(0.05, 0.0, 0.0), xyz=None, gap=False, eva
         (s / "wallpatch").mkdir()
         assert quiet(wallpatch_main, ["suggest", str(s / "map.pcd"), "--n", "2",
                                       "--out", str(s / "wallpatch" / "patches.json")]) == 0
+        if patch_names is not None:    # boxes found on this map, named as the spec's preselected patches
+            doc = json.loads((s / "wallpatch" / "patches.json").read_text())
+            for p, name in zip(doc["patches"], patch_names):
+                p["name"] = name
+            (s / "wallpatch" / "patches.json").write_text(json.dumps(doc))
         assert quiet(wallpatch_main, ["measure", str(s), "--patches", str(s / "wallpatch" / "patches.json"),
                                       "--out", str(s / "wallpatch")]) == 0
     return s
 
 
-def ref(start=0.004, end=0.006, heading="ok"):
-    return {"start_placement_residual_m": start, "end_placement_residual_m": end,
-            "heading_check": heading, "placement_tolerance_m": 0.01}
+def ref(start=0.004, end=0.006, heading="ok", spec_sha=None):
+    out = {"start_placement_residual_m": start, "end_placement_residual_m": end,
+           "heading_check": heading, "placement_tolerance_m": 0.01}
+    if spec_sha is not None:
+        out["spec_sha256"] = spec_sha
+    return out
 
 
-def run(session):
-    return quiet(result.main, [str(session)])
+def run(session, *extra):
+    return quiet(result.main, [str(session), *extra])
 
 
 class ResultTest(unittest.TestCase):
@@ -251,23 +298,213 @@ class ResultTest(unittest.TestCase):
         verdict = json.loads(path.read_text())["verdict"] if path.exists() else None
         return proc.returncode, verdict, proc.stdout + proc.stderr
 
+    def preselected(self, run_id, spec=None, **kw):
+        """A physically referenced run scored on the spec's preselected patches."""
+        spec, sha = spec or write_spec(Path(self.tmp) / "spec.json")
+        s = make_session(self.tmp, run_id, evaluated=True, reference=ref(spec_sha=sha),
+                         patch_names=PATCH_NAMES, **kw)
+        rc = run(s, "--patch-origin", "preselected", "--spec", spec)
+        return s, rc
+
     def test_series_sh_exit_codes_are_spatio_series_codes(self):
+        # Spec correction (walkfix P1): runs now use the spec's preselected
+        # patches, as a scored walk must; auto-suggested patches can no longer
+        # PASS a series (test_auto_suggested_patches_never_count_through_series_sh).
+        good, far = {}, {"offset": (0.15, 0.0, 0.0)}
         cases = {
-            "pass": ([dict(evaluated=True, reference=ref())] * 3, "PASS"),
-            "fail": ([dict(evaluated=True, reference=ref()),
-                      dict(evaluated=True, reference=ref(), offset=(0.15, 0.0, 0.0)),
-                      dict(evaluated=True, reference=ref())], "FAIL"),
-            "short": ([dict(evaluated=True, reference=ref())] * 2, "INCOMPLETE"),
-            "replay": ([{}] * 3, "REPLAY_ONLY"),
+            "pass": ([good] * 3, True, "PASS"),
+            "fail": ([good, far, good], True, "FAIL"),
+            "short": ([good] * 2, True, "INCOMPLETE"),
+            "replay": ([{}] * 3, False, "REPLAY_ONLY"),
         }
-        for name, (kwargs, verdict) in cases.items():
-            runs = [make_session(self.tmp, f"sh-{name}{i}", **kw) for i, kw in enumerate(kwargs)]
-            for s in runs:
-                run(s)
+        for name, (kwargs, pre, verdict) in cases.items():
+            if pre:
+                runs = [self.preselected(f"sh-{name}{i}", **kw)[0] for i, kw in enumerate(kwargs)]
+            else:
+                runs = [make_session(self.tmp, f"sh-{name}{i}", **kw) for i, kw in enumerate(kwargs)]
+                for s in runs:
+                    run(s)
             rc, got, out = self.series_sh(runs, f"sh-{name}")
             self.assertEqual(got, verdict, out)
             self.assertEqual(rc, VERDICT_EXIT[verdict], out)
             self.assertIn(f"SERIES sh-{name}: {verdict}", out)
+
+    def final_and_staged(self, series_id):
+        out = Path(self.tmp) / "series" / series_id
+        return (json.loads((out / "series.json").read_text()),
+                json.loads((out / "spatio_series" / "series.json").read_text()))
+
+    def test_auto_suggested_patches_never_count_through_series_sh(self):
+        # Review P1 (result.py:204): three physically referenced 5 cm loops on
+        # auto-suggested patches. spatio.series alone says PASS; walk day must not.
+        runs = [make_session(self.tmp, f"auto{i}", evaluated=True, reference=ref()) for i in range(3)]
+        for s in runs:
+            self.assertEqual(run(s), 0)
+            self.assertEqual(self.walk(s)["wall_patches"]["origin"], "auto_suggested")
+        rc, verdict, out = self.series_sh(runs, "auto")
+        self.assertEqual(verdict, "FAIL", out)
+        self.assertEqual(rc, VERDICT_EXIT["FAIL"])
+        final, staged = self.final_and_staged("auto")
+        self.assertEqual(staged["verdict"], "PASS")
+        self.assertEqual(final["spatio_series_verdict"], "PASS")
+        self.assertEqual(final["counted_run_ids"], [])
+        for r in final["runs"]:
+            self.assertFalse(r["counts_toward_series"])
+            self.assertTrue(any("auto_suggested" in b for b in r["count_blockers"]))
+        self.assertIn("spatio.series alone said PASS", (Path(self.tmp) / "series" / "auto" / "series.md").read_text())
+
+    def test_preselected_patch_not_verified_blocks_series(self):
+        # One spec patch missing from the measured set: the run itself still
+        # passes on the patches it has, but it cannot count.
+        spec = write_spec(Path(self.tmp) / "spec.json")
+        runs = [self.preselected(f"pv{i}", spec=spec)[0] for i in range(2)]
+        s = make_session(self.tmp, "pv2", evaluated=True, reference=ref(spec_sha=spec[1]),
+                         patch_names=[PATCH_NAMES[0], "some other wall"])
+        self.assertEqual(run(s, "--patch-origin", "preselected", "--spec", spec[0]), 0)
+        wp = self.walk(s)["wall_patches"]
+        self.assertEqual(wp["verified"], [PATCH_NAMES[0]])
+        self.assertIn("not verified: north face", "; ".join(result.acceptance_blockers(wp)))
+        rc, verdict, out = self.series_sh(runs + [s], "pv")
+        self.assertEqual(verdict, "FAIL", out)
+        self.assertEqual(self.final_and_staged("pv")[1]["verdict"], "PASS")
+
+    def test_patch_provenance_rules(self):
+        good = {"status": "MEASURED", "doubled": "false", "gate_p95_pass": True, "gate_separation_pass": True,
+                "box_map_frame": {"center_m": [1, 2, 1], "normal_hint": [1, 0, 0], "half_extent_m": [1, .2, 1]}}
+        wp = {"patches": [dict(good, name="A"), dict(good, name="B")]}
+        spec, sha = write_spec(Path(self.tmp) / "s.json", ["A", "B"])
+        out = result.patch_provenance("preselected", spec, {"spec_sha256": sha}, wp, "/none")
+        self.assertEqual(out["verified"], ["A", "B"])
+        self.assertEqual(result.acceptance_blockers(out), [])
+        # The same patches, declared auto-suggested, never count.
+        self.assertTrue(result.acceptance_blockers(dict(out, origin="auto_suggested")))
+        # A spec that is not the one the physical reference names is contradictory input.
+        with self.assertRaisesRegex(result.ResultError, "not the spec the physical reference names"):
+            result.patch_provenance("preselected", spec, {"spec_sha256": "0" * 64}, wp, "/none")
+        # Two measured patches with one name cannot verify it.
+        dup = {"patches": [dict(good, name="A"), dict(good, name="A"), dict(good, name="B")]}
+        self.assertEqual(result.patch_provenance("preselected", spec, None, dup, "/none")["verified"], ["B"])
+        # A box frozen in the spec must be the box measured (same axis, other length: still equal).
+        box = {"center_m": [1, 2, 1], "normal_hint": [2, 0, 0], "half_extent_m": [1, .2, 1]}
+        spec2, _ = write_spec(Path(self.tmp) / "s2.json", ["A", "B"], [box, dict(box, center_m=[1, 2.5, 1])])
+        self.assertEqual(result.patch_provenance("preselected", spec2, None, wp, "/none")["verified"], ["A"])
+        # One named patch is not two; a doubled or gate-failing patch is not verified.
+        spec1, _ = write_spec(Path(self.tmp) / "s1.json", ["A"])
+        self.assertTrue(result.acceptance_blockers(result.patch_provenance("preselected", spec1, None, wp, "/none")))
+        bad = {"patches": [dict(good, name="A", doubled="true"), dict(good, name="B", gate_p95_pass=False)]}
+        self.assertEqual(result.patch_provenance("preselected", spec, None, bad, "/none")["verified"], [])
+        # No provenance at all (an older walk_result) never counts.
+        self.assertTrue(result.acceptance_blockers(None))
+
+    def test_mixed_settings_make_the_series_not_evaluable(self):
+        # Review P2 (result.py:216): a changed map voxel (or hold limit, ...) starts a new series.
+        changed = dict(TEST_SETTINGS, MAP_VOXEL_M="0.05")
+        runs = [self.preselected(f"ms{i}", settings=changed if i == 2 else TEST_SETTINGS)[0] for i in range(3)]
+        self.assertNotEqual(self.walk(runs[0])["walkday_settings"]["sha256"],
+                            self.walk(runs[2])["walkday_settings"]["sha256"])
+        rc, verdict, out = self.series_sh(runs, "ms")
+        self.assertEqual((verdict, rc), ("NOT_EVALUABLE", VERDICT_EXIT["NOT_EVALUABLE"]), out)
+        final, staged = self.final_and_staged("ms")
+        self.assertEqual(staged["verdict"], "PASS")
+        self.assertIn("MAP_VOXEL_M", " ".join(final["reasons"]))
+        # Same values written differently are the same identity.
+        same = dict(TEST_SETTINGS, PLAYBACK_RATE="0.50", MAX_HOLD_SPEED_M_S="0.10")
+        self.assertEqual(provenance.settings_identity(same), provenance.settings_identity(TEST_SETTINGS))
+        for key in ("MAX_HOLD_SPEED_M_S", "MIN_HOLD_S", "MAX_ENDPOINT_SPREAD_M", "MAX_ENDPOINT_SPEED_M_S",
+                    "PLAYBACK_RATE", "MAP_VOXEL_M"):
+            self.assertNotEqual(provenance.settings_identity(dict(TEST_SETTINGS, **{key: "9"}))["sha256"],
+                                provenance.settings_identity(TEST_SETTINGS)["sha256"], key)
+
+    def test_missing_settings_or_mixed_driver_config_make_the_series_not_evaluable(self):
+        runs = [self.preselected(f"md{i}", settings=None if i == 1 else TEST_SETTINGS)[0] for i in range(3)]
+        self.assertIsNone(self.walk(runs[1])["walkday_settings"])
+        rc, verdict, out = self.series_sh(runs, "md")
+        self.assertEqual(verdict, "NOT_EVALUABLE", out)
+        runs = [self.preselected(f"dc{i}", driver_sha=("c" if i == 0 else "d") * 64)[0] for i in range(3)]
+        self.assertEqual(self.walk(runs[0])["driver_config_sha256"], "c" * 64)
+        rc, verdict, out = self.series_sh(runs, "dc")
+        self.assertEqual(verdict, "NOT_EVALUABLE", out)
+        self.assertIn("driver_config_sha256 values differ", " ".join(self.final_and_staged("dc")[0]["reasons"]))
+
+    def test_config_change_reasons_survive_a_settings_change(self):
+        # spatio.series R1 (FAST-LIO config differs) and G1 (settings differ) together: both reasons stay.
+        runs = [self.preselected(f"cs{i}", settings=dict(TEST_SETTINGS, MIN_HOLD_S="7") if i == 2 else TEST_SETTINGS)[0]
+                for i in range(3)]
+        w = json.loads((runs[2] / "walk_result.json").read_text())
+        w["config_sha256"] = "cd" * 32
+        (runs[2] / "walk_result.json").write_text(json.dumps(w))
+        rc, verdict, out = self.series_sh(runs, "cs")
+        self.assertEqual(verdict, "NOT_EVALUABLE", out)
+        reasons = " ".join(self.final_and_staged("cs")[0]["reasons"])
+        self.assertIn("config_sha256 values differ", reasons)
+        self.assertIn("MIN_HOLD_S", reasons)
+
+    def stage1(self, s):
+        return json.loads((s / "logs" / "provenance.json").read_text())["settings"]
+
+    def test_rescoring_with_a_changed_wall_gate_starts_a_new_series(self):
+        # Review P2 (result.py:369): re-scoring one run with a looser wall gate
+        # kept stage 1's WALL_GATE_M and hash, so a mixed series could PASS.
+        spec = write_spec(Path(self.tmp) / "spec.json")
+        runs = [self.preselected(f"rs{i}", spec=spec)[0] for i in range(3)]
+        for s in runs:                     # nothing changed: stage 1's identity, unchanged
+            self.assertEqual(self.walk(s)["walkday_settings"], self.stage1(s))
+        self.assertEqual(self.series_sh(runs, "rs-same")[1], "PASS")
+        self.assertEqual(run(runs[2], "--patch-origin", "preselected", "--spec", spec[0],
+                             "--wall-gate-m", "0.08"), 0)
+        got = self.walk(runs[2])["walkday_settings"]
+        self.assertTrue(provenance.check_identity(got))
+        self.assertEqual(got["values"]["WALL_GATE_M"], 0.08)
+        self.assertNotEqual(got["sha256"], self.stage1(runs[2])["sha256"])
+        rep = json.loads((runs[2] / "walkday.json").read_text())["provenance"]
+        self.assertEqual(rep["settings_sha256"], got["sha256"])
+        self.assertEqual(rep["stage1_settings_sha256"], self.stage1(runs[2])["sha256"])
+        self.assertEqual(rep["settings_changed"], [{"setting": "WALL_GATE_M", "stage1": 0.05, "used": 0.08,
+                                                    "source": "--wall-gate-m"}])
+        self.assertIn("WALL_GATE_M", (runs[2] / "walkday.md").read_text())
+        rc, verdict, out = self.series_sh(runs, "rs-mixed")
+        self.assertEqual((verdict, rc), ("NOT_EVALUABLE", VERDICT_EXIT["NOT_EVALUABLE"]), out)
+        self.assertIn("WALL_GATE_M", " ".join(self.final_and_staged("rs-mixed")[0]["reasons"]))
+        # The gate state is a scoring argument too.
+        self.assertEqual(run(runs[1], "--patch-origin", "preselected", "--spec", spec[0],
+                             "--wall-gate-state", "proposed"), 0)
+        self.assertEqual(self.walk(runs[1])["walkday_settings"]["values"]["WALL_GATE_STATE"], "proposed")
+
+    def test_walkcheck_rerun_with_other_settings_changes_the_identity(self):
+        # The walk checker's own record of its parameters (walkcheck.json) is
+        # checked against stage 1: a re-run with another minimum hold is not stage 1's identity.
+        s = make_session(self.tmp, "wcre")
+        self.assertIn(quiet(walkcheck_main, [str(s), *walkcheck_args(dict(TEST_SETTINGS, MIN_HOLD_S="7"))]),
+                      (0, 1, 2))
+        self.assertIn(run(s), (0, 1, 2))
+        got = self.walk(s)["walkday_settings"]
+        self.assertTrue(provenance.check_identity(got))
+        self.assertEqual(got["values"]["MIN_HOLD_S"], 7.0)
+        self.assertEqual(dict(got["values"], MIN_HOLD_S=6.0), self.stage1(s)["values"])
+        # A walk check that does not record its parameters cannot be checked: refused.
+        wc = json.loads((s / "walkcheck.json").read_text())
+        del wc["parameters"]["min_hold_s"]
+        (s / "walkcheck.json").write_text(json.dumps(wc))
+        (s / "walk_result.json").unlink()
+        self.assertEqual(run(s), 3)
+        self.assertFalse((s / "walk_result.json").exists())
+
+    def test_provenance_config_hash_must_match_the_manifest(self):
+        # Replay's manifest hashes the same --config path process.sh hashed
+        # (checked on real sessions); a different hash is contradictory input.
+        s = make_session(self.tmp, "cfgmis")
+        write_provenance(s, config_sha="ef" * 32)
+        self.assertEqual(run(s), 3)
+        self.assertFalse((s / "walk_result.json").exists())
+
+    def test_tampered_settings_identity_is_refused(self):
+        s = make_session(self.tmp, "tamper")
+        prov = json.loads((s / "logs" / "provenance.json").read_text())
+        prov["settings"]["values"]["MAP_VOXEL_M"] = 0.5          # sha256 left as it was
+        (s / "logs" / "provenance.json").write_text(json.dumps(prov))
+        self.assertEqual(run(s), 3)
+        self.assertFalse((s / "walk_result.json").exists())
+        self.assertFalse(seriesgate.check_identity(prov["settings"]))
 
     def test_series_sh_rejects_tied_recording_times(self):
         runs = []

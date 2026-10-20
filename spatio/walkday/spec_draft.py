@@ -3,8 +3,9 @@
     python3 -m spatio.walkday.spec_draft --config CFG --fastlio-revision REV --out DRAFT.json
         [--fill FIELDS.json]
 
-Fills config_file, config_sha256 (hashed from CFG), fastlio_revision and
-frames.lidar_to_imu (quoted from CFG's extrinsic). Everything Trevor decides
+Fills config_file, config_sha256 (hashed from CFG), fastlio_revision,
+frames.lidar_to_imu (quoted from CFG's extrinsic) and the walk-day hold
+(stationary_windows_s, HOLD_S at each end). Everything else Trevor decides
 stays TODO(Trevor) unless --fill supplies it (a JSON object merged on top;
 used for synthetic dry-run specs). Then: edit, `spatio.expspec validate`,
 `spatio.expspec freeze`.
@@ -19,6 +20,11 @@ import re
 import sys
 
 from spatio.expspec.template import build_template
+
+# Walk-day protocol hold at the start and at the end (Trevor, 2026-10-20; was
+# 10 s, the expspec template's default). Not the walk checker's MIN_HOLD_S
+# (walkday.conf), which is the shortest stillness its detector accepts.
+HOLD_S = 15
 
 
 def _merge(base, extra):
@@ -44,6 +50,7 @@ def draft(config_path, revision, fill=None):
         "from the config: extrinsic_T [%s], extrinsic_R [%s], extrinsic_est_en %s"
         % (" ".join(t.group(1).split()) if t else "?", " ".join(r.group(1).split()) if r else "?",
            est.group(1) if est else "?"))
+    spec["stationary_windows_s"] = {"start": HOLD_S, "end": HOLD_S}
     if fill:
         _merge(spec, fill)
     return spec
