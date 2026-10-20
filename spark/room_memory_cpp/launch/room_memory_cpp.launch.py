@@ -21,12 +21,18 @@ lidar drivers' parameter services included, stay hidden; the bridge enforces thi
 ``foxglove_client_publish:=true``: foxglove_bridge parses ``client_topic_whitelist`` but does not
 enforce it (3.4.1 through 3.6.2), so client publishing would let any client that reaches the port
 publish on any topic.
+
+Either process exiting shuts the whole launch down, and with it the container (``ros2 launch`` is its
+main process). Without that, a node that crashed leaves the other one holding the container up:
+Docker reports it running, its restart policy never fires, and a deploy's stability window passes.
+A bridge exit restarts the node too, so it reclassifies the room under a new publisher generation;
+a node the Mac cannot reach is down all the same.
 """
 
 from typing import List
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, Shutdown
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
@@ -117,6 +123,7 @@ def generate_launch_description():
     bridge = Node(
         package="foxglove_bridge", executable="foxglove_bridge", name="room_memory_bridge", output="screen",
         condition=IfCondition(LaunchConfiguration("foxglove_bridge")),
+        on_exit=Shutdown(reason="room_memory_bridge exited"),
         parameters=[{
             "port": ParameterValue(LaunchConfiguration("foxglove_port"), value_type=int),
             "address": LaunchConfiguration("foxglove_address"),
@@ -130,6 +137,6 @@ def generate_launch_description():
         [DeclareLaunchArgument(name, default_value=default) for name, (default, _) in ARGUMENTS.items()]
         + [DeclareLaunchArgument(name, default_value=default) for name, default in BRIDGE_ARGUMENTS.items()]
         + [Node(package="room_memory_cpp", executable="room_memory_node", name="room_memory", output="screen",
-                parameters=[parameters]),
+                parameters=[parameters], on_exit=Shutdown(reason="room_memory exited")),
            bridge]
     )

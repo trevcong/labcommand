@@ -156,6 +156,9 @@ public:
             RCLCPP_FATAL(get_logger(), "refusing to start: %s", error.what());
             throw;
         }
+        // The deploy waits for this line (scripts/spark/deploy-room-memory.sh).
+        RCLCPP_INFO(get_logger(), "room-memory ready: publisher_generation %llu",
+                    static_cast<unsigned long long>(generation_->generation()));
         memory_ = std::make_unique<RoomMemory>(config, stamp(), generation_->generation());
 
         // Durability is declared on every topic (protocol §2, D24). Status and activity are full state at

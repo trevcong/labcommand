@@ -77,6 +77,8 @@ class RoomMemoryNode(Node):
         except GenerationError as error:
             self.get_logger().fatal(f"refusing to start: {error}")
             raise
+        # The deploy waits for this line (scripts/spark/deploy-room-memory.sh).
+        self.get_logger().info(f"room-memory ready: publisher_generation {self.generation.generation}")
         self.memory = RoomMemory(self.config, _time(self), self.generation.generation)
 
         # Durability is declared on every topic (protocol §2, D24). Status and activity are full state at
