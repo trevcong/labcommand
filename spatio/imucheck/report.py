@@ -180,8 +180,9 @@ def _markdown(report, bag_path, library_versions, quotes):
             "A window is not used when the IMU samples inside the odometry "
             "interval span less than {1:.0%} of it, when a gap in that "
             "interval is longer than {2:g} s, or when the sum of intermediate "
-            "odometry steps exceeds {3:g} rad. Overlapping clock epochs are "
-            "kept separate and are not sorted onto one timeline. {4}.".format(
+            "odometry steps exceeds {3:g} rad. A sustained clock rewind is its "
+            "own epoch whether or not the time ranges overlap, and epochs are "
+            "not sorted onto one timeline. {4}.".format(
                 GYRO_RATIO_TOL,
                 MIN_IMU_COVERAGE_FRACTION,
                 MAX_IMU_GAP_S,

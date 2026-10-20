@@ -389,6 +389,84 @@ class ImuCheckTests(unittest.TestCase):
         self.assertEqual(mismatch["gyro_unit"]["windows_used"], 0)
         self.assertIn("could not be paired", mismatch["gyro_unit"]["evidence"].lower())
 
+    def test_gyro_unit_rejects_disjoint_clock_resets(self):
+        # Headers 10.50–10.99, then a rewind to 10.00–10.49. The ranges do
+        # not overlap. A genuine deg/s stream of a 0.01 rad/s turn, with the
+        # first run's odometry origin offset by 0.53481 rad, used to sort
+        # onto one timeline and report rad/s at ratio 1.00927. Each run
+        # alone is undetermined.
+        hz = 100.0
+        epoch = np.arange(50, dtype=np.float64) / hz
+        self.assertAlmostEqual(float(epoch[-1]), 0.49, places=6)
+        t = np.concatenate([10.5 + epoch, 10.0 + epoch])
+        self.assertLess(float(np.max(t[50:])), float(np.min(t[:50])))
+        accel = np.zeros((len(t), 3), dtype=np.float64)
+        accel[:, 2] = 1.0
+        gyro = np.zeros((len(t), 3), dtype=np.float64)
+        gyro[:, 2] = 0.01 * DEG_PER_RAD
+        odom_epoch = epoch[::5]
+        odom_t = np.concatenate([10.5 + odom_epoch, 10.0 + odom_epoch])
+        yaw = np.concatenate([0.53481 + 0.01 * odom_epoch, 0.01 * odom_epoch])
+        odom_q = np.zeros((len(odom_t), 4), dtype=np.float64)
+        odom_q[:, 2] = np.sin(yaw / 2.0)
+        odom_q[:, 3] = np.cos(yaw / 2.0)
+        report = characterize(
+            t, accel, gyro, odom_t=odom_t, odom_quat=odom_q, topic="/test"
+        )
+        gyro_unit = report["gyro_unit"]
+        self.assertEqual(gyro_unit["verdict"], "undetermined")
+        self.assertIsNone(gyro_unit["ratio"])
+        self.assertEqual(gyro_unit["windows_used"], 0)
+        evidence = gyro_unit["evidence"].lower()
+        self.assertIn("kept separate", evidence)
+        self.assertNotIn("could not be paired", evidence)
+        self.assertIn("not guessed", evidence)
+        self.assertIn(
+            "1 consecutive header steps decreased", " ".join(report["findings"])
+        )
+        for start, stop, j0, j1 in ((0, 50, 0, 10), (50, 100, 10, 20)):
+            alone = characterize(
+                t[start:stop],
+                accel[start:stop],
+                gyro[start:stop],
+                odom_t=odom_t[j0:j1],
+                odom_quat=odom_q[j0:j1],
+                topic="/test",
+            )
+            self.assertEqual(alone["gyro_unit"]["verdict"], "undetermined")
+            self.assertIsNone(alone["gyro_unit"]["ratio"])
+
+        # The same offset on two disjoint epochs that each turn at 0.5 rad/s,
+        # stored as deg/s, stays deg/s. The boundary is kept, and the turns
+        # on each side are still scored.
+        long = np.arange(int(4.0 * hz), dtype=np.float64) / hz
+        t_long = np.concatenate([20.0 + long, 10.0 + long])
+        self.assertLess(
+            float(np.max(t_long[len(long):])), float(np.min(t_long[: len(long)]))
+        )
+        accel_long = np.zeros((len(t_long), 3), dtype=np.float64)
+        accel_long[:, 2] = 1.0
+        gyro_long = np.zeros((len(t_long), 3), dtype=np.float64)
+        gyro_long[:, 2] = 0.5 * DEG_PER_RAD
+        odom_long = long[::5]
+        odom_t_long = np.concatenate([20.0 + odom_long, 10.0 + odom_long])
+        yaw_long = np.concatenate([0.53481 + 0.5 * odom_long, 0.5 * odom_long])
+        odom_q_long = np.zeros((len(odom_t_long), 4), dtype=np.float64)
+        odom_q_long[:, 2] = np.sin(yaw_long / 2.0)
+        odom_q_long[:, 3] = np.cos(yaw_long / 2.0)
+        kept = characterize(
+            t_long,
+            accel_long,
+            gyro_long,
+            odom_t=odom_t_long,
+            odom_quat=odom_q_long,
+            topic="/test",
+        )
+        self.assertEqual(kept["gyro_unit"]["verdict"], "deg/s")
+        self.assertAlmostEqual(kept["gyro_unit"]["ratio"], DEG_PER_RAD, places=4)
+        self.assertGreater(kept["gyro_unit"]["windows_used"], 0)
+        self.assertIn("kept separate", kept["gyro_unit"]["evidence"].lower())
+
     def test_gyro_unit_rejects_wrapped_odometry_turns(self):
         # Continuous 13.462727 rad/s, fully sampled IMU and matching odometry.
         # The endpoint short-arc is about 0.22 rad, so the old check reported

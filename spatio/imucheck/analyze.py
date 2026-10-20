@@ -44,10 +44,10 @@ noise floor. /Odometry was produced by FAST-LIO using this IMU, so the
 ratio is support, not proof.
 
 Clock epochs. Samples are ordered by header time only inside one clock
-run. A sustained rewind whose time range overlaps an earlier run is a
-separate epoch and is not sorted onto that run. Epochs are paired with
-odometry in read order. One sample out of order, or a rewind into a
-range that does not overlap, stays on one timeline.
+run. A sustained rewind is a separate epoch whether or not its time range
+overlaps an earlier run, and it is not sorted onto that run. Epochs are
+paired with odometry in read order. One sample out of order stays on one
+timeline.
 
 Bias and noise are the per-axis mean and the sample standard deviation
 (ddof 1) on the stationary samples, in the message's native unit.
@@ -413,7 +413,7 @@ def _combine_stationary_diags(diags):
 
 
 def _stationary_across(epochs, gyro_std_max, gyro_median_max):
-    """Stationary windows per clock epoch. Overlapping epochs are not merged."""
+    """Stationary windows per clock epoch. Epochs are not merged."""
     windows: List[Tuple[float, float]] = []
     diags = []
     acc_parts = []
@@ -573,33 +573,15 @@ def _segment_bounds(t):
     return bounds
 
 
-def _segments_overlap(t, bounds):
-    """True when two runs cover the same header time."""
-    if len(bounds) < 2:
-        return False
-    spans = []
-    for start, stop in bounds:
-        chunk = t[start:stop]
-        spans.append((float(np.min(chunk)), float(np.max(chunk))))
-    spans.sort()
-    max_end = spans[0][1]
-    for start, end in spans[1:]:
-        if start < max_end:
-            return True
-        if end > max_end:
-            max_end = end
-    return False
-
-
 def _epoch_series(t, acc, gyr):
     """Sorted (t, accel, gyro) epochs.
 
-    Overlapping rewinds are not sorted onto one timeline. A rewind into
-    a disjoint range is one timeline, which is what a global sort already
-    did.
+    A sustained rewind is its own epoch even when the time ranges do not
+    overlap. Sorting a disjoint reset onto the earlier run lets one window
+    bridge an odometry origin change.
     """
     bounds = _segment_bounds(t)
-    if len(bounds) <= 1 or not _segments_overlap(t, bounds):
+    if len(bounds) <= 1:
         order = np.argsort(t, kind="mergesort")
         return [(t[order], acc[order], gyr[order])]
     epochs = []
@@ -616,8 +598,9 @@ def _epoch_series(t, acc, gyr):
 def _odom_epochs(odom_t, odom_quat):
     """Sorted (t, xyzw) epochs, or None when there is no usable odometry.
 
-    Same overlap rule as the IMU series. Finite samples keep read order
-    until a run is sorted on its own.
+    Same sustained-rewind rule as the IMU series. Finite samples keep read
+    order until a run is sorted on its own. A disjoint reset stays its own
+    epoch.
     """
     if odom_t is None or odom_quat is None:
         return None
@@ -637,7 +620,7 @@ def _odom_epochs(odom_t, odom_quat):
     ot = ot[finite]
     oq = oq[finite]
     bounds = _segment_bounds(ot)
-    if len(bounds) <= 1 or not _segments_overlap(ot, bounds):
+    if len(bounds) <= 1:
         order = np.argsort(ot, kind="mergesort")
         return [(ot[order], oq[order])]
     epochs = []
@@ -947,8 +930,9 @@ def _ratios_to_verdict(ratios, stats, prefix):
 def _gyro_from_epochs(imu_epochs, odom_epochs):
     """Gyro unit across clock epochs.
 
-    Overlapping epochs are paired in read order. They are not matched by
-    the shared timestamp numbers. A count mismatch is ambiguous.
+    Sustained rewinds are paired in read order, whether or not the ranges
+    overlap. They are not matched by the shared timestamp numbers. A count
+    mismatch is ambiguous.
     """
     base = {
         "verdict": "undetermined",
@@ -967,7 +951,7 @@ def _gyro_from_epochs(imu_epochs, odom_epochs):
     n_odom = len(odom_epochs)
     if n_imu != n_odom:
         base["evidence"] = (
-            "Overlapping clock epochs could not be paired ({0} IMU epochs, "
+            "Sustained clock rewinds could not be paired ({0} IMU epochs, "
             "{1} odometry epochs). They were not placed on one timeline. "
             "Gyro unit is undetermined; it was not guessed from the noise level."
         ).format(n_imu, n_odom)
@@ -975,7 +959,7 @@ def _gyro_from_epochs(imu_epochs, odom_epochs):
     prefix = ""
     if n_imu > 1:
         prefix = (
-            "Overlapping clock epochs were kept separate ({0} IMU, {1} odometry). "
+            "Sustained clock rewinds were kept separate ({0} IMU, {1} odometry). "
         ).format(n_imu, n_odom)
     ratios: List[float] = []
     stats = _empty_gyro_stats()
