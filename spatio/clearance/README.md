@@ -29,6 +29,34 @@ python3 -m spatio.clearance --zones /path/to/zones.json \
 The numbers above are example parameters, not recommended operating settings.
 No sensor-specific names, timing rates, calibration or recording paths are used.
 
+## Provenance binding (B2)
+
+Optional inputs bind a result to where its rays came from:
+
+```sh
+python3 -m spatio.clearance --zones zones.json --scans scans.json \
+  --voxel-size 0.1 --uncertainty-m 0.02 \
+  --recording /path/to/bag-or-file --extrinsics extrinsics.yaml \
+  --trajectory trajectory.txt --time-basis "sensor header stamp, seconds" \
+  --output /private/tmp/clearance-bound
+```
+
+`report.json` gains `provenance` (`schema: "spatio.clearance_provenance.v1"`):
+`recording_sha256`, `extrinsics_sha256`, `trajectory_sha256` (sha256 of the
+file bytes; a recording directory hashes its sorted relative names and file
+hashes), `time_basis` (supplied text), `scans_sha256` (canonical JSON of the
+scan document, i.e. the ray evidence) and `limitations`. Only hashes are
+written, never paths. Each zone record gains `zone_geometry_sha256` (frame,
+shape and parsed min/max/axis/direction; not ID, rule or provision) and
+`provenance_limitations`, next to its classification.
+
+A missing recording, extrinsics, trajectory or time basis gives a
+`limitations` key (`no_recording_identity`, `no_extrinsics_identity`,
+`no_trajectory_identity`, `no_time_basis`). The same keys are on every zone
+record and in both Markdown reports, so a PASS is never silent about them.
+They never change a status. Hashes detect changed inputs; they are not
+signatures, and the classifier still decides from the rays alone.
+
 ## One-walk exception report and recheck list (F7a / F8a)
 
 Present an existing clearance result using its matching zone definitions:
@@ -41,9 +69,24 @@ python3 -m spatio.clearance report \
 ```
 
 This subcommand writes `report.md` and `report.json` to a new directory and
-prints the Markdown. The earlier classification CLI is unchanged. The output
-directory must not already exist, including the input results directory.
-No scans, maps, sensors, recordings or network services are opened at this stage.
+prints the Markdown. The output directory must not already exist, including
+the input results directory. Supplied `--trajectory`, `--extrinsics`,
+`--recording` and `--scans` files are only hashed; no maps, sensors or network
+services are opened at this stage.
+
+Reuse is refused (exit 2, nothing written) when any binding fails:
+
+- A zone's geometry hash differs from the supplied zone definition.
+- The results are bound to a trajectory or extrinsics that is not resupplied,
+  or the resupplied file hashes differently.
+- A trajectory or extrinsics is supplied for results bound to none.
+- A supplied recording or scans file hashes differently from the results.
+- The results have no `provenance` block (pre-B2 results), or its limitations
+  disagree with its null identities.
+
+An unsupplied recording or scans file is listed in `reuse_limitations`
+(`recording_not_reverified`, `scans_not_reverified`). The output copies
+`provenance` and lists all limitations in the Markdown.
 
 JSON has `schema: "spatio.clearance_report.v1"`, `walk_id`, `frame_id`,
 `settings`, `scan_count`, `scan_time_range`, `counts` (all four status keys),
@@ -56,10 +99,10 @@ severity, spatial proximity or travel order. There is no planner.
 
 Positions are **required-volume centres in the supplied frame**, derived from
 box or plane-offset geometry. They are references for finding the zone, not
-measured obstacle locations or recommended viewpoints. The input results do
-not contain geometry or a geometry hash: the caller must supply the original
-zone document. The join checks IDs, frame, shape, rule, provision and depth,
-but cannot detect a translated zone with those same attributes.
+measured obstacle locations or recommended viewpoints. The caller must supply
+the original zone document. The join checks IDs, frame, shape, rule,
+provision and depth, and each zone's geometry hash, so a translated zone with
+the same attributes is refused.
 
 The compact one-page-style Markdown includes settings, status counts, all
 FAIL measurements against required minimum depth, positions, evidence times,
