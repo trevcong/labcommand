@@ -3,8 +3,9 @@
 #
 #   spatio/walkday/series.sh <run-id> <run-id> <run-id> [...] [--sessions-root DIR] [--series-id ID]
 #
-# List every attempt in the order it was walked, failed ones included: the
-# series needs three CONSECUTIVE counted runs, and dropping a failure would hide it.
+# List every attempt, failed ones included: the series needs three CONSECUTIVE
+# counted runs, and dropping a failure would hide it. spatio.series orders them
+# by each walk_result's recorded_at (the bag's start time), not by this list.
 # Writes <sessions-root>/series/<series-id>/series.{md,json}.
 # Exit codes are spatio.series compare's own: 0 PASS, 3 FAIL, 4 INCOMPLETE,
 #   5 NOT_EVALUABLE, 6 REPLAY_ONLY (no physical evidence), 1 inputs rejected
@@ -21,11 +22,11 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --sessions-root) ROOT=$2; shift 2 ;;
     --series-id) SERIES_ID=$2; shift 2 ;;
-    -*) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    -*) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
     *) RUNS+=("$1"); shift ;;
   esac
 done
-[[ ${#RUNS[@]} -ge 1 ]] || { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[[ ${#RUNS[@]} -ge 1 ]] || { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [[ -n $SERIES_ID ]] || SERIES_ID="$(IFS=+; echo "${RUNS[*]}")"
 [[ $SERIES_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.+-]*$ ]] || { echo "bad series id: $SERIES_ID" >&2; exit 2; }
 

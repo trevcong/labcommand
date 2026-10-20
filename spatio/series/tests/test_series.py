@@ -1103,6 +1103,12 @@ class SeriesTest(unittest.TestCase):
             "endpoint windows span",
             "epoch-short.json",
         )
+        # 6 us short is beyond 6-decimal rounding (~2 us worst case): rejected.
+        self.assert_rejected(
+            make_walk("epoch-6us", duration_s=65.599973, return_error=windows),
+            "endpoint windows span",
+            "epoch-6us.json",
+        )
 
     def test_duration_shorter_than_window_span_cannot_pass(self):
         from spatio.series.report import counts_toward_series

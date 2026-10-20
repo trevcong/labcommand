@@ -5,7 +5,7 @@ One command per recording, one per series. Plain-English runbook:
 
 ```sh
 spatio/walkday/process.sh <recording-dir> <run-id> [--start-placement-cm Y --placement-cm X --heading ok --spec FROZEN]
-spatio/walkday/series.sh <run-id> <run-id> <run-id>      # in walking order, failures included
+spatio/walkday/series.sh <run-id> <run-id> <run-id>      # every attempt, failures included
 spatio/walkday/synth/dryrun.sh                           # synthetic end-to-end dry run
 python3 -m unittest discover -s spatio/walkday/tests -t .
 ```

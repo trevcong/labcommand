@@ -30,10 +30,11 @@ WALK_SCHEMA = "spatio.walk_result/1"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _METRE_MATCH = 1e-9
 # Times are absolute epoch seconds (~1.8e9 s), where float64 resolves only
-# ~0.24 us and producers round each stamp to 1 us. A duration equal to a
-# window span can therefore differ from it by a few us; 10 us absorbs that and
-# is far below any real timing claim.
-_SECOND_MATCH = 1e-5
+# ~0.24 us, and walkcheck rounds every value to 6 decimals (+-0.5 us). A
+# duration equal to a window span therefore differs from it by at most
+# 3 x 0.5 us of rounding plus ~0.5 us of float error, about 2 us. 3 us is the
+# smallest round bound above that; main's 1e-9 rejects equal spans.
+_SECOND_MATCH = 3e-6
 
 _TOP_KEYS = (
     "schema",
