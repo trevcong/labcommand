@@ -29,6 +29,7 @@ v2 keeps every v1 rule: measurements and guesses in separate tables and fields; 
 | Maps | `sessions.map_id` is `UNIQUE` (`:166`); `add_session` refuses a second session per map (`:1152-1153`). A map is `map_id` + `map_pcd_sha256` (`:154-162`) with no revision | One session per map. Any re-run of the map is a new map |
 | Trajectory | One `trajectory_sha256` per session (`:169`). Pose and centroid are stored in the map frame on the observation (`:193-274`) and are immutable | A corrected trajectory cannot be applied. The old positions stay baked in |
 | Cross-session | Absences count only with `map_id = s.map_id` (`:1789`) | Correctly conservative; it is also why nothing compares walks (DESIGN §3) |
+| Look-again lifecycle | A request row is updated in place: `open` → `fulfilled` or `cancelled`, with `closed_at` (trigger `:443-466`; `fulfil_look_again` and `cancel_look_again`, `:1578-1628`). The purge then nulls `fulfilled_by_observation_id` (`ON DELETE SET NULL`, `:325`, and the third transition at `:461-465`). `object_status` lists `state = 'open'` as it is now (`:1638-1646`) | A closure changes every past answer's `open_look_again`. The purge erases which observation fulfilled a request |
 | Deletion | `purge_expired` deletes camera rows and cascades their interpretations (`:1825` on). It leaves only a counter, `objects.purged_sightings` (`:189`) | Evidence a past report used can vanish. Only the count survives |
 | Schema identity | Thresholds are written into the view SQL as literals (`:142-149`, `:472-481`). `thumbnail_gc` is created lazily by the first purge without bumping `user_version` (`:364-366`, `:1814-1823`) | A reproducible answer must name the constants, not only the schema version. Two v1 files at `user_version` 1 can differ by one table, so a migration must accept both |
 | Clocks | Sensor time is checked to be UNIX UTC (`api_stub.py:35-36`, `ClockError`). DESIGN §2 lists exactly two cross-clock comparisons (retention; look-again fulfilment) | Kept. v2 adds a third axis (§2.1) and says which comparisons use it |
@@ -66,6 +67,15 @@ There are three axes. Each comparison uses one of them, and the doc says which.
 **Visibility rule.** For a query at `(now, known_at)`, a row is visible when `recorded_txn ≤ known_at` and it has no retraction with `retracted_txn ≤ known_at`. Then v1's rules run unchanged on the visible rows, with `acquired_at ≤ now` as before. A late observation is visible only to queries whose `known_at` is at or after its ingest; it never changes an answer given before it was recorded.
 
 **Look-again fulfilment** keeps v1's rule: the fulfilling observation's `acquired_at` must be ≥ the request's creation time. v2 states the request's creation time as its transaction's `recorded_at`, so this stays v1's single sensor-vs-wall comparison, with the same caveat (unverified without a disciplined sensor clock, DESIGN §2). An observation acquired before the request but ingested after it does not fulfil it.
+
+**Look-again lifecycle** [proposal]. v1 closes a request by updating its row (§1). v2 makes the lifecycle append-only, like retractions:
+
+- A request row carries `recorded_txn` and is never updated. v1's `state`, `closed_at` and `fulfilled_by_observation_id` columns move out of it.
+- `look_again_closures(request_id UNIQUE, outcome, fulfilled_by_observation_id, recorded_txn)`, with `outcome` either `fulfilled` or `cancelled`. A request closes at most once, and a closure is never retracted. To ask again, file a new request.
+- `fulfilled_by_observation_id` is a plain id with no foreign key. It is set exactly when `outcome = 'fulfilled'`. The purge does not touch it. If that observation is purged, the id resolves through `purged_observations` (§2.6). v1's third transition, which nulls the id at purge time, does not exist in v2.
+- Fulfilment needs the observation to be visible at the fulfilling transaction (§2.1), plus v1's acquisition rule above.
+- A later retraction of the fulfilling observation does not reopen the request. A closure records an action that was taken, not evidence. It stays closed, and an operator who wants another look files a new request.
+- The open requests at `known_at` are those with `recorded_txn ≤ known_at` and no closure with `recorded_txn ≤ known_at`. As in v1, `now` does not filter them.
 
 ### 2.2 Retractions
 
@@ -175,7 +185,7 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 `object_status(object_id, now, known_at=None, frame=None) -> ObjectStatus` [proposal]:
 
 - `frame=None` means "the frame of the newest sighting". A reference frame may be named. Only aligned evidence takes part then.
-- The return adds `known_at` (the `txn_id` used), `frame`, `revisions_used`, `complete`, `purged_ids` and `purged_unattributed` (§2.9) to v1's fields. v1's `purged_sightings` becomes `len(purged_ids) + purged_unattributed` at `known_at`. `measured` and `hypothesis` stay separate sub-records (v1 invariant I16).
+- The return adds `known_at` (the `txn_id` used), `frame`, `revisions_used`, `complete`, `purged_ids` and `purged_unattributed` (§2.9) to v1's fields. v1's `purged_sightings` becomes `len(purged_ids) + purged_unattributed` at `known_at`. `open_look_again` is X's requests that are open at `known_at` (§2.1), not their state at the time of the query. `measured` and `hypothesis` stay separate sub-records (v1 invariant I16).
 - A **report** is canonical JSON of statuses plus a fingerprint: `schema_version`, `constants_sha256` (a hash of every constant in DESIGN §5 and v2's new ones), `known_at`, `now`. Regenerating a report on a store whose `constants_sha256` differs raises `ReproducibilityError`. It never recomputes the answer under new thresholds.
 
 ### 2.9 Migration from v1
@@ -184,6 +194,7 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 - v1 refuses `user_version = 2` (invariant I23, `store.py:1026-1030`). So the migration copies into a new file and never upgrades in place.
 - Each v1 map becomes `map_revisions` revision 1. Each session's `trajectory_sha256` becomes trajectory revision 1. Every v1 observation becomes a `map`-frame observation bound to revision 1, because v1 stored map-frame poses.
 - Transactions are synthesized in `created_at` order (ties by table, then id). v1 `retracted_at` becomes a retraction row ordered the same way. Every synthesized transaction is flagged `knowledge_basis = 'migrated'`, because v1 wall times were never a knowledge record: `known_at` before the migration point is approximate.
+- Each closed v1 request gets a `look_again_closures` row in a transaction synthesized at its `closed_at`, ordered and flagged like the rest. A v1 fulfilment whose observation was already purged has a NULL `fulfilled_by_observation_id`. That is the only case where v2 allows NULL on a `fulfilled` closure, and it applies only to `migrated` transactions.
 - `thumbnail_gc` may or may not exist (§1). The migration accepts both.
 - A v1 file that has already purged rows keeps only `objects.purged_sightings`; which observations and associations were lost cannot be recovered. The migration copies each non-zero count into `purged_unattributed(object_id, n, recorded_txn)`, with `recorded_txn` set to the migration transaction. For every `known_at` at or after it, that object reports `complete = False` with `purged_unattributed = n` and no ids it cannot name. Its reason stays `no_retained_sightings` when nothing is retained, as in v1.
 
@@ -254,6 +265,13 @@ These are written to become `spatio/memory/tests/test_v2_*.py`, one test per cas
 - D as in V2-3d, attributed to X only, purged at K3. X at `now = t0 − 1` has `complete = True` (D was not yet acquired).
 - A second camera detection E of X at `t0 + 5`, retracted as an observation at K4 and purged at K5. X at `known_at ≥ K4` does not list E in `purged_ids`.
 
+`test_V2_3f_request_closure_keeps_old_report`
+- Given a lidar detection D of X at `t0` (K1), which the purge never deletes. Look-again requests A and B for X are created at injected wall times `t0 + 20` (K2) and `t0 + 30` (K3). A camera detection F of X is acquired at `t0 + 50` (K4). Every report below uses `now = t0 + 60`. R3 = `report(known_at = K3)` and R4 = `report(known_at = K4)` are saved. Both have `open_look_again == [A, B]`.
+- A is fulfilled by F at K5, and B is cancelled at K6. Afterwards `report(known_at = K3)` and `report(known_at = K4)` are byte-identical to R3 and R4. At K5, `open_look_again == [B]`. At K6 it is `[]`.
+- An `UPDATE` on a request or closure row raises, and so does a second closure of A.
+- `purge_expired` deletes F at K7. R3 is still byte-identical, since F is not recorded at K3. At K4, K5 and K6 the open lists are still `[A, B]`, `[B]` and `[]`. Only `complete`, `purged_ids` and the sighting fields change: the sighting falls back to D (§2.6). A's closure still names F.
+- On a copy of the store taken before K7, F retracted as an observation at K7 leaves A closed: at K7, `open_look_again == []`.
+
 ### V2-4. A trajectory correction makes no false "moved"
 
 The drift investigation's lesson in test form: a pose error must not read as an object moving.
@@ -318,7 +336,7 @@ The drift investigation's lesson in test form: a pose error must not read as an 
 These are out of v2 and not designed here:
 
 - **Temporal occupancy and change detection.** Appeared, disappeared and moved regions from free-space evidence between walks (northstar layer 2, M4). v2 only fixes the rule they must obey (§2.5).
-- **Recheck relevance.** Ranking or prioritising look-again requests (northstar layer 6, M7). v2 keeps v1's request table and fulfilment rule unchanged.
+- **Recheck relevance.** Ranking or prioritising look-again requests (northstar layer 6, M7). v2 keeps v1's request fields and fulfilment rule. It changes only how a request closes, which becomes append-only (§2.1).
 - **ConceptGraphs, GNN and GraphRAG.** Open-vocabulary scene graphs, learned graph models and graph-retrieval language answers (northstar layers 4–5). If they come, they write interpretations only.
 
 Also unchanged from v1: no object merge or split, no named places, a single local writer, no camera capture.
