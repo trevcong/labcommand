@@ -135,7 +135,8 @@ if [[ $MODE == historical ]]; then
 fi
 
 # Provenance and run details (outside the contract manifest).
-TOOL_REV="$(git -C "$HERE" rev-parse HEAD)$([[ -n $(git -C "$HERE" status --porcelain -- .) ]] && echo -dirty)"
+TOOL_REV="$(git -C "$HERE" rev-parse HEAD)"
+[[ -n $(git -C "$HERE" status --porcelain -- .) ]] && TOOL_REV="$TOOL_REV-dirty" || true
 dk run --rm --network none "$IMAGE_TAG" cat /opt/spatio/provenance.json > "$SESSION/logs/image_provenance.json"
 python3 - "$SESSION/logs/run_params.json" <<EOF
 import json, sys
