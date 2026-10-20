@@ -187,6 +187,34 @@ def _near(test, name, got, want, tol):
 
 
 class FixtureTests(unittest.TestCase):
+    def test_regeneration_comparison_allows_only_float_roundoff(self):
+        from spatio.io.make_fixtures import _compare_trees
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh, committed = Path(tmp) / "fresh", Path(tmp) / "committed"
+            fresh.mkdir()
+            committed.mkdir()
+            expected = {"distance": 0.05, "count": 3, "valid": True, "notes": "exact"}
+            (fresh / "EXPECTED.json").write_text(json.dumps(expected))
+            (fresh / "map.pcd").write_bytes(b"exact binary")
+            (committed / "map.pcd").write_bytes(b"exact binary")
+            for change, matches in (
+                ({"distance": math.nextafter(0.05, 1.0)}, True),
+                ({"distance": 0.05 + 1e-9}, False),
+                ({"distance": float("nan")}, False),
+                ({"count": 4}, False),
+                ({"count": 3.0}, False),
+                ({"valid": 1}, False),
+                ({"notes": "changed"}, False),
+                ({"extra": 0}, False),
+            ):
+                with self.subTest(change=change):
+                    (committed / "EXPECTED.json").write_text(json.dumps(dict(expected, **change)))
+                    self.assertEqual(_compare_trees(fresh, committed), matches)
+            (committed / "EXPECTED.json").write_text(json.dumps(expected))
+            (committed / "map.pcd").write_bytes(b"changed binary")
+            self.assertFalse(_compare_trees(fresh, committed))
+
     def test_regeneration_refuses_unrelated_contents(self):
         from spatio.io.make_fixtures import _safe_dir, write_fixtures
 

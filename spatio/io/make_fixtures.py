@@ -1,8 +1,9 @@
 """Regenerate the golden session fixtures.
 
 ``python3 -m spatio.io.make_fixtures --out spatio/io/fixtures`` writes them.
-``--check`` writes a fresh copy in a temp directory and byte-compares it
-with ``--out``. The metric used here is not imported by the tests.
+``--check`` writes a fresh copy in a temp directory and compares it with
+``--out``. Computed EXPECTED.json floats allow 1e-12 absolute roundoff;
+other values and files remain exact. The metric is not imported by the tests.
 
 ``--out`` must be missing, empty, or contain only the recognized fixture
 directories and ``.DS_Store``. Any other child is refused before the
@@ -247,7 +248,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="regenerate into a temp directory and byte-compare with --out",
+        help="regenerate and compare with --out (EXPECTED.json float tolerance: 1e-12)",
     )
     args = parser.parse_args(argv)
     target = _safe_dir(Path(args.out))
@@ -539,6 +540,21 @@ def _guard_sizes(out: Path) -> None:
         raise RuntimeError("fixtures total %d bytes, over 5 MB" % total)
 
 
+def _expected_equal(a, b) -> bool:
+    """Only computed float leaves permit roundoff, never counts or types."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, float):
+        return math.isfinite(a) and math.isfinite(b) and math.isclose(
+            a, b, rel_tol=0.0, abs_tol=1e-12
+        )
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_expected_equal(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_expected_equal(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 def _compare_trees(fresh: Path, committed: Path) -> bool:
     def files(root: Path):
         found = set()
@@ -560,7 +576,13 @@ def _compare_trees(fresh: Path, committed: Path) -> bool:
     for rel in sorted(left & right):
         a = (fresh / rel).read_bytes()
         b = (committed / rel).read_bytes()
-        if a != b:
+        equal = a == b
+        if Path(rel).name == "EXPECTED.json":
+            try:
+                equal = _expected_equal(json.loads(a), json.loads(b))
+            except (ValueError, UnicodeDecodeError):
+                equal = False
+        if not equal:
             ok = False
             print("differs: %s (%d vs %d bytes)" % (rel, len(a), len(b)), file=sys.stderr)
     if ok:
