@@ -15,6 +15,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from spatio.wallpatch.errors import WallpatchError
+from spatio.wallpatch.numbers import parse_positive_metres, parse_real
 
 WORLD_UP = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
@@ -87,26 +88,24 @@ def parse_box(box):
     if not isinstance(box, dict):
         raise WallpatchError("box_map_frame must be an object")
     try:
-        center = np.asarray(box["center_m"], dtype=np.float64)
-        hint = np.asarray(box["normal_hint"], dtype=np.float64)
-        half = np.asarray(box["half_extent_m"], dtype=np.float64)
-    except (KeyError, TypeError, ValueError):
+        center = _vec3(box["center_m"], "center_m", positive=False)
+        hint = _vec3(box["normal_hint"], "normal_hint", positive=False)
+        half = _vec3(box["half_extent_m"], "half_extent_m", positive=True)
+    except KeyError:
         raise WallpatchError(
             "box_map_frame needs center_m, normal_hint, and half_extent_m"
         )
-    if center.shape != (3,) or hint.shape != (3,) or half.shape != (3,):
-        raise WallpatchError("box vectors must have length 3")
-    if (
-        not np.isfinite(center).all()
-        or not np.isfinite(hint).all()
-        or not np.isfinite(half).all()
-    ):
-        raise WallpatchError("box values must be finite")
-    if np.any(half <= 0.0):
-        raise WallpatchError("half_extent_m must be positive")
     # Validates the hint and raises if it is degenerate.
     box_axes(hint)
     return center, hint, half
+
+
+def _vec3(raw, name, positive):
+    """Three metres, through the shared number rule."""
+    if isinstance(raw, (str, bytes, bytearray)) or not hasattr(raw, "__len__") or len(raw) != 3:
+        raise WallpatchError("box vectors must have length 3")
+    parser = parse_positive_metres if positive else parse_real
+    return np.asarray([parser(item, name) for item in raw], dtype=np.float64)
 
 
 def crop_mask(points, center, normal_hint, half_extent):

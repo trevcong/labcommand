@@ -18,6 +18,7 @@ import numpy as np
 
 from spatio.wallpatch.errors import WallpatchError
 from spatio.wallpatch.geometry import box_axes, crop_mask, gram3, project
+from spatio.wallpatch.numbers import parse_suggest_n, parse_voxel_m
 from spatio.wallpatch.pcd import iter_xyz, sha256_file
 from spatio.wallpatch.util import write_json
 
@@ -39,10 +40,8 @@ _OVERLAP_IN_PLANE_M = 0.80
 
 def suggest_map(map_path, out_path, n=6, voxel_m=DEFAULT_VOXEL_M, verbose=False):
     """Write a patches.json of the n best vertical wall windows."""
-    if n < 1:
-        raise WallpatchError("--n must be at least 1")
-    if voxel_m <= 0.0:
-        raise WallpatchError("voxel size must be positive")
+    n = parse_suggest_n(n)
+    voxel_m = parse_voxel_m(voxel_m)
     map_path = os.path.abspath(map_path)
     if not os.path.isfile(map_path):
         raise WallpatchError("map not found: %s" % map_path)

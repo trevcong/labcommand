@@ -21,15 +21,17 @@ UNCERTAIN_SEPARATION_M = 0.020
 
 RULE_TEXT = (
     "Signed distances to the robust plane are histogrammed in 2 mm bins and "
-    "smoothed with a 3-bin [1, 2, 1] kernel. Local maxima closer than 12 mm "
-    "count as one peak. The two tallest peaks are split at their midpoint. "
-    "The split is kept when each side holds at least 20% of the points and "
-    "the valley between the peaks is at most 60% of the shorter peak. "
-    "separation_m is the difference of the mean signed distances of the two "
-    "sides. At least 40 mm is doubled=true. At least 20 mm and under 40 mm "
-    "is doubled=undetermined. Otherwise doubled=false and separation_m is "
-    "null, because there is no second surface centre. This is not a "
-    "visit-to-visit measurement."
+    "smoothed with a 3-bin [1, 2, 1] kernel. The smoothed histogram has the "
+    "same length as the raw one. Local maxima closer than 12 mm count as one "
+    "peak. Each pair of remaining peaks is split at its midpoint. A split is "
+    "kept when each side holds at least 20% of the points and the valley "
+    "between the peaks is at most 60% of the shorter peak. A kept split of "
+    "at least 40 mm is preferred. Ties go to the taller shorter peak, then "
+    "the larger separation. separation_m is the difference of the mean signed "
+    "distances of the two sides. At least 40 mm is doubled=true. At least 20 mm "
+    "and under 40 mm is doubled=undetermined. If no split is kept, "
+    "doubled=false and separation_m is null, because there is no second "
+    "surface centre. This is not a visit-to-visit measurement."
 )
 
 
@@ -75,9 +77,19 @@ def _histogram(values):
 
 
 def _smooth(counts):
+    """3-bin [1, 2, 1] smooth. The result has one value per histogram bin.
+
+    np.convolve(..., mode="same") returns max(len(counts), 3). A one-bin
+    plane then looks up a centre that does not exist.
+    """
+    values = np.asarray(counts, dtype=np.float64).reshape(-1)
     kernel = np.array([1.0, 2.0, 1.0], dtype=np.float64)
     kernel /= kernel.sum()
-    return np.convolve(counts.astype(np.float64), kernel, mode="same")
+    if values.size == 0:
+        return values
+    full = np.convolve(values, kernel, mode="full")
+    start = (kernel.size - 1) // 2
+    return full[start : start + values.size]
 
 
 def _local_peaks(smooth):
@@ -114,38 +126,73 @@ def _decide(values, counts, edges):
             "separation_m": None,
             "mark_m": [float(centers[kept[0]])],
         }
-    tall = sorted(kept, key=lambda idx: float(smooth[idx]), reverse=True)[:2]
-    tall = sorted(tall, key=lambda idx: float(centers[idx]))
-    left_i, right_i = tall
-    lo, hi = (left_i, right_i) if left_i < right_i else (right_i, left_i)
-    valley = float(smooth[lo : hi + 1].min())
-    shorter = min(float(smooth[left_i]), float(smooth[right_i]))
-    valley_ok = valley <= VALLEY_HEIGHT_RATIO * shorter
-    midpoint = 0.5 * (float(centers[left_i]) + float(centers[right_i]))
-    left = values[values <= midpoint]
-    right = values[values > midpoint]
-    n_values = float(len(values))
-    mass_left = len(left) / n_values
-    mass_right = len(right) / n_values
-    mass_ok = mass_left >= MIN_PEAK_MASS and mass_right >= MIN_PEAK_MASS
-    if len(left) == 0 or len(right) == 0:
-        separation = 0.0
-    else:
-        separation = abs(float(left.mean()) - float(right.mean()))
-    marks = [float(left.mean()) if len(left) else float(centers[left_i]),
-             float(right.mean()) if len(right) else float(centers[right_i])]
-    if valley_ok and mass_ok and separation >= CONFIDENT_SEPARATION_M:
-        return {"doubled": "true", "separation_m": separation, "mark_m": marks}
-    if valley_ok and mass_ok and separation >= UNCERTAIN_SEPARATION_M:
+    # The two tallest peaks can both sit on one sheet. Try every remaining pair.
+    best = None
+    for i in range(len(kept)):
+        for j in range(i + 1, len(kept)):
+            verdict = _evaluate_pair(values, smooth, centers, kept[i], kept[j])
+            if verdict is None:
+                continue
+            if best is None or _prefer_pair(verdict, best):
+                best = verdict
+    if best is not None:
         return {
-            "doubled": "undetermined",
-            "separation_m": separation,
-            "mark_m": marks,
+            "doubled": best["doubled"],
+            "separation_m": best["separation_m"],
+            "mark_m": best["mark_m"],
         }
-    # One dominant surface. Mark its peak only.
-    main = max(tall, key=lambda idx: float(smooth[idx]))
+    main = max(kept, key=lambda idx: float(smooth[idx]))
     return {
         "doubled": "false",
         "separation_m": None,
         "mark_m": [float(centers[main])],
     }
+
+
+def _evaluate_pair(values, smooth, centers, index_a, index_b):
+    """A kept split, or None when this pair is not two surfaces."""
+    if centers[index_a] <= centers[index_b]:
+        left_i, right_i = index_a, index_b
+    else:
+        left_i, right_i = index_b, index_a
+    height_left = float(smooth[left_i])
+    height_right = float(smooth[right_i])
+    shorter = min(height_left, height_right)
+    if shorter <= 0.0:
+        return None
+    valley = float(smooth[left_i : right_i + 1].min())
+    if valley > VALLEY_HEIGHT_RATIO * shorter:
+        return None
+    midpoint = 0.5 * (float(centers[left_i]) + float(centers[right_i]))
+    left = values[values <= midpoint]
+    right = values[values > midpoint]
+    if len(left) == 0 or len(right) == 0:
+        return None
+    n_values = float(len(values))
+    if (len(left) / n_values) < MIN_PEAK_MASS or (len(right) / n_values) < MIN_PEAK_MASS:
+        return None
+    separation = abs(float(left.mean()) - float(right.mean()))
+    if separation < UNCERTAIN_SEPARATION_M:
+        return None
+    doubled = "true" if separation >= CONFIDENT_SEPARATION_M else "undetermined"
+    return {
+        "doubled": doubled,
+        "separation_m": separation,
+        "mark_m": [float(left.mean()), float(right.mean())],
+        "shorter": shorter,
+    }
+
+
+def _prefer_pair(candidate, incumbent):
+    """True when candidate replaces incumbent.
+
+    A split of at least 40 mm wins over a shorter kept split. Otherwise the
+    taller shorter peak wins, then the larger separation.
+    """
+    candidate_true = candidate["doubled"] == "true"
+    incumbent_true = incumbent["doubled"] == "true"
+    if candidate_true != incumbent_true:
+        return candidate_true
+    if candidate["shorter"] != incumbent["shorter"]:
+        return candidate["shorter"] > incumbent["shorter"]
+    return candidate["separation_m"] > incumbent["separation_m"]

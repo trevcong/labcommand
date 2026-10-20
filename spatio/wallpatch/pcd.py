@@ -14,6 +14,14 @@ from typing import Dict, Iterator, List
 import numpy as np
 
 from spatio.wallpatch.errors import WallpatchError
+from spatio.wallpatch.numbers import (
+    parse_field_count,
+    parse_pcd_size,
+    parse_point_count,
+    parse_point_product,
+    parse_real,
+    reject_xyz,
+)
 
 # One chunk is about 2.4 MB of xyz float32. Large enough to be vectorized,
 # small enough that several agents can read maps at once.
@@ -131,17 +139,17 @@ def _read_header(handle):
         if key == "FIELDS":
             fields = parts[1:]
         elif key == "SIZE":
-            sizes = [int(item) for item in parts[1:]]
+            sizes = [parse_pcd_size(item, "SIZE") for item in parts[1:]]
         elif key == "TYPE":
             types = [item.upper() for item in parts[1:]]
         elif key == "COUNT":
-            counts = [int(item) for item in parts[1:]]
+            counts = [parse_field_count(item, "COUNT") for item in parts[1:]]
         elif key == "WIDTH":
-            width = int(parts[1])
+            width = parse_point_count(parts[1], "WIDTH")
         elif key == "HEIGHT":
-            height = int(parts[1])
+            height = parse_point_count(parts[1], "HEIGHT")
         elif key == "POINTS":
-            points = int(parts[1])
+            points = parse_point_count(parts[1], "POINTS")
         elif key == "DATA":
             if len(parts) < 2:
                 raise WallpatchError("PCD DATA line has no type")
@@ -156,7 +164,7 @@ def _read_header(handle):
     if points is None:
         if width is None or height is None:
             raise WallpatchError("PCD header has no POINTS count")
-        points = width * height
+        points = parse_point_product(width, height)
     for name in ("x", "y", "z"):
         if name not in fields:
             raise WallpatchError("PCD is missing field %s" % name)
@@ -220,7 +228,9 @@ def _iter_binary(handle, header, chunk):
                 raise WallpatchError(
                     "PCD binary payload is shorter than the header POINTS"
                 )
-            yield buf.reshape(take, 3).astype(np.float64, copy=False)
+            xyz = buf.reshape(take, 3).astype(np.float64, copy=False)
+            reject_xyz(xyz)
+            yield xyz
             remaining -= take
         return
     xi = _xyz_index(header, "x")
@@ -243,14 +253,27 @@ def _iter_binary(handle, header, chunk):
             piece = np.ascontiguousarray(raw[:, start : start + size])
             dtype = "<f4" if size == 4 else "<f8"
             columns.append(np.frombuffer(piece.tobytes(), dtype=dtype))
-        yield np.column_stack(columns).astype(np.float64, copy=False)
+        xyz = np.column_stack(columns).astype(np.float64, copy=False)
+        reject_xyz(xyz)
+        yield xyz
         remaining -= take
 
 
+def _ascii_token_offsets(header):
+    """Column of each field in an ascii row. COUNT, not the field index."""
+    offsets = []
+    cursor = 0
+    for count in header["counts"]:
+        offsets.append(cursor)
+        cursor += int(count)
+    return offsets
+
+
 def _iter_ascii(handle, header, chunk):
-    xi = _xyz_index(header, "x")
-    yi = _xyz_index(header, "y")
-    zi = _xyz_index(header, "z")
+    token_at = _ascii_token_offsets(header)
+    xi = token_at[_xyz_index(header, "x")]
+    yi = token_at[_xyz_index(header, "y")]
+    zi = token_at[_xyz_index(header, "z")]
     batch = []  # type: List
     seen = 0
     limit = header["points"]
@@ -263,9 +286,13 @@ def _iter_ascii(handle, header, chunk):
         parts = stripped.split()
         try:
             batch.append(
-                (float(parts[xi]), float(parts[yi]), float(parts[zi]))
+                (
+                    parse_real(parts[xi], "x"),
+                    parse_real(parts[yi], "y"),
+                    parse_real(parts[zi], "z"),
+                )
             )
-        except (IndexError, ValueError):
+        except IndexError:
             raise WallpatchError("bad ascii PCD row")
         seen += 1
         if len(batch) >= chunk:

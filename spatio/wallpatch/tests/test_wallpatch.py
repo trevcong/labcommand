@@ -14,10 +14,18 @@ import unittest
 
 import numpy as np
 
-from spatio.wallpatch.errors import MapShaMismatch
-from spatio.wallpatch.geometry import box_axes, crop_points
+from spatio.wallpatch.doubled import _histogram, _smooth, analyze_distances
+from spatio.wallpatch.errors import MapShaMismatch, WallpatchError
+from spatio.wallpatch.geometry import box_axes, crop_points, parse_box
 from spatio.wallpatch.measure import measure_map
-from spatio.wallpatch.pcd import read_xyz, sha256_file, write_ascii_pcd, write_binary_pcd
+from spatio.wallpatch.numbers import parse_real, parse_suggest_n, parse_voxel_m
+from spatio.wallpatch.pcd import (
+    DEFAULT_CHUNK,
+    read_xyz,
+    sha256_file,
+    write_ascii_pcd,
+    write_binary_pcd,
+)
 from spatio.wallpatch.suggest import suggest_map
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -28,7 +36,7 @@ _REVISIT = (
     "separation_m is the distance between two parallel surfaces found inside the patch. "
     "It cannot be attributed to a specific visit or revisit."
 )
-_GATE_LABEL = "proposed, not yet approved by Trevor"
+_GATE_LABEL = "provisional (approved for now, revisit after real data)"
 
 
 def _box(name, center, hint, half):
@@ -352,6 +360,8 @@ class WallpatchTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(out_dir, "wallpatch.json")))
 
     def test_gates_labelled_proposed(self):
+        # Spec correction: the 5 cm gates are approved as provisional.
+        # The numbers are unchanged. The old "not yet approved" phrase is retired.
         rng = np.random.default_rng(21)
         n_points = 4000
         clean = np.column_stack(
@@ -499,6 +509,208 @@ class WallpatchTests(unittest.TestCase):
                 ]
             )
             self.assertEqual(absent.returncode, 1)
+
+    def test_minimum_count_same_sheet_peaks_do_not_hide_the_gap(self):
+        # Review case: seed 65, 100 points on each sheet, 6 cm apart, σ = 8 mm.
+        # The two tallest peaks sit on one sheet. The y-mean gap is 5.94 cm.
+        # That must not come back as a single wall with both gates passing.
+        separation = 0.06
+        sigma = 0.008
+        n_each = 100
+        points = _two_sheets(separation=separation, sigma=sigma, n_each=n_each, seed=65)
+        gap = abs(float(points[:n_each, 1].mean() - points[n_each:, 1].mean()))
+        self.assertAlmostEqual(gap, 0.0594, delta=0.0001)
+        with tempfile.TemporaryDirectory() as directory:
+            report, _out = _measure(
+                directory,
+                points,
+                [_box("thin", (0, 0, 0), (0, 1, 0), (0.6, 0.2, 0.6))],
+            )
+        patch = report["patches"][0]
+        self.assertEqual(patch["status"], "MEASURED")
+        self.assertEqual(patch["n_measured"], n_each * 2)
+        self.assertEqual(patch["doubled"], "true")
+        self.assertAlmostEqual(patch["separation_m"], gap, delta=0.002)
+        self.assertGreater(patch["separation_m"], 0.05)
+        self.assertTrue(patch["gate_p95_pass"])
+        self.assertFalse(patch["gate_separation_pass"])
+
+    def test_zero_noise_plane_keeps_histogram_length(self):
+        # A flat patch is one histogram bin. The old smoother emitted three
+        # bins and raised IndexError. Two close values are two bins.
+        counts, _edges = _histogram(np.zeros(400))
+        self.assertEqual(len(counts), 1)
+        self.assertEqual(len(_smooth(counts)), 1)
+        # 0 mm and 3 mm land in two 2 mm bins. 1 mm would still share a bin.
+        close = np.array([0.0] * 10 + [0.003] * 10)
+        counts_two, _edges_two = _histogram(close)
+        self.assertEqual(len(counts_two), 2)
+        self.assertEqual(len(_smooth(counts_two)), 2)
+        flat = analyze_distances(np.zeros(400))
+        self.assertEqual(flat["doubled"], "false")
+        self.assertIsNone(flat["separation_m"])
+        spanned = analyze_distances(close)
+        self.assertEqual(spanned["doubled"], "false")
+
+        xs = np.linspace(-0.2, 0.2, 20)
+        zs = np.linspace(-0.2, 0.2, 20)
+        xx, zz = np.meshgrid(xs, zs)
+        points = np.column_stack([xx.ravel(), np.zeros(400), zz.ravel()])
+        self.assertEqual(len(points), 400)
+        with tempfile.TemporaryDirectory() as directory:
+            report, _out = _measure(
+                directory,
+                points,
+                [_box("flat", (0, 0, 0), (0, 1, 0), (0.3, 0.2, 0.3))],
+            )
+        patch = report["patches"][0]
+        self.assertEqual(patch["status"], "MEASURED")
+        self.assertEqual(patch["n_measured"], 400)
+        self.assertEqual(patch["doubled"], "false")
+        self.assertIsNone(patch["separation_m"])
+        self.assertEqual(patch["residuals"]["p95_abs_m"], 0.0)
+
+    def test_ascii_pcd_uses_cumulative_field_counts(self):
+        # Independent of write_ascii_pcd. COUNT 3 on the leading field means
+        # xyz starts at token 3. Field indices would read (20, 30, 1).
+        text = (
+            "# .PCD v0.7 - Point Cloud Data file format\n"
+            "VERSION 0.7\n"
+            "FIELDS descriptor x y z\n"
+            "SIZE 4 4 4 4\n"
+            "TYPE F F F F\n"
+            "COUNT 3 1 1 1\n"
+            "WIDTH 2\n"
+            "HEIGHT 1\n"
+            "VIEWPOINT 0 0 0 1 0 0 0\n"
+            "POINTS 2\n"
+            "DATA ascii\n"
+            "10 20 30 1 2 3\n"
+            "10 20 30 4 5 6\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "count.pcd")
+            with open(path, "w", encoding="ascii") as handle:
+                handle.write(text)
+            cloud = read_xyz(path)
+        self.assertEqual(cloud.shape, (2, 3))
+        np.testing.assert_allclose(cloud, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        self.assertFalse(np.allclose(cloud[0], [20.0, 30.0, 1.0]))
+
+    def test_absurd_numbers_rejected_by_one_rule(self):
+        # Every rejection below is the shared parser. The phrase is one rule.
+        with self.assertRaises(WallpatchError) as huge:
+            parse_real(1e20, "x")
+        with self.assertRaises(WallpatchError) as nan:
+            parse_real(float("nan"), "x")
+        with self.assertRaises(WallpatchError) as infinite:
+            parse_real(float("inf"), "x")
+        with self.assertRaises(WallpatchError) as over:
+            parse_real(10000.1, "x")
+        for caught in (huge, nan, infinite, over):
+            self.assertIn("outside the accepted range", str(caught.exception))
+        self.assertEqual(parse_real(10000, "x"), 10000.0)
+        self.assertEqual(parse_real(-10000, "y"), -10000.0)
+        self.assertEqual(parse_real(104.0611572265625, "z"), 104.0611572265625)
+
+        with self.assertRaises(WallpatchError) as box:
+            parse_box(
+                {
+                    "center_m": [0, 0, 0],
+                    "normal_hint": [0, 1, 0],
+                    "half_extent_m": [0.5, 1e20, 0.5],
+                }
+            )
+        self.assertIn("outside the accepted range", str(box.exception))
+        with self.assertRaises(WallpatchError) as negative:
+            parse_box(
+                {
+                    "center_m": [0, 0, 0],
+                    "normal_hint": [0, 1, 0],
+                    "half_extent_m": [0.5, -0.2, 0.5],
+                }
+            )
+        self.assertIn("must be positive", str(negative.exception))
+        with self.assertRaises(WallpatchError) as flag:
+            parse_real(True, "x")
+        self.assertIn("not a real number", str(flag.exception))
+
+        with self.assertRaises(WallpatchError) as voxel:
+            parse_voxel_m(float("inf"))
+        self.assertIn("outside the accepted range", str(voxel.exception))
+        with self.assertRaises(WallpatchError) as big_n:
+            parse_suggest_n(10 ** 12)
+        self.assertIn("outside the accepted range", str(big_n.exception))
+        with self.assertRaises(WallpatchError):
+            parse_suggest_n(0)
+        with self.assertRaises(WallpatchError):
+            parse_voxel_m(0.0)
+
+        ascii_huge = (
+            "# .PCD v0.7\n"
+            "VERSION 0.7\n"
+            "FIELDS x y z\n"
+            "SIZE 4 4 4\n"
+            "TYPE F F F\n"
+            "COUNT 1 1 1\n"
+            "WIDTH 1\n"
+            "HEIGHT 1\n"
+            "VIEWPOINT 0 0 0 1 0 0 0\n"
+            "POINTS 1\n"
+            "DATA ascii\n"
+            "1e20 0 0\n"
+        )
+        absurd_count = (
+            "# .PCD v0.7\n"
+            "VERSION 0.7\n"
+            "FIELDS x y z\n"
+            "SIZE 4 4 4\n"
+            "TYPE F F F\n"
+            "COUNT 1 1 1\n"
+            "WIDTH 1\n"
+            "HEIGHT 1\n"
+            "VIEWPOINT 0 0 0 1 0 0 0\n"
+            "POINTS 999999999999\n"
+            "DATA ascii\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            huge_path = os.path.join(directory, "huge.pcd")
+            count_path = os.path.join(directory, "count.pcd")
+            binary_path = os.path.join(directory, "far.pcd")
+            near_path = os.path.join(directory, "near.pcd")
+            with open(huge_path, "w", encoding="ascii") as handle:
+                handle.write(ascii_huge)
+            with open(count_path, "w", encoding="ascii") as handle:
+                handle.write(absurd_count)
+            with self.assertRaises(WallpatchError) as ascii_err:
+                read_xyz(huge_path)
+            with self.assertRaises(WallpatchError) as count_err:
+                read_xyz(count_path)
+            write_binary_pcd(binary_path, np.array([[20000.0, 0.0, 0.0]]))
+            with self.assertRaises(WallpatchError) as binary_err:
+                read_xyz(binary_path)
+            write_binary_pcd(near_path, np.array([[104.0, -26.0, 0.5]]))
+            near = read_xyz(near_path)
+        self.assertIn("outside the accepted range", str(ascii_err.exception))
+        self.assertIn("outside the accepted range", str(count_err.exception))
+        self.assertIn("outside the accepted range", str(binary_err.exception))
+        np.testing.assert_allclose(near, [[104.0, -26.0, 0.5]])
+
+    def test_binary_pcd_spans_more_than_one_chunk(self):
+        # The chunk length must stay an integer across iterations. A cloud
+        # one point past the reader chunk used to crash on the second read.
+        n_points = DEFAULT_CHUNK + 1
+        points = np.zeros((n_points, 3), dtype=np.float64)
+        points[0] = (1.0, 2.0, 3.0)
+        points[-1] = (4.0, 5.0, 6.0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "wide.pcd")
+            write_binary_pcd(path, points)
+            cloud = read_xyz(path)
+        self.assertEqual(len(cloud), n_points)
+        np.testing.assert_allclose(cloud[0], [1.0, 2.0, 3.0])
+        np.testing.assert_allclose(cloud[-1], [4.0, 5.0, 6.0])
+        self.assertEqual(float(np.max(np.abs(cloud[1:-1]))), 0.0)
 
 
 def _two_sheets(separation, sigma, n_each, seed):

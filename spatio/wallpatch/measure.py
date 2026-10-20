@@ -33,9 +33,11 @@ from spatio.wallpatch.geometry import (
 from spatio.wallpatch.pcd import iter_xyz, sha256_file
 from spatio.wallpatch.util import write_json
 
+# Provisional: approved for now, revisit after a taped walk.
+# The 0.05 m numbers are the workplan gates. They did not change.
 P95_GATE_M = 0.05
 SEPARATION_GATE_M = 0.05
-GATE_LABEL = "proposed, not yet approved by Trevor"
+GATE_LABEL = "provisional (approved for now, revisit after real data)"
 MIN_POINTS = 200
 REVISIT_NOTE = (
     "map.pcd has no per-point time or visit id. "
