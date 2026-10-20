@@ -11,7 +11,9 @@
 The settings identity is the sha256 of the canonical JSON of the values
 process.sh actually used (after sourcing the settings file), so comment edits
 do not change it and "0.10" equals "0.1". A changed value starts a new series
-(enforced by spatio.walkday.seriesgate).
+(enforced by spatio.walkday.seriesgate). spatio.walkday.result checks the
+identity against the values the walk check and the scoring really used, and
+recomputes it when one differs (a re-scored run is then not stage 1's identity).
 
 The driver config is the sensor driver's own config, upstream of FAST-LIO (for
 the JT128: the Hesai driver's jt128_post.yaml). Replay does not read it: the bag
@@ -42,6 +44,17 @@ SETTINGS_KEYS = (
     "WALL_GATE_M", "WALL_GATE_STATE", "SUGGEST_PATCHES", "BAGTIMING_SAMPLE_EVERY",
     "MAP_VOXEL_M", "PLAYBACK_RATE",
 )
+# Settings spatio.walkday.result can check after the fact, against the walk
+# checker's own record (walkcheck.json "parameters", stage 6). WALL_GATE_M and
+# WALL_GATE_STATE are checked against result.py's own arguments. SUGGEST_PATCHES,
+# BAGTIMING_SAMPLE_EVERY, MAP_VOXEL_M and PLAYBACK_RATE leave no record result.py
+# reads, so stage 1's values stand for them.
+WALKCHECK_PARAMS = {
+    "STATIONARY_WINDOW_S": "stationary_window_s", "MAX_GAP_S": "max_gap_s",
+    "MIN_PATH_LENGTH_M": "min_path_length_m", "MIN_EXCURSION_M": "min_excursion_m",
+    "MAX_ENDPOINT_SPREAD_M": "max_endpoint_spread_m", "MAX_ENDPOINT_SPEED_M_S": "max_endpoint_speed_m_s",
+    "MAX_HOLD_SPEED_M_S": "max_hold_speed_m_s", "MIN_HOLD_S": "min_hold_s",
+}
 DRIVER_NOTE = ("not read by the FAST-LIO replay (the bag already holds the driver's or an adapter's "
                "output); recorded for provenance and series consistency only")
 _TOPIC = re.compile(r"""^\s*[A-Za-z0-9_]*topic[A-Za-z0-9_]*\s*:\s*["']?(/[^"'\s#]+)""", re.M)
@@ -85,6 +98,21 @@ def check_identity(identity):
         return settings_identity(identity["values"]) == identity
     except (ProvenanceError, AttributeError, ValueError, TypeError):
         return False
+
+
+def effective_identity(identity, used):
+    """Stage 1's identity with the values a later stage actually used.
+
+    used: {NAME: (value, source)}. Returns (identity, changes): stage 1's own
+    identity when every value matches, else a recomputed one, with one
+    {setting, stage1, used, source} per changed value."""
+    values, changes = dict(identity["values"]), []
+    for key, (value, source) in used.items():
+        v = _value(str(value).strip())
+        if v != values[key]:
+            changes.append({"setting": key, "stage1": values[key], "used": v, "source": source})
+            values[key] = v
+    return (identity, []) if not changes else (settings_identity(values), changes)
 
 
 def _sha_file(path):

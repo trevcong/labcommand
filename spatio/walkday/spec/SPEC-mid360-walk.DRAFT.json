@@ -37,8 +37,8 @@
     }
   ],
   "stationary_windows_s": {
-    "start": 10,
-    "end": 10
+    "start": 15,
+    "end": 15
   },
   "acceptance": {
     "return_error_threshold_m": 0.1,

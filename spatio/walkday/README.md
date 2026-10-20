@@ -24,7 +24,7 @@ python3 -m unittest discover -s spatio/walkday/tests -t .
 7. **manifest (g2):** build plus validate. The replay's own manifest is kept as `logs/replay_manifest.json`.
 8. **walk check (B):** settings come from `walkday.conf`.
 9. **wall patches (g8):** `--patches FILE` holds the frozen spec's preselected patches (same names), boxed on this run's map. Without it, patches are auto-suggested and labelled NOT preselected. Such a run is still scored, but it never counts toward a series.
-10. **result:** `result.py` writes `walk_result.json` (the `spatio.series` input), `walkday.md` and `walkday.json`.
+10. **result:** `result.py` writes `walk_result.json` (the `spatio.series` input), `walkday.md` and `walkday.json`. The settings identity it writes is checked against what was actually used: the walk check's recorded parameters (`walkcheck.json`) and its own `--wall-gate-m`/`--wall-gate-state`. If any differs (for example, re-scoring with `--wall-gate-m 0.08`), the identity is recomputed from the used values and `walkday.md` lists each change. That run then starts a new series.
 
 `process.sh` exit codes: 0 PASS, 1 FAIL, 2 NOT-EVALUABLE, 3 usage.
 

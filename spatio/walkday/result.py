@@ -40,7 +40,12 @@ spatio.walkday.seriesgate enforces them):
     name, MEASURED, not doubled, both gates passed, and the spec's box when the
     spec fixes one. A run counts toward a series only with origin preselected
     and every one of at least two required patches verified.
-  walkday_settings: the effective settings identity from logs/provenance.json.
+  walkday_settings: the effective settings identity. Stage 1's (logs/provenance.json)
+    when the walk check (walkcheck.json parameters) and this scoring
+    (--wall-gate-m, --wall-gate-state) used its values; recomputed from the
+    values used when one differs, so a re-scored run starts a new series.
+    walkday.json/md list each changed setting. A walkcheck.json that does not
+    record its parameters cannot be checked (exit 3).
   driver_config_sha256: the sensor driver config (process.sh --driver-config).
 """
 
@@ -55,7 +60,7 @@ import sys
 from datetime import datetime, timezone
 
 from spatio.replay.recording import RecordingError, recorded_at
-from spatio.walkday.provenance import check_identity
+from spatio.walkday.provenance import WALKCHECK_PARAMS, check_identity, effective_identity
 from spatio.series.validate import (
     PLACEMENT_TOLERANCE_M,
     REPLAY_LABEL,
@@ -271,6 +276,26 @@ def _provenance(session, manifest=None):
     return prov
 
 
+def _settings_used(prov, walkcheck, gate_m, gate_state):
+    """Stage 1's settings identity checked against what this run used: the walk
+    checker's recorded parameters and this scoring's arguments.
+
+    Returns (identity, changes); (None, []) without logs/provenance.json."""
+    if prov is None:
+        return None, []
+    params = walkcheck.get("parameters")
+    used = {}
+    for key, name in WALKCHECK_PARAMS.items():
+        v = _num(params.get(name)) if isinstance(params, dict) else None
+        if v is None:
+            raise ResultError(f"walkcheck.json does not record parameters.{name}, so the walk-day "
+                              f"settings ({key}) cannot be checked against the walk check that ran")
+        used[key] = (v, f"walkcheck.json parameters.{name}")
+    used["WALL_GATE_M"] = (gate_m, "--wall-gate-m")
+    used["WALL_GATE_STATE"] = (gate_state, "--wall-gate-state")
+    return effective_identity(prov["settings"], used)
+
+
 def build(session: str, gate_m: float, gate_state: str, patch_source: str,
           patch_origin: str = "auto_suggested", spec_path=None):
     wc = _load(os.path.join(session, "walkcheck.json"))
@@ -315,6 +340,7 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str,
     wc_result = wc.get("result")
     if wc_result not in ("PASS", "FAIL", "NOT-EVALUABLE"):
         raise ResultError(f"walkcheck result {wc_result!r}")
+    settings, settings_changed = _settings_used(prov, wc, gate_m, gate_state)
     p95, doubled, wall_fail, wall_notes, patches, wall_warn = wall_evidence(wc, wp, gate_m)
 
     d3 = _num(rts.get("error_3d_m"))
@@ -366,7 +392,7 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str,
                   "gate_m": gate_m, "gate_state": gate_state},
         "physical_reference": reference,
         "wall_patches": wall_patches,
-        "walkday_settings": None if prov is None else prov["settings"],
+        "walkday_settings": settings,
         "driver_config_sha256": None if driver is None else driver.get("sha256"),
     }
     try:
@@ -402,7 +428,7 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str,
                                                   "config_sha256", "image", "source_recording")},
         "wall_patches": wall_patches,
         "acceptance_blockers": acceptance_blockers(wall_patches),
-        "provenance": _prov_summary(prov),
+        "provenance": _prov_summary(prov, settings, settings_changed),
         "synthetic_truth": synthetic,
         "raw_start_end": _startend(session),
     }
@@ -447,11 +473,13 @@ def _synthetic_truth(source):
     return {"marker": path, "statement": data.get("statement"), "ground_truth": data.get("ground_truth")}
 
 
-def _prov_summary(prov):
+def _prov_summary(prov, settings=None, changed=()):
     if prov is None:
         return None
     d = prov.get("driver_config")
-    return {"settings_sha256": prov["settings"]["sha256"],
+    return {"settings_sha256": (settings or prov["settings"])["sha256"],
+            "stage1_settings_sha256": prov["settings"]["sha256"],
+            "settings_changed": list(changed),
             "fastlio_config": prov.get("fastlio_config"),
             "driver_config": None if d is None else {k: d.get(k) for k in ("file", "sha256", "topics_in_bag", "note")}}
 
@@ -477,7 +505,14 @@ def stopped(session: str, stage: str, reason: str):
 def _prov_lines(prov):
     if not prov:
         return ["- walk-day settings / driver config: not recorded (no logs/provenance.json)"]
-    L = [f"- walk-day settings sha256 {prov['settings_sha256']} (logs/provenance.json; a change starts a new series)"]
+    changed = prov.get("settings_changed") or []
+    if not changed:
+        L = [f"- walk-day settings sha256 {prov['settings_sha256']} (logs/provenance.json; a change starts a new series)"]
+    else:
+        L = [f"- walk-day settings sha256 {prov['settings_sha256']}: NOT stage 1's {prov['stage1_settings_sha256']} "
+             "(logs/provenance.json, manifest notes). This run was checked or scored with other settings, "
+             "so it starts a new series:"]
+        L += [f"  - {c['setting']}: stage 1 {c['stage1']}, used {c['used']} ({c['source']})" for c in changed]
     fc = prov.get("fastlio_config") or {}
     L.append(f"- FAST-LIO config {fc.get('file')} sha256 {fc.get('sha256')}")
     d = prov.get("driver_config")

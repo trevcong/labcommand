@@ -17,7 +17,7 @@ from pathlib import Path
 
 from spatio.series.cli import VERDICT_EXIT
 from spatio.walkcheck.synthetic import four_wall_room, hold_and_square, write_pcd_binary, write_tum
-from spatio.walkday.tests.test_result import TEST_SETTINGS, write_recording
+from spatio.walkday.tests.test_result import TEST_SETTINGS, walkcheck_args, write_recording
 
 REPO = Path(__file__).resolve().parents[3]
 SPEC_FILL = REPO / "spatio" / "walkday" / "synth" / "spec_fill.json"
@@ -60,6 +60,15 @@ class PlacementPathTest(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp)
 
+    def test_walk_spec_hold_is_15_s(self):
+        # Trevor's decision (2026-10-20): hold 15 s at each end (was 10 s).
+        # The synthetic dry-run spec states its own 12 s holds instead.
+        from spatio.walkday.spec_draft import draft
+        self.assertEqual(draft(str(self.config), REV)["stationary_windows_s"], {"start": 15, "end": 15})
+        committed = json.loads((REPO / "spatio" / "walkday" / "spec" / "SPEC-mid360-walk.DRAFT.json").read_text())
+        self.assertEqual(committed["stationary_windows_s"], {"start": 15, "end": 15})
+        self.assertEqual(json.loads(self.spec.read_text())["stationary_windows_s"], {"start": 12, "end": 12})
+
     def scored_run(self, run_id, start_m, end_m, heading="ok", preselected=False):
         spec = self.named_spec if preselected else self.spec
         s = self.tmp / "sessions" / run_id
@@ -78,7 +87,7 @@ class PlacementPathTest(unittest.TestCase):
            "--config-file", str(self.config), "--image", "test-image", "--notes", "placement path test",
            "--physical-reference", str(ref))
         py("spatio.manifest", "validate", str(s))
-        self.assertIn(py("spatio.walkcheck", str(s), ok=False).returncode, (0, 1))
+        self.assertIn(py("spatio.walkcheck", str(s), *walkcheck_args(TEST_SETTINGS), ok=False).returncode, (0, 1))
         (s / "wallpatch").mkdir()
         patches = s / "wallpatch" / "patches.json"
         py("spatio.wallpatch", "suggest", str(s / "map.pcd"), "--n", "2", "--out", str(patches))

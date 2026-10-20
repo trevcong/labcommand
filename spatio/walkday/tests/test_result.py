@@ -41,6 +41,16 @@ TEST_SETTINGS = {"STATIONARY_WINDOW_S": "4", "MAX_GAP_S": "0.8", "MIN_PATH_LENGT
                  "WALL_GATE_STATE": "approved", "SUGGEST_PATCHES": "2", "BAGTIMING_SAMPLE_EVERY": "2",
                  "MAP_VOXEL_M": "0.04", "PLAYBACK_RATE": "0.5"}
 PATCH_NAMES = ["east face", "north face"]      # a test spec's preselected patch names
+# The walk checker flags process.sh stage 6 passes for each setting.
+WALKCHECK_FLAGS = {"STATIONARY_WINDOW_S": "--stationary-window", "MAX_GAP_S": "--max-gap",
+                   "MIN_PATH_LENGTH_M": "--min-path-length", "MIN_EXCURSION_M": "--min-excursion",
+                   "MAX_ENDPOINT_SPREAD_M": "--max-endpoint-spread", "MAX_ENDPOINT_SPEED_M_S": "--max-endpoint-speed",
+                   "MAX_HOLD_SPEED_M_S": "--max-hold-speed", "MIN_HOLD_S": "--min-hold"}
+
+
+def walkcheck_args(settings):
+    """walkcheck arguments for these settings, as process.sh stage 6 passes them."""
+    return [x for k, flag in WALKCHECK_FLAGS.items() for x in (flag, str(settings[k]))]
 
 
 def write_provenance(session, settings=TEST_SETTINGS, driver_sha=None, config_sha=CONFIG_SHA):
@@ -99,7 +109,8 @@ def make_session(root, run_id, offset=(0.05, 0.0, 0.0), xyz=None, gap=False, eva
     (s / "manifest.json").write_text(json.dumps(manifest))
     if reference is not None:
         (s / "physical_reference.json").write_text(json.dumps(reference))
-    assert quiet(walkcheck_main, [str(s)]) in (0, 1, 2)
+    # The walk check uses the settings provenance.json records, as in process.sh.
+    assert quiet(walkcheck_main, [str(s), *([] if settings is None else walkcheck_args(settings))]) in (0, 1, 2)
     if boxes is not None:              # explicit patch boxes, as with process.sh --patches
         (s / "wallpatch").mkdir()
         digest = hashlib.sha256((s / "map.pcd").read_bytes()).hexdigest()
@@ -427,6 +438,56 @@ class ResultTest(unittest.TestCase):
         reasons = " ".join(self.final_and_staged("cs")[0]["reasons"])
         self.assertIn("config_sha256 values differ", reasons)
         self.assertIn("MIN_HOLD_S", reasons)
+
+    def stage1(self, s):
+        return json.loads((s / "logs" / "provenance.json").read_text())["settings"]
+
+    def test_rescoring_with_a_changed_wall_gate_starts_a_new_series(self):
+        # Review P2 (result.py:369): re-scoring one run with a looser wall gate
+        # kept stage 1's WALL_GATE_M and hash, so a mixed series could PASS.
+        spec = write_spec(Path(self.tmp) / "spec.json")
+        runs = [self.preselected(f"rs{i}", spec=spec)[0] for i in range(3)]
+        for s in runs:                     # nothing changed: stage 1's identity, unchanged
+            self.assertEqual(self.walk(s)["walkday_settings"], self.stage1(s))
+        self.assertEqual(self.series_sh(runs, "rs-same")[1], "PASS")
+        self.assertEqual(run(runs[2], "--patch-origin", "preselected", "--spec", spec[0],
+                             "--wall-gate-m", "0.08"), 0)
+        got = self.walk(runs[2])["walkday_settings"]
+        self.assertTrue(provenance.check_identity(got))
+        self.assertEqual(got["values"]["WALL_GATE_M"], 0.08)
+        self.assertNotEqual(got["sha256"], self.stage1(runs[2])["sha256"])
+        rep = json.loads((runs[2] / "walkday.json").read_text())["provenance"]
+        self.assertEqual(rep["settings_sha256"], got["sha256"])
+        self.assertEqual(rep["stage1_settings_sha256"], self.stage1(runs[2])["sha256"])
+        self.assertEqual(rep["settings_changed"], [{"setting": "WALL_GATE_M", "stage1": 0.05, "used": 0.08,
+                                                    "source": "--wall-gate-m"}])
+        self.assertIn("WALL_GATE_M", (runs[2] / "walkday.md").read_text())
+        rc, verdict, out = self.series_sh(runs, "rs-mixed")
+        self.assertEqual((verdict, rc), ("NOT_EVALUABLE", VERDICT_EXIT["NOT_EVALUABLE"]), out)
+        self.assertIn("WALL_GATE_M", " ".join(self.final_and_staged("rs-mixed")[0]["reasons"]))
+        # The gate state is a scoring argument too.
+        self.assertEqual(run(runs[1], "--patch-origin", "preselected", "--spec", spec[0],
+                             "--wall-gate-state", "proposed"), 0)
+        self.assertEqual(self.walk(runs[1])["walkday_settings"]["values"]["WALL_GATE_STATE"], "proposed")
+
+    def test_walkcheck_rerun_with_other_settings_changes_the_identity(self):
+        # The walk checker's own record of its parameters (walkcheck.json) is
+        # checked against stage 1: a re-run with another minimum hold is not stage 1's identity.
+        s = make_session(self.tmp, "wcre")
+        self.assertIn(quiet(walkcheck_main, [str(s), *walkcheck_args(dict(TEST_SETTINGS, MIN_HOLD_S="7"))]),
+                      (0, 1, 2))
+        self.assertIn(run(s), (0, 1, 2))
+        got = self.walk(s)["walkday_settings"]
+        self.assertTrue(provenance.check_identity(got))
+        self.assertEqual(got["values"]["MIN_HOLD_S"], 7.0)
+        self.assertEqual(dict(got["values"], MIN_HOLD_S=6.0), self.stage1(s)["values"])
+        # A walk check that does not record its parameters cannot be checked: refused.
+        wc = json.loads((s / "walkcheck.json").read_text())
+        del wc["parameters"]["min_hold_s"]
+        (s / "walkcheck.json").write_text(json.dumps(wc))
+        (s / "walk_result.json").unlink()
+        self.assertEqual(run(s), 3)
+        self.assertFalse((s / "walk_result.json").exists())
 
     def test_provenance_config_hash_must_match_the_manifest(self):
         # Replay's manifest hashes the same --config path process.sh hashed
