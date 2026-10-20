@@ -18,6 +18,9 @@ from spatio.imucheck.analyze import (
     GYRO_MAG_MEDIAN_MAX,
     GYRO_MAG_STD_MAX,
     GYRO_RATIO_TOL,
+    MAX_IMU_GAP_S,
+    MIN_IMU_COVERAGE_FRACTION,
+    PROVISIONAL_LABEL,
     WINDOW_S,
 )
 from spatio.imucheck.fastlio import quotes_as_text
@@ -172,8 +175,14 @@ def _markdown(report, bag_path, library_versions, quotes):
             gyro["caveat"],
             "",
             "The ratio band is ±{0:.0%} around 1 (rad/s) and around 180/π (deg/s). "
-            "The raw sum |gyro| dt is the verdict. Bias is not removed first.".format(
-                GYRO_RATIO_TOL
+            "The raw sum |gyro| dt is the verdict. Bias is not removed first. "
+            "A window is not used when the IMU samples inside the odometry "
+            "interval span less than {1:.0%} of it, or when a gap in that "
+            "interval is longer than {2:g} s. {3}.".format(
+                GYRO_RATIO_TOL,
+                MIN_IMU_COVERAGE_FRACTION,
+                MAX_IMU_GAP_S,
+                PROVISIONAL_LABEL,
             ),
             "",
             "## Bias and noise",

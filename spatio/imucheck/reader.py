@@ -16,6 +16,8 @@ import mcap
 import mcap_ros2
 from mcap_ros2.reader import read_ros2_messages
 
+from spatio.imucheck.analyze import parse_positive_seconds
+
 
 def library_versions():
     return "mcap {0}, mcap_ros2 {1}".format(
@@ -47,6 +49,8 @@ def read_imu_and_odometry(path, imu_topic, odom_topic=None, max_seconds=None):
     header plus that many seconds. The stop follows file order, so it is a
     development slice, not a clock analysis.
     """
+    if max_seconds is not None:
+        max_seconds = parse_positive_seconds(max_seconds, "max_seconds")
     paths = resolve_mcap_paths(path)
     topics = [imu_topic]
     if odom_topic:

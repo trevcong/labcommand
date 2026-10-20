@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from spatio.imucheck.analyze import characterize
+from spatio.imucheck.analyze import characterize, parse_positive_seconds
 from spatio.imucheck.fastlio import load_quotes
 from spatio.imucheck.reader import read_imu_and_odometry
 from spatio.imucheck.report import write_reports
@@ -28,7 +28,6 @@ def build_parser():
     )
     parser.add_argument(
         "--max-seconds",
-        type=float,
         default=None,
         help="Stop after this many header seconds from the first IMU sample. Development slices.",
     )
@@ -39,16 +38,20 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.max_seconds is not None and args.max_seconds <= 0:
-        print("imucheck: --max-seconds must be positive", file=sys.stderr)
-        return 2
+    max_seconds = None
+    if args.max_seconds is not None:
+        try:
+            max_seconds = parse_positive_seconds(args.max_seconds, "--max-seconds")
+        except ValueError as exc:
+            print("imucheck: {0}".format(exc), file=sys.stderr)
+            return 2
     odom_topic = args.odometry or None
     try:
         loaded = read_imu_and_odometry(
             args.bag,
             args.topic,
             odom_topic=odom_topic,
-            max_seconds=args.max_seconds,
+            max_seconds=max_seconds,
         )
     except FileNotFoundError as exc:
         print("imucheck: {0}".format(exc), file=sys.stderr)

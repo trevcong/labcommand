@@ -31,9 +31,12 @@ Gyro unit. On the same 1 s grid, compare trapezoidal ∑|ω|Δt with the
 geodesic rotation angle of /Odometry over the odometry samples that fall
 in the window. Magnitudes only. A window is used when the odometry span
 covers at least half the window, the angle is between 0.15 and 2.5 rad
-(below π, so the quaternion short-arc is the whole turn), and
-|∫ω dt| / ∫|ω| dt >= 0.70 (the body rate does not reverse). Median ratio
-0.75–1.25 → rad/s. The same band times 180/π → deg/s (57.3 is that
+(below π, so the quaternion short-arc is the whole turn),
+|∫ω dt| / ∫|ω| dt >= 0.70 (the body rate does not reverse), and the IMU
+samples inside that odometry interval actually cover it. Coverage means
+those samples span at least 80% of the interval and no step, including
+either uncovered end, is longer than the provisional 1 s gap. Median
+ratio 0.75–1.25 → rad/s. The same band times 180/π → deg/s (57.3 is that
 constant rounded). Otherwise undetermined. Nothing is inferred from a
 noise floor. /Odometry was produced by FAST-LIO using this IMU, so the
 ratio is support, not proof.
@@ -77,6 +80,20 @@ MAX_MOTION_ANGLE_RAD = 2.5
 MIN_COHERENCE = 0.70
 MIN_ODOM_SPAN_FRACTION = 0.50
 
+# Delegate-approved gap. Anything longer is not a measurement of that turn.
+# provisional (approved for now, revisit after real data)
+PROVISIONAL_LABEL = "provisional (approved for now, revisit after real data)"
+MAX_IMU_GAP_S = 1.0
+# Local provisional gate, same 0.80 fraction as MIN_SPAN_FRACTION. The 1 s
+# gap is wider than the hole that produced a false rad/s verdict (0.01 s of
+# gyro against 0.61 s of rotation), so the span of the samples inside the
+# odometry interval has to cover this fraction of that interval.
+MIN_IMU_COVERAGE_FRACTION = 0.80
+# User-typed durations. One parser rejects non-finite, non-positive, and
+# values past this. Unix header stamps are not parsed here; they are larger
+# than this and are still valid sample times.
+ABSURD_DURATION_S = 1.0e6
+
 UPRIGHT_MAX_DEG = 15.0
 
 CAVEAT = (
@@ -118,18 +135,26 @@ def characterize(
         raise ValueError("t_s, accel, and gyro must have the same length")
 
     n = int(len(t))
-    finite = np.isfinite(t)
+    # Header rate, intervals, and backward steps use the stamp only. A NaN
+    # vector must not halve the rate or hide a backward stamp. Physics
+    # still requires a finite header and finite vectors.
+    header_finite = np.isfinite(t) if n else np.zeros(0, dtype=bool)
+    vector_finite = header_finite
     if n:
-        finite = finite & np.all(np.isfinite(acc), axis=1) & np.all(np.isfinite(gyr), axis=1)
-    n_dropped = int(n - int(np.count_nonzero(finite)))
+        vector_finite = (
+            header_finite
+            & np.all(np.isfinite(acc), axis=1)
+            & np.all(np.isfinite(gyr), axis=1)
+        )
+    n_dropped = int(n - int(np.count_nonzero(vector_finite)))
 
-    rate, intervals, n_backward = _rate_and_intervals(t, finite)
+    rate, intervals, n_backward = _rate_and_intervals(t, header_finite)
 
-    if n and np.any(finite):
-        order = np.argsort(t[finite], kind="mergesort")
-        t_srt = t[finite][order]
-        acc_srt = acc[finite][order]
-        gyr_srt = gyr[finite][order]
+    if n and np.any(vector_finite):
+        order = np.argsort(t[vector_finite], kind="mergesort")
+        t_srt = t[vector_finite][order]
+        acc_srt = acc[vector_finite][order]
+        gyr_srt = gyr[vector_finite][order]
     else:
         t_srt = np.zeros(0, dtype=np.float64)
         acc_srt = np.zeros((0, 3), dtype=np.float64)
@@ -147,8 +172,13 @@ def characterize(
         gyro_std_max=GYRO_MAG_STD_MAX * gyro_gate_scale,
         gyro_median_max=GYRO_MAG_MEDIAN_MAX * gyro_gate_scale,
     )
-    diag["t_first"] = float(t_srt[0]) if t_srt.size else None
-    diag["t_last"] = float(t_srt[-1]) if t_srt.size else None
+    if n and np.any(header_finite):
+        header_times = t[header_finite]
+        diag["t_first"] = float(np.min(header_times))
+        diag["t_last"] = float(np.max(header_times))
+    else:
+        diag["t_first"] = None
+        diag["t_last"] = None
     stat_mask = _mask_windows(t_srt, windows)
 
     accel_norm_stats, accel_unit = _accel_unit(acc_srt, stat_mask)
@@ -492,12 +522,88 @@ def _rotation_angle_rad(q_a, q_b) -> Optional[float]:
     return 2.0 * math.atan2(vnorm, abs(w))
 
 
-def _integrate(t_s, gyro, t_a, t_b):
-    """Trapezoidal ∫|ω| dt and ∫ω dt for samples inside [t_a, t_b]."""
+def parse_positive_seconds(value, name):
+    """Accept one user-typed duration in seconds.
+
+    This is the only check for those numbers. It rejects text that is not
+    a number, and any value that is not finite, not strictly positive, or
+    larger than ABSURD_DURATION_S.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            number = float(text)
+        except ValueError as exc:
+            raise ValueError(
+                "{0} must be a positive finite number of seconds".format(name)
+            ) from exc
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "{0} must be a positive finite number of seconds".format(name)
+            ) from exc
+    if (
+        not math.isfinite(number)
+        or number <= 0.0
+        or number > ABSURD_DURATION_S
+    ):
+        raise ValueError(
+            "{0} must be a positive finite number of seconds at most {1:g}".format(
+                name, ABSURD_DURATION_S
+            )
+        )
+    return number
+
+
+def _imu_slice(t_s, t_a, t_b):
     i0 = int(np.searchsorted(t_s, t_a, side="left"))
     i1 = int(np.searchsorted(t_s, t_b, side="right"))
+    return i0, i1
+
+
+def _imu_interval_problem(t_s, t_a, t_b):
+    """Why the IMU samples do not support a ratio over [t_a, t_b].
+
+    Returns None when they do. 'gap' means a step or an uncovered end is
+    longer than the provisional 1 s gap. 'coverage' means the samples that
+    are inside the interval span less than MIN_IMU_COVERAGE_FRACTION of it,
+    or the times themselves are not usable. One function owns both gates.
+    """
+    if not math.isfinite(t_a) or not math.isfinite(t_b):
+        return "coverage"
+    duration = float(t_b - t_a)
+    if not math.isfinite(duration) or duration <= 0.0:
+        return "coverage"
+    i0, i1 = _imu_slice(t_s, t_a, t_b)
     if i1 - i0 < 2:
+        return "coverage"
+    ts = t_s[i0:i1]
+    if not np.all(np.isfinite(ts)):
+        return "coverage"
+    gaps = [float(ts[0] - t_a), float(t_b - ts[-1])]
+    gaps.extend(float(v) for v in np.diff(ts))
+    for gap in gaps:
+        if not math.isfinite(gap) or gap < -1e-9:
+            return "coverage"
+        if gap > MAX_IMU_GAP_S:
+            return "gap"
+    covered = float(ts[-1] - ts[0])
+    if covered < MIN_IMU_COVERAGE_FRACTION * duration:
+        return "coverage"
+    return None
+
+
+def _integrate(t_s, gyro, t_a, t_b):
+    """Trapezoidal ∫|ω| dt and ∫ω dt for samples inside [t_a, t_b].
+
+    Returns None when those samples do not cover the interval. A short
+    burst at one end must not be compared with the whole rotation.
+    """
+    if _imu_interval_problem(t_s, t_a, t_b) is not None:
         return None
+    i0, i1 = _imu_slice(t_s, t_a, t_b)
     ts = t_s[i0:i1]
     g = gyro[i0:i1]
     dt = np.diff(ts)
@@ -532,6 +638,8 @@ def _gyro_unit(t_srt, gyr_srt, odom_t, odom_q):
     max_angle = 0.0
     n_with_pair = 0
     n_angle_in_range = 0
+    n_coverage_fail = 0
+    n_gap_fail = 0
     n_coherence_fail = 0
     for start, stop, _i0, _i1, long_enough in _window_bounds(t_srt):
         if not long_enough:
@@ -553,6 +661,13 @@ def _gyro_unit(t_srt, gyr_srt, odom_t, odom_q):
         if angle < MIN_MOTION_ANGLE_RAD or angle > MAX_MOTION_ANGLE_RAD:
             continue
         n_angle_in_range += 1
+        reason = _imu_interval_problem(t_srt, t_a, t_b)
+        if reason == "gap":
+            n_gap_fail += 1
+            continue
+        if reason is not None:
+            n_coverage_fail += 1
+            continue
         integrated = _integrate(t_srt, gyr_srt, t_a, t_b)
         if integrated is None:
             continue
@@ -570,15 +685,23 @@ def _gyro_unit(t_srt, gyr_srt, odom_t, odom_q):
             detail = (
                 "No motion window met the gates (odometry rotation between "
                 "{0:.2f} and {1:.1f} rad, coherence >= {2:.2f}, odometry span "
-                ">= {3:.0%} of the window). Windows with a pose pair: {4}. "
-                "Of those, {5} had a rotation in range and {6} of those failed "
-                "coherence. Largest 1 s odometry rotation was {7:.4f} rad.".format(
+                ">= {3:.0%} of the window, IMU samples spanning >= {4:.0%} of "
+                "the odometry interval, no gap above {5:g} s). These coverage "
+                "limits are {6}. Windows with a pose pair: {7}. Of those, {8} "
+                "had a rotation in range, {9} failed IMU coverage, {10} failed "
+                "the gap limit, and {11} failed coherence. Largest 1 s "
+                "odometry rotation was {12:.4f} rad.".format(
                     MIN_MOTION_ANGLE_RAD,
                     MAX_MOTION_ANGLE_RAD,
                     MIN_COHERENCE,
                     MIN_ODOM_SPAN_FRACTION,
+                    MIN_IMU_COVERAGE_FRACTION,
+                    MAX_IMU_GAP_S,
+                    PROVISIONAL_LABEL,
                     n_with_pair,
                     n_angle_in_range,
+                    n_coverage_fail,
+                    n_gap_fail,
                     n_coherence_fail,
                     max_angle,
                 )

@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 
 import numpy as np
 
-from spatio.imucheck.analyze import DEG_PER_RAD, characterize
+from spatio.imucheck.analyze import (
+    ABSURD_DURATION_S,
+    DEG_PER_RAD,
+    MAX_IMU_GAP_S,
+    _imu_interval_problem,
+    _integrate,
+    characterize,
+    parse_positive_seconds,
+)
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -238,6 +248,60 @@ class ImuCheckTests(unittest.TestCase):
         self.assertIn("not proof", gyro_unit["caveat"])
         self.assertIn("not guessed", gyro_unit["evidence"].lower())
 
+    def test_gyro_unit_rejects_incomplete_imu_coverage(self):
+        # IMU at 0–0.19 s and 0.80–0.99 s, odometry at 0.20 s and 0.81 s,
+        # 0.5 rad/s stored as deg/s. Only 0.01 s of gyro sits in the 0.61 s
+        # turn. That used to report rad/s at ratio 0.9393.
+        hz = 100.0
+        t = np.concatenate([np.arange(0, 20), np.arange(80, 100)]) / hz
+        accel = np.zeros((len(t), 3), dtype=np.float64)
+        accel[:, 2] = 1.0
+        gyro = np.zeros((len(t), 3), dtype=np.float64)
+        gyro[:, 2] = 0.5 * DEG_PER_RAD
+        odom_t = np.array([20.0, 81.0]) / hz
+        yaw = 0.5 * (odom_t - odom_t[0])
+        odom_q = np.zeros((2, 4), dtype=np.float64)
+        odom_q[:, 2] = np.sin(yaw / 2.0)
+        odom_q[:, 3] = np.cos(yaw / 2.0)
+        report = characterize(
+            t, accel, gyro, odom_t=odom_t, odom_quat=odom_q, topic="/test"
+        )
+        gyro_unit = report["gyro_unit"]
+        self.assertEqual(gyro_unit["verdict"], "undetermined")
+        self.assertIsNone(gyro_unit["ratio"])
+        self.assertEqual(gyro_unit["windows_used"], 0)
+        evidence = gyro_unit["evidence"].lower()
+        self.assertIn("coverage", evidence)
+        self.assertIn("provisional", evidence)
+        self.assertIn("not guessed", evidence)
+
+        # The same turn with IMU samples through the whole second is deg/s.
+        full_t = np.arange(100) / hz
+        full_accel = np.zeros((len(full_t), 3), dtype=np.float64)
+        full_accel[:, 2] = 1.0
+        full_gyro = np.zeros((len(full_t), 3), dtype=np.float64)
+        full_gyro[:, 2] = 0.5 * DEG_PER_RAD
+        full = characterize(
+            full_t,
+            full_accel,
+            full_gyro,
+            odom_t=odom_t,
+            odom_quat=odom_q,
+            topic="/test",
+        )
+        self.assertEqual(full["gyro_unit"]["verdict"], "deg/s")
+        self.assertAlmostEqual(full["gyro_unit"]["ratio"], DEG_PER_RAD, places=3)
+
+        # Endpoints span the interval, but the hole is past the provisional 1 s.
+        hole_t = np.array([0.0, MAX_IMU_GAP_S + 0.25], dtype=np.float64)
+        self.assertEqual(
+            _imu_interval_problem(hole_t, float(hole_t[0]), float(hole_t[1])),
+            "gap",
+        )
+        self.assertIsNone(
+            _integrate(hole_t, np.ones((2, 3)), float(hole_t[0]), float(hole_t[1]))
+        )
+
     def test_gyro_bias_and_noise(self):
         n = 200
         t = np.arange(n, dtype=np.float64) / float(n)
@@ -273,6 +337,75 @@ class ImuCheckTests(unittest.TestCase):
         self.assertAlmostEqual(interval["p50"], 0.005, places=8)
         self.assertAlmostEqual(interval["p95"], 0.0051, places=6)
         self.assertAlmostEqual(interval["max"], 0.007, places=8)
+
+    def test_header_diagnostics_ignore_vector_validity(self):
+        # 200 regular 100 Hz headers, alternating NaN gyro. The old combined
+        # mask reported 50 Hz and 20 ms intervals.
+        n = 200
+        t = np.arange(n, dtype=np.float64) / 100.0
+        accel = np.zeros((n, 3), dtype=np.float64)
+        accel[:, 2] = 1.0
+        gyro = np.zeros((n, 3), dtype=np.float64)
+        gyro[0::2] = np.nan
+        report = characterize(t, accel, gyro, topic="/test")
+        self.assertAlmostEqual(report["rate_hz"], 100.0, places=6)
+        interval = report["interval_s"]
+        self.assertAlmostEqual(interval["p5"], 0.01, places=8)
+        self.assertAlmostEqual(interval["p50"], 0.01, places=8)
+        self.assertAlmostEqual(interval["p95"], 0.01, places=8)
+        self.assertAlmostEqual(interval["max"], 0.01, places=8)
+        text = " ".join(report["findings"])
+        self.assertIn("Header-span rate is 100 Hz", text)
+        self.assertIn("0.01 / 0.01 / 0.01 / 0.01", text)
+        self.assertIn("100 messages were left out of the physics", text)
+        self.assertIn("0 consecutive header steps decreased", text)
+
+        # A backward header on the NaN sample must still count.
+        t_back = np.array([0.00, 0.01, 0.005, 0.02], dtype=np.float64)
+        accel_back = np.zeros((4, 3), dtype=np.float64)
+        accel_back[:, 2] = 1.0
+        gyro_back = np.zeros((4, 3), dtype=np.float64)
+        gyro_back[2] = np.nan
+        back = characterize(t_back, accel_back, gyro_back, topic="/test")
+        self.assertIn(
+            "1 consecutive header steps decreased", " ".join(back["findings"])
+        )
+        self.assertAlmostEqual(back["rate_hz"], 3.0 / 0.02, places=6)
+
+    def test_duration_parser_rejects_absurd_values(self):
+        self.assertEqual(parse_positive_seconds(" 2.5 ", "--max-seconds"), 2.5)
+        self.assertEqual(
+            parse_positive_seconds(ABSURD_DURATION_S, "--max-seconds"),
+            ABSURD_DURATION_S,
+        )
+        for bad in ("nan", "NaN", "inf", "+inf", "-inf", "0", "-4", "1e20", "nope", ""):
+            with self.assertRaises(ValueError):
+                parse_positive_seconds(bad, "--max-seconds")
+        from spatio.imucheck.cli import main
+
+        out = "/tmp/imucheck-absurd-should-not-exist"
+        self.assertFalse(Path(out).exists())
+        for bad in ("nan", "inf", "0", "-1", "1e20"):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                code = main(
+                    [
+                        "/no/such-imucheck.mcap",
+                        "--topic",
+                        "/imu",
+                        "--max-seconds",
+                        bad,
+                        "--out",
+                        out,
+                    ]
+                )
+            self.assertEqual(code, 2, bad)
+            self.assertIn("positive finite", err.getvalue())
+        self.assertFalse(Path(out).exists())
+        from spatio.imucheck.reader import read_imu_and_odometry
+
+        with self.assertRaises(ValueError):
+            read_imu_and_odometry("/no/such-imucheck.mcap", "/imu", max_seconds="nan")
 
     def test_input_values_never_rescaled(self):
         t = np.arange(200, dtype=np.float64) / 100.0
