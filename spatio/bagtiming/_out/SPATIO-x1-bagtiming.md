@@ -1,6 +1,6 @@
 # Spatio x1 bag timing findings — 2026-10-19 CDT
 
-The real Mid-360 schema is now supported. Both 30-second slices and both complete-message passes finished with exit 0 under the shared lock. Mid-360 full-pass point timing is sampled every second scan; all selected headers and receipts are included. This supersedes the earlier real-data-blocked findings. **The requested new local commit is blocked: the sandbox denied Git index.lock creation during staging; changes remain uncommitted.**
+The real Mid-360 schema is now supported. Both 30-second slices and both complete-message passes finished with exit 0 under the shared lock. Mid-360 full-pass point timing is sampled every second scan; all selected headers and receipts are included. This supersedes the earlier real-data-blocked findings. The implementation and original regressions were subsequently committed by the orchestrator in `aaa9670`. The real-data results below are retained from that run; this review-fix pass reran the package tests and checked the saved full-report message counts, without rerunning the recordings.
 
 ## Change and evidence
 
@@ -84,4 +84,26 @@ No observed topic header/receipt backward jumps, resets, or zero stamps in eithe
 
 This is a bag timing inspection, not a new FAST-LIO replay, trajectory evaluation, or physical acceptance result. Historical replay artifacts must retain the label **“replay demonstrated; physical accuracy not evaluated”**; this task independently proves decoding/timing inspection only. Physical synchronization, mount/IMU axes, deployed configuration, and <10 cm closure remain unproved. MCAP ros2msg/CDR only; no SQLite/IDL support added.
 
-No additional product/design approval is needed. A permitted environment is required to finish Git staging/commit and Swift validation. `git add` failed before staging with `Unable to create /Users/tconf/Developer/labcommand/.git/worktrees/spatio-x1-bagtiming/index.lock: Operation not permitted`; no workaround was attempted. The requested local commit remains outstanding; any Spark execution, live capture, or physical test needs separate authorization. No Spark access, container operations, other-workstream edits, app input, push, PR, gh, or Actions trigger occurred. Only this task’s code/docs, derived outputs and requested findings were written. When permissions allow, stage only `spatio/bagtiming/` and commit with `Fix recorded Livox schema whitespace validation [skip ci]`. An independent review remains separate from this implementation.
+No additional product/design approval is needed for this fix. Any Spark execution, live capture, or physical test still needs separate authorization. No Spark access, container operations, other-workstream edits, app input, push, PR, gh, or Actions trigger occurred.
+
+## Review fixes
+
+The review in `sp-rv-x1-final.md` names `1591f89` and contains one P1, with no P2 findings. The P1 is valid: repeated spaces in the real Mid-360 schema caused rejection before decode. At the start of this pass, the branch already contained `aaa9670`, which fixes the central `schema_sections` parser by normalizing declaration whitespace. Exact field names, types, array sizes and order remain enforced. No additional production change is needed, and no specification or existing test was loosened.
+
+Retained the three regressions from that fix: recorded-schema CLI/sampling, forced fallback parity, and rejection of incompatible layouts. Added one regression that pins the recorded schema SHA-256 from the review and requires normal `mcap_ros2` decoding without manual fallback. It verifies receipt time, the exact integer timebase `1700000000000000017` ns, offsets `[5, 19]` ns, and scan bounds `1700000000000000022`–`1700000000000000036` ns. Substituting the original `1591f89` schema gate in memory reproduces the exact pre-decode `InputError`; the current gate passes. No source files were reverted for this check.
+
+Run the full package suite sequentially from this worktree:
+
+```sh
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python3 -m unittest discover -s spatio/bagtiming/tests -t . -v
+```
+
+Current result: **42 tests run, 42 passed, 0 failures, 0 errors, 0 skipped**, in 0.587 s. All 41 prior tests remain unchanged. `git diff --check` passes for this follow-up.
+
+Swift attempt: `swift run -j 1 LabCommandCoreTestsRunner`, with writable module caches under `/private/tmp`, exited 1 during manifest evaluation: `sandbox-exec: sandbox_apply: Operation not permitted`. **0 Swift tests executed**; this is blocked validation, not a passing suite. Log: `/private/tmp/spatio-x1-review-swift-tests.log`. No Swift code changed and no app was built or launched.
+
+The saved full reports were read again: Mid-360 has **88,328** inspected messages, matching its MCAP summary; JT128 has **77,111**, also matching. These are prior-run report values, not fresh bag runs. The new regression uses synthetic point data with the verbatim recorded schema. Neither establishes physical accuracy or synchronization.
+
+The delegate-approved 5 cm wall gate, 5 s window, 1 s gap, must-move minimums, memory-design numbers, and 1 cm placement tolerance remain **provisional**. They are outside this schema fix; x1 does not implement those acceptance gates. No numeric parser changes or scattered numeric guards were introduced.
+
+The implementation fix is already locally committed in `aaa9670`. The requested follow-up commit was attempted with message `Verify x1 recorded Livox schema review fix [skip ci]`, but staging failed: `Unable to create /Users/tconf/Developer/labcommand/.git/worktrees/spatio-x1-bagtiming/index.lock: Operation not permitted`. The new regression and findings remain uncommitted; no permission workaround was attempted. A permitted environment is needed to stage these two worktree files and make that local commit, and to run the Swift suite. The requested findings file outside the worktree was also updated. No further design approval is needed for the P1 fix.

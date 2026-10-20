@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -325,6 +326,31 @@ class TimingTests(unittest.TestCase):
 class ReaderCliTests(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run([sys.executable, '-m', 'spatio.bagtiming', *map(str, args)], capture_output=True, text=True)
+
+    def test_recorded_mid360_schema_preserves_exact_nanoseconds_without_fallback(self):
+        self.assertEqual(
+            hashlib.sha256(RECORDED_CUSTOM_SCHEMA.encode()).hexdigest(),
+            'e1955256d7a20d899b742d06f929cba135a3393edd3a69cc3cb6dc762ba53230')
+        base = 1_700_000_000 * NS + 17
+        with tempfile.TemporaryDirectory() as td:
+            bag = Path(td) / 'recorded-layout.mcap'
+            with bag.open('wb') as f:
+                writer = Writer(f)
+                schema = writer.register_msgdef(CUSTOM, RECORDED_CUSTOM_SCHEMA)
+                writer.write_message('/livox/lidar', schema, custom(base, [5, 19]), log_time=base + 23)
+                writer.finish()
+            with patch('spatio.bagtiming.reader.manual_custommsg',
+                       side_effect=AssertionError('The recorded schema must decode through mcap_ros2')):
+                reader = BagReader(bag)
+                records = list(reader.records())
+            self.assertEqual(len(records), 1)
+            topic, receipt, decoded = records[0]
+            self.assertEqual((topic, receipt), ('/livox/lidar', base + 23))
+            self.assertEqual(decoded.timebase, base)
+            self.assertEqual([p.offset_time for p in decoded.points], [5, 19])
+            scan = scan_summary(decoded, CUSTOM)
+            self.assertEqual((scan['start_ns'], scan['end_ns']), (base + 5, base + 19))
+            self.assertEqual(reader.manual_topics, set())
 
     def test_recorded_mid360_schema_cli_and_sampling(self):
         with tempfile.TemporaryDirectory() as td:
