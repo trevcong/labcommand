@@ -1,0 +1,12 @@
+{
+  "run_id": "map_doubled_wall_6cm",
+  "source_recording": "synthetic://map_doubled_wall_6cm",
+  "sensor": "synthetic",
+  "fastlio_revision": "none",
+  "config_file": "spatio/io/synth.py",
+  "config_sha256": "56ac84068e0b886e49b69fbd5bd7c5c3751dd499086af6de2a3a9f4fab81442b",
+  "image": "none",
+  "created_at": "2026-10-19T00:00:00Z",
+  "notes": "replay demonstrated; physical accuracy not evaluated. Synthetic fixture, not a FAST-LIO replay. closed square plus the same room with the +X wall copied 0.06 m along +X. config_sha256 is the SHA-256 of the canonical JSON of the synthetic parameters.",
+  "physical_accuracy_evaluated": false
+}

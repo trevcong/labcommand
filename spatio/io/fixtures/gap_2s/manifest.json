@@ -1,0 +1,12 @@
+{
+  "run_id": "gap_2s",
+  "source_recording": "synthetic://gap_2s",
+  "sensor": "synthetic",
+  "fastlio_revision": "none",
+  "config_file": "spatio/io/synth.py",
+  "config_sha256": "6a66efb994479cd05b249e4f37ae9bae8140536f7ac0f2b86fc91b19ff29495d",
+  "image": "none",
+  "created_at": "2026-10-19T00:00:00Z",
+  "notes": "replay demonstrated; physical accuracy not evaluated. Synthetic fixture, not a FAST-LIO replay. closed square with 2.0 s added to timestamps from 15 s onward. config_sha256 is the SHA-256 of the canonical JSON of the synthetic parameters.",
+  "physical_accuracy_evaluated": false
+}

@@ -1,0 +1,12 @@
+{
+  "run_id": "pcd_formats",
+  "source_recording": "synthetic://pcd_formats",
+  "sensor": "synthetic",
+  "fastlio_revision": "none",
+  "config_file": "spatio/io/synth.py",
+  "config_sha256": "53285525d8be921f16b46e064b0fb615166cd8011e9755606feffcfe2cbe55ee",
+  "image": "none",
+  "created_at": "2026-10-19T00:00:00Z",
+  "notes": "replay demonstrated; physical accuracy not evaluated. Synthetic fixture, not a FAST-LIO replay. 10 second hold and 1000 float32 points stored as ascii, binary, and binary_compressed. config_sha256 is the SHA-256 of the canonical JSON of the synthetic parameters.",
+  "physical_accuracy_evaluated": false
+}

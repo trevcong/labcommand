@@ -1,0 +1,12 @@
+{
+  "run_id": "timestamp_reset",
+  "source_recording": "synthetic://timestamp_reset",
+  "sensor": "synthetic",
+  "fastlio_revision": "none",
+  "config_file": "spatio/io/synth.py",
+  "config_sha256": "86289d2774b25c43460c9970d9ed1c2cea949b45a269ab5150ec91af597906b7",
+  "image": "none",
+  "created_at": "2026-10-19T00:00:00Z",
+  "notes": "replay demonstrated; physical accuracy not evaluated. Synthetic fixture, not a FAST-LIO replay. closed square whose clock restarts at the middle pose. config_sha256 is the SHA-256 of the canonical JSON of the synthetic parameters.",
+  "physical_accuracy_evaluated": false
+}

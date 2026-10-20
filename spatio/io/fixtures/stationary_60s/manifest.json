@@ -1,0 +1,12 @@
+{
+  "run_id": "stationary_60s",
+  "source_recording": "synthetic://stationary_60s",
+  "sensor": "synthetic",
+  "fastlio_revision": "none",
+  "config_file": "spatio/io/synth.py",
+  "config_sha256": "1db3b09a0ba3ea402bba6e49bdca8c4ec63a3694303c3a1081b40992efd66522",
+  "image": "none",
+  "created_at": "2026-10-19T00:00:00Z",
+  "notes": "replay demonstrated; physical accuracy not evaluated. Synthetic fixture, not a FAST-LIO replay. 60 second hold at the origin. config_sha256 is the SHA-256 of the canonical JSON of the synthetic parameters.",
+  "physical_accuracy_evaluated": false
+}

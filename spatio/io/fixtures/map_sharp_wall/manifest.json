@@ -1,0 +1,12 @@
+{
+  "run_id": "map_sharp_wall",
+  "source_recording": "synthetic://map_sharp_wall",
+  "sensor": "synthetic",
+  "fastlio_revision": "none",
+  "config_file": "spatio/io/synth.py",
+  "config_sha256": "44eebd1d314d444e858b78a8699ec12015ab5855fb29ec38abfafb92abe03365",
+  "image": "none",
+  "created_at": "2026-10-19T00:00:00Z",
+  "notes": "replay demonstrated; physical accuracy not evaluated. Synthetic fixture, not a FAST-LIO replay. closed square plus a sharp synthetic room, noise 0. config_sha256 is the SHA-256 of the canonical JSON of the synthetic parameters.",
+  "physical_accuracy_evaluated": false
+}
