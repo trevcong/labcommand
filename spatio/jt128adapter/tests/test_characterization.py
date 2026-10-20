@@ -69,6 +69,20 @@ class UpstreamWithMissingInput(UPSTREAM.TestJt128SlamAdapter):
 
 
 class Characterization(unittest.TestCase):
+    def test_root_pytest_collects_all_upstream_tests_through_harness(self):
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q", "spatio/jt128adapter"],
+            cwd=BASE.parents[1], capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        nodes = [line for line in proc.stdout.splitlines() if "::" in line]
+        upstream_names = unittest.defaultTestLoader.getTestCaseNames(UPSTREAM.TestJt128SlamAdapter)
+        self.assertEqual(len(upstream_names), 3)
+        for name in upstream_names:
+            matching = [node for node in nodes if node.endswith("::" + name)]
+            self.assertEqual(len(matching), 1, matching)
+            self.assertIn("::UpstreamWithMissingInput::", matching[0])
+
     def test_vendor_sha256_matches_provenance(self):
         provenance = (BASE / "vendor/PROVENANCE.md").read_text()
         for name, expected in [("jt128_slam_adapter.py", HASH), ("test_jt128_slam_adapter.py", UPSTREAM_HASH)]:
