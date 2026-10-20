@@ -171,6 +171,7 @@ struct CommandCenterView: View {
             case .workspace: rigWorkspace
             case .settings: SettingsView()
             case .liveRoom: LiveRoomPage()
+            case .trail: TrailReplayView(player: state.trail)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

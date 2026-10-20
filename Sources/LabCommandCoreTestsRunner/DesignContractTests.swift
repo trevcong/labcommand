@@ -114,8 +114,9 @@ func testRoomFirstShell() {
 
     expect(state.contains("var windowTitle: String { \"LabCommand - \\(label)\" }"),
            "window titles are declared on Dest")
-    expect(state.contains("static var navCases: [Dest] { [.liveRoom, .settings, .workspace] }"),
-           "nav order is Room, Settings, Rig")
+    // Spec change (Spatio E2, approved): Trail is a permanent fourth tab. ⌘1–⌘3 are unchanged.
+    expect(state.contains("static var navCases: [Dest] { [.liveRoom, .settings, .workspace, .trail] }"),
+           "nav order is Room, Settings, Rig, Trail")
     expect(state.contains("navCases.firstIndex(of: self)"), "the shortcut is the tab's place in nav order")
     expect(state.contains("String(index + 1)"), "the first tab is ⌘1 and the third is ⌘3")
     expect(!chrome.contains("KeyEquivalent(Character(d.shortcutKey))"),
