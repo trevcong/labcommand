@@ -27,6 +27,7 @@ SERIES_SCHEMA = "spatio.series/1"
 _TABLE_HEADERS = (
     "attempt",
     "run_id",
+    "recorded at (UTC)",
     "status",
     "return 3D (cm)",
     "horizontal (cm)",
@@ -44,7 +45,7 @@ _TABLE_HEADERS = (
 
 _RULES_MD = """## Rules
 
-This report checks the producer's walk_result files again. It does not trust a PASS that the numbers do not support. Attempts are in the order given on the command line.
+This report checks the producer's walk_result files again. It does not trust a PASS that the numbers do not support. Attempts are ordered by recorded_at (recording time), never command-line order. Missing or tied recording times are rejected.
 
 Precedence is input error (exit 1), then NOT_EVALUABLE, then REPLAY_ONLY, then PASS, then INCOMPLETE, then FAIL. A weaker verdict must not hide a stronger problem.
 
@@ -83,12 +84,13 @@ def explain_text(walk: WalkResult) -> str:
 
 
 def build_series(walks: Sequence[WalkResult], series_id: str) -> dict:
-    """Judge the runs in the order given. Raises InputRejected on duplicate ids."""
+    """Judge runs in recorded order, rejecting ambiguous chronology or ids."""
     if not walks:
         raise InputRejected(series_id, "compare needs at least one walk_result")
     if not isinstance(series_id, str) or not series_id.strip():
         raise InputRejected(walks[0].source_path, "series_id must be a non-empty string")
     _reject_duplicate_ids(walks)
+    walks = order_walks(walks)
     verdict, counted, reasons = _judge(walks)
     retained = [walk.run_id for walk in walks if not counts_toward_series(walk)]
     return {
@@ -164,11 +166,27 @@ def render_markdown(report: dict) -> str:
 
 
 def default_series_id(walks: Sequence[WalkResult]) -> str:
+    walks = order_walks(walks)
     first = walks[0].run_id
     last = walks[-1].run_id
     if first == last:
         return first
     return "%s--%s" % (first, last)
+
+
+def order_walks(walks: Sequence[WalkResult]) -> List[WalkResult]:
+    seen = {}
+    for walk in walks:
+        if walk.recorded_at is None:
+            raise InputRejected(walk.source_path, "recorded_at is required for compare")
+        if walk.recorded_at in seen:
+            raise InputRejected(
+                walk.source_path,
+                "recorded_at ties with %s; recording order is ambiguous"
+                % seen[walk.recorded_at],
+            )
+        seen[walk.recorded_at] = walk.source_path
+    return sorted(walks, key=lambda walk: walk.recorded_at)
 
 
 def counts_toward_series(walk: WalkResult) -> bool:
@@ -330,6 +348,7 @@ def _run_dict(walk: WalkResult, attempt: int) -> dict:
     return {
         "attempt": attempt,
         "run_id": walk.run_id,
+        "recorded_at": walk.recorded_at.isoformat() if walk.recorded_at else None,
         "status": walk.status,
         "reasons": list(walk.reasons),
         "physical_accuracy_evaluated": walk.physical_accuracy_evaluated,
@@ -512,6 +531,7 @@ def _table_cells(run: dict) -> List[str]:
     return [
         str(run["attempt"]),
         _cell(run["run_id"]),
+        run["recorded_at"] or "not measured",
         run["status"],
         _cm_cell(error["d3_m"]),
         _cm_cell(error["horizontal_m"]),

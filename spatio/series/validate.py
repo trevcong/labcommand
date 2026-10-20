@@ -10,6 +10,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, List, Optional, Sequence
 
 # Milestone gates. A looser value in the file must not create a pass.
@@ -138,6 +139,7 @@ class WalkResult:
     validity: Validity
     walls: Walls
     physical_reference: Optional[PhysicalReference]
+    recorded_at: Optional[datetime] = None
 
     def w1_supports_pass(self) -> bool:
         """True when the milestone numbers themselves allow status PASS.
@@ -192,6 +194,7 @@ def parse_walk_result(data: Any, source_path: str) -> WalkResult:
 
     errors: List[str] = []
     _require_keys(data, _TOP_KEYS, "walk_result", errors)
+    recorded_at = _recorded_at(data.get("recorded_at"), errors)
 
     schema = data.get("schema")
     if schema != WALK_SCHEMA:
@@ -293,7 +296,23 @@ def parse_walk_result(data: Any, source_path: str) -> WalkResult:
         validity=validity,
         walls=walls,
         physical_reference=reference,
+        recorded_at=recorded_at,
     )
+
+
+def _recorded_at(value: Any, errors: List[str]) -> Optional[datetime]:
+    if value is None:
+        return None  # Legacy explain remains usable; compare requires chronology.
+    try:
+        if not isinstance(value, str):
+            raise ValueError()
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError()
+        return stamp.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        errors.append("recorded_at must be an ISO 8601 timestamp with a timezone")
+        return None
 
 
 class _Missing(object):
@@ -719,12 +738,10 @@ def _check_duration_covers_span(
     the end window minus the start of the start window. Both comparisons
     are lengths, so the clock does not have to start at zero. A duration
     equal to a length still fits. A null window is skipped. A null duration
-    is not measured, and a duration of exactly 0 is left to
-    _check_zero_duration. This is not a minimum duration.
+    is not measured. Zero duration must also cover each present window,
+    even when the other window is null. This is not a minimum duration.
     """
-    # Exact 0 is already rejected by _check_zero_duration when the paired
-    # span is positive. This check is the positive-duration case.
-    if duration is None or duration == 0.0 or error is None:
+    if duration is None or error is None:
         return
     _check_one_window_duration(
         duration, error.start_window_s, "return_error.start_window_s", errors
