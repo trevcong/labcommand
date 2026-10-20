@@ -92,6 +92,25 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(required.returncode, 1, required.stdout + required.stderr)
             self.assertIn('Required rosbags cross-check', required.stdout)
 
+    def test_cli_kinds_pytest_reads_no_ctest_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = [sys.executable, str(Path(ci_checks.__file__)), 'summary', str(root), '--require-rosbags']
+            (root / 'pytest.xml').write_text(
+                '<testsuite><testcase classname="room_memory.tests.test_rosbags" name="one"/></testsuite>')
+            both = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(both.returncode, 1, both.stdout + both.stderr)
+            self.assertIn('### CTest entries', both.stdout)
+            alone = subprocess.run(command + ['--kinds', 'pytest'], capture_output=True, text=True)
+            self.assertEqual(alone.returncode, 0, alone.stdout + alone.stderr)
+            self.assertIn('rosbags independent CDR cross-check: **PASS**', alone.stdout)
+            self.assertNotIn('### CTest entries', alone.stdout)
+            (root / 'pytest.xml').write_text(
+                '<testsuite><testcase name="test_rosbags"><skipped/></testcase></testsuite>')
+            skipped = subprocess.run(command + ['--kinds', 'pytest'], capture_output=True, text=True)
+            self.assertEqual(skipped.returncode, 1, skipped.stdout + skipped.stderr)
+            self.assertIn('**SKIPPED**', skipped.stdout)
+
     def test_nested_suites_failures_errors_and_skip_reasons(self):
         summary, ok = self.report('''<testsuites><testsuite tests="4">
           <testcase name="pass"/><testcase name="fail"><failure/></testcase>

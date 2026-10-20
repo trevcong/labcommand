@@ -138,12 +138,14 @@ def main():
     summary.add_argument('reports', type=Path)
     summary.add_argument('--require-rosbags', action='store_true',
                          help='fail when the independent CDR cross-check is absent, skipped, or failed')
+    summary.add_argument('--kinds', nargs='+', choices=('pytest', 'ctest'), default=['pytest', 'ctest'],
+                         help='reports to read (default: both); scripts/check-rosbags.sh reads pytest only')
     args = parser.parse_args()
     if args.command == 'fixtures':
         check_fixtures(args.root)
         return 0
     ok = True
-    for kind in ('pytest', 'ctest'):
+    for kind in args.kinds:
         text, valid = summarize_report(args.reports / f'{kind}.xml', kind, args.require_rosbags)
         print(text)
         ok = ok and valid
