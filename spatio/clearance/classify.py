@@ -5,12 +5,20 @@ import numpy as np
 from .model import number
 
 
-def classify(zone, grid, uncertainty_m):
+def validate_min_free_rays(value):
+    if type(value) is not int or value < 1:
+        raise ValueError("min_free_rays must be a positive integer")
+    return value
+
+
+def classify(zone, grid, uncertainty_m, min_free_rays=2):
+    min_free_rays = validate_min_free_rays(min_free_rays)
     uncertainty = number(uncertainty_m, "uncertainty_m")
     if uncertainty < 0:
         raise ValueError("uncertainty_m must be nonnegative")
     required = list(grid.volume_cells(zone))
     occupied, free, unknown, conflicts = [], [], [], []
+    insufficient = []
     times = set()
     for index in required:
         cell = grid.cells.get(index)
@@ -24,6 +32,9 @@ def classify(zone, grid, uncertainty_m):
             free.append(index)
         else:
             unknown.append(index)
+        if not (cell and cell.occupied_times) and (
+                cell is None or cell.free_ray_count < min_free_rays):
+            insufficient.append(index)
 
     axis, direction, ref = zone.axis, zone.direction, zone.reference
     tangents = [a for a in range(3) if a != axis]
@@ -32,8 +43,12 @@ def classify(zone, grid, uncertainty_m):
     for cell in grid.cells.values():
         for timestamp, point in cell.hits:
             distance = float(direction * (point[axis] - ref))
-            if distance > 0 and all(zone.low[a] <= point[a] < zone.high[a]
-                                     for a in tangents):
+            in_footprint = all(zone.low[a] <= point[a] < zone.high[a]
+                               for a in tangents)
+            in_band = uncertainty > 0 and all(
+                zone.low[a] - uncertainty - 1e-12 <= point[a]
+                <= zone.high[a] + uncertainty + 1e-12 for a in tangents)
+            if distance > 0 and (in_footprint or in_band):
                 distances.append(distance)
                 times.add(timestamp)
     measured = min(distances) if distances else None
@@ -61,20 +76,25 @@ def classify(zone, grid, uncertainty_m):
         status = "INDETERMINATE" if near else "FAIL"
         reason = "occupied required cells; margin within uncertainty" if near else \
             "occupied required cells"
-    elif unknown:
+    elif insufficient:
         margin = None if measured is None else measured - zone.depth
-        status, reason = "NOT_MEASURED", "required cells lack free-space evidence"
+        status, reason = "NOT_MEASURED", "required cells lack minimum free-ray evidence"
     else:
         margin = None if measured is None else measured - zone.depth
-        near = margin is not None and uncertainty > 0 and abs(margin) <= uncertainty + 1e-12
+        # A sideways hit can lie deep inside the required depth while outside
+        # its nominal footprint. It must also block PASS, not only end-face hits.
+        near = margin is not None and uncertainty > 0 and margin <= uncertainty + 1e-12
         status = "INDETERMINATE" if near else "PASS"
-        reason = "margin within uncertainty" if near else "every required cell observed free"
+        reason = "hit within expanded uncertainty volume" if near else \
+            "every required cell has minimum free-ray evidence"
     return {
         "id": zone.id, "shape": zone.shape, "rule_id": zone.rule_id,
         "provision": zone.provision, "status": status, "reason": reason,
         "required_depth_m": zone.depth, "min_clearance_m": measured,
         "occupied_voxel_clearance_lower_bound_m": lower,
         "decision_margin_m": margin, "uncertainty_m": uncertainty,
+        "min_free_rays": min_free_rays,
+        "insufficient_evidence_cells": len(insufficient),
         "required_cells": len(required), "free_only_cells": len(free),
         "occupied_cells": len(occupied), "unknown_cells": len(unknown),
         "conflicting_cells": [list(i) for i in conflicts],
