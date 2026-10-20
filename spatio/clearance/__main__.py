@@ -64,7 +64,13 @@ def markdown(result):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "report":
+        from .report import main as report_main
+        return report_main(argv[1:])
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Output stage: python3 -m spatio.clearance report --help")
     parser.add_argument("--synthetic", action="store_true", help="use EXAMPLE, NOT APPROVED scene")
     parser.add_argument("--zones", type=Path)
     parser.add_argument("--scans", type=Path)

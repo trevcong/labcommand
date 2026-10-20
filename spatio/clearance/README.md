@@ -29,6 +29,62 @@ python3 -m spatio.clearance --zones /path/to/zones.json \
 The numbers above are example parameters, not recommended operating settings.
 No sensor-specific names, timing rates, calibration or recording paths are used.
 
+## One-walk exception report and recheck list (F7a / F8a)
+
+Present an existing clearance result using its matching zone definitions:
+
+```sh
+python3 -m spatio.clearance report \
+  --results /path/to/clearance-results/report.json \
+  --zones /path/to/zones.json --walk-id fresh-walk-id \
+  --output /private/tmp/clearance-walk-summary
+```
+
+This subcommand writes `report.md` and `report.json` to a new directory and
+prints the Markdown. The earlier classification CLI is unchanged. The output
+directory must not already exist, including the input results directory.
+No scans, maps, sensors, recordings or network services are opened at this stage.
+
+JSON has `schema: "spatio.clearance_report.v1"`, `walk_id`, `frame_id`,
+`settings`, `scan_count`, `scan_time_range`, `counts` (all four status keys),
+`zone_count`, `zones`, `failures`, and `rechecks`. `physical_accuracy_evaluated`
+remains false. Each zone item contains the complete unchanged upstream record
+under `evidence` plus `map_position_m`. Failures contain only FAIL items;
+rechecks contain every NOT_MEASURED and INDETERMINATE item with a consecutive
+`number` starting at 1. Lists sort by case-sensitive Unicode zone ID, not
+severity, spatial proximity or travel order. There is no planner.
+
+Positions are **required-volume centres in the supplied frame**, derived from
+box or plane-offset geometry. They are references for finding the zone, not
+measured obstacle locations or recommended viewpoints. The input results do
+not contain geometry or a geometry hash: the caller must supply the original
+zone document. The join checks IDs, frame, shape, rule, provision and depth,
+but cannot detect a translated zone with those same attributes.
+
+The compact one-page-style Markdown includes settings, status counts, all
+FAIL measurements against required minimum depth, positions, evidence times,
+supplied provisions, and numbered recheck reasons. A missing hit clearance
+stays “not measured”; the occupied-voxel lower bound is labelled separately.
+Neither a voxel bound nor a measured hit proves full-volume coverage.
+Long supplied text or many exceptions can exceed one printed page: Markdown
+has no fixed page geometry, and no exception is truncated to force a page fit.
+The JSON retains all evidence and full numeric precision.
+
+Input statuses are never upgraded or recomputed. Missing fields, mismatched
+zone sets, unknown statuses and inconsistent evidence summaries fail explicitly.
+A PASS requires positive required-cell count, all cells free, zero insufficient
+or conflicting cells, and evidence times within a nonempty scan range.
+This validates upstream summary consistency, not the original rays or physical
+truth. The classifier remains responsible for the actual decision.
+Empty result and definition zone lists produce zero counts and an explicit
+“no clearance conclusions” note; the classifier's nonempty-zone rule is unchanged.
+
+Output uses sorted JSON keys, UTF-8, LF endings and no generated clock or path
+metadata. Identical inputs and walk ID produce identical bytes. Observed time
+ranges are copied in the input's time basis; they are not labelled UTC.
+Processing latency and recording-end-to-report latency are not measured here.
+Synthetic tests cover fidelity and deterministic formatting, not physical accuracy.
+
 ## Zone contract, version 1
 
 The document has exactly `schema_version` (integer 1), a nonempty `frame_id`,
