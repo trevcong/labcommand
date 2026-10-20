@@ -2,9 +2,10 @@
 
 Binary clouds are returned as views of a read-only memory map. Compressed
 clouds follow PCL: a little-endian uint32 compressed size, a uint32
-uncompressed size, then an liblzf payload laid out field-by-field. Fields
-named ``_`` or starting with ``_`` are padding. They occupy bytes in ascii
-and binary records and are omitted from the compressed payload.
+uncompressed size, then an liblzf payload laid out field-by-field. Only a
+field whose name is exactly ``_`` is padding. It occupies bytes in ascii
+and binary records and is omitted from the compressed payload. A name such
+as ``_intensity`` is a real field and is stored.
 """
 
 from __future__ import annotations
@@ -48,6 +49,17 @@ class PcdFormatError(ValueError):
     """The PCD header or body does not match PCD v0.7."""
 
 
+def _is_padding_field(name: str) -> bool:
+    """PCL reserves only the exact field name ``_`` as padding.
+
+    ``pcd_io.cpp`` skips a field when ``name == "_"`` in the ASCII reader
+    and in the binary_compressed reader and writer. ``_intensity`` is not
+    padding.
+    """
+
+    return name == "_"
+
+
 @dataclass(frozen=True)
 class PcdField:
     """One column of a PCD header, in file order."""
@@ -65,7 +77,7 @@ class PcdField:
 
     @property
     def padding(self) -> bool:
-        return self.name == "_" or self.name.startswith("_")
+        return _is_padding_field(self.name)
 
 
 @dataclass(frozen=True)
@@ -612,7 +624,7 @@ def _binary_payload(prepared, n: int) -> bytes:
 def _compressed_payload(prepared, n: int) -> bytes:
     parts = []
     for name, size, _, count, arr in prepared:
-        if name == "_" or name.startswith("_"):
+        if _is_padding_field(name):
             continue
         raw = np.ascontiguousarray(arr)
         if count == 1:

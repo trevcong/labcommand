@@ -3,6 +3,11 @@
 ``python3 -m spatio.io.make_fixtures --out spatio/io/fixtures`` writes them.
 ``--check`` writes a fresh copy in a temp directory and byte-compares it
 with ``--out``. The metric used here is not imported by the tests.
+
+``--out`` must be missing, empty, or contain only the recognized fixture
+directories and ``.DS_Store``. Any other child is refused before the
+directory is changed. The repository root, this package directory, ``/``,
+and the home directory are refused as well.
 """
 
 from __future__ import annotations
@@ -260,19 +265,23 @@ def main(argv=None) -> int:
 
 
 def write_fixtures(out: Path) -> None:
-    """Replace fixture sessions under ``out``. Unknown children are removed."""
+    """Replace recognized fixture sessions under ``out``.
+
+    Refuses, before any write or delete, when ``out`` contains a child that
+    is not a recognized fixture directory. ``.DS_Store`` is left in place.
+    """
 
     out = _safe_dir(out)
+    if out.exists() and not out.is_dir():
+        raise SystemExit("refusing to use a file as the fixture directory: %s" % out)
+    unrelated = _unrelated_children(out)
+    if unrelated:
+        raise SystemExit(
+            "refusing to write %s: unrelated contents: %s. "
+            "Remove them first. Only recognized fixture directories are replaced."
+            % (out, ", ".join(unrelated))
+        )
     out.mkdir(parents=True, exist_ok=True)
-    names = {spec["name"] for spec in SPECS}
-    for child in list(out.iterdir()):
-        if child.name == ".DS_Store":
-            continue
-        if child.name not in names:
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
     for spec in SPECS:
         dest = out / spec["name"]
         if dest.exists():
@@ -559,13 +568,46 @@ def _compare_trees(fresh: Path, committed: Path) -> bool:
     return ok
 
 
+def _recognized_fixture_names():
+    return {spec["name"] for spec in SPECS}
+
+
+def _unrelated_children(path: Path):
+    """Names under ``path`` that regeneration must not touch.
+
+    An absent directory has none. A present directory may contain the
+    recognized fixture directories and ``.DS_Store``. Anything else,
+    including a fixture name that is not a directory, is unrelated.
+    """
+
+    if not path.exists():
+        return []
+    if not path.is_dir():
+        return [path.name]
+    recognized = _recognized_fixture_names()
+    unrelated = []
+    for child in path.iterdir():
+        if child.name == ".DS_Store":
+            continue
+        if child.name not in recognized or not child.is_dir():
+            unrelated.append(child.name)
+    return sorted(unrelated)
+
+
 def _safe_dir(path: Path) -> Path:
     path = path.expanduser()
     if path.exists():
         resolved = path.resolve()
     else:
         resolved = path.absolute()
-    forbidden = {Path("/").resolve(), Path.home().resolve()}
+    package = Path(__file__).resolve().parent
+    repo = package.parents[1]
+    forbidden = {
+        Path("/").resolve(),
+        Path.home().resolve(),
+        package,
+        repo,
+    }
     if resolved in forbidden:
         raise SystemExit("refusing to use %s as the fixture directory" % resolved)
     return path

@@ -164,6 +164,52 @@ class PcdTests(unittest.TestCase):
             loaded["binary_compressed"]["_"], np.zeros(4, dtype=np.uint8)
         )
 
+    def test_pcd_compressed_keeps_underscore_fields(self):
+        # PCL padding is the exact name "_". "_intensity" is stored.
+        intensity = np.array([7.0, 7.0], dtype=np.float32)
+        padding = np.array([9, 8], dtype=np.uint8)
+        arrays = {
+            "x": np.array([1.0, 4.0], dtype=np.float32),
+            "y": np.array([2.0, 5.0], dtype=np.float32),
+            "z": np.array([3.0, 6.0], dtype=np.float32),
+            "_": padding,
+            "_intensity": intensity,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "round.pcd"
+            write_pcd(str(path), arrays, data="binary_compressed")
+            xyz = read_pcd(str(path), fields=("x", "y", "z"))
+            full = read_pcd(str(path), fields=("x", "_", "_intensity"))
+        np.testing.assert_array_equal(xyz["x"], arrays["x"])
+        np.testing.assert_array_equal(xyz["y"], arrays["y"])
+        np.testing.assert_array_equal(xyz["z"], arrays["z"])
+        np.testing.assert_array_equal(full["_intensity"], intensity)
+        np.testing.assert_array_equal(full["_"], np.zeros(2, dtype=np.uint8))
+        # A payload that actually stores _intensity must load, including
+        # when the caller asks only for xyz. Field order is x, y, z, then
+        # _intensity, each as a plane of two float32 values.
+        raw = struct.pack("<ffffffff", 1, 4, 2, 5, 3, 6, 7, 7)
+        self.assertEqual(len(raw), 32)
+        compressed = bytes([len(raw) - 1]) + raw
+        payload = struct.pack("<II", len(compressed), len(raw)) + compressed
+        body = _header(
+            "binary_compressed",
+            "x y z _intensity",
+            "4 4 4 4",
+            "F F F F",
+            "1 1 1 1",
+            2,
+        ).encode("ascii") + payload
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hand.pcd"
+            path.write_bytes(body)
+            xyz_only = read_pcd(str(path), fields=("x", "y", "z"))
+            stored = read_pcd(str(path), fields=("_intensity",))
+        np.testing.assert_array_equal(xyz_only["x"], np.array([1, 4], dtype=np.float32))
+        np.testing.assert_array_equal(xyz_only["y"], np.array([2, 5], dtype=np.float32))
+        np.testing.assert_array_equal(xyz_only["z"], np.array([3, 6], dtype=np.float32))
+        np.testing.assert_array_equal(stored["_intensity"], intensity)
+
     def test_pcd_width_height_points_mismatch_errors(self):
         mismatch = "\n".join(
             [

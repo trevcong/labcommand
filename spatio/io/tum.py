@@ -133,12 +133,12 @@ def read_tum(path: str, normalize_quat: bool = False) -> Trajectory:
 
 
 def write_tum(path: str, traj: Trajectory, comments: Sequence[str] = ()) -> None:
-    """Write ``traj`` with ``%.9f`` for time and ``%.9g`` for the other columns.
+    """Write ``traj`` with ``%.9f`` on every column.
 
-    ``%.9f`` round-trips epoch-second float64 values to well inside 1e-9 s.
-    ``%.9g`` has nine significant digits, so a coordinate with magnitude in
-    [1, 10) can move by up to 5e-9 m. Comments are written first, one ``#``
-    line each. The file uses LF newlines.
+    Nine digits after the decimal keep a round trip inside 1e-9 s and
+    1e-9 m. The original ``%.9g`` position format does not: on coordinates
+    in [1, 10) its absolute error reaches 5e-9 m. Comments are written
+    first, one ``#`` line each. The file uses LF newlines.
     """
 
     if len(traj.t) != len(traj.xyz) or len(traj.t) != len(traj.quat_xyzw):
@@ -157,7 +157,7 @@ def write_tum(path: str, traj: Trajectory, comments: Sequence[str] = ()) -> None
         x, y, z = (float(v) for v in traj.xyz[i])
         qx, qy, qz, qw = (float(v) for v in traj.quat_xyzw[i])
         lines.append(
-            "%.9f %.9g %.9g %.9g %.9g %.9g %.9g %.9g" % (t, x, y, z, qx, qy, qz, qw)
+            "%.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f" % (t, x, y, z, qx, qy, qz, qw)
         )
     payload = ("\n".join(lines) + ("\n" if lines else ""))
     with open(path, "w", encoding="utf-8", newline="\n") as handle:

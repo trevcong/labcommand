@@ -6,6 +6,7 @@ import json
 import math
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -186,6 +187,97 @@ def _near(test, name, got, want, tol):
 
 
 class FixtureTests(unittest.TestCase):
+    def test_regeneration_refuses_unrelated_contents(self):
+        from spatio.io.make_fixtures import _safe_dir, write_fixtures
+
+        package = Path(__file__).resolve().parents[1]
+        repo = package.parents[1]
+        for path in (repo, package, Path("/"), Path.home()):
+            with self.assertRaises(SystemExit):
+                _safe_dir(path)
+        source = (package / "tum.py").read_bytes()
+        with self.assertRaises(SystemExit) as package_refusal:
+            write_fixtures(package)
+        self.assertIn("refusing", str(package_refusal.exception))
+        self.assertEqual((package / "tum.py").read_bytes(), source)
+        proc = subprocess.run(
+            [sys.executable, "-m", "spatio.io.make_fixtures", "--out", "spatio/io"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + "\n" + proc.stderr)
+        self.assertIn("refusing", (proc.stderr + proc.stdout).lower())
+        self.assertEqual((package / "tum.py").read_bytes(), source)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dirty = root / "dirty"
+            dirty.mkdir()
+            kept = dirty / "README.md"
+            kept.write_text("keep\n", encoding="utf-8")
+            nested = dirty / "loop_5cm"
+            nested.mkdir()
+            (nested / "old.txt").write_text("old\n", encoding="utf-8")
+            with self.assertRaises(SystemExit) as dirty_refusal:
+                write_fixtures(dirty)
+            self.assertIn("unrelated", str(dirty_refusal.exception))
+            self.assertEqual(kept.read_text(encoding="utf-8"), "keep\n")
+            self.assertEqual((nested / "old.txt").read_text(encoding="utf-8"), "old\n")
+            self.assertFalse((dirty / "loop_15cm").exists())
+            named = root / "named"
+            named.mkdir()
+            marker = named / "loop_5cm"
+            marker.write_text("not a directory\n", encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                write_fixtures(named)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "not a directory\n")
+            blocked = root / "blocked"
+            blocked.write_text("file\n", encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                write_fixtures(blocked)
+            self.assertEqual(blocked.read_text(encoding="utf-8"), "file\n")
+            cli = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "spatio.io.make_fixtures",
+                    "--out",
+                    str(dirty),
+                ],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(cli.returncode, 0)
+            self.assertIn("unrelated", cli.stderr.lower())
+            self.assertEqual(kept.read_text(encoding="utf-8"), "keep\n")
+            clean = root / "clean"
+            clean.mkdir()
+            (clean / ".DS_Store").write_bytes(b"store")
+            (clean / "loop_5cm").mkdir()
+            (clean / "loop_5cm" / "old.txt").write_text("replace me\n", encoding="utf-8")
+            write_fixtures(clean)
+            self.assertEqual((clean / ".DS_Store").read_bytes(), b"store")
+            self.assertFalse((clean / "loop_5cm" / "old.txt").exists())
+            self.assertTrue((clean / "loop_5cm" / "trajectory.tum").is_file())
+            children = {path.name for path in clean.iterdir()}
+            self.assertEqual(
+                children,
+                {
+                    ".DS_Store",
+                    "gap_2s",
+                    "loop_15cm",
+                    "loop_5cm",
+                    "loop_heading_10deg",
+                    "loop_vertical_8cm",
+                    "map_doubled_wall_6cm",
+                    "map_sharp_wall",
+                    "pcd_formats",
+                    "stationary_60s",
+                    "timestamp_reset",
+                },
+            )
+
     def test_golden_fixtures_match_regeneration(self):
         proc = subprocess.run(
             [

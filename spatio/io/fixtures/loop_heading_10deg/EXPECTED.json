@@ -8,7 +8,7 @@
   "return_error_d3_m": 0.0,
   "return_error_horizontal_m": 0.0,
   "return_error_vertical_m": 0.0,
-  "heading_error_deg": 9.99999999357453,
+  "heading_error_deg": 10.000000028341468,
   "stationary_window_s": 10.0,
   "map_points": 8,
   "wall_separation_m": null,

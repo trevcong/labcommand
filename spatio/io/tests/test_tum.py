@@ -36,8 +36,7 @@ def _memory(times, xyz=None, quat=None):
 
 class TumTests(unittest.TestCase):
     def test_tum_roundtrip_exact(self):
-        # %.9f keeps epoch seconds inside 1e-9 s. %.9g has nine significant
-        # digits, so a coordinate in [1, 10) can move by at most 5e-9 m.
+        # %.9f keeps time, position, and quaternion inside 1e-9.
         traj = square_loop(end_offset_m=(0.03, 0.04, 0.0), end_yaw_deg=10.0)
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "trajectory.tum")
@@ -47,13 +46,39 @@ class TumTests(unittest.TestCase):
             self.assertNotIn("\r", text)
             back = read_tum(path)
         self.assertLessEqual(float(np.max(np.abs(back.t - traj.t))), 1e-9)
-        self.assertLessEqual(float(np.max(np.abs(back.xyz - traj.xyz))), 5e-9)
+        self.assertLessEqual(float(np.max(np.abs(back.xyz - traj.xyz))), 1e-9)
         self.assertLessEqual(
-            float(np.max(np.abs(back.quat_xyzw - traj.quat_xyzw))), 5e-9
+            float(np.max(np.abs(back.quat_xyzw - traj.quat_xyzw))), 1e-9
         )
         self.assertEqual(check_trajectory(back), [])
         # File order is the array order, including the opening hold.
         self.assertLess(float(back.t[0]), float(back.t[-1]))
+
+    def test_tum_position_roundtrip_within_1e9(self):
+        # 1.100083214967233 is the square-loop coordinate whose %.9g form
+        # moved by 4.967e-9 m. The writer must keep that point inside 1e-9 m.
+        bad = 1.100083214967233
+        self.assertGreater(abs(float("%.9g" % bad) - bad), 1e-9)
+        xyz = np.array(
+            [
+                [bad, -4.000000123, 0.03],
+                [9.999999994, 0.150000001, -0.08],
+                [0.0, 10.5, 100.123456789],
+            ],
+            dtype=np.float64,
+        )
+        traj = _memory([1786223548.0, 1786223549.0, 1786223550.0], xyz=xyz)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "trajectory.tum")
+            write_tum(path, traj)
+            text = Path(path).read_text(encoding="utf-8")
+            back = read_tum(path)
+        self.assertIn("%.9f" % bad, text)
+        self.assertLessEqual(float(np.max(np.abs(back.t - traj.t))), 1e-9)
+        self.assertLessEqual(float(np.max(np.abs(back.xyz - traj.xyz))), 1e-9)
+        self.assertLessEqual(
+            float(np.max(np.abs(back.quat_xyzw - traj.quat_xyzw))), 1e-9
+        )
 
     def test_tum_comment_and_blank_lines(self):
         body = "\n".join(
