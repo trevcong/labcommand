@@ -274,7 +274,7 @@ These are written to become `spatio/memory/tests/test_v2_*.py`, one test per cas
 - Given a lidar detection D of X at `t0` (K1), which the purge never deletes. Look-again requests A and B for X are created at injected wall times `t0 + 20` (K2) and `t0 + 30` (K3). A camera detection F of X is acquired at `t0 + 50` (K4). Every report below uses `now = t0 + 60`. R3 = `report(known_at = K3)` and R4 = `report(known_at = K4)` are saved. Both have `open_look_again == [A, B]`.
 - A is fulfilled by F at K5, and B is cancelled at K6. Afterwards `report(known_at = K3)` and `report(known_at = K4)` are byte-identical to R3 and R4. At K5, `open_look_again == [B]`. At K6 it is `[]`.
 - An `UPDATE` on a request or closure row raises, and so does a second closure of A.
-- `purge_expired` deletes F at K7. R3 is still byte-identical, since F is not recorded at K3. At K4, K5 and K6 the open lists are still `[A, B]`, `[B]` and `[]`. Only `complete`, `purged_ids` and the sighting fields change: the sighting falls back to D (§2.6). A's closure still names F.
+- `purge_expired` deletes F at K7. R3 is still byte-identical, since F is not recorded at K3. At K4, K5 and K6 the open lists are still `[A, B]`, `[B]` and `[]`, and A's closure still names F. The rest of those answers changes as §2.6 says: the sighting falls back to D, 60 s old, so X becomes `LAST_SEEN` with `complete = False` and `purged_ids == [F]`.
 - On a copy of the store taken before K7, F retracted as an observation at K7 leaves A closed: at K7, `open_look_again == []`.
 
 ### V2-4. A trajectory correction makes no false "moved"
@@ -302,6 +302,7 @@ The drift investigation's lesson in test form: a pose error must not read as an 
 - An absence A in R1 at `t0 + 5` (K2) has region `[2.42, 2.71] × [1.06, 1.35] × [-0.01, 0.41]` and coverage 1.0. Its corners in D's body frame span about `[0.415, 0.787] × [-0.187, 0.185] × [-0.01, 0.41]`, within the footprint + 0.10 m.
 - At `now = t0 + 10, known_at = K2`: `compare_positions(D, A)` is comparable with `frame == R1` and `revisions_used == {T1, R1}`. X is `NOT_SEEN_ON_RECHECK` with `absence.observation_id == A`.
 - At `known_at = K1` X is `CURRENT` (V2-1).
+- Control, the re-boxing trap: with a 45° yaw instead, D's corners map to about `[2.283, 2.566] × [1.283, 1.566] × [0, 0.4]`, and A's region is `[2.27, 2.58] × [1.27, 1.58] × [-0.01, 0.41]`. Re-boxing D into R1 and running v1's `_region_is_tight` on the re-box passes; assert that as a precondition. A's corners in D's body frame span about `[0.382, 0.820] × [-0.219, 0.219]`, about 0.02 m beyond the footprint + 0.10 m. So A does not count, and X stays `CURRENT` with `absence is None`.
 
 `test_V2_4e_body_sighting_map_absence_mismatched_revision`
 - The same D and A, then trajectory revision T2 (parent T1, same pose at `t0`) at K3, and map revision R2 built from T2 at K4.
@@ -362,8 +363,9 @@ Also unchanged from v1: no object merge or split, no named places, a single loca
 
 1. Approve schema v2 at all (DESIGN §3 requires it), and the star topology (§2.4) over chained alignments.
 2. Set the alignment gates for a cart against a building map: fit, basin margin and held-out residual. The rig values are placeholders.
-3. Set `MOVED_SIGMA_K` (3 proposed) for the comparability predicate.
+3. Set `MOVED_SIGMA_K` (3 proposed) for the comparability predicate, and confirm that a `body` observation's pose adds 0 to `sigma_m` and to the absence containment growth (§2.5) until a pose σ is recorded.
 4. Allow observation retraction (§2.2)? I recommend yes, operator-only.
 5. Retention against reproducibility: confirm that a purge may make an old report `complete = False`, rather than keeping images longer. Two parts of this conflict with the workplan's wording that "derived records are kept locally for 30 days" (v1 DESIGN §8), so they need your decision, not my assumption:
    - `purged_associations` keeps an object association, which is a derived record, past 30 days. It holds ids and transaction numbers only.
    - A retraction's free-text `reason` stays after its target is purged. That text may name what the image showed. The alternative is to blank `reason` in the purge, keeping the row.
+   - A look-again closure keeps `fulfilled_by_observation_id` after that camera observation is purged (§2.1), where v1 nulls it. When the request names an object, that link is an object association kept past 30 days. It holds ids only. The alternative is v1's: drop the id at purge, which makes the closure row mutable.
