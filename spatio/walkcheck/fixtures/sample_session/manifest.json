@@ -1,0 +1,12 @@
+{
+  "run_id": "fixture-sample-5cm",
+  "source_recording": null,
+  "sensor": "synthetic",
+  "fastlio_revision": null,
+  "config_file": null,
+  "config_sha256": null,
+  "image": null,
+  "created_at": "2026-10-19T00:00:00+00:00",
+  "notes": "Synthetic sample session for the walk checker. Not a physical walk. replay demonstrated; physical accuracy not evaluated",
+  "physical_accuracy_evaluated": false
+}
