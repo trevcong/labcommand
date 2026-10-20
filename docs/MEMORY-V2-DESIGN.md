@@ -64,7 +64,7 @@ There are three axes. Each comparison uses one of them, and the doc says which.
 
 **Queries.** Every read takes `known_at`, a `txn_id`. It is optional only in the sense that `None` means "the newest committed transaction"; the answer always reports the `txn_id` it used, so it can be run again. `known_at_wall(T)` is a pure helper that returns the newest `txn_id` with `recorded_at ≤ T`.
 
-**Visibility rule.** For a query at `(now, known_at)`, a row is visible when `recorded_txn ≤ known_at` and it has no retraction with `retracted_txn ≤ known_at`. Then v1's rules run unchanged on the visible rows, with `acquired_at ≤ now` as before. A late observation is visible only to queries whose `known_at` is at or after its ingest; it never changes an answer given before it was recorded.
+**Visibility rule.** For a query at `(now, known_at)`, a row is visible when `recorded_txn ≤ known_at` and it is not invalid at `known_at`: neither it nor any row it depends on has a retraction with `retracted_txn ≤ known_at` (§2.2). Then v1's rules run unchanged on the visible rows that have a position in a current frame (§2.3), or a `body` position under the active trajectory revision, with `acquired_at ≤ now` as before. A visible row in a superseded frame stays readable as history and counts as neither a sighting nor an absence. A late observation is visible only to queries whose `known_at` is at or after its ingest; it never changes an answer given before it was recorded.
 
 **Look-again fulfilment** keeps v1's rule: the fulfilling observation's `acquired_at` must be ≥ the request's creation time. v2 states the request's creation time as its transaction's `recorded_at`, so this stays v1's single sensor-vs-wall comparison, with the same caveat (unverified without a disciplined sensor clock, DESIGN §2). An observation acquired before the request but ingested after it does not fulfil it.
 
@@ -74,19 +74,36 @@ There are three axes. Each comparison uses one of them, and the doc says which.
 - `look_again_closures(request_id UNIQUE, outcome, fulfilled_by_observation_id, recorded_txn)`, with `outcome` either `fulfilled` or `cancelled`. A request closes at most once, and a closure is never retracted. To ask again, file a new request.
 - `fulfilled_by_observation_id` is a plain id with no foreign key. It is set exactly when `outcome = 'fulfilled'`. The purge does not touch it. If that observation is purged, the id resolves through `purged_observations` (§2.6). v1's third transition, which nulls the id at purge time, does not exist in v2.
 - Fulfilment needs the observation to be visible at the fulfilling transaction (§2.1), plus v1's acquisition rule above.
-- A later retraction of the fulfilling observation does not reopen the request. A closure records an action that was taken, not evidence. It stays closed, and an operator who wants another look files a new request.
+- A later retraction of the fulfilling observation, or of a session or revision it depends on (§2.2), does not reopen the request. A closure records an action that was taken, not evidence. It stays closed, and an operator who wants another look files a new request.
 - The open requests at `known_at` are those with `recorded_txn ≤ known_at` and no closure with `recorded_txn ≤ known_at`. As in v1, `now` does not filter them.
 
 ### 2.2 Retractions
 
 [proposal] One append-only table replaces v1's in-row `retracted_at`:
 
-`retractions(retraction_id, target_kind, target_id, recorded_txn, reason, retracted_by)`, with `target_kind` one of `interpretation`, `observation`, `alignment`, `trajectory_revision`.
+`retractions(retraction_id, target_kind, target_id, recorded_txn, reason, retracted_by)`, with `target_kind` one of `interpretation`, `observation`, `alignment`, `trajectory_revision`, `session`.
 
 - A target can be retracted once (`UNIQUE (target_kind, target_id)`). A retraction cannot itself be retracted. To undo one, add the content again as a new row. This keeps the history one-directional, as v1's trigger does.
 - Retracting an **observation** is new. It is for a measurement later found bad (a sensor fault, a clock offset, the wrong session). The row stays, immutable; it stops counting from `retracted_txn` on. It is not a deletion and not an absence.
-- A **correction** is one transaction: retract the old row and insert its replacement. Both carry the same `recorded_txn`, so no `known_at` can see neither or both.
-- `retracted_by` is an operator id or `model:<name>@<version>`. A model may retract only interpretations it wrote [proposal]. A model can never retract an observation, alignment or trajectory revision ("guesses never flow down", northstar §2).
+- Retracting a **session** is new too. It is for a whole walk later found bad (the wrong building, a corrupt recording, a clock offset across the walk).
+- A **correction** is one transaction: retract the old row and insert its replacement. Both carry the same `recorded_txn`, so no `known_at` can see neither or both. A session is corrected the same way: retract it and ingest the replacement as a new session.
+- `retracted_by` is an operator id or `model:<name>@<version>`. A model may retract only interpretations it wrote [proposal]. A model can never retract an observation, alignment, trajectory revision or session ("guesses never flow down", northstar §2).
+
+**Retraction is transitive** [proposal]. Retracting a session or a trajectory revision invalidates all evidence derived from it, and all evidence derived from that. A row is *invalid* at `known_at` when it, or any row it depends on, has a retraction with `retracted_txn ≤ known_at`. An invalid row counts as retracted: it is not visible (§2.1), supports no sighting, refutes nothing and enables no comparison. The dependencies are immutable columns:
+
+| Row | Depends on |
+|---|---|
+| interpretation | its observation |
+| observation | its session; a `map`-frame one also its map revision |
+| trajectory revision | its session and its parent revision |
+| map revision | the trajectory revision it was built from |
+| alignment | its `from_frame` and `to_frame` map revisions |
+
+A `body` observation's position depends on its session's active trajectory revision (§2.3). That is checked per revision, not stored as a column.
+
+- Invalidity is computed at read time from these columns and `retractions`. A retraction writes one row, for its target, and none for what depends on it. Cascade rows would collide with `UNIQUE (target_kind, target_id)` when a dependent row is later retracted on its own, and would make what is stored depend on the graph at write time. Since nothing else is written, every answer at a `known_at` before the retraction is unchanged (V2-3).
+- A **trajectory correction** (a new revision, nothing retracted) supersedes instead. The rows derived from the old revision are not invalid, and answers before the new revision's `recorded_txn` keep them. From that transaction on, they take part in no conclusion: their frame is no longer current (§2.3, §2.5).
+- Either way, every conclusion that depended on the evidence is recomputed without it. An absence from a retracted session cannot refute a sighting from another session, and a "moved" claim or absence that used it is superseded (§2.5). Only a look-again closure stays as it is, because it records an action, not evidence (§2.1).
 
 ### 2.3 Map and trajectory revisions
 
@@ -95,7 +112,8 @@ A walk produces a trajectory, and the map is built from it. The two are revised 
 - `trajectory_revisions(trajectory_revision_id, session_id, revision, tum_sha256, parent_revision_id, method, method_version, params_sha256, reason, recorded_txn)`. Revision 1 is the session's FAST-LIO output. A loop-closure back end, an offline bundle adjustment or a timing fix adds revision 2, with its parent.
 - `map_revisions(map_id, revision, map_pcd_sha256, trajectory_revision_id, built_by, recorded_txn)`. A map revision names the trajectory revision it was built from. Every revision is kept. This is room memory's `map_epoch`, without the overwrite.
 - A **frame** is `(map_id, revision)`. Every stored position names its frame, as v1's positions name their `map_id`.
-- The session's **active** trajectory revision at `known_at` is its newest revision visible at `known_at` (§2.1). A retracted revision falls back to its parent.
+- The session's **active** trajectory revision at `known_at` is its newest revision visible at `known_at` (§2.1). A retracted revision falls back to its parent. Retracting a revision also invalidates its descendants (§2.2), so the fallback is the newest revision with no retracted ancestor. If there is none, the session's `body` observations have no position (`source_retracted`). A revision rebuilt from the raw recording, not from a parent's poses, is recorded with `parent_revision_id = NULL` [proposal].
+- A frame is **current** at `known_at` when its map revision is valid (§2.2) and was built from its session's active trajectory revision. Only current frames take part in conclusions (§2.5).
 
 **Observation geometry** comes in two kinds [proposal]:
 
@@ -119,7 +137,7 @@ A trajectory correction is generally not rigid: the drift investigation measured
   - **basin uniqueness:** `basin_margin`, the score gap between the best solution and the best distinct solution from a seed grid. The drift investigation found the identity seed converged to a wrong basin (M1: 1.37 m / +22°, against 1.81 m / −15.2°). Only the 600-seed grid exposed it (M16). One seed is not evidence. Repeating rack aisles (northstar §6) make this the main failure mode;
   - **held-out check:** residual at `holdout_n` points or landmarks not used in the fit (the Codex suggestion in the drift investigation).
 - **Star topology, no chaining** [proposal]. A session aligns only directly into a reference revision. Transforms are never composed through other sessions, so errors do not accumulate unseen. A new reference revision needs fresh alignments; old ones stay valid only for the revision they name.
-- An alignment can be retracted (§2.2), for example when a later walk shows it locked onto the wrong aisle. Comparisons that used it then become `not_comparable` for every `known_at` from the retraction on.
+- An alignment can be retracted (§2.2), for example when a later walk shows it locked onto the wrong aisle. Comparisons that used it then become `not_comparable` for every `known_at` from the retraction on. It also stops counting, with no retraction row of its own, while its `from_frame` or `to_frame` is invalid (`source_retracted`) or not current (`superseded_revision`) (§2.2, §2.3).
 
 ### 2.5 Comparability: the rule behind "moved" and absence
 
@@ -129,7 +147,7 @@ v2 compares positions only through one function [proposal]:
 
 **Resolved frame.** At `known_at`, each observation resolves to at most one map revision:
 
-- a `map` observation resolves to the revision it is bound to;
+- a `map` observation resolves to the revision it is bound to, while that frame is current (§2.3). Otherwise it has no resolved frame, and it is neither a sighting nor an absence for any status at that `known_at`;
 - a `body` observation resolves to its session's *active map revision*. That is the newest visible map revision built from the session's active trajectory revision (§2.3). If no such revision is visible yet, it has no resolved frame. A `body` observation whose pose is `invalid` under the active trajectory revision (§2.3) has no position at all, and is not comparable (`invalid_pose`).
 
 Two observations are comparable at `known_at` only when one of these holds:
@@ -138,13 +156,15 @@ Two observations are comparable at `known_at` only when one of these holds:
 2. both resolve to the **same map revision**, whatever their `geometry_frame`. A `body` and a `map` observation are comparable when the `map` one is bound to the `body` one's active map revision. This is how a same-session absence, which is always `map`-frame (below), rechecks a `body`-frame sighting; or
 3. each resolved frame has a visible `validated` alignment into the **same reference revision**, and the positions are compared there.
 
-Anything else returns `comparable = False` with a reason (`different_frames`, `no_validated_alignment`, `alignment_retracted`, `superseded_revision`, `no_map_revision`, `invalid_pose`). It never returns a distance. In particular, a position from trajectory revision 1 is never compared with one from revision 2. A `body` observation under T2 against a `map` observation bound to a revision built from T1 is `superseded_revision`. If T2 has no map revision yet, the reason is `no_map_revision`.
+Under every rule, both observations must be valid at `known_at` (§2.2); otherwise the reason is `source_retracted`. Under rules 2 and 3, every frame used must be current (§2.3); otherwise the reason is `superseded_revision`.
+
+Anything else returns `comparable = False` with a reason (`different_frames`, `no_validated_alignment`, `alignment_retracted`, `superseded_revision`, `no_map_revision`, `invalid_pose`, `source_retracted`). It never returns a distance. In particular, a position from trajectory revision 1 is never compared with one from revision 2. A `body` observation under T2 against a `map` observation bound to a revision built from T1 is `superseded_revision`. If T2 has no map revision yet, the reason is `no_map_revision`.
 
 `sigma_m` is `sqrt(σa² + σb²)`, plus each alignment's `rms_m` when case 3 applies. The pose leg of a `body` observation adds nothing: v1 records no pose σ, only the bracket check (`pose_quality`), and that check is the only gate on it [provisional].
 
 Uses:
-- **Absence.** v1's step 3 (`map_id = s.map_id`, DESIGN §6) becomes "comparable with s", tested in the absence's own frame (below).
-- **Moved.** v2 does not detect changes (§4). A future detector may call something "moved" only when `compare_positions` is comparable and `distance_m > MOVED_SIGMA_K × sigma_m` [provisional: `MOVED_SIGMA_K = 3`], and the claim stores the `revisions_used` and `known_at`. When a later trajectory revision or a retracted alignment makes that comparison non-comparable, the claim is superseded, never silently kept.
+- **Absence.** v1's step 3 (`map_id = s.map_id`, DESIGN §6) becomes "comparable with s", tested in the absence's own frame (below). An absence that is invalid, or whose frame or alignment is no longer current, refutes nothing. The status is recomputed without it.
+- **Moved.** v2 does not detect changes (§4). A future detector may call something "moved" only when `compare_positions` is comparable and `distance_m > MOVED_SIGMA_K × sigma_m` [provisional: `MOVED_SIGMA_K = 3`], and the claim stores the `revisions_used` and `known_at`. When a later trajectory revision, a retracted alignment, or a retraction of anything either observation depends on (§2.2) makes that comparison non-comparable, the claim is superseded, never silently kept.
 
 **Absence across frames** [proposal]. An absence region and its one coverage number are exact only in the frame where the region was measured, its *native* frame. v2 never re-boxes that region in another frame. Re-boxing a rotated region adds corners nobody measured, and v1's tightness test can still accept a footprint sitting in one of them (V2-5e: the 45° re-box of `[-0.03, 0.03]²` passes `_region_is_tight` for a footprint at `[0.033, 0.039]²`, which lies wholly outside the measured square). Instead, s's footprint is brought into the absence's native frame and v1's step 3 runs there:
 
@@ -171,7 +191,7 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
   **When an answer is incomplete.** `object_status(X, now, known_at)` returns `complete = False` and lists in `purged_ids` every purged observation D with a tombstoned association A where all of these hold:
   - `A.object_id = X`;
   - `A.recorded_txn ≤ known_at`, and A has no retraction with `retracted_txn ≤ known_at`;
-  - `D.recorded_txn ≤ known_at`, and D has no retraction with `retracted_txn ≤ known_at`;
+  - `D.recorded_txn ≤ known_at`, and D is not invalid at `known_at`: neither D nor its session has a retraction with `retracted_txn ≤ known_at` (§2.2). The tombstone keeps `session_id` but not D's trajectory revision, so a trajectory retraction cannot be checked here and D stays listed. That over-reports, as below;
   - `D.acquired_at ≤ now`.
 
   `purged_txn` is not compared. A purge is not a retraction: the evidence was known and is now missing, both before and after the purge. The tombstone does not keep the inputs to v1's sighting gates (confidences, pose validity). Pose validity depends on the trajectory revision anyway (§2.3). So the flag means "this answer **may** have depended on purged evidence". It can over-report and never under-reports. In the other direction, the status reason uses the same set: X with no retained sighting and a non-empty `purged_ids` is `UNKNOWN / no_retained_sightings` (v1 DESIGN §6 step 2), never `never_seen`.
@@ -181,7 +201,7 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 ### 2.7 Unaligned sessions stay separate
 
 - A session with no visible `validated` alignment lives only in its own frames. That is exactly v1's behaviour: its absences cannot refute another session's sightings, and its places are never compared with another session's.
-- A `rejected` or retracted alignment counts as none.
+- A `rejected` or retracted alignment counts as none, and so does one that is invalid or not current (§2.4).
 - `object_status` reports which frame its answer is in. A sighting in an unaligned session can still be `CURRENT` or `LAST_SEEN` in that session's frame. It is never reported in the reference frame.
 - `describe()` keeps v1's wording and appends `; not aligned to the building map` when the sighting's frame has no validated alignment [proposal].
 
@@ -295,7 +315,7 @@ The drift investigation's lesson in test form: a pose error must not read as an 
 `test_V2_4c_map_frame_not_transformed`
 - Given a `map`-frame detection of X bound to map revision R1 (built from T1), and T2 recorded with map revision R2.
 - The R1 detection is not projected into R2. Comparing it with an R2 observation returns `comparable = False`.
-- X's status in frame R2 uses only observations re-extracted from R2. With none yet, X in R2 is `UNKNOWN`, and in R1 it is unchanged.
+- X's status in frame R2 uses only observations re-extracted from R2. With none yet, X in R2 is `UNKNOWN`. From T2's transaction on, R1 is not current (§2.3), so the R1 detection supports no status in any frame, R1 included. At `known_at` before T2, X in R1 is unchanged (V2-3).
 
 `test_V2_4d_body_sighting_map_absence_same_revision`
 - Given a body-frame detection D of X at `t0` (K1), footprint `[0.5, 0.7] × [-0.1, 0.1] × [0, 0.4]` in the body frame. T1's pose at `t0` is a 20° yaw about z with translation (2, 1, 0), valid. Its corners map into R1 with AABB about `[2.436, 2.692] × [1.077, 1.333] × [0, 0.4]`.
@@ -349,6 +369,37 @@ The drift investigation's lesson in test form: a pose error must not read as an 
 - Given a v1 database after I27's purge, so X has `purged_sightings = 1` and no rows.
 - After migration, X at `known_at=None` is `UNKNOWN / no_retained_sightings`, `purged_sightings == 1`, `complete = False`, `purged_unattributed == 1`, `purged_ids == []`, as v1 reports it.
 
+### V2-7. Retracting or correcting a source invalidates what was derived from it
+
+Unless stated, S1 and S2 are each aligned `validated` into reference revision B1, as in V2-5b. S2 spans `[t0 + 100, t0 + 300]`, with trajectory revision U1 and map revision Q1 built from it; its alignment is from Q1. D is a valid detection of X in S1 at `t0`. A is an absence over X in S2, bound to Q1, at `t0 + 150`, which passes the native-frame test (§2.5) against D. Both are recorded through K1. Every query uses `now = t0 + 200`.
+
+`test_V2_7_retracted_session_absence_cannot_refute`
+- A camera detection E of Y in S2 at `t0 + 160` is recorded at K1 and purged at K2. Y has no other evidence.
+- At `known_at = K2`: X is `NOT_SEEN_ON_RECHECK` in frame B1, with `absence.observation_id == A`. Y is `UNKNOWN / no_retained_sightings` with `purged_ids == [E]`.
+- At K3 the operator retracts S2 (reason "clock offset").
+- At `known_at = K3`: X is `LAST_SEEN` in frame B1 with `absence is None`. `compare_positions(D, A)` returns `comparable = False, reason = "source_retracted"` and `distance_m is None`. Y is `UNKNOWN / never_seen`, `complete = True`, `purged_ids == []`.
+- At `known_at = K2`, both answers are byte-identical to those before K3 (V2-3).
+- K3 added exactly one row to `retractions`, targeting S2. A, U1, Q1 and S2's alignment have no retraction row of their own. Retracting A afterwards succeeds and changes no answer.
+- Control: an absence A3 over X at `t0 + 180` in a third aligned session S3 (K4) makes X `NOT_SEEN_ON_RECHECK` again for `known_at ≥ K4`, with `absence.observation_id == A3`.
+- A model writer retracting a session raises `ValidationError`, and nothing is written.
+
+`test_V2_7b_retracted_trajectory_revision_is_transitive`
+- At K2, U1 is retracted.
+- At `known_at = K2`: Q1, S2's alignment and A are invalid, with no retraction rows of their own. X is `LAST_SEEN` with `absence is None`, and `compare_positions(D, A)` gives `source_retracted`. A `body` detection in S2 has no position, and comparing it gives `source_retracted`.
+- Descendants. On a copy of the store taken before K2: U2 (parent U1), Q2 built from U2, a `validated` alignment Q2 → B1, and an absence A2 re-extracted from Q2 with A's region are recorded at K2. X is `NOT_SEEN_ON_RECHECK` with A2. Retracting U1 at K3 invalidates U2, Q2, that alignment and A2 too: X is `LAST_SEEN` for `known_at ≥ K3`.
+- Rebuilt root. On the same copy, U3 with `parent_revision_id = NULL`, Q3 built from it, an alignment Q3 → B1 and a re-extracted absence A3, recorded at K4, are not invalidated by U1's retraction. X is `NOT_SEEN_ON_RECHECK` with A3 for `known_at ≥ K4`.
+
+`test_V2_7c_trajectory_correction_supersedes_derived_evidence`
+- At K2, U2 (parent U1) is recorded. Nothing is retracted.
+- At `known_at = K2`: Q1 is not current. `compare_positions(D, A)` gives `superseded_revision`, and the Q1 → B1 alignment enables no comparison. X is `LAST_SEEN` with `absence is None`. A and the alignment each have no retraction and the alignment is `validated`, so this is the case rule 3 alone would let through.
+- At K3: Q2 built from U2, a `validated` alignment Q2 → B1, and an absence A2 re-extracted from Q2 with A's region. X is `NOT_SEEN_ON_RECHECK` with `absence.observation_id == A2` for `known_at ≥ K3`.
+- At `known_at = K1`, the answer is byte-identical to the one before K2.
+
+`test_V2_7d_moved_claim_recomputed_after_retraction`
+- Instead of A, a body-frame detection F of X in S2 at `t0 + 150` (K1). D and F are σ = 0.03 m, both alignments have `rms_m = 0.002`, and they are 0.5 m apart in B1. `compare_positions(D, F)` is comparable with `sigma_m ≈ 0.046`. The 3σ predicate is true, and a claim records `revisions_used = {T1, R1, U1, Q1}` and both alignments. X's newest sighting is F.
+- S2 is retracted at K2. At `known_at = K2`: the claim is reported superseded, `compare_positions(D, F)` gives `source_retracted`, and X's status is recomputed from D alone (`measured.observation_id == D`).
+- At `known_at = K1`, the claim and X's status are reported unchanged (V2-3).
+
 ## 4. Deferred, deliberately
 
 These are out of v2 and not designed here:
@@ -369,3 +420,4 @@ Also unchanged from v1: no object merge or split, no named places, a single loca
    - `purged_associations` keeps an object association, which is a derived record, past 30 days. It holds ids and transaction numbers only.
    - A retraction's free-text `reason` stays after its target is purged. That text may name what the image showed. The alternative is to blank `reason` in the purge, keeping the row.
    - A look-again closure keeps `fulfilled_by_observation_id` after that camera observation is purged (§2.1), where v1 nulls it. When the request names an object, that link is an object association kept past 30 days. It holds ids only. The alternative is v1's: drop the id at purge, which makes the closure row mutable.
+6. Approve transitive invalidation (§2.2): retracting a session or trajectory revision invalidates everything derived from it, including child trajectory revisions, so a rebuild from raw data must be recorded with no parent. A trajectory correction supersedes the old revision's map frame, alignments and map-frame observations rather than keeping them usable. Two consequences follow. A new trajectory revision on the reference map's session makes B1 not current, so every alignment into it stops counting until the sessions are aligned again. And a migrated session's first new trajectory revision retires all its migrated observations, which are bound to revision 1 (§2.9).
