@@ -16,7 +16,7 @@ Rules, applied on top of spatio.series R0-R5. They never upgrade a verdict:
       series (as R1 does for a changed FAST-LIO config).
   G2. A run counts only if spatio.series counts it AND its wall_patches show
       both (all, at least two) of the frozen spec's preselected patches
-      verified (spatio.walkday.result.acceptance_blockers). When spatio.series
+      verified (spatio.wall_scoring.acceptance_blockers). When spatio.series
       said PASS, the earliest three consecutive counting attempts are found
       again; if none remain the verdict is FAIL (R5: three or more attempts and
       no counting triple).
