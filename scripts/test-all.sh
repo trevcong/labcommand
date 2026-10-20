@@ -10,6 +10,7 @@ stages=(
   "Committed fixtures"
   "Spatio pytest"
   "Spark pytest"
+  "rosbags cross-check"
   "C++ configure"
   "C++ build"
   "C++ ctest"
@@ -24,12 +25,24 @@ for stage in "${stages[@]}"; do
 done
 current=0
 absent_recordings=""
+# SKIP_CPP=1 ends a run whose other stages pass with this code, never 0.
+# A stage failure that returns the same code is reported as 1 instead.
+PARTIAL_EXIT=10
+partial=""
 
 summary() {
   local status=$?
   trap - EXIT
   if [[ -n "$absent_recordings" ]]; then
     rmdir "$absent_recordings" || true
+  fi
+  local overall=FAIL
+  if [[ "$status" == 0 ]]; then
+    overall=PASS
+  elif [[ "$status" == "$PARTIAL_EXIT" && -n "$partial" && "$current" == "${#stages[@]}" ]]; then
+    overall="PARTIAL ($partial)"
+  elif [[ "$status" == "$PARTIAL_EXIT" ]]; then
+    status=1
   fi
   printf '\nLocal test summary (exit %s)\n' "$status"
   if [[ "$status" != 0 && "${results[$current]:-}" == "SKIPPED (not reached)" ]]; then
@@ -39,6 +52,7 @@ summary() {
   for ((i = 0; i < ${#stages[@]}; i++)); do
     printf '%s: %s\n' "${results[$i]}" "${stages[$i]}"
   done
+  printf 'Overall: %s\n' "$overall"
   exit "$status"
 }
 trap summary EXIT
@@ -89,8 +103,11 @@ run_stage "$PYTHON" -m unittest discover -s .github/scripts -p 'test_*.py'
 run_stage "$PYTHON" .github/scripts/ci_checks.py fixtures "$ROOT"
 run_stage "$SPATIO_PYTHON" -m pytest -q -rs spatio .github/scripts
 run_stage spark_pytest
+# pytest skips test_rosbags.py without rosbags; this script fails instead (issue #73).
+run_stage env PY="$PYTHON" bash scripts/check-rosbags.sh
 
 if [[ "${SKIP_CPP:-0}" == 1 ]]; then
+  partial="SKIP_CPP=1: 3 C++ stages skipped"
   for ((i = 0; i < 3; i++)); do
     results[$current]="SKIPPED (SKIP_CPP=1)"
     current=$((current + 1))
@@ -109,3 +126,7 @@ run_stage swift run LabCommandCoreTestsRunner
 run_stage swift build --product change-detect
 run_stage bash scripts/check-shared-goldens.sh
 run_stage "$SPATIO_PYTHON" -m spatio.io.make_fixtures --out spatio/io/fixtures --check
+
+if [[ -n "$partial" ]]; then
+  exit "$PARTIAL_EXIT"
+fi
