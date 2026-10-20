@@ -1,8 +1,8 @@
 # Spatio memory v2: time, revisions and alignment (design only)
 
-Status: design only, written 2026-10-20 for job B3 of the solidity plan. No code, schema or test changes come with it. Schema v2 needs Trevor's approval before anyone builds it (DESIGN §3, northstar M3).
+Status: design only, written 2026-10-20 for job B3 of the solidity plan. No code, schema or test changes come with it. Schema v2 needed Trevor's approval before anyone builds it (DESIGN §3, northstar M3). He gave it on 2026-10-20, and §5 records his decisions (job M5).
 
-Tags, as in the northstar: **[measured]** is read in the code cited; **[proposal]** is my recommendation, not decided; **[provisional]** marks a number Trevor sets before it is used.
+Tags, as in the northstar: **[measured]** is read in the code cited; **[proposal]** is my recommendation, not decided; **[provisional]** marks a number Trevor sets before it is used. Where §5 records a decision, that decision governs, whatever the inline tag says.
 
 ## 0. What this is grounded in
 
@@ -79,7 +79,7 @@ There are three axes. Each comparison uses one of them, and the doc says which.
 
 ### 2.2 Retractions
 
-[proposal] One append-only table replaces v1's in-row `retracted_at`:
+[proposal] One append-only table replaces v1's in-row `retracted_at`. The one exception is that the purge blanks `reason` (§2.6):
 
 `retractions(retraction_id, target_kind, target_id, recorded_txn, reason, retracted_by)`, with `target_kind` one of `interpretation`, `observation`, `alignment`, `trajectory_revision`, `session`.
 
@@ -188,6 +188,8 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 
   Neither table holds image data, a label, a confidence or geometry. Rows in `retractions` (§2.2) are never purged. Their targets may be deleted, but the retraction stays, so an association's retracted state at any `known_at` can still be worked out.
 
+  **A retraction's `reason` is blanked at purge** (decision 5, §5). The free text may name what the image showed. When the purge deletes a retraction's target (an observation, or an interpretation deleted in its cascade), it sets that retraction's `reason` to NULL in the same transaction. Every other column stays. This is the only change ever made to a `retractions` row. `reason` is not part of any status or report (§2.8), so blanking it changes no answer at any `known_at`.
+
   **When an answer is incomplete.** `object_status(X, now, known_at)` returns `complete = False` and lists in `purged_ids` every purged observation D with a tombstoned association A where all of these hold:
   - `A.object_id = X`;
   - `A.recorded_txn ≤ known_at`, and A has no retraction with `retracted_txn ≤ known_at`;
@@ -226,6 +228,10 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 ## 3. Acceptance scenarios (future tests)
 
 These are written to become `spatio/memory/tests/test_v2_*.py`, one test per case. They use v1's notation (DESIGN §9): `t0 = 1.76e9`, a "valid detection of X" with `measurement_confidence = 0.9` and a model interpretation linking it to X at confidence 0.9, and "absence over X" with coverage 1.0 and a region equal to X's AABB. `K1 < K2 < …` are transaction ids in write order. One session S1 spans `[t0, t0 + 200]` unless stated. S1 has trajectory revision T1 and map revision R1 built from it. Unless stated, a detection is `body`-frame with an identity pose under T1 throughout, so its footprint is X's AABB in R1. An absence is bound to R1. V2-1 is therefore a body/map recheck, compared under rule 2 of §2.5.
+
+**Required tests.** Trevor made these required (§5). A v2 build is not complete until each one exists and passes:
+
+- `test_V2_6c_migrated_session_first_trajectory_correction` (V2-6): a migrated session's first new trajectory revision retires its migrated observations without retracting or changing them (§5 decision 6).
 
 ### V2-1. A late observation does not rewrite the past
 
@@ -284,7 +290,7 @@ These are written to become `spatio/memory/tests/test_v2_*.py`, one test per cas
 
 - Control, on a copy of the store taken before K3: X at K1 and Y at K2 are both `CURRENT`, with `measured.observation_id == D`.
 - The column set of `purged_observations` and `purged_associations` contains no label, confidence, thumbnail path or geometry column.
-- The retraction written at K2 still exists after K3.
+- The retraction written at K2 still exists after K3, with its `reason` blank (NULL) and every other column unchanged (§2.6).
 
 `test_V2_3e_purge_flag_respects_now_and_observation_retraction`
 - D as in V2-3d, attributed to X only, purged at K3. X at `now = t0 − 1` has `complete = True` (D was not yet acquired).
@@ -369,6 +375,16 @@ The drift investigation's lesson in test form: a pose error must not read as an 
 - Given a v1 database after I27's purge, so X has `purged_sightings = 1` and no rows.
 - After migration, X at `known_at=None` is `UNKNOWN / no_retained_sightings`, `purged_sightings == 1`, `complete = False`, `purged_unattributed == 1`, `purged_ids == []`, as v1 reports it.
 
+`test_V2_6c_migrated_session_first_trajectory_correction` **(required, §5 decision 6)**
+- Given a v1 database with one session S and two valid detections of X in it, D at `t0` and E at `t0 + 5`. After migration at transaction KM, S has trajectory revision T1 and map revision R1 built from it, and D and E are `map`-frame observations bound to R1 (§2.9). Every query uses `now = t0 + 10`.
+- At `known_at = KM`: X is `CURRENT` with `measured.observation_id == E`, equal to v1's answer (V2-6). `compare_positions(D, E)` is comparable with `frame == R1` (rule 2 of §2.5).
+- At K2, S's first new trajectory revision T2 (parent T1) is recorded. No map revision is built from it yet.
+- At `known_at = K2`: R1 is not current (§2.3), so D and E support no status in any frame, R1 included, and X is `UNKNOWN`. `compare_positions(D, E)` returns `comparable = False, reason = "superseded_revision"` and `distance_m is None`.
+- At `known_at = KM`, the answer is byte-identical to the one before K2 (V2-3).
+- K2 added no row to `retractions`. D and E have no retraction rows, and their row hashes are unchanged.
+- At K3, map revision R2 built from T2 is recorded. D and E stay bound to R1 and are not moved into R2 (V2-4c), so X is still `UNKNOWN` at `known_at = K3`.
+- At K4, a detection D2 re-extracted from R2 at `t0 + 5`, with `derived_from` naming S's raw recording, is recorded. X is `CURRENT` in frame R2 with `measured.observation_id == D2` for `known_at ≥ K4`.
+
 ### V2-7. Retracting or correcting a source invalidates what was derived from it
 
 Unless stated, S1 and S2 are each aligned `validated` into reference revision B1, as in V2-5b. S2 spans `[t0 + 100, t0 + 300]`, with trajectory revision U1 and map revision Q1 built from it; its alignment is from Q1. D is a valid detection of X in S1 at `t0`. A is an absence over X in S2, bound to Q1, at `t0 + 150`, which passes the native-frame test (§2.5) against D. Both are recorded through K1. Every query uses `now = t0 + 200`.
@@ -410,14 +426,22 @@ These are out of v2 and not designed here:
 
 Also unchanged from v1: no object merge or split, no named places, a single local writer, no camera capture.
 
-## 5. Questions for Trevor
+## 5. Decisions (formerly questions for Trevor)
+
+Each item keeps its question's number. The question is kept as asked, and the decision follows it.
 
 1. Approve schema v2 at all (DESIGN §3 requires it), and the star topology (§2.4) over chained alignments.
+   - **Decision:** build v2, with the star topology. A session aligns only directly into a reference revision, and alignments are never chained. **Approved by Trevor, 2026-10-20.**
 2. Set the alignment gates for a cart against a building map: fit, basin margin and held-out residual. The rig values are placeholders.
+   - **Decision:** no numbers yet. Every gate (fit, basin margin, held-out residual) stays [provisional], with room memory's rig values as placeholders only. The gates are tuned after the first real cart walks. **Approved by Trevor, 2026-10-20.**
 3. Set `MOVED_SIGMA_K` (3 proposed) for the comparability predicate, and confirm that a `body` observation's pose adds 0 to `sigma_m` and to the absence containment growth (§2.5) until a pose σ is recorded.
+   - **Decision:** `MOVED_SIGMA_K = 3`. A `body` observation's pose adds 0 to `sigma_m` and to the absence containment growth until a pose σ is recorded. **Approved by Trevor, 2026-10-20.**
 4. Allow observation retraction (§2.2)? I recommend yes, operator-only.
+   - **Decision:** observation retraction is allowed, operator-only. A model writer can never retract an observation. **Approved by Trevor, 2026-10-20.**
 5. Retention against reproducibility: confirm that a purge may make an old report `complete = False`, rather than keeping images longer. Two parts of this conflict with the workplan's wording that "derived records are kept locally for 30 days" (v1 DESIGN §8), so they need your decision, not my assumption:
    - `purged_associations` keeps an object association, which is a derived record, past 30 days. It holds ids and transaction numbers only.
    - A retraction's free-text `reason` stays after its target is purged. That text may name what the image showed. The alternative is to blank `reason` in the purge, keeping the row.
    - A look-again closure keeps `fulfilled_by_observation_id` after that camera observation is purged (§2.1), where v1 nulls it. When the request names an object, that link is an object association kept past 30 days. It holds ids only. The alternative is v1's: drop the id at purge, which makes the closure row mutable.
+   - **Decision:** keep the purge. A report that depended on purged evidence is marked `complete = False`, and images are not kept longer. `purged_associations` and look-again closures' `fulfilled_by_observation_id` are kept past 30 days, holding ids and transaction numbers only. This overrides v1 DESIGN §8's wording for those two records. A retraction's free-text `reason` is blanked at purge, and the row is kept (§2.6). **Approved by Trevor, 2026-10-20.**
 6. Approve transitive invalidation (§2.2): retracting a session or trajectory revision invalidates everything derived from it, including child trajectory revisions, so a rebuild from raw data must be recorded with no parent. A trajectory correction supersedes the old revision's map frame, alignments and map-frame observations rather than keeping them usable. Two consequences follow. A new trajectory revision on the reference map's session makes B1 not current, so every alignment into it stops counting until the sessions are aligned again. And a migrated session's first new trajectory revision retires all its migrated observations, which are bound to revision 1 (§2.9).
+   - **Decision:** transitive invalidation is approved as described, both consequences included. The migrated-session first-correction case must have an acceptance test: `test_V2_6c_migrated_session_first_trajectory_correction` (V2-6) is on the required-tests list (§3). **Approved by Trevor, 2026-10-20.**
