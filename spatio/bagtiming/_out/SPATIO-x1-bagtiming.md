@@ -1,152 +1,87 @@
 # Spatio x1 bag timing findings — 2026-10-19 CDT
 
-**UNCOMMITTED: sandbox refused Git's worktree index.lock. Real-data slices and full passes NOT RUN: sandbox refused the mandatory shared lock. This task is incomplete against the real-data and local-commit criteria.** Code and these findings remain in the assigned worktree for Claude/Trevor to recover. No permission workaround was attempted.
+The real Mid-360 schema is now supported. Both 30-second slices and both complete-message passes finished with exit 0 under the shared lock. Mid-360 full-pass point timing is sampled every second scan; all selected headers and receipts are included. This supersedes the earlier real-data-blocked findings. **The requested new local commit is blocked: the sandbox denied Git index.lock creation during staging; changes remain uncommitted.**
 
-## 1. What I built
+## Change and evidence
 
-A read-only Python inspector in `spatio/bagtiming/`. It writes `bagtiming.json` and `bagtiming.md`, with a compatibility table, schema definitions, frame ids, counts, rates, gaps, backward jumps, resets, zeros, separate receipt/header/point statistics, header-minus-receipt quantiles and drift, lidar-minus-nearest-IMU header offsets, numerical scan coverage, and odometry/input rate comparisons.
+The bug was whitespace-sensitive schema validation, not a different wire layout. The recorded `ros2msg` definition contains `uint8  lidar_id`, `uint8[3]  rsvd`, and unqualified `CustomPoint[]`. All six root fields and seven CustomPoint fields equal the copied driver declarations after comment/whitespace normalization. The validator now normalizes whitespace while retaining exact field types, names, array sizes, and order. Original schema text remains in reports. The exact recorded definition and provenance are saved in `spatio/bagtiming/tests/fixtures/`.
 
-`core.py` has no file IO and accepts `(topic, receipt_ns, decoded_msg_like)` records. `reader.py` streams MCAP in storage order. `report.py` defines the measurements and renders Markdown. `__main__.py` supplies the CLI. `tests/` generates only tiny synthetic inputs. No other workstream imports or files are involved.
+Nanoseconds are source-backed: copied `livox_ros_driver2/src/lddc.cpp:367-395` uses timebase for the ROS stamp and subtracts it for offsets; copied `FAST_LIO_ROS2/src/preprocess.cpp:180-181` divides offsets by 1e6 to get milliseconds. The `.msg` comments do not specify units. Recording provenance names driver `4a1def9` and FAST-LIO `2fffc57`; this is not independent deployed-binary proof. `src/comm/pub_handler.cpp:278-289` has device-time and host-clock branches, so clock selection remains unknown.
 
-Reader evidence: installed mcap 1.4.0 and mcap-ros2-support 0.5.7. mcap_ros2 successfully decoded embedded schemas for synthetic Imu, PointCloud2 and Livox CustomMsg, including a full CLI roundtrip. A limited CDR1 CustomMsg fallback and header-only sampling parser pass independent hand-buffer and decoder-comparison tests. Actual recording-schema decoding remains unverified because the first probe could not acquire the required lock. No actual decoder failure has been established.
+The actual JT adapter copy is `~/Developer/spatio-data/spark-src/hesai_ws/jt128_slam_adapter.py` (SHA-256 `66cbd90b3d976dacf9e0509ecaa69951854d294e987e88cea38562087e1f61c7`). Lines 94-102 write FLOAT32 seconds relative to the first kept point and clip negative offsets; line 205 preserves the input header. This does not prove that the header equals the first-point timestamp. No header-origin contract was supplied. The empty `launchers/` copy is not evidence about this adapter. Adapter correctness/IMU units are other workstreams.
 
-## 2. How to run it
+## Runs and reproduction
 
-From `~/Developer/spatio-x1-bagtiming`:
-
-```sh
-python3 -m spatio.bagtiming BAG_DIR_OR_MCAP --out DIR [--max-seconds 30] [--topics /livox/lidar /livox/imu /Odometry] [--gap-factor 3.0]
-```
-
-The optional `--evidence FILE.json` supplies evidence-backed PointCloud2 units/origin and clock domains; see `spatio/bagtiming/README.md`. Without evidence, units and clock domains remain unknown. Livox point-time units have copied-source evidence built in. Exit 0 means inspection completed, even with warnings/errors; 2 means unreadable/invalid input; 1 means output-write failure.
-
-Required real-data procedure, once the environment permits it: run each 30-second slice under the shared lock, record wall time, extrapolate to full duration, then run full passes sequentially under the same lock. Do not run unlocked. Example Mid-360 slice:
+From `~/Developer/spatio-x1-bagtiming`, for each RUN below:
 
 ```sh
-/usr/bin/lockf -k -t 1800 ~/Developer/lc-tasks/.spatio-bigio.lock nice -n 10 python3 -m spatio.bagtiming ~/Developer/spatio-data/recordings/session_20260808_211213/bag --out ~/Developer/spatio-data/derived/x1-bagtiming/session_20260808_211213/slice30 --max-seconds 30
+/usr/bin/lockf -k -t 1800 ~/Developer/lc-tasks/.spatio-bigio.lock nice -n 10 python3 -m spatio.bagtiming ~/Developer/spatio-data/recordings/RUN/bag --out ~/Developer/spatio-data/derived/x1-bagtiming/RUN/slice30 --max-seconds 30
+# Full: change output slice30 to full and omit --max-seconds 30.
+# Mid-360 full additionally uses --point-timing-sampled-every 2.
 ```
 
-Example JT128 slice, after the Mid-360 slice finishes:
+RUN = `session_20260808_211213` or `20260826T221936Z_JT128_room_walk`. Every output directory contains `bagtiming.json` and `bagtiming.md`. No topic filter or evidence override was used. `spatio-copy.log` contains `COPY_DONE 0`. Every real bag probe and run held `.spatio-bigio.lock`; runs were sequential. `nice` reported `setpriority: Operation not permitted`, so reduced priority was not established.
 
-```sh
-/usr/bin/lockf -k -t 1800 ~/Developer/lc-tasks/.spatio-bigio.lock nice -n 10 python3 -m spatio.bagtiming ~/Developer/spatio-data/recordings/20260826T221936Z_JT128_room_walk/bag --out ~/Developer/spatio-data/derived/x1-bagtiming/20260826T221936Z_JT128_room_walk/slice30 --max-seconds 30
-```
+| Recording / scope | Messages decoded or header-parsed | Point sampling K | Analysis wall time (s) |
+|---|---:|---:|---:|
+| Mid-360 / slice30 | 7126 | 1 | 98.608 |
+| Mid-360 / full | 88328 | 2 | 627.189 |
+| JT128 / slice30 | 12719 | 1 | 1.180 |
+| JT128 / full | 77111 | 1 | 7.094 |
 
-Full runs use the same commands without `--max-seconds 30`, writing into each recording's output directory rather than `slice30/`. If projected runtime exceeds about 1,200 s, select `--point-timing-sampled-every K`. All message headers/receipts remain included; only every Kth point array is decoded. Unknown coverage of unsampled scans stays explicit. No K or runtime estimate was selected here, since neither slice ran.
+Slice-based unsampled full estimates were 1259.086 s (Mid) and 7.182 s (JT). Mid exceeded the documented ~1,200 s threshold, so K=2 was selected; halving point decoding suggested roughly 630 s plus overhead, not a guarantee. Actual times above exclude final report serialization and lock wait. Full durations: 383.058498782 s and 182.651983165 s. Full decoded/header-parsed counts match MCAP summary counts exactly; every topic decoded successfully through mcap_ros2 0.5.7, with no manual fallback.
 
-The sandbox also refused the requested derived-output directory. The authorized fallback is `spatio/bagtiming/_out/`, with recording-specific subdirectories for any later permitted outputs. No real reports were fabricated there.
+## Compatibility table — measured full-pass values
 
-## 3. Tests
+Rates are span rates. All receipt timestamps use MCAP nanoseconds; headers use ROS seconds + nanoseconds. Mid receipt/header/point clock provenance is unknown. JT receipt time is postprocessing receipt by `meta.yaml`, `postprocess.yaml`, and bag dates; JT header/point physical clock identity remains unknown. These sidecars are interpreted here; the CLI does not auto-import them.
 
-Exact command:
+| Recording / topic | Type | Frame | Count | Header / receipt Hz | Point timing, scan duration, numerical IMU coverage | FAST-LIO path / limit |
+|---|---|---|---:|---:|---|---|
+| Mid-360 `/livox/imu` | `sensor_msgs/msg/Imu` | livox_frame | 76799 | 199.994079 / 200.486349 | n/a; paired coverage reported with lidar | configured IMU input |
+| Mid-360 `/livox/lidar` | `livox_ros_driver2/msg/CustomMsg` | livox_frame | 3845 | 9.96629584 / 10.0367373 | timebase + UINT32 offset ns; median 100.216885 ms; 1916/1923 = 99.635985% evaluable, 1922 unknown | CustomMsg direct, lidar_type 1; physical sync unproved |
+| Mid-360 `/Odometry` | `nav_msgs/msg/Odometry` | camera_init | 3842 | 9.96624931 / 10.0301059 | n/a | output/diagnostic; not lidar input |
+| Mid-360 `/tf` | `tf2_msgs/msg/TFMessage` | camera_init | 3842 | unknown / 10.0301282 | n/a | output/diagnostic; not lidar input |
+| JT128 `/slam/points` | `sensor_msgs/msg/PointCloud2` | hesai_lidar | 1818 | 9.97235988 / 9.94832761 | FLOAT32 time at byte 16; raw range 0–0.1004050001502037, 0 nonfinite; seconds/first-kept-point by source; absolute bounds, duration and coverage unknown in CLI | adapter → lidar_type 2; header/first-point relation and effective time-unit config unverified |
+| JT128 `/slam/imu` | `sensor_msgs/msg/Imu` | hesai_lidar | 36446 | 199.903371 / 199.540458 | n/a; paired coverage reported with lidar | configured IMU input |
+| JT128 `/lidar_packets_loss` | `hesai_ros_driver/msg/LossPacket` | none | 1817 | unknown / 9.94445557 | n/a | output/diagnostic; not lidar input |
+| JT128 `/lidar_imu` | `sensor_msgs/msg/Imu` | hesai_lidar | 36420 | 199.902785 / 199.430964 | n/a; paired coverage reported with lidar | raw IMU candidate; adapter input |
+| JT128 `/Odometry` | `nav_msgs/msg/Odometry` | camera_init | 555 | 3.04941163 / 3.04211219 | n/a | output/diagnostic; not lidar input |
+| JT128 `/path` | `nav_msgs/msg/Path` | camera_init | 55 | unknown / 0.303897458 | n/a | output/diagnostic; not lidar input |
 
-```sh
-cd ~/Developer/spatio-x1-bagtiming && nice -n 10 python3 -m unittest discover -s spatio/bagtiming/tests -t . -v
-```
+JT seconds are supported by the supplied adapter source, but its exact execution and upstream epoch relationship are not established by the bag. The conservative CLI `UNKNOWN_TIME_UNIT` finding combines missing units/origin; it does not refute this source evidence. Neither the 0.100405 raw maximum nor header cadence is substituted for an absolute scan interval. Coverage against both JT IMU topics is unknown for all 1,818 scans, not 0% coverage.
 
-Final result: **ran 38 / passed 38 / failed 0 / skipped 0**, unittest elapsed **0.473 s**, exit 0. All 17 task-mandated test names exist exactly and pass. No skipped, expected-failure, or external-data tests. Additional tests cover endian/row padding, malformed layout, nonfinite times, unsigned subtraction, sampling, receipt storage order, bounded gap examples, drift, explicit clock evidence, missing IMU, schema validation, and point epoch resets.
+## Timing findings
 
-The shell printed `nice: setpriority: Operation not permitted`. The test command nevertheless ran and passed; reduced priority was not established. Tests were sequential, and no worker pool was used. No packages were installed.
-
-Swift suite not run: no Swift files changed.
-
-## 4. Real-data results
-
-**No bag payloads were inspected. No measured scan duration, per-topic rate, header offset, clock drift, discontinuity count, or IMU coverage result is available. No 30-second runtime or full-pass extrapolation exists. This is a lock-access refusal, not a lock timeout.**
-
-The following are rechecked filesystem/metadata facts only, not independent message counts. Source root: `/Users/tconf/Developer/spatio-data/recordings/`.
-
-| Recording | File bytes (stat) | Metadata duration | Metadata starting time (ns) | Metadata total messages |
+| Recording / topic | Header gap count / max interval s | Receipt gap count / max interval s | Header − receipt median s | Offset drift s/s |
 |---|---:|---:|---:|---:|
-| `session_20260808_211213/bag/bag_0.mcap` | 1,570,788,339 | 383.058498782 s | 1786223548870054793 | 88,328 |
-| `20260826T221936Z_JT128_room_walk/bag/bag_0.mcap` | 1,285,874,848 | 182.651983165 s | 1787794728266184044 | 77,111 |
+| Mid-360 `/livox/imu` | 0 / 0.012586343 | 0 / 0.012653832 | -0.000291365 | 1.80690725e-05 |
+| Mid-360 `/livox/lidar` | 1 / 1.39978272 | 0 / 0.102529856 | -0.103675778 | 0.000118293877 |
+| Mid-360 `/Odometry` | 1 / 1.40186501 | 0 / 0.110752959 | -0.018104463 | 8.22373599e-05 |
+| JT128 `/slam/points` | 0 / 0.100624 | 0 / 0.11588862 | -1.787794e+09 | -0.00245471067 |
+| JT128 `/slam/imu` | 0 / 0.01005 | 3365 / 0.107395254 | -1.787794e+09 | -0.00245659738 |
+| JT128 `/lidar_imu` | 0 / 0.01005 | 1827 / 0.10767225 | -1.787794e+09 | -0.00245149886 |
+| JT128 `/Odometry` | 77 / 4.112815 | 78 / 4.12171546 | -1.787794e+09 | -0.00246057702 |
+| JT128 `/path` | 0 / 0 | 0 / 7.45362807 | -94.1023377 | -1 |
 
-Sources: each recording's `bag/metadata.yaml`; file sizes were obtained using stat without opening the large MCAP files. `~/Developer/lc-tasks/spatio-copy.log` contains `COPY_DONE 0`.
+Mid scan duration distribution over 1923/3845 scans: min 98.782975, p5 99.237266, median 100.216885, p95 100.488230, max 101.420400 ms. Sampled header-minus-minimum-point time is zero throughout. There are 259866 negative within-scan point intervals and 0 within-scan resets; storage order is not firing order. Unsampled point behavior remains unknown.
 
-Metadata topic inventory:
+Mid slice coverage was 301/315 (95.555556%); its first lidar header precedes the first IMU header by 1.863188315 s. Full sampled coverage is 1916/1923, with 7 uncovered and 1922 unknown scans. The initial 1.399782717 s lidar header gap is real timestamp evidence, despite smooth receipt cadence. No timestamps were shifted or repaired.
 
-| Recording | Topic | Exact declared type | Declared count |
-|---|---|---|---:|
-| Mid-360 | `/livox/lidar` | `livox_ros_driver2/msg/CustomMsg` | 3,845 |
-| Mid-360 | `/livox/imu` | `sensor_msgs/msg/Imu` | 76,799 |
-| Mid-360 | `/tf` | `tf2_msgs/msg/TFMessage` | 3,842 |
-| Mid-360 | `/Odometry` | `nav_msgs/msg/Odometry` | 3,842 |
-| JT128 | `/slam/points` | `sensor_msgs/msg/PointCloud2` | 1,818 |
-| JT128 | `/slam/imu` | `sensor_msgs/msg/Imu` | 36,446 |
-| JT128 | `/lidar_imu` | `sensor_msgs/msg/Imu` | 36,420 |
-| JT128 | `/Odometry` | `nav_msgs/msg/Odometry` | 555 |
-| JT128 | `/path` | `nav_msgs/msg/Path` | 55 |
-| JT128 | `/lidar_packets_loss` | `hesai_ros_driver/msg/LossPacket` | 1,817 |
+JT `/slam/points` headers span 730.175829–912.379442 s, whereas receipt times are Unix-epoch values. Large negative header-minus-receipt offsets must not be interpreted as transport latency. The bag begins 11,952.266184044 s after the walk start recorded in metadata. IMU receipt gaps describe batched/postprocessed arrival; their headers have no gap above 3× median. `/path` repeats header 1787794728019273971 ns across 55 messages (54 duplicates); its top-level header is not a trajectory time axis. The 555/1,818 odometry/input count ratio is 0.305280528; it does not establish the cause or prove processing backlog.
 
-JT128 `meta.yaml` records the walk at 2026-08-26 22:19:36–22:22:42 UTC, duration 182.323 s, PTP off. `bag/metadata.yaml` starts at 2026-08-27 01:38:48.266184044 UTC, **11,952.266184044 s after the stated walk start**. `postprocess.yaml` records postprocessing at 01:42:36 UTC, `use_timestamp_type: 0 # sensor clock`, stride 4, FAST-LIO lidar_type 2. These metadata records identify the bag log time as postprocess receipt, not walk acquisition. They do not prove `/slam/points` or `/slam/imu` header/point clock semantics after the adapter.
+Mid-360: `/livox/lidar` minus nearest `/livox/imu` header: median -0.000281401 s, p5 -0.0026041738, p95 0.0017038634. This cadence-dependent statistic is not physical clock calibration.
 
-Mid-360 `provenance.txt` declares FAST_LIO_ROS2 2fffc57, livox_ros_driver2 4a1def9, `ptp4l running: 0`. `mid360.yaml` selects CustomMsg input `/livox/lidar`, `/livox/imu`, lidar_type 1, timestamp_unit 3, time_sync_en false, time_offset_lidar_to_imu 0.0. The copied driver can use sensor or host timestamps; PTP-not-running alone cannot decide the message clock domain.
+JT128: `/slam/points` minus nearest `/slam/imu` header: median -0.000219 s, p5 -0.002188, p95 0.002191. This cadence-dependent statistic is not physical clock calibration.
+JT128: `/slam/points` minus nearest `/lidar_imu` header: median -0.000219 s, p5 -0.002188, p95 0.002191. This cadence-dependent statistic is not physical clock calibration.
 
-`/Users/tconf/Developer/spatio-data/spark-src/launchers/jt128_slam_adapter.py` is **0 bytes** by stat. No claim is made about the Spark original. The JT metadata has no raw `/lidar_points` topic.
+No observed topic header/receipt backward jumps, resets, or zero stamps in either full pass. TF and LossPacket lack top-level headers and are not treated as zero-stamped messages. Gaps use 3× the stored-order median interval, not a fixed failure tolerance.
 
-### Compatibility table — provisional metadata/source evidence, NOT a completed bag inspection
+## Validation and limits
 
-All receipt units are ns by MCAP log_time contract. Standard ROS Header units are seconds + nanoseconds by schema contract; actual bag schemas/header values remain untested. Clock-domain labels below distinguish receipt from header/points. “Unknown” is a deliberate result of missing evidence, not a guessed sensor domain.
+`python3 -m unittest discover -s spatio/bagtiming/tests -t . -v`: **41 run, 41 passed, 0 failed, 0 skipped**, 0.587 s. Three added tests cover the exact recorded schema through CLI/sampling, forced fallback parity, and strict rejection of type/name/order/array changes. All 38 existing tests remain. `git diff --check` passed for implementation/docs; the verbatim recorded schema intentionally retains its original trailing space on line 44.
 
-| Topic | Type | Time unit | Clock domain + evidence | Per-point timing present? | Scan duration | IMU coverage % | FAST-LIO input path | Unknowns |
-|---|---|---|---|---|---|---|---|---|
-| Mid `/livox/lidar` | `livox_ros_driver2/msg/CustomMsg` | receipt ns; header s+ns; point timebase/offset ns by copied source | receipt unknown; header/points unknown: copied driver has device and host fallback branches | Defined by copied schema; actual records unverified | unknown | unknown | CustomMsg direct, lidar_type 1; mid360.yaml and copied preprocess.cpp | actual schemas, frame ids, rates, offsets, selected clock branch, coverage |
-| Mid `/livox/imu` | `sensor_msgs/msg/Imu` | receipt ns; header s+ns | receipt/header unknown; provenance PTP off does not establish clock origin | n/a | n/a | unknown paired coverage | direct IMU topic selected by mid360.yaml | actual frame, timing, physical synchronization; units/axes owned by g6 |
-| Mid `/tf` | `tf2_msgs/msg/TFMessage` | receipt ns; nested header s+ns | unknown; no top-level header clock | n/a | n/a | n/a | output | nested clocks not combined into one header timeline |
-| Mid `/Odometry` | `nav_msgs/msg/Odometry` | receipt ns; header s+ns | unknown; no publisher stamp evidence | n/a | n/a | n/a | output | actual output rate and stamp semantics |
-| JT `/slam/points` | `sensor_msgs/msg/PointCloud2` | receipt ns; header s+ns; point units unknown | receipt postprocess-receipt from walk/bag/postprocess metadata; header/points unknown because adapter copy is empty | unknown: fields not decoded | unknown | unknown | adapter → PointCloud2 lidar_type 2 declared in postprocess.yaml; x2 must establish transformation | timing field, datatype/range, origin/units, adapter semantics, effective time-unit config |
-| JT `/slam/imu` | `sensor_msgs/msg/Imu` | receipt ns; header s+ns | receipt postprocess-receipt; header unknown: adapter transformation unavailable | n/a | n/a | unknown paired coverage | declared paired input; transformation owned by x2 | original vs transformed headers; g6 units/axes |
-| JT `/lidar_imu` | `sensor_msgs/msg/Imu` | receipt ns; header s+ns | receipt postprocess-receipt; header unknown: sensor-clock parameter is supporting provenance, not decoded proof | n/a | n/a | unknown paired coverage | raw IMU candidate; actual FAST-LIO pairing/config unverified | actual stamps and relation to `/slam/imu` |
-| JT `/Odometry` | `nav_msgs/msg/Odometry` | receipt ns; header s+ns | receipt postprocess-receipt; header unknown | n/a | n/a | n/a | output | output rate/stamp semantics and reason for fewer outputs |
-| JT `/path` | `nav_msgs/msg/Path` | receipt ns; header s+ns | receipt postprocess-receipt; header unknown | n/a | n/a | n/a | output | actual schema/frames; nested poses not a single header time base |
-| JT `/lidar_packets_loss` | `hesai_ros_driver/msg/LossPacket` | receipt ns; other fields unknown | receipt postprocess-receipt; any internal clock unknown | n/a | n/a | n/a | diagnostic, not lidar/IMU input | actual schema and header availability |
+`swift run LabCommandCoreTestsRunner`: exit 1 before tests (0 executed). Initial default-cache denial also produced SDK/compiler errors; retry with writable `CLANG_MODULE_CACHE_PATH` and `SWIFTPM_MODULECACHE_OVERRIDE` failed at `sandbox-exec: sandbox_apply: Operation not permitted`. Logs: `/private/tmp/spatio-x1-swift-tests.log` and `/private/tmp/spatio-x1-swift-tests-retry.log`. No Swift files changed, no test weakened or skipped, and no app build/launch occurred.
 
-The metadata count ratios are **3842/3845 = 0.999219766** for Mid-360 and **555/1818 = 0.305280528** for JT128. These are output/input count ratios only. They are not per-topic rate ratios, completeness guarantees, or evidence of FAST-LIO backlog.
+This is a bag timing inspection, not a new FAST-LIO replay, trajectory evaluation, or physical acceptance result. Historical replay artifacts must retain the label **“replay demonstrated; physical accuracy not evaluated”**; this task independently proves decoding/timing inspection only. Physical synchronization, mount/IMU axes, deployed configuration, and <10 cm closure remain unproved. MCAP ros2msg/CDR only; no SQLite/IDL support added.
 
-### Errors and warnings / blocked evidence
-
-- **ERROR — shared lock refused:** `/usr/bin/lockf -k -t 1800 /Users/tconf/Developer/lc-tasks/.spatio-bigio.lock ...` exited **73**: `cannot open ... Operation not permitted`. Therefore **0/2 slices and 0/2 full passes** ran. No wait-for-lock timeout occurred.
-- **ERROR — commit refused:** `git add spatio/bagtiming/ && git commit ... [skip ci]` exited **128**: cannot create `/Users/tconf/Developer/labcommand/.git/worktrees/spatio-x1-bagtiming/index.lock`, `Operation not permitted`. The failure happened during git add; no commit exists.
-- **WARN — external writes refused:** requested plan and derived directory returned `Operation not permitted`; findings use the same task-authorized owned `_out/` fallback. Real outputs do not exist.
-- **WARN — reduced priority not established:** `nice` reported `setpriority: Operation not permitted`; synthetic tests still ran and returned 0.
-- **WARN — JT receipt/acquisition mismatch:** metadata start is **11,952.266184044 s** after walk start. Receipt timestamps must not be used as firing times.
-- **WARN — adapter unavailable:** copied adapter is **0 bytes**. PointCloud2 timing unit/origin and transformed-header semantics are unknown.
-- **WARN — clock synchronization unproved:** both recordings' metadata says PTP was off; no physical synchronization conclusion follows from that alone.
-- **WARN — real timing inspection absent:** all real scan durations, per-topic rates, header offsets/drifts, reset/gap counts, frames and IMU coverage percentages remain unknown. No per-message error/warn findings were emitted because no real bag was read.
-
-## 5. Measured vs guessed
-
-Measured locally: test results, synthetic decoding/roundtrip behavior, copied source text, metadata text, file byte counts, sandbox failures. The compatibility table labels metadata/source-derived claims explicitly. No real message timing was measured. No timestamps were invented or shifted.
-
-Copied source evidence: `livox_ros_driver2/msg/CustomMsg.msg` defines `uint64 timebase` (first point); `CustomPoint.msg` defines `uint32 offset_time` relative to base. Neither comment names ns. `src/lddc.cpp:367-373` sets header from timebase using rclcpp::Time / ROS1 division by 1e9; line 395 subtracts base_time. `FAST_LIO_ROS2/src/preprocess.cpp:180-181` divides offset_time by 1e6 for milliseconds. This establishes the ns contract used by the inspector. `livox_ros_driver2/src/comm/pub_handler.cpp:278-289` selects sensor time for PTP/GPS or a host high-resolution-clock fallback. It prevents a blanket “sensor clock” classification.
-
-Not established: real recording decoder compatibility, live timestamp source, clock sync, adapter correctness, FAST-LIO backlog, replay success, or physical accuracy. No replay was run here; therefore this work does not independently establish “replay demonstrated; physical accuracy not evaluated.” Historical replay evidence belongs to the lead's separate artifacts.
-
-## 6. Known limits
-
-- This handoff is incomplete until locked real runs and the local commit can be made. No measured compatibility verdict is possible yet.
-- MCAP/CDR ros2msg only; no SQLite, IDL/XCDR2, or ROS runtime. CustomMsg fallback supports only the validated copied schema. Unknown encodings/schema differences return 2 rather than skipping messages.
-- Clock domains and PointCloud2 unit/origin contracts require explicit evidence; sidecar YAML is not automatically parsed. Magnitudes/datatypes do not supply semantics. The synthetic float32/float64 tests supply explicit producer contracts.
-- Physical synchronization cannot be established from timestamp overlap. Nearest-IMU offsets are cadence dependent and not clock calibrations. No unit/axis/gravity or trajectory evaluation was performed.
-- Sampled scans have unknown bounds/coverage; point-clock diagnostics apply to the sampled sequence. Header/receipt statistics still cover every selected message. A slice stops at its first out-of-window stored receipt and cannot establish whole-bag discontinuity absence.
-- Rates are span rates; null across backward jumps. Gap threshold uses the median stored-order interval and is undefined if that median is nonpositive. Numerical coverage is conservative across missing/zero/reset IMU headers and gaps intersecting scan boundaries.
-- Per-point negative intervals describe storage order, not necessarily hardware clock reversals. Float timestamps retain source precision; rounded integer ns do not add precision.
-- ROS TFMessage has no top-level header. Nested frame ids are inventoried, but transform header timestamps are not combined into an invented topic clock.
-
-## 7. Needs Trevor's approval
-
-No new product/design approval is needed for the existing authorized scope. A permitted environment is needed for the shared lock, derived outputs, external findings path, and Git worktree metadata. The current approval policy cannot grant those writes from this session. Re-run the documented locked checks and commit locally after those permissions are available. Do not bypass the shared lock or run on the Spark.
-
-Claude's one independent review is still pending. I did not review my own implementation or request another reviewer. Spark execution, live sampling, physical accuracy evaluation and other workstreams remain outside this task.
-
-## 8. Design decisions
-
-- Preserve integer ns until subtraction; never estimate, shift, or correct timestamps.
-- Keep receipt, header, timebase, absolute scan bounds and within-scan storage-order diagnostics separate.
-- Use mcap_ros2 embedded-schema decoding as the default, with a bounded tested CustomMsg fallback and exact header-only parsing for unsampled lidar records.
-- Require explicit evidence for PointCloud2 time units and origin. Unknown stays unknown even when a number looks like an epoch or scan-relative seconds.
-- Keep numerical coverage and physical synchronization separate; include boundary-crossing gaps and unknown denominators.
-- Stream records; retain only timestamp vectors and scan summaries. Single-process analysis, no installations or pools.
-- Preserve source order to expose receipt clock reversals. All schema variants are retained in JSON.
-- Use the task's `_out/` fallback after refused writes. `_out/*.md` is unignored for a later commit; generated outputs and caches remain ignored. No file was created outside `spatio/bagtiming/` except disposable synthetic test temporary directories.
-- Both shared plans were read fully, branch/base were verified as `spatio-x1-bagtiming` / `d675f8a2d4941647bcbef536ce0ca30838cdf352`. Only the owned folder changed. No Spark access, container operations, app launches, AppleScript, process killing, Swift build, gh, push, PR or Actions trigger occurred.
+No additional product/design approval is needed. A permitted environment is required to finish Git staging/commit and Swift validation. `git add` failed before staging with `Unable to create /Users/tconf/Developer/labcommand/.git/worktrees/spatio-x1-bagtiming/index.lock: Operation not permitted`; no workaround was attempted. The requested local commit remains outstanding; any Spark execution, live capture, or physical test needs separate authorization. No Spark access, container operations, other-workstream edits, app input, push, PR, gh, or Actions trigger occurred. Only this task’s code/docs, derived outputs and requested findings were written. When permissions allow, stage only `spatio/bagtiming/` and commit with `Fix recorded Livox schema whitespace validation [skip ci]`. An independent review remains separate from this implementation.

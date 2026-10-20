@@ -22,9 +22,9 @@ Time one 30-second slice from each bag, sequentially. `analysis.elapsed_wall_s` 
 
 ## Reader and dependencies
 
-Uses the preinstalled Python 3.9-compatible `mcap`, `mcap_ros2` (distribution `mcap-ros2-support`), and numpy. Tested here with mcap 1.4.0 and mcap-ros2-support 0.5.7. No installations required. The embedded-schema decoder succeeds for synthetic Imu, PointCloud2 and Livox CustomMsg. The first successful decode per topic/segment is recorded in `decoder_probes`. Actual copied-bag decoding is **unverified** because the sandbox refused the required shared lock.
+Uses the preinstalled Python 3.9-compatible `mcap`, `mcap_ros2` (distribution `mcap-ros2-support`), and numpy. Tested here with mcap 1.4.0 and mcap-ros2-support 0.5.7. No installations required. The first successful decode per topic/segment is recorded in `decoder_probes`. See `_out/SPATIO-x1-bagtiming.md` for measured recording results.
 
-A minimal CDR1 CustomMsg fallback handles the exact copied message layout; it activates only if the embedded-schema decoder fails and the schema matches. Hand-built big/little endian buffers and independent mcap_ros2 decoding test that fallback. On unsampled lidar messages, an exact standard Header CDR1 parser avoids decoding the point array. Other unknown schema/encoding failures return exit 2; messages are never silently dropped. SQLite ROS bags and IDL-only schemas are unsupported.
+A minimal CDR1 CustomMsg fallback handles the exact copied message layout; it activates only if the embedded-schema decoder fails and the schema matches. Schema checks normalize declaration whitespace and supported type qualification, preserving exact names, types, arrays and order. The real Mid-360 embedded schema is retained in `tests/fixtures/`, including the aligned whitespace that caused the original rejection. Hand-built big/little endian buffers and independent mcap_ros2 decoding test the fallback. On unsampled lidar messages, an exact standard Header CDR1 parser avoids decoding the point array. Other unknown schema/encoding failures return exit 2; messages are never silently dropped. SQLite ROS bags and IDL-only schemas are unsupported.
 
 IO streams in storage order, retaining timestamp arrays and per-scan summaries rather than decoded point clouds. Natural segment filename order preserves recording order across `bag_2`/`bag_10`; MCAP log-time sorting is deliberately disabled. Large MCAP chunk allocation is determined by the input file. No other `spatio.*` package is imported.
 
@@ -58,7 +58,7 @@ Supported units: `ns`, `s`; origins: `header` (relative) or `absolute`. Clock do
 
 Livox `timebase + offset_time` nanoseconds are established by the copied source, detailed in every report. The `.msg` files themselves establish names/types/relative offset but do not explicitly name units. Publisher clock provenance is still unknown: the copied driver chooses device timestamps for PTP/GPS and a host-clock fallback otherwise. `ptp4l running: 0` alone does not establish which branch generated a particular message.
 
-Numeric IMU coverage and nearest-header offsets do not prove synchronization. `/slam/points`' proposed adapter → PointCloud2 `lidar_type 2` path is explicitly qualified; the empty adapter copy cannot establish transformation, point units, or effective configuration. Physical fit for FAST-LIO cannot be concluded while these unknowns remain. This tool evaluates neither IMU units/axes nor trajectories.
+Numeric IMU coverage and nearest-header offsets do not prove synchronization. The real copied JT128 adapter is `spark-src/hesai_ws/jt128_slam_adapter.py`; the `launchers/` copy is empty. It writes FLOAT32 `time` in seconds relative to the first kept point, clips negative offsets, and preserves the input header. It does not establish that header time equals first-point time. Without upstream evidence of that relationship, do not supply an `origin: header` contract: absolute bounds and IMU coverage remain unknown. Physical fit for FAST-LIO cannot be concluded while these unknowns remain. This tool evaluates neither IMU units/axes nor trajectories.
 
 ## Tests
 
@@ -66,4 +66,4 @@ Numeric IMU coverage and nearest-header offsets do not prove synchronization. `/
 cd ~/Developer/spatio-x1-bagtiming && nice -n 10 python3 -m unittest discover -s spatio/bagtiming/tests -t . -v
 ```
 
-Only small synthetic MCAP files are generated, in temporary directories. No skips or external recordings required. Swift suite not run: no Swift files changed.
+Only small synthetic MCAP files are generated, in temporary directories, using synthetic schemas and the checked-in recorded schema. No skips or external recordings required. See findings for exact test results and the Swift validation limitation.

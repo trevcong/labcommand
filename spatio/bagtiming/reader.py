@@ -23,7 +23,10 @@ def schema_sections(text, root_type):
             current = line[5:].strip()
             sections.setdefault(current, [])
         elif line and not line.startswith('='):
-            sections[current].append(line)
+            # ROS .msg permits repeated spaces/tabs between type and name.
+            # The recorded Mid-360 schema retains the driver's aligned fields.
+            # Normalize tokens, not names/types/order or array declarations.
+            sections[current].append(' '.join(line.split()))
     return sections
 
 

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from mcap_ros2.writer import Writer
 from mcap_ros2.decoder import DecoderFactory
@@ -88,6 +89,8 @@ uint8 reflectivity
 uint8 tag
 uint8 line
 '''
+RECORDED_CUSTOM_SCHEMA = (Path(__file__).parent / 'fixtures' /
+                          'mid360_recorded_custommsg.ros2msg').read_text()
 IMU, PC, CUSTOM = 'sensor_msgs/msg/Imu', 'sensor_msgs/msg/PointCloud2', 'livox_ros_driver2/msg/CustomMsg'
 
 
@@ -323,6 +326,47 @@ class ReaderCliTests(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run([sys.executable, '-m', 'spatio.bagtiming', *map(str, args)], capture_output=True, text=True)
 
+    def test_recorded_mid360_schema_cli_and_sampling(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'input').mkdir()
+            bag = root / 'input/recorded-layout.mcap'
+            with bag.open('wb') as f:
+                writer = Writer(f)
+                schema = writer.register_msgdef(CUSTOM, RECORDED_CUSTOM_SCHEMA)
+                for i in range(3):
+                    t = 10 * NS + i * NS
+                    writer.write_message('/livox/lidar', schema, custom(t), log_time=t)
+                writer.finish()
+            proc = self.run_cli(bag, '--out', root / 'out')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads((root / 'out/bagtiming.json').read_text())
+            topic = result['topics'][0]
+            self.assertEqual(topic['count'], 3)
+            self.assertEqual(topic['points']['scan_duration_s']['median'], .1)
+            self.assertEqual(topic['schema_definitions'], [RECORDED_CUSTOM_SCHEMA])
+            self.assertIn('mcap_ros2', result['decoder_probes'][0]['reader'])
+            reader = BagReader(bag, sample_every=2)
+            sampled = analyze(reader.records(), reader.topic_info, point_timing_sampled_every=2)
+            self.assertEqual(sampled['topics'][0]['header'], topic['header'])
+            self.assertEqual(sampled['topics'][0]['points']['scans_sampled'], 2)
+
+    def test_recorded_mid360_schema_manual_fallback_matches_decoder(self):
+        with tempfile.TemporaryDirectory() as td:
+            bag = Path(td) / 'recorded-layout.mcap'
+            with bag.open('wb') as f:
+                writer = Writer(f)
+                schema = writer.register_msgdef(CUSTOM, RECORDED_CUSTOM_SCHEMA)
+                writer.write_message('/livox/lidar', schema, custom(10 * NS), log_time=10 * NS)
+                writer.finish()
+            reader = BagReader(bag)
+            expected = analyze(reader.records(), reader.topic_info)
+            with patch.object(DecoderFactory, 'decoder_for', side_effect=ValueError('forced decoder failure')):
+                reader = BagReader(bag)
+                actual = analyze(reader.records(), reader.topic_info)
+            self.assertEqual(actual, expected)
+            self.assertEqual(reader.manual_topics, {'/livox/lidar'})
+
     def test_cdr_or_decoder_roundtrip_small_synthetic_mcap(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -429,6 +473,28 @@ class ReaderCliTests(unittest.TestCase):
                     self.assertEqual(scan_summary(decoded, CUSTOM), scan_summary(manual, CUSTOM))
 
 class BoundaryTests(unittest.TestCase):
+    def test_recorded_schema_normalization_preserves_strict_layout(self):
+        from mcap.records import Schema
+        from spatio.bagtiming.reader import custom_schema_supported, schema_sections
+        def supported(text):
+            return custom_schema_supported(Schema(id=1, name=CUSTOM, encoding='ros2msg', data=text.encode()))
+        self.assertTrue(supported(RECORDED_CUSTOM_SCHEMA))
+        self.assertTrue(supported(RECORDED_CUSTOM_SCHEMA.replace('uint8  lidar_id', 'uint8\t lidar_id')))
+        self.assertEqual(schema_sections(RECORDED_CUSTOM_SCHEMA, CUSTOM)[CUSTOM],
+                         ['std_msgs/Header header', 'uint64 timebase', 'uint32 point_num',
+                          'uint8 lidar_id', 'uint8[3] rsvd', 'CustomPoint[] points'])
+        for before, after in [('uint64 timebase', 'uint32 timebase'),
+                              ('uint32 offset_time', 'float32 offset_time'),
+                              ('uint8[3]', 'uint8[4]'),
+                              ('uint8  lidar_id', 'uint8  device_id'),
+                              ('float32 x', 'float32 other'),
+                              ('CustomPoint[] points', 'CustomPoint[2] points')]:
+            with self.subTest(after=after):
+                self.assertFalse(supported(RECORDED_CUSTOM_SCHEMA.replace(before, after)))
+        reordered = RECORDED_CUSTOM_SCHEMA.replace('float32 x', 'float32 temporary')
+        reordered = reordered.replace('float32 y', 'float32 x').replace('float32 temporary', 'float32 y')
+        self.assertFalse(supported(reordered))
+
     def test_custom_schema_must_include_standard_header_contract(self):
         from mcap.records import Schema
         from spatio.bagtiming.reader import custom_schema_supported
