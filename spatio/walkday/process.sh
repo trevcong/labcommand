@@ -5,7 +5,8 @@
 #
 # Stages: copy check -> x1 bag timing + input gate -> FAST-LIO replay (A)
 #   -> physical reference (g5, only with --placement-cm) -> manifest (g2)
-#   -> walk check (B) -> wall patches (g8) -> per-run result + report.
+#   -> walk check (B) -> wall patches (g8) -> raw-scan start->end registration
+#   (information only) -> per-run result + report.
 # Output: <sessions-root>/<run-id>/ with trajectory.tum, map.pcd, manifest.json,
 #   walkcheck.{json,md}, topdown.png, wallpatch/, walk_result.json (for series.sh),
 #   walkday.md (read this first), logs/.
@@ -110,7 +111,7 @@ stop() {  # stage reason
 say "run $RUN_ID  recording $REC  -> $SESSION"
 [[ $SYNTHETIC == 1 ]] && say "SYNTHETIC recording: physical accuracy will not be claimed"
 
-say "[1/8] copy check (bag files vs metadata.yaml)"
+say "[1/9] copy check (bag files vs metadata.yaml)"
 python3 "$REPO/spatio/replay/recording.py" complete "$REC" || stop copy-check "recording copy incomplete or unreadable"
 if [[ -z $CONFIG ]]; then
   CONFIG="$(python3 "$REPO/spatio/replay/recording.py" find-config "$REC")" || stop config "no FAST-LIO config in the recording; pass --config"
@@ -131,14 +132,14 @@ sys.exit(0 if want == have else 1)
 PY
 fi
 
-say "[2/8] bag timing (x1) and input gate"
+say "[2/9] bag timing (x1) and input gate"
 python3 -m spatio.bagtiming "$REC/bag" --out "$SESSION/logs/bagtiming" \
   --point-timing-sampled-every "$BAGTIMING_SAMPLE_EVERY" || stop bag-timing "x1 could not inspect the bag"
 python3 -m spatio.walkday.gate "$SESSION/logs/bagtiming/bagtiming.json" --lidar "$LIDAR" --imu "$IMU" \
   --out "$SESSION/logs/input_gate.json"
 rc=$?; [[ $rc == 0 ]] || stop input-gate "input is not evaluable (see logs/input_gate.json)"
 
-say "[3/8] FAST-LIO replay (A)"
+say "[3/9] FAST-LIO replay (A)"
 "$REPO/spatio/replay/replay.sh" "$REC" "$RUN_ID" --sessions-root "$ROOT" --config "$CONFIG" \
   --rate "$PLAYBACK_RATE" --map-voxel "$MAP_VOXEL_M" ${SENSOR:+--sensor "$SENSOR"}
 rc=$?
@@ -149,7 +150,7 @@ mv "$SESSION/manifest.json" "$SESSION/logs/replay_manifest.json"
 
 REF_ARGS=()
 if [[ -n $END_CM ]]; then
-  say "[4/8] physical reference (g5): start ${START_CM:-not measured} cm, end $END_CM cm, heading $HEADING"
+  say "[4/9] physical reference (g5): start ${START_CM:-not measured} cm, end $END_CM cm, heading $HEADING"
   REF="$SESSION/logs/physical_reference.input.json"
   python3 -m spatio.expspec record --spec "$SPEC" --run-id "$RUN_ID" --start-residual-m "$START_M" \
     --end-residual-m "$END_M" --heading "$HEADING" --operator "$OPERATOR" --method "$METHOD" --out "$REF" \
@@ -161,10 +162,10 @@ if [[ -n $END_CM ]]; then
     REF_ARGS=(--physical-reference "$REF")
   fi
 else
-  say "[4/8] no placement measurement given: physical accuracy not evaluated"
+  say "[4/9] no placement measurement given: physical accuracy not evaluated"
 fi
 
-say "[5/8] manifest (g2)"
+say "[5/9] manifest (g2)"
 eval "$(python3 - "$SESSION/logs/replay_manifest.json" <<'PY'
 import json, shlex, sys
 m = json.load(open(sys.argv[1]))
@@ -187,14 +188,14 @@ python3 -m spatio.manifest build "$SESSION" --run-id "$RUN_ID" --source-recordin
   --image "$M_IMAGE" --notes "$M_NOTES" ${REF_ARGS[@]+"${REF_ARGS[@]}"} || stop manifest "g2 build failed"
 python3 -m spatio.manifest validate "$SESSION" || stop manifest "g2 validate found an ERROR"
 
-say "[6/8] walk check (B)"
+say "[6/9] walk check (B)"
 python3 -m spatio.walkcheck "$SESSION" --stationary-window "$STATIONARY_WINDOW_S" --max-gap "$MAX_GAP_S" \
   --min-path-length "$MIN_PATH_LENGTH_M" --min-excursion "$MIN_EXCURSION_M" \
   --max-endpoint-spread "$MAX_ENDPOINT_SPREAD_M" --max-endpoint-speed "$MAX_ENDPOINT_SPEED_M_S"
 rc=$?
 case $rc in 0|1|2) say "walk checker exit $rc" ;; *) stop walk-check "walkcheck could not use the session (exit $rc)" ;; esac
 
-say "[7/8] wall patches (g8)"
+say "[7/9] wall patches (g8)"
 mkdir -p "$SESSION/wallpatch"
 if [[ -n $PATCHES ]]; then
   PATCH_SOURCE="patches from $PATCHES (chosen for this map)"
@@ -213,7 +214,11 @@ if [[ -f $SESSION/wallpatch/patches.json ]]; then
     || say "WARNING: wall-patch measurement failed; walls will be not evaluable"
 fi
 
-say "[8/8] result"
+say "[8/9] raw-scan start->end registration (information only, never scored)"
+python3 -m spatio.walkday.startend "$REC/bag" "$SESSION/trajectory.tum" "$SESSION/startend" \
+  --lidar "$LIDAR" --hold "$STATIONARY_WINDOW_S" || say "start->end registration not available (see above)"
+
+say "[9/9] result"
 python3 -m spatio.walkday.result "$SESSION" --wall-gate-m "$WALL_GATE_M" --wall-gate-state "$WALL_GATE_STATE" \
   --patch-source "$PATCH_SOURCE"
 rc=$?

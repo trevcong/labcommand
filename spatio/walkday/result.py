@@ -244,11 +244,22 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str):
         "manifest": {k: manifest.get(k) for k in ("sensor", "fastlio_revision", "config_file",
                                                   "config_sha256", "image", "source_recording")},
         "synthetic_truth": synthetic,
+        "raw_start_end": _startend(session),
     }
     if synthetic is not None and raw_return["d3_m"] is not None:
         report["synthetic_truth"]["estimated_minus_true_return_m"] = round(
             raw_return["d3_m"] - synthetic["ground_truth"]["true_return_error_3d_m"], 6)
     return walk, report
+
+
+def _startend(session):
+    """Raw-scan start->end registration (startend.py). Information only."""
+    data = _load(os.path.join(session, "startend", "startend.json"), required=False)
+    if data is None:
+        return None
+    keep = {k: data.get(k) for k in ("computed", "reason", "note", "registration", "fastlio_relative",
+                                     "fastlio_minus_registration", "winner_seed")}
+    return keep
 
 
 def _placement(ref):
@@ -326,6 +337,22 @@ def render(report: dict) -> str:
         gt = truth["ground_truth"]
         L.append(f"- synthetic ground truth: true return {gt['true_return_error_3d_m'] * 100:.1f} cm; "
                  f"estimate minus truth {_f(truth.get('estimated_minus_true_return_m'), 100, ' cm')}")
+    se = report.get("raw_start_end")
+    L += ["", "## Raw-scan start to end (information only, not scored)", ""]
+    if not se:
+        L.append("- not run")
+    elif not se.get("computed"):
+        L.append(f"- not computed: {se.get('reason')}")
+    else:
+        r, fl = se["registration"], se["fastlio_relative"]
+        L.append(f"- raw scans say the sensor ended {r['translation_m'] * 100:.1f} cm "
+                 f"(horizontal {r['xy_m'] * 100:.1f} cm) and {r['yaw_deg']:+.2f} deg from its start pose; "
+                 f"fit {r['inlier_frac_5cm'] * 100:.0f}% of points within 5 cm")
+        L.append(f"- FAST-LIO's own start-to-end pose: {fl['translation_m'] * 100:.1f} cm, {fl['yaw_deg']:+.2f} deg "
+                 f"(difference {se['fastlio_minus_registration']['translation_m'] * 100:.1f} cm)")
+        L.append("- read the fit first: it is the share of end-hold points lying within 5 cm of a start-hold "
+                 "surface after registration. Near 100% means both holds see the same scene; a few percent "
+                 "means they did not match and the distance above means nothing. No cutoff is applied.")
     w = report["walls"]
     L += ["", "## Walls", "",
           f"- whole map p95 point-to-plane: {_f(w['whole_map_p95_m'], 100, ' cm')} "

@@ -42,7 +42,7 @@ run() {  # name [process.sh options]
   "$WD/process.sh" "$SY/$name" "$id" --sessions-root "$OUT/sessions" "$@"
   echo "DRYRUN $name -> exit $? ($OUT/sessions/$id/walkday.md)"
   python3 "$HERE/truth.py" "$SY/$name" "$OUT/sessions/$id" --json "$OUT/sessions/$id/logs/synthetic_truth.json" \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); e=d["position_error_m"]; print(f"DRYRUN {sys.argv[1]} estimate vs truth: median {e[\"median\"]*100:.1f} cm, max {e[\"max\"]*100:.1f} cm, parked drift {d[\"drift_while_parked_at_start_m\"]*100:.1f} cm")' "$name"
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); e=d["position_error_m"]; print("DRYRUN %s estimate vs truth: median %.1f cm, max %.1f cm, parked drift %.1f cm" % (sys.argv[1], e["median"]*100, e["max"]*100, d["drift_while_parked_at_start_m"]*100))' "$name"
 }
 run pass-a --spec "$SPEC" --placement-cm 0.4 --start-placement-cm 0.3 --heading ok --operator dryrun \
   --method "synthetic: no physical measurement"
