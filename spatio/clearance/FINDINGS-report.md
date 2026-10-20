@@ -12,7 +12,8 @@ Run from the repository root with a new output directory:
 ```sh
 python3 -m spatio.clearance report \
   --results /path/to/clearance-results/report.json \
-  --zones /path/to/zones.json --walk-id fresh-walk-id \
+  --zones /path/to/zones.json --scans /path/to/scans.json \
+  --walk-id fresh-walk-id \
   --output /private/tmp/clearance-walk-summary
 PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider spatio/clearance
 ```
