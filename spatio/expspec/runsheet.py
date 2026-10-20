@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from spatio.expspec.constants import PROPOSED_BANNER
+from spatio.expspec.constants import PROPOSED_BANNER, PROVISIONAL_LABEL
 from spatio.expspec.freeze import FrozenSpecError, load_frozen
 from spatio.expspec.io_util import write_bytes_atomic
+from spatio.expspec.numbers import format_quantity, parse_quantity
 
 
 class RunsheetError(Exception):
@@ -22,7 +23,10 @@ def render_runsheet(spec, spec_sha256, runs):
         raise RunsheetError("runs must be an integer >= 1")
     acceptance = spec["acceptance"]
     windows = spec["stationary_windows_s"]
-    tolerance_m = float(acceptance["placement_tolerance_m"])
+    parsed_tolerance, reason = parse_quantity(acceptance["placement_tolerance_m"], "m")
+    if reason is not None or parsed_tolerance <= 0:
+        raise RunsheetError("placement tolerance is not a positive room-scale number")
+    tolerance_m = parsed_tolerance
     lines = []
     lines.append("# Operator run sheet: {0}".format(spec["spec_id"]))
     lines.append("")
@@ -34,7 +38,10 @@ def render_runsheet(spec, spec_sha256, runs):
     lines.append("Route: {0}".format(_one_line(spec["route"]["description"])))
     lines.append("Reference point: {0}".format(_one_line(spec["reference_point"])))
     lines.append("Start marks: {0}".format(_one_line(spec["start_marks"])))
-    lines.append("Placement tolerance: {0:.1f} cm ({1} m).".format(tolerance_m * 100.0, tolerance_m))
+    lines.append("Placement tolerance: {0} cm ({1} m).".format(
+        format_quantity(tolerance_m * 100.0),
+        format_quantity(tolerance_m),
+    ))
     lines.append("Write residuals in centimetres. The record command takes metres (divide cm by 100).")
     lines.append("Leave the residual blank if you did not measure. Blank means null, and null is not zero.")
     lines.append("Heading must be ok. off or not_checked is not within tolerance.")
@@ -42,6 +49,11 @@ def render_runsheet(spec, spec_sha256, runs):
     lines.append("Held-still checkboxes: held still {0:g} s at start / held still {1:g} s at end.".format(
         windows["start"], windows["end"]
     ))
+    lines.append(
+        "The 5 s window minimum, the wall gates, and the placement tolerance are {0}.".format(
+            PROVISIONAL_LABEL
+        )
+    )
     lines.append("")
     stops = spec["route"]["intermediate_stops"]
     for number in range(1, runs + 1):

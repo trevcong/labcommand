@@ -2,6 +2,9 @@
 
 Errors block freeze. Warnings do not. A warning is only raised when one of
 the four workplan thresholds differs from the proposed value.
+
+Magnitudes go through numbers.parse_quantity. Endpoint windows must be
+disjoint on the shortest run in the duration band.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from spatio.expspec.constants import (
     TOP_LEVEL_KEYS,
 )
 from spatio.expspec.issues import Issue
+from spatio.expspec.numbers import parse_quantity, windows_are_disjoint
 
 _SPEC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -134,7 +138,14 @@ def _check_box(box, path, issues):
             issues.append(Issue("error", "{0}.normal_hint".format(path), "zero normal_hint"))
     if half is not None:
         for index, component in enumerate(half):
-            if component <= 0:
+            _parsed, reason = parse_quantity(component, "m")
+            if reason == "absurd":
+                issues.append(Issue(
+                    "error",
+                    "{0}.half_extent_m[{1}]".format(path, index),
+                    "half extent is an absurd magnitude",
+                ))
+            elif component <= 0:
                 issues.append(Issue(
                     "error",
                     "{0}.half_extent_m[{1}]".format(path, index),
@@ -180,6 +191,7 @@ def validate(spec):
         if not isinstance(digest, str) or _SHA256.match(digest) is None:
             issues.append(Issue("error", "config_sha256", "must be 64 lowercase hex characters"))
 
+    duration_low = None
     route = _expect_object(spec, "route", "", issues) if "route" in spec else None
     if route is not None:
         _unknown_keys(route, ROUTE_KEYS, "route", issues)
@@ -196,12 +208,26 @@ def validate(spec):
                 2,
                 "duration_target_s",
             )
-            if pair is not None and (pair[0] <= 0 or pair[1] <= 0 or pair[0] > pair[1]):
-                issues.append(Issue(
-                    "error",
-                    "route.duration_target_s",
-                    "must be two positive numbers, low then high",
-                ))
+            if pair is not None:
+                absurd = False
+                for item in pair:
+                    _parsed, reason = parse_quantity(item, "s")
+                    if reason == "absurd":
+                        absurd = True
+                if absurd:
+                    issues.append(Issue(
+                        "error",
+                        "route.duration_target_s",
+                        "duration is an absurd magnitude",
+                    ))
+                elif pair[0] <= 0 or pair[1] <= 0 or pair[0] > pair[1]:
+                    issues.append(Issue(
+                        "error",
+                        "route.duration_target_s",
+                        "must be two positive numbers, low then high",
+                    ))
+                else:
+                    duration_low = pair[0]
         if "intermediate_stops" in route:
             stops = route["intermediate_stops"]
             if not isinstance(stops, list):
@@ -263,6 +289,7 @@ def validate(spec):
                 if "box_map_frame" in patch:
                     _check_box(patch["box_map_frame"], "{0}.box_map_frame".format(path), issues)
 
+    window_values = {}
     windows = _expect_object(spec, "stationary_windows_s", "", issues) if "stationary_windows_s" in spec else None
     if windows is not None:
         _unknown_keys(windows, STATIONARY_KEYS, "stationary_windows_s", issues)
@@ -272,12 +299,30 @@ def validate(spec):
                 _missing(full, issues)
                 continue
             value = windows[key]
-            if not _finite(value) or float(value) < MIN_STATIONARY_S:
+            parsed, reason = parse_quantity(value, "s")
+            if reason == "absurd":
+                issues.append(Issue("error", full, "stationary window is an absurd magnitude"))
+                continue
+            if reason is not None or parsed < MIN_STATIONARY_S:
                 issues.append(Issue(
                     "error",
                     full,
                     "stationary window must be at least {0:g} s".format(MIN_STATIONARY_S),
                 ))
+                continue
+            window_values[key] = parsed
+        if (
+            duration_low is not None
+            and "start" in window_values
+            and "end" in window_values
+            and not windows_are_disjoint(window_values["start"], window_values["end"], duration_low)
+        ):
+            issues.append(Issue(
+                "error",
+                "stationary_windows_s",
+                "start and end windows overlap on the shortest allowed run; "
+                "scoring requires disjoint windows",
+            ))
 
     acceptance = _expect_object(spec, "acceptance", "", issues) if "acceptance" in spec else None
     if acceptance is not None:
@@ -290,7 +335,11 @@ def validate(spec):
                 continue
             value = acceptance[key]
             full = "acceptance.{0}".format(key)
-            if not _finite(value) or float(value) <= 0:
+            parsed, reason = parse_quantity(value, "m")
+            if reason == "absurd":
+                issues.append(Issue("error", full, "threshold is an absurd magnitude"))
+                continue
+            if reason is not None or parsed <= 0:
                 issues.append(Issue("error", full, "threshold must be a positive finite number"))
                 continue
             proposed = PROPOSED_THRESHOLDS[key]

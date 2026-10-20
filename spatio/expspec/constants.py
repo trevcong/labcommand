@@ -6,12 +6,25 @@ SPEC_SCHEMA = "spatio.experiment_spec/1"
 REFERENCE_SCHEMA = "spatio.physical_reference/1"
 
 # Workplan step 1 and step 6. A spec may differ; validate() then warns.
+# The 0.10 m return error is the milestone rule.
+# Trevor's delegate approved the rest as provisional (approved for now,
+# revisit after real data): the 1 cm placement tolerance and the 5 cm
+# wall gates. The 5 s window minimum below is provisional on the same terms.
 PROPOSED_THRESHOLDS = {
     "return_error_threshold_m": 0.10,
     "placement_tolerance_m": 0.01,
     "wall_p95_gate_m": 0.05,
     "revisit_separation_gate_m": 0.05,
 }
+
+PROVISIONAL_LABEL = "provisional (approved for now, revisit after real data)"
+
+# One magnitude cap, used only by numbers.parse_quantity.
+# Smaller than this (and not zero) is below a micrometre or a microsecond.
+ABSURD_MIN_POSITIVE = 1e-6
+# A kilometre, or a hold longer than a day, is not a room-walk quantity.
+ABSURD_MAX_M = 1000.0
+ABSURD_MAX_S = 100000.0
 
 # Exact list items. A longer sentence that only contains the phrase does not count.
 REQUIRED_FORBIDDEN = (
@@ -25,6 +38,7 @@ EXTRA_FORBIDDEN = (
     "sliding the stationary window to shrink the error",
 )
 
+# Provisional: approved for now, revisit after real data.
 MIN_STATIONARY_S = 5.0
 MIN_RUNS = 3
 MIN_STOPS = 2

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
+
 from spatio.expspec.constants import (
     APPROVED_BANNER,
     MAX_RENDER_LINES,
     PROPOSED_BANNER,
     RETURN_ERROR_SENTENCE,
 )
+from spatio.expspec.numbers import format_quantity
 
 
 class RenderError(Exception):
@@ -31,10 +34,16 @@ def _labelled(label, value, rest):
 
 
 def _metres(value):
+    """Print a gate with enough digits that a different gate stays different."""
+    if isinstance(value, bool):
+        return _one_line(value)
     try:
-        return "{0:.2f}".format(float(value))
+        number = float(value)
     except (TypeError, ValueError):
         return _one_line(value)
+    if not math.isfinite(number):
+        return _one_line(value)
+    return format_quantity(number)
 
 
 def _wrap_line(line):
@@ -156,7 +165,9 @@ def render_markdown(spec):
     lines.append("## Stationary windows and return error")
     lines.append(
         "Start window: the first {0} s of the run. End window: the last {1} s of the run. "
-        "Both lengths are fixed in this spec before the walk.".format(
+        "Both lengths are fixed in this spec before the walk. "
+        "Scoring requires disjoint windows, so both lengths fit in the shortest run. "
+        "The 5 s minimum is provisional.".format(
             windows.get("start"), windows.get("end")
         )
     )
@@ -176,12 +187,13 @@ def render_markdown(spec):
     lines.append(
         "Placement tolerance: {0} m. A residual equal to the tolerance is within it. A residual above it is not. "
         "A null residual is not measured, is not zero, and is not within tolerance. "
-        "heading_check must be ok. off or not_checked is not within tolerance.".format(
+        "heading_check must be ok. off or not_checked is not within tolerance. "
+        "This tolerance is provisional.".format(
             _metres(acceptance.get("placement_tolerance_m"))
         )
     )
     lines.append(
-        "Wall p95 gate: {0} m. Revisit separation gate: {1} m.".format(
+        "Wall p95 gate: {0} m. Revisit separation gate: {1} m. Both are provisional.".format(
             _metres(acceptance.get("wall_p95_gate_m")),
             _metres(acceptance.get("revisit_separation_gate_m")),
         )

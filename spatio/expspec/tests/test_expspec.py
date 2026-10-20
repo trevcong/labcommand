@@ -14,14 +14,16 @@ from pathlib import Path
 from spatio.expspec.canonical import canonical_bytes
 from spatio.expspec.constants import (
     PROPOSED_BANNER,
+    PROVISIONAL_LABEL,
     REFERENCE_KEYS,
     REQUIRED_FORBIDDEN,
     RETURN_ERROR_SENTENCE,
 )
 from spatio.expspec.freeze import FreezeError, freeze_spec
+from spatio.expspec.numbers import format_quantity, parse_quantity, windows_are_disjoint
 from spatio.expspec.record import RecordError, record_physical_reference
 from spatio.expspec.render import render_markdown
-from spatio.expspec.runsheet import write_runsheet
+from spatio.expspec.runsheet import render_runsheet, write_runsheet
 from spatio.expspec.template import build_template
 from spatio.expspec.validate import validate
 
@@ -602,6 +604,161 @@ class ExpspecTests(unittest.TestCase):
             ])
             self.assertEqual(nan_rejected.returncode, 1)
             self.assertFalse((Path(tmp) / "nan-record.json").exists())
+
+    def test_render_preserves_nondefault_threshold_precision(self):
+        # Two decimal places would show 0.096 as 0.10 and 0.006 as 0.01.
+        spec = valid_spec()
+        spec["acceptance"]["return_error_threshold_m"] = 0.096
+        spec["acceptance"]["placement_tolerance_m"] = 0.006
+        spec["acceptance"]["wall_p95_gate_m"] = 0.049
+        spec["acceptance"]["revisit_separation_gate_m"] = 0.051
+        self.assertEqual(_errors(spec), [])
+        text = render_markdown(spec)
+        self.assertIn("Return error threshold: 0.096 m", text)
+        self.assertIn("Placement tolerance: 0.006 m", text)
+        self.assertIn("Wall p95 gate: 0.049 m", text)
+        self.assertIn("Revisit separation gate: 0.051 m", text)
+        self.assertNotIn("Return error threshold: 0.10 m", text)
+        self.assertNotIn("Placement tolerance: 0.01 m", text)
+        self.assertNotIn("Wall p95 gate: 0.05 m", text)
+        self.assertNotIn("Revisit separation gate: 0.05 m", text)
+        self.assertEqual(format_quantity(0.096), "0.096")
+        self.assertEqual(format_quantity(0.006), "0.006")
+        self.assertEqual(float(format_quantity(0.096)), 0.096)
+        self.assertEqual(float(format_quantity(0.006)), 0.006)
+        # Defaults that are exactly two decimals stay two decimals.
+        default_page = render_markdown(valid_spec())
+        self.assertIn("Return error threshold: 0.10 m", default_page)
+        self.assertIn("Placement tolerance: 0.01 m", default_page)
+        self.assertIn("Wall p95 gate: 0.05 m", default_page)
+        sheet = render_runsheet(spec, "a" * 64, 1)
+        self.assertIn("0.60 cm", sheet)
+        self.assertIn("0.006 m", sheet)
+        self.assertNotIn("0.01 m", sheet)
+
+    def test_validate_rejects_overlapping_endpoint_windows(self):
+        # The reproduced case: 180 s windows on a 180–300 s route. On a
+        # 180 s run both midpoints are the same pose, so the return error
+        # is zero no matter how far the cart actually moved.
+        overlapping = valid_spec()
+        overlapping["stationary_windows_s"] = {"start": 180, "end": 180}
+        messages = [item.message for item in _errors(overlapping)]
+        self.assertTrue(any("disjoint" in message for message in messages))
+        self.assertFalse(windows_are_disjoint(180, 180, 180))
+        start_mid = 180 / 2.0
+        end_mid = 180 - (180 / 2.0)
+        self.assertEqual(start_mid, end_mid)
+
+        almost = valid_spec()
+        almost["stationary_windows_s"] = {"start": 100, "end": 81}
+        almost_messages = [item.message for item in _errors(almost)]
+        self.assertTrue(any("disjoint" in message for message in almost_messages))
+
+        # Lengths that only touch still share an instant, so they are not disjoint.
+        touching = valid_spec()
+        touching["stationary_windows_s"] = {"start": 90, "end": 90}
+        touch_messages = [item.message for item in _errors(touching)]
+        self.assertTrue(any("disjoint" in message for message in touch_messages))
+        self.assertFalse(windows_are_disjoint(90, 90, 180))
+
+        # A gap on the shortest run is disjoint, and the midpoints differ.
+        gap = valid_spec()
+        gap["stationary_windows_s"] = {"start": 90, "end": 89}
+        self.assertEqual(_errors(gap), [])
+        self.assertTrue(windows_are_disjoint(90, 89, 180))
+        self.assertNotEqual(90 / 2.0, 180 - (89 / 2.0))
+
+        self.assertEqual(_errors(valid_spec()), [])
+        page = render_markdown(valid_spec())
+        self.assertIn("Scoring requires disjoint windows", page)
+        self.assertIn("shortest run", page)
+        self.assertIn("The 5 s minimum is provisional", page)
+        self.assertIn("This tolerance is provisional", page)
+        self.assertIn("Both are provisional", page)
+        self.assertIn(PROVISIONAL_LABEL, render_runsheet(valid_spec(), "b" * 64, 1))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "SPEC.frozen.json"
+            with self.assertRaises(FreezeError):
+                freeze_spec(overlapping, out)
+            self.assertFalse(out.exists())
+            self.assertFalse(Path(str(out) + ".sha256").exists())
+
+    def test_absurd_magnitude_rejected_by_one_parser(self):
+        self.assertEqual(parse_quantity(1e-12, "m")[1], "absurd")
+        self.assertEqual(parse_quantity(1e9, "m")[1], "absurd")
+        self.assertEqual(parse_quantity(1e9, "s")[1], "absurd")
+        self.assertEqual(parse_quantity(float("nan"), "m")[1], "not_finite")
+        self.assertEqual(parse_quantity(True, "m")[1], "not_a_number")
+        self.assertIsNone(parse_quantity(0.096, "m")[1])
+        self.assertIsNone(parse_quantity(0.006, "m")[1])
+        self.assertIsNone(parse_quantity(0.0, "m")[1])
+        self.assertIsNone(parse_quantity(180, "s")[1])
+
+        tiny = valid_spec()
+        tiny["acceptance"]["return_error_threshold_m"] = 1e-12
+        tiny_errors = [
+            item for item in _errors(tiny) if item.path == "acceptance.return_error_threshold_m"
+        ]
+        self.assertEqual(len(tiny_errors), 1)
+        self.assertIn("absurd", tiny_errors[0].message)
+        self.assertEqual(_warnings(tiny), [])
+
+        huge_gate = valid_spec()
+        huge_gate["acceptance"]["wall_p95_gate_m"] = 1e9
+        self.assertTrue(any(
+            item.path == "acceptance.wall_p95_gate_m" and "absurd" in item.message
+            for item in _errors(huge_gate)
+        ))
+
+        huge_window = valid_spec()
+        huge_window["stationary_windows_s"]["start"] = 1e9
+        self.assertTrue(any(
+            item.path == "stationary_windows_s.start" and "absurd" in item.message
+            for item in _errors(huge_window)
+        ))
+
+        huge_duration = valid_spec()
+        huge_duration["route"]["duration_target_s"] = [180, 1e12]
+        self.assertTrue(any(
+            item.path == "route.duration_target_s" and "absurd" in item.message
+            for item in _errors(huge_duration)
+        ))
+
+        huge_box = valid_spec()
+        huge_box["wall_patches"][0]["box_map_frame"] = {
+            "center_m": [0.0, 0.0, 0.0],
+            "normal_hint": [0.0, 1.0, 0.0],
+            "half_extent_m": [0.5, 1e9, 0.5],
+        }
+        self.assertTrue(any("absurd" in item.message for item in _errors(huge_box)))
+
+        # A non-default gate inside the room-scale range is a warning, not an error.
+        near = valid_spec()
+        near["acceptance"]["return_error_threshold_m"] = 0.096
+        near["acceptance"]["placement_tolerance_m"] = 0.006
+        self.assertEqual(_errors(near), [])
+        self.assertEqual(len(_warnings(near)), 2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            frozen, _digest = self._freeze(tmp, valid_spec())
+            out = Path(tmp) / "physical_reference.json"
+            out.write_text("sentinel", encoding="utf-8")
+            with self.assertRaises(RecordError) as caught:
+                record_physical_reference(
+                    spec_path=frozen,
+                    run_id="run-a",
+                    start_residual_m=1e9,
+                    end_residual_m=0.001,
+                    heading="ok",
+                    operator="Trevor",
+                    method="tape",
+                    notes="",
+                    out_path=out,
+                    measured_at="2026-10-19T21:30:00-05:00",
+                )
+            self.assertIn("absurd", str(caught.exception))
+            self.assertEqual(out.read_text(encoding="utf-8"), "sentinel")
 
 
 def _reverse_keys(value):

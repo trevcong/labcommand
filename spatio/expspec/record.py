@@ -8,7 +8,6 @@ as a pass.
 
 from __future__ import annotations
 
-import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +16,7 @@ from spatio.expspec.canonical import canonical_bytes
 from spatio.expspec.constants import HEADING_VALUES, REFERENCE_KEYS, REFERENCE_SCHEMA
 from spatio.expspec.freeze import FrozenSpecError, load_frozen
 from spatio.expspec.io_util import write_bytes_atomic
+from spatio.expspec.numbers import parse_quantity
 
 _MEASURED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -52,10 +52,12 @@ def parse_residual_arg(text, flag):
 def _check_residual(value, flag):
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    number, reason = parse_quantity(value, "m")
+    if reason == "not_a_number":
         raise RecordError("{0} must be a number >= 0 or null".format(flag))
-    number = float(value)
-    if not math.isfinite(number) or number < 0:
+    if reason == "absurd":
+        raise RecordError("{0} is an absurd magnitude".format(flag))
+    if reason == "not_finite" or number < 0:
         raise RecordError("{0} must be finite and >= 0, or null".format(flag))
     if number == 0:
         return 0.0
@@ -125,20 +127,27 @@ def validate_physical_reference(document, spec, spec_sha256):
         value = document.get(flag)
         if value is None:
             continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        number, reason = parse_quantity(value, "m")
+        if reason == "not_a_number":
             problems.append("{0} must be a number or null".format(flag))
             continue
-        if not math.isfinite(float(value)) or float(value) < 0:
+        if reason == "absurd":
+            problems.append("{0} is an absurd magnitude".format(flag))
+            continue
+        if reason == "not_finite" or number < 0:
             problems.append("{0} must be finite and >= 0, or null".format(flag))
     if document.get("heading_check") not in HEADING_VALUES:
         problems.append("heading_check must be ok, off, or not_checked")
     tolerance = document.get("placement_tolerance_m")
     spec_tolerance = spec.get("acceptance", {}).get("placement_tolerance_m")
-    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+    parsed_tolerance, tolerance_reason = parse_quantity(tolerance, "m")
+    if tolerance_reason == "not_a_number":
         problems.append("placement_tolerance_m must be a positive number")
-    elif not math.isfinite(float(tolerance)) or float(tolerance) <= 0:
+    elif tolerance_reason == "absurd":
+        problems.append("placement_tolerance_m is an absurd magnitude")
+    elif tolerance_reason == "not_finite" or parsed_tolerance <= 0:
         problems.append("placement_tolerance_m must be a positive finite number")
-    elif not _near(tolerance, spec_tolerance):
+    elif not _near(parsed_tolerance, spec_tolerance):
         problems.append("placement_tolerance_m must match the frozen spec")
     method = document.get("method")
     if not isinstance(method, str) or method.strip() == "":
