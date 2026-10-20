@@ -3,6 +3,10 @@
 Binary payloads are little-endian and are read with np.fromfile in chunks.
 A float32 memory map is not used: the data offset is not always a multiple
 of 4. The JT128 map's payload starts at byte 174.
+
+When WIDTH and HEIGHT are both present, POINTS must equal their product.
+The payload must contain that many points and no more. A short count that
+stops early can drop a second surface and turn a failed wall into a pass.
 """
 
 from __future__ import annotations
@@ -161,10 +165,17 @@ def _read_header(handle):
         counts = [1] * len(fields)
     if not (len(fields) == len(sizes) == len(types) == len(counts)):
         raise WallpatchError("PCD FIELDS, SIZE, TYPE, and COUNT disagree")
-    if points is None:
-        if width is None or height is None:
-            raise WallpatchError("PCD header has no POINTS count")
-        points = parse_point_product(width, height)
+    if width is not None and height is not None:
+        product = parse_point_product(width, height)
+        if points is None:
+            points = product
+        elif int(points) != int(product):
+            raise WallpatchError(
+                "PCD POINTS %d does not match WIDTH %d x HEIGHT %d"
+                % (int(points), int(width), int(height))
+            )
+    elif points is None:
+        raise WallpatchError("PCD header has no POINTS count")
     for name in ("x", "y", "z"):
         if name not in fields:
             raise WallpatchError("PCD is missing field %s" % name)
@@ -197,10 +208,11 @@ def _xyz_index(header, name):
 def _check_binary_size(path, offset, header):
     payload = os.path.getsize(path) - offset
     expected = header["points"] * header["stride"]
-    if payload < expected:
+    if payload != expected:
         raise WallpatchError(
-            "PCD binary payload is shorter than the header POINTS "
-            "(%d bytes at offset %d, need %d)" % (payload, offset, expected)
+            "PCD binary payload is %d bytes at offset %d, "
+            "header POINTS needs %d"
+            % (payload, offset, expected)
         )
 
 
@@ -278,11 +290,14 @@ def _iter_ascii(handle, header, chunk):
     seen = 0
     limit = header["points"]
     for line in handle:
-        if seen >= limit:
-            break
         stripped = line.strip()
         if not stripped or stripped.startswith(b"#"):
             continue
+        if seen >= limit:
+            raise WallpatchError(
+                "PCD ascii payload has more points than the header POINTS %d"
+                % limit
+            )
         parts = stripped.split()
         try:
             batch.append(

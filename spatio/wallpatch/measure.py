@@ -23,6 +23,7 @@ from spatio.wallpatch.doubled import (
 from spatio.wallpatch.errors import MapShaMismatch, WallpatchError
 from spatio.wallpatch.figures import write_note_figure, write_patch_figure
 from spatio.wallpatch.geometry import (
+    MAX_HINT_ANGLE_DEG,
     angle_deg,
     box_axes,
     crop_mask,
@@ -210,6 +211,18 @@ def _measure_one(name, points, spec, invalid_reason):
     fitted = fit_plane(points, hint)
     if fitted is None:
         return _blank(name, n_cropped, "plane fit failed", spec)
+    if not fitted["orientation_supported"]:
+        # A normal past 45 degrees from the hint is the thin axis of the
+        # patch, not the wall. Scoring it reports the wrong residual and
+        # can pass a doubled wall. Leave both gates unevaluated.
+        return _blank(
+            name,
+            n_cropped,
+            "fitted plane is %.2f deg from normal_hint "
+            "(limit %.0f deg); wall orientation is not supported"
+            % (fitted["angle_from_hint_deg"], MAX_HINT_ANGLE_DEG),
+            spec,
+        )
     normal = fitted["normal"]
     plane_point = fitted["point"]
     # Residuals use every cropped point. The inlier set is only the fit support.

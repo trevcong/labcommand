@@ -712,6 +712,176 @@ class WallpatchTests(unittest.TestCase):
         np.testing.assert_allclose(cloud[-1], [4.0, 5.0, 6.0])
         self.assertEqual(float(np.max(np.abs(cloud[1:-1]))), 0.0)
 
+    def test_plane_perpendicular_to_hint_does_not_pass_doubled_wall(self):
+        # Review repro: two strips 6 cm apart, 1 m along x, 1 cm along z.
+        # The thinnest axis is vertical, 90 degrees from normal_hint. Scoring
+        # that plane reports a 5 mm residual and both gates pass. The same
+        # sheets with a 1 m vertical span are a doubled wall and fail.
+        narrow = _two_strips(z_half=0.005)
+        wide = _two_strips(z_half=0.5)
+        self.assertEqual(len(narrow), 400)
+        self.assertEqual(len(wide), 400)
+        box = [_box("strips", (0, 0, 0), (0, 1, 0), (0.6, 0.2, 0.6))]
+        with tempfile.TemporaryDirectory() as directory:
+            narrow_report, _out = _measure(directory, narrow, box)
+            wide_report, _wide_out = _measure(directory, wide, box)
+        hidden = narrow_report["patches"][0]
+        self.assertEqual(hidden["n_cropped"], 400)
+        self.assertEqual(hidden["status"], "NOT_EVALUABLE")
+        self.assertIsNone(hidden["n_measured"])
+        self.assertIsNone(hidden["doubled"])
+        self.assertIsNone(hidden["separation_m"])
+        self.assertIsNone(hidden["gate_p95_pass"])
+        self.assertIsNone(hidden["gate_separation_pass"])
+        self.assertNotEqual(hidden["gate_p95_pass"], True)
+        self.assertNotEqual(hidden["gate_separation_pass"], True)
+        reason = hidden["reasons"][0]
+        self.assertIn("normal_hint", reason)
+        self.assertIn("not supported", reason)
+        self.assertGreater(float(reason.split()[3]), 45.0)
+        shown = wide_report["patches"][0]
+        self.assertEqual(shown["status"], "MEASURED")
+        self.assertEqual(shown["n_measured"], 400)
+        self.assertEqual(shown["doubled"], "true")
+        self.assertAlmostEqual(shown["separation_m"], 0.06, delta=1e-6)
+        self.assertFalse(shown["gate_separation_pass"])
+        self.assertLess(shown["plane"]["angle_from_hint_deg"], 1.0)
+
+    def test_understated_pcd_count_does_not_hide_the_second_wall(self):
+        # Review repro: 400 points on two sheets 6 cm apart, header POINTS 200
+        # and WIDTH 400. Reading 200 points keeps the first sheet. That sheet
+        # passes both gates. The full cloud fails the separation gate.
+        points = _two_strips(z_half=0.5)
+        self.assertEqual(len(points), 400)
+        self.assertEqual(len(points[:200]), 200)
+        box = [_box("sheets", (0, 0, 0), (0, 1, 0), (0.6, 0.2, 0.6))]
+        with tempfile.TemporaryDirectory() as directory:
+            full, _out = _measure(directory, points, box)
+            first_only, _first_out = _measure(directory, points[:200], box)
+        self.assertEqual(full["patches"][0]["status"], "MEASURED")
+        self.assertEqual(full["patches"][0]["n_measured"], 400)
+        self.assertEqual(full["patches"][0]["doubled"], "true")
+        self.assertAlmostEqual(full["patches"][0]["separation_m"], 0.06, delta=1e-6)
+        self.assertFalse(full["patches"][0]["gate_separation_pass"])
+        self.assertEqual(first_only["patches"][0]["doubled"], "false")
+        self.assertTrue(first_only["patches"][0]["gate_p95_pass"])
+        self.assertTrue(first_only["patches"][0]["gate_separation_pass"])
+
+        exact_header = (
+            "VERSION 0.7\n"
+            "FIELDS x y z\n"
+            "SIZE 4 4 4\n"
+            "TYPE F F F\n"
+            "COUNT 1 1 1\n"
+            "WIDTH 400\n"
+            "HEIGHT 1\n"
+            "POINTS 200\n"
+            "DATA ascii\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            ascii_path = os.path.join(directory, "map.pcd")
+            with open(ascii_path, "w", encoding="ascii") as handle:
+                handle.write(exact_header + _ascii_rows(points))
+            patches_path = os.path.join(directory, "patches.json")
+            out_dir = os.path.join(directory, "out")
+            _write_patches(patches_path, ascii_path, box)
+            with self.assertRaises(WallpatchError) as ascii_exact:
+                measure_map(ascii_path, patches_path, out_dir)
+            self.assertFalse(os.path.isfile(os.path.join(out_dir, "wallpatch.json")))
+            binary_path = os.path.join(directory, "under.pcd")
+            _write_raw_pcd(binary_path, points, 400, 1, 200, binary=True)
+            with self.assertRaises(WallpatchError) as binary_exact:
+                read_xyz(binary_path)
+        for caught in (ascii_exact, binary_exact):
+            self.assertIn("does not match", str(caught.exception))
+            self.assertIn("WIDTH 400", str(caught.exception))
+            self.assertIn("HEIGHT 1", str(caught.exception))
+            self.assertIn("POINTS 200", str(caught.exception))
+
+        # Counts agree with each other. The extra sheet is still in the file.
+        with tempfile.TemporaryDirectory() as directory:
+            ascii_extra = os.path.join(directory, "extra.pcd")
+            binary_extra = os.path.join(directory, "extra_bin.pcd")
+            _write_raw_pcd(ascii_extra, points, 200, 1, 200, binary=False)
+            _write_raw_pcd(binary_extra, points, 200, 1, 200, binary=True)
+            with self.assertRaises(WallpatchError) as ascii_extra_err:
+                read_xyz(ascii_extra)
+            with self.assertRaises(WallpatchError) as binary_extra_err:
+                read_xyz(binary_extra)
+        self.assertIn(
+            "more points than the header POINTS 200",
+            str(ascii_extra_err.exception),
+        )
+        self.assertIn("payload", str(binary_extra_err.exception))
+        self.assertNotIn("does not match", str(binary_extra_err.exception))
+
+        # Payload length matches POINTS. WIDTH x HEIGHT does not, including
+        # a height other than 1 so the product, not the width alone, is checked.
+        with tempfile.TemporaryDirectory() as directory:
+            ascii_short = os.path.join(directory, "short.pcd")
+            binary_short = os.path.join(directory, "short_bin.pcd")
+            product = os.path.join(directory, "product.pcd")
+            _write_raw_pcd(ascii_short, points[:200], 400, 1, 200, binary=False)
+            _write_raw_pcd(binary_short, points[:200], 400, 1, 200, binary=True)
+            _write_raw_pcd(product, points[:200], 200, 2, 200, binary=False)
+            with self.assertRaises(WallpatchError) as ascii_short_err:
+                read_xyz(ascii_short)
+            with self.assertRaises(WallpatchError) as binary_short_err:
+                read_xyz(binary_short)
+            with self.assertRaises(WallpatchError) as product_err:
+                read_xyz(product)
+        for caught in (ascii_short_err, binary_short_err):
+            self.assertIn("WIDTH 400", str(caught.exception))
+            self.assertIn("POINTS 200", str(caught.exception))
+        self.assertIn("WIDTH 200 x HEIGHT 2", str(product_err.exception))
+        self.assertIn("POINTS 200", str(product_err.exception))
+
+        with tempfile.TemporaryDirectory() as directory:
+            ok_path = os.path.join(directory, "ok.pcd")
+            write_ascii_pcd(ok_path, points)
+            cloud = read_xyz(ok_path)
+        self.assertEqual(len(cloud), 400)
+        np.testing.assert_allclose(cloud[:200, 1], -0.03)
+        np.testing.assert_allclose(cloud[200:, 1], 0.03)
+
+
+def _two_strips(z_half):
+    """200 points on each of two sheets at y = ±0.03. x spans 1 m."""
+    xx, zz = np.meshgrid(
+        np.linspace(-0.5, 0.5, 20),
+        np.linspace(-z_half, z_half, 10),
+    )
+    first = np.column_stack([xx.ravel(), np.full(xx.size, -0.03), zz.ravel()])
+    second = first.copy()
+    second[:, 1] = 0.03
+    return np.vstack([first, second])
+
+
+def _ascii_rows(points):
+    return "".join("%.9g %.9g %.9g\n" % (row[0], row[1], row[2]) for row in points)
+
+
+def _write_raw_pcd(path, points, width, height, n_header, binary):
+    """A PCD whose header counts are chosen by the test, not by the writer."""
+    data_line = "DATA binary\n" if binary else "DATA ascii\n"
+    header = (
+        "VERSION 0.7\n"
+        "FIELDS x y z\n"
+        "SIZE 4 4 4\n"
+        "TYPE F F F\n"
+        "COUNT 1 1 1\n"
+        "WIDTH %d\n"
+        "HEIGHT %d\n"
+        "POINTS %d\n"
+        "%s"
+    ) % (width, height, n_header, data_line)
+    with open(path, "wb") as handle:
+        handle.write(header.encode("ascii"))
+        if binary:
+            handle.write(np.ascontiguousarray(points, dtype="<f4").tobytes())
+        else:
+            handle.write(_ascii_rows(points).encode("ascii"))
+
 
 def _two_sheets(separation, sigma, n_each, seed):
     rng = np.random.default_rng(seed)
