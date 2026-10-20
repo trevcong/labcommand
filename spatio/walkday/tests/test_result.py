@@ -428,6 +428,14 @@ class ResultTest(unittest.TestCase):
         self.assertIn("config_sha256 values differ", reasons)
         self.assertIn("MIN_HOLD_S", reasons)
 
+    def test_provenance_config_hash_must_match_the_manifest(self):
+        # Replay's manifest hashes the same --config path process.sh hashed
+        # (checked on real sessions); a different hash is contradictory input.
+        s = make_session(self.tmp, "cfgmis")
+        write_provenance(s, config_sha="ef" * 32)
+        self.assertEqual(run(s), 3)
+        self.assertFalse((s / "walk_result.json").exists())
+
     def test_tampered_settings_identity_is_refused(self):
         s = make_session(self.tmp, "tamper")
         prov = json.loads((s / "logs" / "provenance.json").read_text())
