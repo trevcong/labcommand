@@ -100,13 +100,20 @@ def main():
     poses, frames = read_odometry(args.bag, args.topic)
     if not poses:
         raise SystemExit(f"no messages on {args.topic}")
+    recorded_order = tum.summarize(poses)
+    poses, swapped = tum.undo_adjacent_swaps(poses)
     comments = [
         "t x y z qx qy qz qw  (t = header stamp seconds; map frame; metres)",
         f"source: {args.topic} in {args.bag}",
         f"frames (frame_id, child_frame_id): {frames}",
     ]
+    if swapped:
+        comments.append(f"{len(swapped)} pair(s) of neighbouring poses stored swapped by the recorder were put "
+                        f"back in stamp order (pose indices {swapped[:20]}); nothing else reordered")
     n = tum.write_tum(args.out, poses, comments)
-    summary = {"topic": args.topic, "frames": frames, **tum.summarize(poses)}
+    summary = {"topic": args.topic, "frames": frames, **tum.summarize(poses),
+               "recorder_adjacent_swaps_undone": len(swapped), "swapped_at": swapped,
+               "backward_time_steps_as_recorded": recorded_order["backward_time_steps"]}
 
     if args.path_topic:
         path_poses, path_msgs = read_last_path(args.bag, args.path_topic)

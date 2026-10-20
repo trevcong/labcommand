@@ -131,3 +131,36 @@ class WindowClosureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdjacentSwapTests(unittest.TestCase):
+    """Task I: the recorder can store two neighbouring /Odometry messages swapped."""
+
+    def poses(self, times):
+        return [tum.make_pose(t, (t, 0.0, 0.0), IDENTITY) for t in times]
+
+    def test_neighbour_swap_is_put_back_and_reported(self):
+        out, fixed = tum.undo_adjacent_swaps(self.poses([3.3, 3.4, 3.6, 3.5, 3.7, 3.8]))
+        self.assertEqual([p.t for p in out], [3.3, 3.4, 3.5, 3.6, 3.7, 3.8])
+        self.assertEqual(fixed, [2])
+        self.assertEqual(out[2].x, 3.5)            # the pose travels with its stamp
+
+    def test_swap_at_either_end(self):
+        self.assertEqual(tum.undo_adjacent_swaps(self.poses([2.0, 1.0, 3.0]))[1], [0])
+        self.assertEqual(tum.undo_adjacent_swaps(self.poses([1.0, 3.0, 2.0]))[1], [1])
+
+    def test_reset_is_not_repaired(self):
+        times = [10.0, 10.1, 10.2, 0.0, 0.1, 0.2]
+        out, fixed = tum.undo_adjacent_swaps(self.poses(times))
+        self.assertEqual(fixed, [])
+        self.assertEqual([p.t for p in out], times)
+
+    def test_longer_jump_back_is_not_repaired(self):
+        times = [1.0, 2.0, 3.0, 1.5, 4.0]
+        out, fixed = tum.undo_adjacent_swaps(self.poses(times))
+        self.assertEqual(fixed, [])
+        self.assertEqual(tum.summarize(out)["backward_time_steps"], 1)
+
+    def test_duplicate_stamp_is_not_repaired(self):
+        times = [1.0, 2.0, 2.0, 1.9, 3.0]
+        self.assertEqual(tum.undo_adjacent_swaps(self.poses(times))[1], [])

@@ -5,8 +5,10 @@ Stdlib only so it runs on the Mac (Python 3.9) and inside the ROS container.
 A TUM line is ``t x y z qx qy qz qw``: t in seconds, position in metres in the
 map frame, unit quaternion. Lines starting with ``#`` are comments.
 
-Nothing here aligns, smooths, reorders or interpolates poses. Rows are written
-in the order given; problems are reported, not repaired.
+Nothing here aligns, smooths or interpolates poses. Rows are written in the
+order given and problems are reported, not repaired, with one narrow
+exception: `undo_adjacent_swaps` puts back two neighbouring poses that the bag
+recorder stored in swapped receipt order (each is counted and reported).
 """
 
 from __future__ import annotations
@@ -53,6 +55,32 @@ def make_pose(t: float, position: Sequence[float], orientation: Sequence[float])
     if abs(norm - 1.0) > QUAT_NORM_TOLERANCE:
         raise TumError(f"quaternion norm {norm:.6f} is not unit at t={t:.9f}")
     return Pose(float(t), *map(float, position), *map(float, orientation))
+
+
+def undo_adjacent_swaps(poses: Sequence[Pose]):
+    """Undo receipt-order transpositions of two neighbouring poses.
+
+    An estimator stamps its outputs in processing order; a recorder can still
+    store two consecutive messages swapped. A pair (i-1, i) is swapped back only
+    if that makes time strictly increasing from i-2 through i+1. Anything else
+    (a reset, a duplicate stamp, a longer jump back) is left as recorded so the
+    walk checker rejects it. Returns (poses, [indices that were swapped back]).
+    """
+    out = list(poses)
+    fixed = []
+    i = 1
+    while i < len(out):
+        if out[i].t < out[i - 1].t:
+            a, b = out[i - 1], out[i]
+            before_ok = i < 2 or out[i - 2].t < b.t
+            after_ok = i + 1 >= len(out) or a.t < out[i + 1].t
+            if before_ok and after_ok:
+                out[i - 1], out[i] = b, a
+                fixed.append(i - 1)
+                i += 2
+                continue
+        i += 1
+    return out, fixed
 
 
 def format_line(p: Pose) -> str:
