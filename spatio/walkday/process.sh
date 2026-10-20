@@ -224,6 +224,11 @@ python3 -m spatio.walkday.result "$SESSION" --wall-gate-m "$WALL_GATE_M" --wall-
 rc=$?
 [[ $rc == 3 ]] && stop result "could not build walk_result.json (see output above)"
 echo
+if [[ $rc == 2 ]]; then
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo "!! NOT-EVALUABLE: scored, but the evidence is incomplete (see Why: in walkday.md)"
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+fi
 echo "========================================================================"
 sed -n '3p' "$SESSION/walkday.md"
 echo "report:  $SESSION/walkday.md"

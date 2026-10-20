@@ -50,6 +50,7 @@ python3 -m spatio.series compare "${FILES[@]}" --out "$OUT" --series-id "$SERIES
 rc=$?
 [[ $rc == 0 ]] || { echo "!! spatio.series rejected the inputs (exit $rc)" >&2; exit 2; }
 VERDICT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$OUT/series.json")"
+[[ $VERDICT == NOT_EVALUABLE ]] && echo "!! NOT-EVALUABLE series: the runs do not share one config/FAST-LIO revision (see series.md)"
 echo "========================================================================"
 echo "SERIES $SERIES_ID: $VERDICT"
 echo "table: $OUT/series.md"
