@@ -1,8 +1,15 @@
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+
+import pytest
+
+from spatio.walkcheck.evaluate import evaluate_session
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -10,6 +17,36 @@ import session_table  # noqa: E402
 import tum  # noqa: E402
 
 IDENTITY = (0.0, 0.0, 0.0, 1.0)
+
+
+@pytest.mark.parametrize("name", ["loop_5cm", "timestamp_reset", "map_sharp_wall"])
+def test_table_reads_real_walkcheck_output(tmp_path, name):
+    root = Path(__file__).resolve().parents[3]
+    session = tmp_path / name
+    shutil.copytree(root / "spatio/io/fixtures" / name, session)
+    report = evaluate_session(session)
+    saved = json.loads((session / "walkcheck.json").read_text())
+    if name != "map_sharp_wall":
+        assert saved["walls"]["p95_point_to_plane_cm"]["status"] == "not_measured"
+    if name == "timestamp_reset":
+        assert saved["return_to_start"]["status"] == "not_measured"
+    cells = [c.strip() for c in session_table.row(str(session)).split("|")[1:-1]]
+    returned = report["return_to_start"]
+    expected_return = "—" if returned is None else f"{returned['error_3d_m']:.3f}"
+    p95 = report["walls"]["p95_point_to_plane_cm"]
+    expected_wall = "—" if p95 is None else f"{p95:.2f}"
+    assert cells[6].startswith(report["result"])
+    assert cells[7:] == [expected_return, expected_wall]
+
+    # Exercise the documented standalone script without relying on PYTHONPATH.
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    completed = subprocess.run(
+        [sys.executable, str(root / "spatio/replay/session_table.py"), str(session)],
+        cwd=tmp_path, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines()[-1] == session_table.row(str(session))
 
 
 def write_session(d, walkcheck=None):

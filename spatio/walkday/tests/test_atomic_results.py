@@ -90,6 +90,13 @@ def test_fixture_verdicts_and_both_readers_with_explicit_missing_values(tmp_path
     manifest = json.loads((session / "manifest.json").read_text())
     manifest.update(run_id=name, source_recording=str(write_recording(tmp_path / "rec")),
                     fastlio_revision="abc1234", config_sha256="ab" * 32)
+    if name == "map_sharp_wall":
+        # A PASS walk can lack a stop comparison, but a null error is not a
+        # missing measurement. Supply one visit so the comparison is unavailable.
+        start = float(np.loadtxt(session / "trajectory.tum")[0, 0])
+        manifest["intermediate_stops"] = [
+            {"name": "single_visit", "visits": [{"t0": start, "t1": start + 5}]},
+        ]
     (session / "manifest.json").write_text(json.dumps(manifest))
     (session / "logs").mkdir()
     write_gate(session)
@@ -98,6 +105,11 @@ def test_fixture_verdicts_and_both_readers_with_explicit_missing_values(tmp_path
     explicit = json.loads(path.read_text())
     assert explicit["result"] == walkcheck_status
     assert '"status": "not_measured"' in path.read_text()
+    assert explicit["intermediate_stops"]["error"] is None
+    if name == "map_sharp_wall":
+        stop = explicit["intermediate_stops"]["stops"][0]
+        assert stop["visits_used"] == 1
+        assert stop["max_mean_separation_cm"]["status"] == "not_measured"
     legacy = measurement_values(explicit)
     assert render_markdown(explicit) == render_markdown(legacy)
 
