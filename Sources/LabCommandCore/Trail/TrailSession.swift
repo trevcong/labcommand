@@ -57,11 +57,12 @@ public struct TrailSession: Equatable, Sendable {
     public var problems: [String]
     /// Optional `walkcheck.json`. Its verdict is shown; it never changes `accuracyLabel`.
     public var walkcheck: TrailWalkcheck?
-    /// Why the verdict must not be shown as current, or nil when it may. A stale file and a
-    /// missing trajectory both set this. The verdict is still shown, and never green.
+    /// Why the verdict must not be shown as current, or nil when it may. A stale file, a
+    /// missing trajectory, and an unusable trajectory all set this. The verdict is still
+    /// shown, and never green.
     public var walkcheckStale: String?
-    /// True when the trajectory is missing, so the verdict cannot be checked. The readout
-    /// then says "unverifiable", not "stale".
+    /// True when the trajectory is missing or unusable, so the verdict cannot be checked.
+    /// The readout then says "unverifiable", not "stale".
     public var walkcheckUnverifiable: Bool
     /// Optional `topdown.png` written by walkcheck.
     public var topdownPath: String?
@@ -321,7 +322,7 @@ public enum TrailReadout {
     public enum VerdictTone: Equatable, Sendable { case good, bad, warn }
 
     /// The verdict as shown in the walk check block and the sessions list.
-    /// A missing trajectory is "unverifiable". An older file is "stale".
+    /// A missing or unusable trajectory is "unverifiable". An older file is "stale".
     public static func verdictText(_ result: String, stale: Bool, unverifiable: Bool = false) -> String {
         if unverifiable { return "\(result) · unverifiable" }
         return stale ? "\(result) · stale" : result

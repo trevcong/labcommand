@@ -910,6 +910,96 @@ func testTrailDeletedTrajectoryIsUnverifiable() {
     try? fm.removeItem(at: only)
 }
 
+/// A report newer than an unusable trajectory must not look current in either display.
+private func expectUnusableTrajectory(_ name: String, data: Data, reason: String, unreadable: Bool = false) {
+    let fm = FileManager.default
+    let root = tempDirectory("unusable-\(name)")
+    let dir = root.appendingPathComponent("fresh-walk")
+    try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    let tum = dir.appendingPathComponent("trajectory.tum")
+    let walk = dir.appendingPathComponent("walkcheck.json")
+    defer {
+        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tum.path)
+        try? fm.removeItem(at: root)
+    }
+    try! data.write(to: tum)
+    try! TrailFixture.binaryPCD(TrailFixture.mapPoints()).write(to: dir.appendingPathComponent("map.pcd"))
+    try! walkcheckJSON(result: "PASS", returnError: 4).write(to: walk)
+    let scoredAt = Date(timeIntervalSince1970: 1_800_000_000)
+    try! fm.setAttributes([.modificationDate: scoredAt], ofItemAtPath: walk.path)
+    try! fm.setAttributes([.modificationDate: scoredAt.addingTimeInterval(-60)],
+                          ofItemAtPath: dir.appendingPathComponent("map.pcd").path)
+    if unreadable {
+        try! fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: tum.path)
+        expect(fm.contents(atPath: tum.path) == nil, "\(name): fixture must actually deny file reads")
+    }
+    let expectedReason = "trajectory.tum is \(reason), so this verdict cannot be checked"
+    // Check the reported older-file hole and that unusable takes priority over merely stale.
+    for offset: TimeInterval in [-30, 30] {
+        try! fm.setAttributes([.modificationDate: scoredAt.addingTimeInterval(offset)], ofItemAtPath: tum.path)
+        let inputs = TrailLibrary.VerdictInputs.read(directory: dir.path)
+        expect(inputs.trajectory == scoredAt.addingTimeInterval(offset) && inputs.walkcheck == scoredAt,
+               "\(name): fixture has the intended input/report ages")
+        let session = try! TrailSession.load(directory: dir.path)
+        expect(session.trajectory == nil && session.map != nil, "\(name): opens as map-only")
+        expect(session.walkcheck?.result == "PASS" && session.walkcheckUnverifiable,
+               "\(name): keeps the reported verdict but marks it unverifiable")
+        expect(session.walkcheckStale == expectedReason && session.problems.contains(expectedReason),
+               "\(name): explains the unusable trajectory under Files")
+        let rows = TrailReadout.walkcheckRows(session.walkcheck!, stale: session.walkcheckStale != nil,
+                                             unverifiable: session.walkcheckUnverifiable)
+        expect(rows.first?.value == "PASS · unverifiable", "\(name): opened verdict is qualified")
+        expect(TrailReadout.verdictTone(session.walkcheck!.result, stale: session.walkcheckStale != nil,
+                                       unverifiable: session.walkcheckUnverifiable) == .warn,
+               "\(name): opened verdict is amber")
+        let note = TrailReadout.walkcheckNote(session.walkcheck!, stale: session.walkcheckStale,
+                                              accuracyLabel: session.accuracyLabel,
+                                              unverifiable: session.walkcheckUnverifiable)
+        expect(note.hasPrefix("Unverifiable: \(expectedReason). Re-run walkcheck"),
+               "\(name): readout explains why verification failed")
+        guard let entry = TrailLibrary.scan(root: root.path).first else {
+            return expect(false, "\(name): session must remain listed")
+        }
+        expect(entry.walkcheckResult == "PASS" && entry.walkcheckUnverifiable && entry.walkcheckStale,
+               "\(name): list also marks the verdict unverifiable")
+        expect(TrailReadout.verdictText(entry.walkcheckResult!, stale: entry.walkcheckStale,
+                                       unverifiable: entry.walkcheckUnverifiable) == "PASS · unverifiable",
+               "\(name): list verdict is qualified")
+        expect(TrailReadout.verdictTone(entry.walkcheckResult!, stale: entry.walkcheckStale,
+                                       unverifiable: entry.walkcheckUnverifiable) == .warn,
+               "\(name): list verdict is amber")
+    }
+
+    // Repair using a separate synthetic walk, then supply a newer report.
+    try! fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tum.path)
+    try! Data("10 3 2 0 0 0 0 1\n11 4 2 0 0 0 0 1\n12 3.04 2 0 0 0 0 1\n".utf8).write(to: tum)
+    try! fm.setAttributes([.modificationDate: scoredAt.addingTimeInterval(60)], ofItemAtPath: tum.path)
+    try! walkcheckJSON(result: "PASS", returnError: 4).write(to: walk)
+    try! fm.setAttributes([.modificationDate: scoredAt.addingTimeInterval(90)], ofItemAtPath: walk.path)
+    let repaired = try! TrailSession.load(directory: dir.path)
+    expect(repaired.trajectory?.poses.count == 3 && repaired.walkcheckStale == nil && !repaired.walkcheckUnverifiable,
+           "\(name): a usable trajectory and newer report restore current status")
+    let repairedEntry = TrailLibrary.scan(root: root.path).first
+    expect(repairedEntry?.walkcheckResult == "PASS" && repairedEntry?.walkcheckStale == false
+           && repairedEntry?.walkcheckUnverifiable == false, "\(name): repaired list agrees")
+}
+
+func testTrailEmptyTrajectoryIsUnverifiable() {
+    expectUnusableTrajectory("empty", data: Data(), reason: "empty")
+    expectUnusableTrajectory("comments-only", data: Data("# no poses\n \n".utf8), reason: "empty")
+}
+
+func testTrailMalformedTrajectoryIsUnverifiable() {
+    expectUnusableTrajectory("malformed", data: Data("broken TUM\n".utf8), reason: "malformed")
+    expectUnusableTrajectory("broken-tail", data: Data("10 0 0 0 0 0 0 1\n11 1 0\n".utf8), reason: "malformed")
+}
+
+func testTrailUnreadableTrajectoryIsUnverifiable() {
+    expectUnusableTrajectory("permissions", data: Data("10 0 0 0 0 0 0 1\n".utf8),
+                             reason: "unreadable", unreadable: true)
+    expectUnusableTrajectory("non-utf8", data: Data([0xff, 0xfe]), reason: "unreadable")
+}
+
 /// Rescan must not leave the opened readout on a green PASS after the files change.
 func testTrailRescanReloadsOpenedVerdict() {
     let fm = FileManager.default
@@ -1009,6 +1099,12 @@ func runTrailTests() {
     print("  trail: sessions root lists newest first, skips empty folders; last folder reopens only if present"); passed()
     testTrailDeletedTrajectoryIsUnverifiable()
     print("  trail: deleting trajectory.tum makes a PASS unverifiable in the session and the list"); passed()
+    testTrailEmptyTrajectoryIsUnverifiable()
+    print("  trail: empty and comments-only trajectories make PASS unverifiable in both displays"); passed()
+    testTrailMalformedTrajectoryIsUnverifiable()
+    print("  trail: malformed trajectories, including a broken tail, make PASS unverifiable in both displays"); passed()
+    testTrailUnreadableTrajectoryIsUnverifiable()
+    print("  trail: permission-denied and non-UTF8 trajectories make PASS unverifiable in both displays"); passed()
     testTrailRescanReloadsOpenedVerdict()
     print("  trail: rescan reloads the opened session when the trajectory or walkcheck changes"); passed()
     testTrailViewContract()
