@@ -18,6 +18,9 @@ VALLEY_HEIGHT_RATIO = 0.60
 # band below and is reported undetermined, never as a single wall.
 CONFIDENT_SEPARATION_M = 0.040
 UNCERTAIN_SEPARATION_M = 0.020
+# Split positions for the stepped-band pass guard, as a share of the points.
+SPLIT_STEP = 0.01
+SPLIT_TURN_DEG = 15.0
 
 RULE_TEXT = (
     "Signed distances to the robust plane are histogrammed in 2 mm bins and "
@@ -33,13 +36,22 @@ RULE_TEXT = (
     "doubled=false and separation_m is null, because there is no second "
     "surface centre. This is not a visit-to-visit measurement. "
     "The same rule is run on distances along the fitted plane and along "
-    "normal_hint. A confident split the fitted plane misses is kept when "
-    "normal_hint still shows it, so a small rotation of the pooled fit cannot "
-    "erase it. A confident split the hint misses is kept when the fitted plane "
-    "still shows it. If both confident splits fall on opposite sides of the "
-    "separation gate, or one axis reports a candidate the other does not "
-    "confirm, the patch is not evaluable. A false result on both axes is a "
-    "single surface."
+    "normal_hint. A confident split that only one axis shows is kept as a "
+    "failure when its gap is above the separation gate; at or under the gate "
+    "the patch is not evaluable, because a gap along an axis a few degrees "
+    "off the sheets reads short. If both confident splits fall on opposite "
+    "sides of the separation gate, or one axis reports a candidate the other "
+    "does not confirm, the patch is not evaluable. A false result on both "
+    "axes is a single surface. A patch that would pass both gates is still "
+    "not evaluable when the narrowest band holding 80% of the signed "
+    "distances to the fitted plane is at least the separation gate wide, "
+    "since two surfaces that far apart, each holding at least 20% of the "
+    "points, could sit inside it. The same holds after the patch is split in "
+    "two, at every 1% of the points with at least 20% on each side and in "
+    "split directions every 15 deg across the wall, and the tilt a step "
+    "between the parts would cause is taken out of the distances. That "
+    "catches two offset sheets that tilt the fitted plane. Results that fail "
+    "a gate are kept."
 )
 
 
@@ -61,6 +73,7 @@ def analyze_distances(distances):
         "p2_5_m": float(low),
         "p97_5_m": float(high),
         "thickness_m": float(high - low),
+        "core_band_m": core_band(values),
         "bin_width_m": BIN_WIDTH_M,
         "n": int(values.size),
         "doubled": decision["doubled"],
@@ -69,6 +82,21 @@ def analyze_distances(distances):
         "hist_counts": counts,
         "hist_edges": edges,
     }
+
+
+def core_band(values):
+    """Width of the narrowest interval holding 1 - MIN_PEAK_MASS of the values.
+
+    Any surface with at least MIN_PEAK_MASS of the points, the share the
+    split rule needs, has points inside this interval. Far clutter under
+    that share falls outside it, unlike the p2.5 - p97.5 thickness.
+    """
+    ordered = np.sort(np.asarray(values, dtype=np.float64).reshape(-1))
+    n_values = len(ordered)
+    keep = int(np.ceil((1.0 - MIN_PEAK_MASS) * n_values - 1e-9))
+    keep = min(max(keep, 1), n_values)
+    widths = ordered[keep - 1 :] - ordered[: n_values - keep + 1]
+    return float(widths.min())
 
 
 def _histogram(values):
@@ -228,10 +256,17 @@ def reconcile_axes(fit_stats, hint_stats, separation_gate_m):
         # Both sides of the gate agree. Keep the plane-normal gap. The hint
         # cannot shrink it under the gate, because that case was refused above.
         return _measured(fit_stats)
+    # A split one axis sees and the other misses is measured along an axis
+    # that may be a few degrees off the sheets, which shrinks the gap. It can
+    # fail the gate. It cannot pass it.
     if fit_d == "false" and hint_d == "true":
-        return _measured(hint_stats)
+        if hint_s is not None and float(hint_s) > float(separation_gate_m):
+            return _measured(hint_stats)
+        return _refused(_one_axis(fit_d, hint_d, hint_s, separation_gate_m))
     if fit_d == "true" and hint_d == "false":
-        return _measured(fit_stats)
+        if fit_s is not None and float(fit_s) > float(separation_gate_m):
+            return _measured(fit_stats)
+        return _refused(_one_axis(fit_d, hint_d, fit_s, separation_gate_m))
     # A confident split that already fails the gate is still reported.
     # A confident split that would pass, next to an unconfirmed candidate,
     # is not a pass.
@@ -256,6 +291,109 @@ def _disagree(fit_d, hint_d):
     return (
         "fitted plane reports doubled=%s and normal_hint reports doubled=%s; "
         "the axes disagree, so the patch is not evaluable" % (fit_d, hint_d)
+    )
+
+
+def _one_axis(fit_d, hint_d, separation, separation_gate_m):
+    shown = "null" if separation is None else "%.4f m" % separation
+    return (
+        "fitted plane reports doubled=%s and normal_hint reports doubled=%s; "
+        "the one-axis separation %s is not above the %.2f m separation gate, "
+        "so the patch is not evaluable" % (fit_d, hint_d, shown, separation_gate_m)
+    )
+
+
+def thick_band_reason(core_band_m, separation_gate_m):
+    """Why a would-be pass is refused, or None when the band is thin enough.
+
+    core_band_m is the narrowest interval holding 80% of every signed
+    distance to the fitted plane. A band at least as wide as the separation
+    gate can hold two surfaces that far apart, whatever the histogram along
+    either axis shows. A pooled fit tilted by partly overlapping sheets, or
+    a hint a few degrees off, both look like one wide surface. Not a pass.
+    """
+    if float(core_band_m) < float(separation_gate_m):
+        return None
+    return (
+        "narrowest band holding %d%% of the distances to the fitted plane is "
+        "%.4f m wide, at least the %.2f m separation gate; two surfaces that far "
+        "apart could sit inside it, so the patch is not evaluable"
+        % (
+            int(round(100 * (1.0 - MIN_PEAK_MASS))),
+            core_band_m,
+            separation_gate_m,
+        )
+    )
+
+
+def stepped_band(signed, coords):
+    """Widest 80% band left after taking out the tilt a step would cause.
+
+    Two sheets that are offset along the normal and only partly overlap tilt
+    the pooled fit. The tilt soaks up the offset, so the band around the
+    pooled plane stays thin. For each in-plane coordinate in coords, the
+    patch is split at every SPLIT_STEP of the points, keeping MIN_PEAK_MASS
+    on each side. That is the same floor the split rule uses. The model
+    signed = a + b * u + c * [past the split] is fitted, and the tilt b * u
+    is removed. On one flat surface b stays near zero and the band does not
+    change. Two sheets split near their join give back the tilt that the
+    offset caused. The band then shows the offset.
+    """
+    values = np.asarray(signed, dtype=np.float64).reshape(-1)
+    n_values = len(values)
+    lo = int(np.ceil(MIN_PEAK_MASS * n_values - 1e-9))
+    widest = core_band(values)
+    if lo < 1 or n_values - lo < lo:
+        return widest
+    for coord in coords:
+        u_all = np.asarray(coord, dtype=np.float64).reshape(-1)
+        order = np.argsort(u_all, kind="stable")
+        u = u_all[order]
+        r = values[order]
+        cum_u = np.concatenate([[0.0], np.cumsum(u)])
+        cum_r = np.concatenate([[0.0], np.cumsum(r)])
+        sum_uu = float(np.dot(u, u))
+        sum_ur = float(np.dot(u, r))
+        splits = np.unique(
+            np.round(
+                np.arange(MIN_PEAK_MASS, 1.0 - MIN_PEAK_MASS + 1e-9, SPLIT_STEP) * n_values
+            ).astype(int)
+        )
+        splits = splits[(splits >= lo) & (splits <= n_values - lo)]
+        for k in splits:
+            n_after = float(n_values - k)
+            u_after = cum_u[-1] - cum_u[k]
+            normal_eq = np.array(
+                [
+                    [n_values, cum_u[-1], n_after],
+                    [cum_u[-1], sum_uu, u_after],
+                    [n_after, u_after, n_after],
+                ]
+            )
+            rhs = np.array([cum_r[-1], sum_ur, cum_r[-1] - cum_r[k]])
+            try:
+                _a, slope, _c = np.linalg.solve(normal_eq, rhs)
+            except np.linalg.LinAlgError:
+                continue
+            widest = max(widest, core_band(values - slope * u_all))
+    return float(widest)
+
+
+def stepped_band_reason(stepped_band_m, separation_gate_m):
+    """Why a would-be pass is refused, or None when the band stays thin."""
+    if float(stepped_band_m) < float(separation_gate_m):
+        return None
+    return (
+        "with the patch split in two and the tilt a step between the parts "
+        "would cause taken out, the narrowest band holding %d%% of the "
+        "distances is %.4f m wide, at least the %.2f m separation gate; two "
+        "offset surfaces that far apart could sit in the patch, so the patch "
+        "is not evaluable"
+        % (
+            int(round(100 * (1.0 - MIN_PEAK_MASS))),
+            stepped_band_m,
+            separation_gate_m,
+        )
     )
 
 

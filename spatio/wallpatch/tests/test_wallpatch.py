@@ -17,7 +17,7 @@ import numpy as np
 from spatio.wallpatch.doubled import _histogram, _smooth, analyze_distances, reconcile_axes
 from spatio.wallpatch.errors import MapShaMismatch, WallpatchError
 from spatio.wallpatch.geometry import box_axes, crop_points, parse_box
-from spatio.wallpatch.measure import measure_map
+from spatio.wallpatch.measure import _measure_one, measure_map
 from spatio.wallpatch.numbers import parse_real, parse_suggest_n, parse_voxel_m
 from spatio.wallpatch.pcd import (
     DEFAULT_CHUNK,
@@ -919,6 +919,276 @@ class WallpatchTests(unittest.TestCase):
         )
         self.assertEqual(agreed["kind"], "measured")
         self.assertEqual(agreed["stats"]["separation_m"], 0.06)
+
+    def test_rotated_hint_on_6cm_overlap_never_passes(self):
+        # Review repro: the 6 cm partial-overlap grids with normal_hint rotated
+        # 4 deg about z came back doubled=false, p95 4.14 cm, both gates
+        # passing. Before this fix, rotations about z of -6, -4 and -2 deg,
+        # and of -4 and +4 deg about x, all passed. At -4 deg about z the
+        # hint lies 0.03 deg from the fitted plane, so no angle check sees it.
+        points = _partial_overlap_grids(separation=0.06, overlap=0.2)
+        self.assertEqual(len(points), 1600)
+        passed_before = {("z", -6), ("z", -4), ("z", -2), ("x", -4), ("x", 4)}
+        seen = 0
+        with tempfile.TemporaryDirectory() as directory:
+            for axis in ("z", "x"):
+                for degrees in (-6, -5, -4, -3, -2, -1, 1, 2, 3, 4, 5, 6):
+                    theta = np.radians(degrees)
+                    if axis == "z":
+                        hint = (np.sin(theta), np.cos(theta), 0.0)
+                    else:
+                        hint = (0.0, np.cos(theta), np.sin(theta))
+                    box = [_box("overlap", (0, 0, 0), hint, (0.6, 0.2, 0.6))]
+                    report, _out = _measure(directory, points, box)
+                    patch = report["patches"][0]
+                    label = "%s %+d deg" % (axis, degrees)
+                    self.assertEqual(patch["n_cropped"], 1600, label)
+                    self.assertFalse(
+                        patch["gate_p95_pass"] is True
+                        and patch["gate_separation_pass"] is True,
+                        label,
+                    )
+                    self.assertIn(patch["status"], ("MEASURED", "NOT_EVALUABLE"), label)
+                    if patch["status"] == "MEASURED":
+                        self.assertEqual(patch["doubled"], "true", label)
+                        self.assertFalse(patch["gate_separation_pass"], label)
+                        self.assertGreater(patch["separation_m"], 0.05, label)
+                    if (axis, degrees) in passed_before:
+                        seen += 1
+                        self.assertEqual(patch["status"], "NOT_EVALUABLE", label)
+                        self.assertIsNone(patch["gate_p95_pass"], label)
+                        self.assertIsNone(patch["gate_separation_pass"], label)
+                        self.assertIn("not evaluable", patch["reasons"][0], label)
+        self.assertEqual(seen, len(passed_before))
+
+    def test_one_axis_split_under_the_gate_is_not_a_pass(self):
+        # Review case at z -2 deg: the hint saw a split the fit missed, and the
+        # gap along that tilted hint read under 5 cm, so the gate passed.
+        for fit_d, hint_d in (("false", "true"), ("true", "false")):
+            short = {"doubled": "true", "separation_m": 0.045}
+            single = {"doubled": "false", "separation_m": None}
+            fit_stats = short if fit_d == "true" else single
+            hint_stats = short if hint_d == "true" else single
+            refused = reconcile_axes(fit_stats, hint_stats, 0.05)
+            self.assertEqual(refused["kind"], "not_evaluable")
+            self.assertIn("not evaluable", refused["reason"])
+            self.assertIn("0.0450 m", refused["reason"])
+            wide = {"doubled": "true", "separation_m": 0.06}
+            fit_stats = wide if fit_d == "true" else single
+            hint_stats = wide if hint_d == "true" else single
+            failed = reconcile_axes(fit_stats, hint_stats, 0.05)
+            self.assertEqual(failed["kind"], "measured")
+            self.assertEqual(failed["stats"]["separation_m"], 0.06)
+
+    def test_64_clutter_points_in_the_valley_do_not_pass(self):
+        # 64 points on the mid-plane of the overlap, where they fill the
+        # valley between the two sheets and could merge the split.
+        sheets = _partial_overlap_grids(separation=0.06, overlap=0.2)
+        xx, zz = np.meshgrid(np.linspace(-0.2, 0.2, 8), np.linspace(-0.5, 0.5, 8))
+        clutter = np.column_stack([xx.ravel(), np.zeros(xx.size), zz.ravel()])
+        self.assertEqual(len(clutter), 64)
+        points = np.vstack([sheets, clutter])
+        theta = np.radians(-4.0)
+        hints = ((0.0, 1.0, 0.0), (np.sin(theta), np.cos(theta), 0.0))
+        with tempfile.TemporaryDirectory() as directory:
+            for hint in hints:
+                box = [_box("cluttered", (0, 0, 0), hint, (0.6, 0.2, 0.6))]
+                report, _out = _measure(directory, points, box)
+                patch = report["patches"][0]
+                self.assertEqual(patch["n_cropped"], 1664, hint)
+                self.assertFalse(
+                    patch["gate_p95_pass"] is True
+                    and patch["gate_separation_pass"] is True,
+                    hint,
+                )
+                if patch["status"] == "MEASURED":
+                    self.assertEqual(patch["doubled"], "true", hint)
+                    self.assertFalse(patch["gate_separation_pass"], hint)
+
+    def test_clean_single_wall_with_exact_hint_still_passes(self):
+        rng = np.random.default_rng(4242)
+        n_points = 6000
+        points = np.column_stack(
+            [
+                rng.uniform(-0.5, 0.5, n_points),
+                rng.normal(0.0, 0.005, n_points),
+                rng.uniform(-0.5, 0.5, n_points),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            report, _out = _measure(
+                directory,
+                points,
+                [_box("clean", (0, 0, 0), (0, 1, 0), (0.6, 0.2, 0.6))],
+            )
+        patch = report["patches"][0]
+        self.assertEqual(patch["status"], "MEASURED")
+        self.assertEqual(patch["reasons"], [])
+        self.assertEqual(patch["n_measured"], n_points)
+        self.assertEqual(patch["doubled"], "false")
+        self.assertLess(patch["residuals"]["thickness_m"], 0.05)
+        self.assertLess(patch["residuals"]["core_band_m"], 0.05)
+        self.assertLess(patch["residuals"]["stepped_band_m"], 0.05)
+        self.assertIs(patch["gate_p95_pass"], True)
+        self.assertIs(patch["gate_separation_pass"], True)
+        self.assertEqual(report["doubled_wall_rule"]["pass_needs_band_under_m"], 0.05)
+
+    def test_thick_band_blocks_only_a_would_be_pass(self):
+        # A 7 cm slab of uniform depth: p95 is about 3.3 cm and passes the
+        # p95 gate, but the narrowest band holding 80% is about 5.6 cm.
+        # Two surfaces 5 cm apart fit inside it. That is not a pass.
+        rng = np.random.default_rng(77)
+        n_points = 6000
+        points = np.column_stack(
+            [
+                rng.uniform(-0.5, 0.5, n_points),
+                rng.uniform(-0.035, 0.035, n_points),
+                rng.uniform(-0.5, 0.5, n_points),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            report, _out = _measure(
+                directory,
+                points,
+                [_box("wide", (0, 0, 0), (0, 1, 0), (0.6, 0.2, 0.6))],
+            )
+        patch = report["patches"][0]
+        self.assertEqual(patch["status"], "NOT_EVALUABLE")
+        self.assertIsNone(patch["gate_p95_pass"])
+        self.assertIsNone(patch["gate_separation_pass"])
+        self.assertIn("narrowest band holding 80%", patch["reasons"][0])
+        self.assertIn("not evaluable", patch["reasons"][0])
+        # The guard never turns a fail into NOT_EVALUABLE: the 6 cm sheets
+        # with an exact hint have an even wider band and stay a measured fail.
+        wide = _partial_overlap_grids(separation=0.06, overlap=0.2)
+        with tempfile.TemporaryDirectory() as directory:
+            failed, _out = _measure(
+                directory, wide, [_box("overlap", (0, 0, 0), (0, 1, 0), (0.6, 0.2, 0.6))]
+            )
+        kept = failed["patches"][0]
+        self.assertEqual(kept["status"], "MEASURED")
+        self.assertGreater(kept["residuals"]["core_band_m"], 0.05)
+        self.assertFalse(kept["gate_separation_pass"])
+        self.assertIsNone(kept["residuals"]["stepped_band_m"])
+
+    def test_offset_sheets_tilting_the_fit_are_not_a_pass(self):
+        # The blind spot left by the 80% band. Two sheets 5.2 to 7 cm apart,
+        # end to end, with a 20 cm gap, or with a 10 cm overlap. The hint is
+        # rotated 4 deg toward the pooled tilt. The fit tilts and takes up
+        # the offset, so the band around it stays under 5 cm. Every case
+        # here passed both gates before the stepped-band guard.
+        theta = np.radians(-4.0)
+        hint = (np.sin(theta), np.cos(theta), 0.0)
+        cases = (
+            (0.0, 0.052),
+            (0.0, 0.055),
+            (0.0, 0.06),
+            (-0.1, 0.052),
+            (-0.1, 0.06),
+            (-0.1, 0.07),
+            (0.1, 0.052),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for layout, gap in cases:
+                label = "layout %+.1f gap %.3f" % (layout, gap)
+                points = _offset_sheets(gap, layout, 0.0, 0.0)
+                box = [_box("offset", (0, 0, 0), hint, (0.6, 0.2, 0.6))]
+                report, _out = _measure(directory, points, box)
+                patch = report["patches"][0]
+                self.assertEqual(patch["n_cropped"], len(points), label)
+                self.assertEqual(patch["status"], "NOT_EVALUABLE", label)
+                self.assertIsNone(patch["gate_p95_pass"], label)
+                self.assertIsNone(patch["gate_separation_pass"], label)
+                self.assertIn("tilt a step", patch["reasons"][0], label)
+                self.assertIn("not evaluable", patch["reasons"][0], label)
+        self.assertEqual(report["doubled_wall_rule"]["stepped_band_split_step"], 0.01)
+        self.assertEqual(report["doubled_wall_rule"]["stepped_band_turn_deg"], 15.0)
+
+    def test_offset_sheet_matrix_never_passes(self):
+        # Step position, step direction in the wall plane, layout, gap and
+        # hint all vary. A sheet under MIN_PEAK_MASS of the points is below
+        # the split rule's own floor, so those layouts are left out.
+        hints = {"exact": (0.0, 1.0, 0.0)}
+        for degrees in (-4, -2, 4):
+            theta = np.radians(degrees)
+            hints["z%+d" % degrees] = (np.sin(theta), np.cos(theta), 0.0)
+            hints["x%+d" % degrees] = (0.0, np.cos(theta), np.sin(theta))
+        checked = 0
+        for layout in (0.0, -0.1, 0.1, 0.2):
+            for gap in (0.052, 0.06, 0.07):
+                for position in (-0.3, -0.15, 0.0, 0.2):
+                    for turn in (0.0, 30.0, 45.0, 90.0):
+                        points = _offset_sheets(gap, layout, position, turn)
+                        minority = min(np.mean(points[:, 1] < 0), np.mean(points[:, 1] > 0))
+                        if minority < 0.2:
+                            continue
+                        for name, hint in sorted(hints.items()):
+                            label = "layout %+.1f gap %.3f at %+.2f turn %.0f hint %s" % (
+                                layout,
+                                gap,
+                                position,
+                                turn,
+                                name,
+                            )
+                            spec = (np.zeros(3), np.asarray(hint), np.array([0.6, 0.2, 0.6]))
+                            cropped = crop_points(points, *spec)
+                            patch = _measure_one("matrix", cropped, spec, None)
+                            checked += 1
+                            self.assertFalse(
+                                patch["gate_p95_pass"] is True
+                                and patch["gate_separation_pass"] is True,
+                                label,
+                            )
+        self.assertGreater(checked, 500)
+
+    def test_bowed_single_wall_still_passes(self):
+        # The stepped-band guard must not refuse a smooth wall: 1 cm of bow
+        # over 1 m, sigma 5 mm, exact hint.
+        rng = np.random.default_rng(31)
+        n_points = 6000
+        x = rng.uniform(-0.5, 0.5, n_points)
+        z = rng.uniform(-0.5, 0.5, n_points)
+        y = 0.04 * x * x + rng.normal(0.0, 0.005, n_points)
+        with tempfile.TemporaryDirectory() as directory:
+            report, _out = _measure(
+                directory,
+                np.column_stack([x, y, z]),
+                [_box("bowed", (0, 0, 0), (0, 1, 0), (0.6, 0.2, 0.6))],
+            )
+        patch = report["patches"][0]
+        self.assertEqual(patch["status"], "MEASURED")
+        self.assertEqual(patch["reasons"], [])
+        self.assertIs(patch["gate_p95_pass"], True)
+        self.assertIs(patch["gate_separation_pass"], True)
+        self.assertLess(patch["residuals"]["stepped_band_m"], 0.05)
+
+
+def _offset_sheets(separation, layout, position, turn_deg):
+    """Two noiseless sheets at y = ±separation / 2, 40 points per metre by 20 rows.
+
+    The join is at u = position. layout > 0 overlaps each sheet that far past
+    the join; layout < 0 leaves a gap of twice that. The pair is then turned
+    by turn_deg about y, so the join can run across the wall at any angle.
+    """
+    sheets = []
+    for side in (-1, 1):
+        if side < 0:
+            low, high = -0.5, min(position + layout, 0.5)
+        else:
+            low, high = max(position - layout, -0.5), 0.5
+        uu, vv = np.meshgrid(
+            np.linspace(low, high, max(2, int(round(40 * (high - low))))),
+            np.linspace(-0.5, 0.5, 20),
+        )
+        sheets.append(
+            np.column_stack([uu.ravel(), np.full(uu.size, side * 0.5 * separation), vv.ravel()])
+        )
+    points = np.vstack(sheets)
+    turn = np.radians(turn_deg)
+    u, y, v = points.T
+    return np.column_stack(
+        [u * np.cos(turn) - v * np.sin(turn), y, u * np.sin(turn) + v * np.cos(turn)]
+    )
 
 
 def _partial_overlap_grids(separation, overlap):
