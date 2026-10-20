@@ -31,11 +31,23 @@ Run status (stricter than spatio.series W1, never looser):
   withheld from walk_result.json and kept in walkday.json), or the wall evidence
   is incomplete (a patch undetermined/not measurable, or no patch measured).
   FAIL otherwise.
+
+Acceptance provenance (extra walk_result.json keys; spatio.series ignores them,
+spatio.walkday.seriesgate enforces them):
+  wall_patches: origin ("preselected" only with process.sh --patches), the
+    frozen spec's patch names (required; the spec must be the one the physical
+    reference names) and which of them were verified: exactly one patch of that
+    name, MEASURED, not doubled, both gates passed, and the spec's box when the
+    spec fixes one. A run counts toward a series only with origin preselected
+    and every one of at least two required patches verified.
+  walkday_settings: the effective settings identity from logs/provenance.json.
+  driver_config_sha256: the sensor driver config (process.sh --driver-config).
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -43,6 +55,7 @@ import sys
 from datetime import datetime, timezone
 
 from spatio.replay.recording import RecordingError, recorded_at
+from spatio.walkday.provenance import check_identity
 from spatio.series.validate import (
     PLACEMENT_TOLERANCE_M,
     REPLAY_LABEL,
@@ -54,6 +67,10 @@ from spatio.series.validate import (
 WALK_SCHEMA = "spatio.walk_result/1"
 REPORT_SCHEMA = "spatio.walkday.report/1"
 PROVISIONAL = "provisional (approved for now, revisit after real data)"
+PATCH_ORIGINS = ("preselected", "auto_suggested")
+# Workplan step 1/6: "two preselected patches". The milestone's rule, not a
+# property of any recording (expspec's MIN_PATCHES is the same number).
+REQUIRED_PATCHES = 2
 
 
 class ResultError(Exception):
@@ -146,11 +163,121 @@ def wall_evidence(walkcheck: dict, wallpatch, gate_m: float):
     return p95, suspected, failures, notes, patches, warnings
 
 
-def build(session: str, gate_m: float, gate_state: str, patch_source: str):
+def patch_provenance(origin, spec_path, raw_reference, wallpatch, patches_file):
+    """Which of the frozen spec's preselected patches this run verified."""
+    if origin not in PATCH_ORIGINS:
+        raise ResultError(f"patch origin must be one of {PATCH_ORIGINS}, got {origin!r}")
+    out = {"origin": origin, "spec_sha256": None, "required": [], "verified": [], "problems": [],
+           "patches_sha256": _sha_file(patches_file) if os.path.isfile(patches_file) else None}
+    if spec_path is None:
+        out["problems"].append("no frozen spec given, so there are no preselected patch names to check")
+        return out
+    try:
+        with open(spec_path, "rb") as f:
+            raw = f.read()
+        spec = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise ResultError(f"cannot read spec {spec_path}: {exc}")
+    if not isinstance(spec, dict):
+        raise ResultError(f"spec {spec_path} is not a JSON object")
+    sha = hashlib.sha256(raw).hexdigest()
+    if raw_reference is not None and raw_reference.get("spec_sha256") != sha:
+        raise ResultError(f"spec {spec_path} (sha256 {sha}) is not the spec the physical reference names "
+                          f"({raw_reference.get('spec_sha256')})")
+    out["spec_sha256"] = sha
+    wanted = []
+    for p in spec.get("wall_patches") or []:
+        name = p.get("name") if isinstance(p, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            out["problems"].append("the spec has a wall patch without a name")
+            continue
+        wanted.append((name.strip(), p.get("box_map_frame")))
+    out["required"] = [n for n, _ in wanted]
+    measured = (wallpatch or {}).get("patches") or []
+    for name, box in wanted:
+        hits = [p for p in measured if isinstance(p.get("name"), str) and p["name"].strip() == name]
+        if len(hits) != 1:
+            out["problems"].append(f"patch {name}: {len(hits)} measured patches have this name, need exactly 1")
+            continue
+        p, why = hits[0], []
+        if p.get("status") != "MEASURED":
+            why.append(f"status {p.get('status')}")
+        if p.get("doubled") != "false":
+            why.append(f"doubled={p.get('doubled')}")
+        if p.get("gate_p95_pass") is not True:
+            why.append(f"p95 gate {p.get('gate_p95_pass')}")
+        if p.get("gate_separation_pass") is not True:
+            why.append(f"separation gate {p.get('gate_separation_pass')}")
+        if box is not None and not _same_box(box, p.get("box_map_frame")):
+            why.append("box differs from the frozen spec's box")
+        if why:
+            out["problems"].append(f"patch {name}: " + ", ".join(why))
+        else:
+            out["verified"].append(name)
+    return out
+
+
+def acceptance_blockers(wall_patches):
+    """Why a run's wall patches cannot count toward acceptance. Empty = they can.
+
+    Re-derived from the lists, so a hand-edited summary cannot make a run count."""
+    wp = wall_patches
+    if not isinstance(wp, dict) or not isinstance(wp.get("required"), list) \
+            or not isinstance(wp.get("verified"), list):
+        return ["no wall-patch provenance in walk_result.json"]
+    why = []
+    if wp.get("origin") != "preselected":
+        why.append(f"wall patches were {wp.get('origin')}, not the spec's preselected patches")
+    if wp.get("spec_sha256") is None:
+        why.append("no frozen spec named the preselected patches")
+    required = set(wp["required"])
+    if len(required) < REQUIRED_PATCHES:
+        why.append(f"{len(required)} preselected patches named; {REQUIRED_PATCHES} are required")
+    missing = [n for n in wp["required"] if n not in wp["verified"]]
+    if missing:
+        why.append("preselected patches not verified: " + ", ".join(missing))
+    return why
+
+
+def _same_box(want, got, tol=1e-9):
+    def unit(v):
+        n = math.sqrt(sum(float(x) ** 2 for x in v))
+        return [float(x) / n for x in v]
+    try:
+        pairs = [(want["center_m"], got["center_m"]), (want["half_extent_m"], got["half_extent_m"]),
+                 (unit(want["normal_hint"]), unit(got["normal_hint"]))]
+        return all(len(a) == len(b) == 3 and all(abs(float(x) - float(y)) <= tol for x, y in zip(a, b))
+                   for a, b in pairs)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return False
+
+
+def _sha_file(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def _provenance(session, manifest=None):
+    """logs/provenance.json (process.sh stage 1), checked; None when absent."""
+    prov = _load(os.path.join(session, "logs", "provenance.json"), required=False)
+    if prov is None:
+        return None
+    if not check_identity(prov.get("settings")):
+        raise ResultError("logs/provenance.json: settings sha256 does not match its values")
+    want = (prov.get("fastlio_config") or {}).get("sha256")
+    if manifest is not None and want != manifest.get("config_sha256"):
+        raise ResultError(f"logs/provenance.json FAST-LIO config sha256 {want} != manifest "
+                          f"config_sha256 {manifest.get('config_sha256')}")
+    return prov
+
+
+def build(session: str, gate_m: float, gate_state: str, patch_source: str,
+          patch_origin: str = "auto_suggested", spec_path=None):
     wc = _load(os.path.join(session, "walkcheck.json"))
     manifest = _load(os.path.join(session, "manifest.json"))
     wp = _load(os.path.join(session, "wallpatch", "wallpatch.json"), required=False)
     gate = _load(os.path.join(session, "logs", "input_gate.json"), required=False)
+    prov = _provenance(session, manifest)
     run_id = os.path.basename(os.path.normpath(session))
     if manifest.get("run_id") != run_id:
         raise ResultError(f"manifest run_id {manifest.get('run_id')!r} != folder {run_id!r}")
@@ -167,16 +294,20 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str):
         raise ResultError("synthetic recording but manifest claims physical accuracy was evaluated")
     reference = None
     placement = None
+    ref = None
     if evaluated:
         ref = _load(os.path.join(session, "physical_reference.json"))
         reference = {k: ref.get(k) for k in ("start_placement_residual_m", "end_placement_residual_m",
                                              "heading_check", "placement_tolerance_m")}
         placement = _placement(reference)
     elif os.path.isfile(os.path.join(session, "logs", "physical_reference.not_applied.json")):
-        ref = _load(os.path.join(session, "logs", "physical_reference.not_applied.json"))
-        placement = _placement({k: ref.get(k) for k in ("start_placement_residual_m", "end_placement_residual_m",
-                                                        "heading_check", "placement_tolerance_m")})
+        na = _load(os.path.join(session, "logs", "physical_reference.not_applied.json"))
+        placement = _placement({k: na.get(k) for k in ("start_placement_residual_m", "end_placement_residual_m",
+                                                       "heading_check", "placement_tolerance_m")})
         placement["applied"] = False
+    wall_patches = patch_provenance(patch_origin, spec_path, ref, wp,
+                                    os.path.join(session, "wallpatch", "patches.json"))
+    driver = None if prov is None else prov.get("driver_config")
 
     rts = wc.get("return_to_start") or {}
     ts = wc.get("timestamps") or {}
@@ -234,6 +365,9 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str):
         "walls": {"p95_point_to_plane_m": p95, "doubled_wall_suspected": doubled,
                   "gate_m": gate_m, "gate_state": gate_state},
         "physical_reference": reference,
+        "wall_patches": wall_patches,
+        "walkday_settings": None if prov is None else prov["settings"],
+        "driver_config_sha256": None if driver is None else driver.get("sha256"),
     }
     try:
         parse_walk_result(walk, os.path.join(session, "walk_result.json"))
@@ -266,6 +400,9 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str):
         "input_gate": None if gate is None else {k: gate.get(k) for k in ("evaluable", "blocking", "warnings")},
         "manifest": {k: manifest.get(k) for k in ("sensor", "fastlio_revision", "config_file",
                                                   "config_sha256", "image", "source_recording")},
+        "wall_patches": wall_patches,
+        "acceptance_blockers": acceptance_blockers(wall_patches),
+        "provenance": _prov_summary(prov),
         "synthetic_truth": synthetic,
         "raw_start_end": _startend(session),
     }
@@ -310,8 +447,21 @@ def _synthetic_truth(source):
     return {"marker": path, "statement": data.get("statement"), "ground_truth": data.get("ground_truth")}
 
 
+def _prov_summary(prov):
+    if prov is None:
+        return None
+    d = prov.get("driver_config")
+    return {"settings_sha256": prov["settings"]["sha256"],
+            "fastlio_config": prov.get("fastlio_config"),
+            "driver_config": None if d is None else {k: d.get(k) for k in ("file", "sha256", "topics_in_bag", "note")}}
+
+
 def stopped(session: str, stage: str, reason: str):
     gate = _load(os.path.join(session, "logs", "input_gate.json"), required=False)
+    try:
+        prov = _prov_summary(_provenance(session))
+    except ResultError as exc:
+        prov, reason = None, f"{reason}; also {exc}"
     return {
         "schema": REPORT_SCHEMA,
         "run_id": os.path.basename(os.path.normpath(session)),
@@ -320,7 +470,21 @@ def stopped(session: str, stage: str, reason: str):
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "stopped_at": stage,
         "input_gate": None if gate is None else {k: gate.get(k) for k in ("evaluable", "blocking", "warnings")},
+        "provenance": prov,
     }
+
+
+def _prov_lines(prov):
+    if not prov:
+        return ["- walk-day settings / driver config: not recorded (no logs/provenance.json)"]
+    L = [f"- walk-day settings sha256 {prov['settings_sha256']} (logs/provenance.json; a change starts a new series)"]
+    fc = prov.get("fastlio_config") or {}
+    L.append(f"- FAST-LIO config {fc.get('file')} sha256 {fc.get('sha256')}")
+    d = prov.get("driver_config")
+    L.append("- driver config: none given" if d is None else
+             f"- driver config {d['file']} sha256 {d['sha256']} (topics in the bag: "
+             f"{', '.join(d['topics_in_bag'])}; {d['note']})")
+    return L
 
 
 def _f(v, scale=1.0, unit="", nd=1):
@@ -341,6 +505,8 @@ def render(report: dict) -> str:
         if gate:
             L += ["", "Input check:"] + [f"- BLOCKED: {b}" for b in gate.get("blocking") or []]
             L += [f"- warning: {w}" for w in gate.get("warnings") or []]
+        if report.get("provenance"):
+            L += ["", "Provenance:"] + _prov_lines(report["provenance"])
         return "\n".join(L) + "\n"
     if report["reasons"]:
         L.append("Why: " + "; ".join(report["reasons"]))
@@ -393,6 +559,14 @@ def render(report: dict) -> str:
                  "while this report decides on the patches.)")
     for x in w["notes"]:
         L.append(f"- note: {x}")
+    blockers = report["acceptance_blockers"]
+    L.append("- preselected patches verified: "
+             + (", ".join(report["wall_patches"]["verified"]) or "none")
+             + f" of {', '.join(report['wall_patches']['required']) or 'none named'}")
+    L.append("- these patches can count toward the series: "
+             + ("yes" if not blockers else "NO: " + "; ".join(blockers)))
+    for x in report["wall_patches"]["problems"]:
+        L.append(f"  - {x}")
     L += ["", "## Physical reference", ""]
     pl = report.get("placement")
     if pl is None:
@@ -417,7 +591,8 @@ def render(report: dict) -> str:
           f"- recorded at {report['recorded_at']} (bag starting_time: recorder clock, first message received)",
           f"- sensor: {m['sensor']}",
           f"- FAST-LIO {m['fastlio_revision']}, config {m['config_file']} (sha256 {m['config_sha256']})",
-          f"- image: {m['image']}", ""]
+          f"- image: {m['image']}"]
+    L += _prov_lines(report.get("provenance")) + [""]
     return "\n".join(L) + "\n"
 
 
@@ -440,6 +615,9 @@ def main(argv=None) -> int:
     ap.add_argument("--wall-gate-m", type=float, default=0.05)
     ap.add_argument("--wall-gate-state", choices=("approved", "proposed"), default="approved")
     ap.add_argument("--patch-source", default="auto-suggested from this map, NOT Trevor's preselected patches")
+    ap.add_argument("--patch-origin", choices=PATCH_ORIGINS, default="auto_suggested",
+                    help="preselected only when the patches file holds the spec's preselected patches")
+    ap.add_argument("--spec", help="the frozen spec (its wall_patches are the preselected patches)")
     ap.add_argument("--stopped-at")
     ap.add_argument("--reason", default="")
     args = ap.parse_args(argv)
@@ -453,7 +631,8 @@ def main(argv=None) -> int:
         if args.stopped_at:
             report = stopped(args.session, args.stopped_at, args.reason)
         else:
-            walk, report = build(args.session, args.wall_gate_m, args.wall_gate_state, args.patch_source)
+            walk, report = build(args.session, args.wall_gate_m, args.wall_gate_state, args.patch_source,
+                                 args.patch_origin, args.spec)
             _write(args.session, "walk_result.json", walk)
     except ResultError as exc:
         print(f"result: {exc}", file=sys.stderr)

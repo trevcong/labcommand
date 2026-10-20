@@ -24,8 +24,12 @@
 #   --method TEXT           how the placement was measured
 #   --config FILE           FAST-LIO config. Default: the one *.yaml with lid_topic
 #                           inside the recording (the live recorder copies it there)
-#   --patches FILE          wall patches chosen on THIS run's map (g8 format);
-#                           default: auto-suggest (labelled NOT preselected)
+#   --driver-config FILE    the sensor driver's own config upstream of FAST-LIO
+#                           (JT128: the Hesai driver's jt128_post.yaml). Not read by
+#                           replay; hashed, checked against the bag, kept in logs/
+#   --patches FILE          the spec's preselected wall patches, boxed on THIS run's
+#                           map (g8 format); default: auto-suggest (labelled NOT
+#                           preselected; such a run never counts toward a series)
 #   --sessions-root DIR     default $SPATIO_WALKDAY_ROOT or ~/Developer/spatio-data/walkday
 #   --sensor TEXT           manifest sensor text (default derived from the bag)
 #   --settings FILE         settings (default spatio/walkday/walkday.conf)
@@ -38,14 +42,14 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
-usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 3; }
+usage() { sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; exit 3; }
 die() { echo "process.sh: $*" >&2; exit 3; }
 
 [[ $# -ge 2 ]] || usage
 REC_ARG=$1 RUN_ID=$2; shift 2
 END_CM="" START_CM="" HEADING=not_checked SPEC="${SPATIO_WALK_SPEC:-}" OPERATOR="${USER:-unknown}"
 METHOD="tape measure from the cart reference point to the floor marks"
-CONFIG="" PATCHES="" SENSOR="" SETTINGS="$HERE/walkday.conf"
+CONFIG="" DRIVER_CONFIG="" PATCHES="" SENSOR="" SETTINGS="$HERE/walkday.conf"
 ROOT="${SPATIO_WALKDAY_ROOT:-$HOME/Developer/spatio-data/walkday}"
 while [[ $# -gt 0 ]]; do
   [[ $# -ge 2 ]] || usage
@@ -57,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --operator) OPERATOR=$2 ;;
     --method) METHOD=$2 ;;
     --config) CONFIG=$2 ;;
+    --driver-config) DRIVER_CONFIG=$2 ;;
     --patches) PATCHES=$2 ;;
     --sessions-root) ROOT=$2 ;;
     --sensor) SENSOR=$2 ;;
@@ -86,7 +91,15 @@ if [[ -n $END_CM ]]; then
 fi
 [[ -z $PATCHES || -f $PATCHES ]] || die "patches file not found: $PATCHES"
 [[ -z $PATCHES ]] || PATCHES="$(cd "$(dirname "$PATCHES")" && pwd)/$(basename "$PATCHES")"
+[[ -z $DRIVER_CONFIG || -f $DRIVER_CONFIG ]] || die "driver config not found: $DRIVER_CONFIG"
+[[ -z $DRIVER_CONFIG ]] || DRIVER_CONFIG="$(cd "$(dirname "$DRIVER_CONFIG")" && pwd)/$(basename "$DRIVER_CONFIG")"
 python3 -c 'import numpy, matplotlib, mcap, mcap_ros2' 2>/dev/null || die "python3 needs numpy, matplotlib, mcap, mcap_ros2"
+# The effective settings identity (walk_result.json carries it; a change starts a new series).
+SETTING_PAIRS=()
+for k in $(python3 -c 'from spatio.walkday.provenance import SETTINGS_KEYS as K; print(*K)'); do
+  SETTING_PAIRS+=("$k=${!k:-}")
+done
+SETTINGS_SHA="$(python3 -m spatio.walkday.provenance settings "${SETTING_PAIRS[@]}")" || die "bad settings in $SETTINGS"
 
 mkdir -p "$ROOT" || die "cannot create $ROOT"
 ROOT="$(cd "$ROOT" && pwd)"
@@ -125,6 +138,10 @@ CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 PROFILE="$(python3 "$REPO/spatio/replay/recording.py" profile "$REC" --config "$CONFIG")" || stop config "config does not match the bag"
 eval "$PROFILE"
 say "config $CONFIG: lidar $LIDAR ($LIDAR_MSG_TYPE), imu $IMU"
+python3 -m spatio.walkday.provenance write "$SESSION/logs/provenance.json" --rec "$REC" --config "$CONFIG" \
+  ${DRIVER_CONFIG:+--driver-config "$DRIVER_CONFIG"} "${SETTING_PAIRS[@]}" \
+  || stop config "provenance not written: driver config rejected or unreadable (see above)"
+[[ -z $DRIVER_CONFIG ]] || cp "$DRIVER_CONFIG" "$SESSION/logs/driver_config.$(basename "$DRIVER_CONFIG")"
 if [[ -n $SPEC && -f $SPEC ]]; then
   python3 - "$SPEC" "$CONFIG" <<'PY' || stop spec "config does not match the frozen spec (a changed config starts a new series)"
 import hashlib, json, sys
@@ -187,6 +204,10 @@ sys.exit(0 if want and (have.startswith(want) or want.startswith(have)) else 1)
 PY
 fi
 [[ $SYNTHETIC == 1 ]] && M_NOTES="SYNTHETIC recording (spatio/walkday/synth), not a physical walk. $M_NOTES"
+if [[ -n $DRIVER_CONFIG ]]; then
+  M_NOTES="$M_NOTES Driver config $DRIVER_CONFIG sha256 $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["driver_config"]["sha256"])' "$SESSION/logs/provenance.json") (not read by replay; see logs/provenance.json)."
+fi
+M_NOTES="$M_NOTES Walk-day settings sha256 $SETTINGS_SHA."
 python3 -m spatio.manifest build "$SESSION" --run-id "$RUN_ID" --source-recording "$M_SOURCE_RECORDING" \
   --sensor "$M_SENSOR" --fastlio-revision "$M_FASTLIO_REVISION" --config-file "$M_CONFIG_FILE" \
   --image "$M_IMAGE" --notes "$M_NOTES" ${REF_ARGS[@]+"${REF_ARGS[@]}"} || stop manifest "g2 build failed"
@@ -203,9 +224,11 @@ case $rc in 0|1|2) say "walk checker exit $rc" ;; *) stop walk-check "walkcheck 
 say "[7/9] wall patches (g8)"
 mkdir -p "$SESSION/wallpatch"
 if [[ -n $PATCHES ]]; then
+  PATCH_ORIGIN=preselected
   PATCH_SOURCE="patches from $PATCHES (chosen for this map)"
   cp "$PATCHES" "$SESSION/wallpatch/patches.json"
 else
+  PATCH_ORIGIN=auto_suggested
   PATCH_SOURCE="auto-suggested from this map (top $SUGGEST_PATCHES), NOT Trevor's preselected patches"
   python3 -m spatio.wallpatch suggest "$SESSION/map.pcd" --n "$SUGGEST_PATCHES" --out "$SESSION/wallpatch/patches.json" \
     || say "WARNING: wall-patch suggestion failed; walls will be not evaluable"
@@ -224,8 +247,10 @@ python3 -m spatio.walkday.startend "$REC/bag" "$SESSION/trajectory.tum" "$SESSIO
   --lidar "$LIDAR" --hold "$STATIONARY_WINDOW_S" || say "start->end registration not available (see above)"
 
 say "[9/9] result"
+SPEC_ARGS=()
+[[ -n $SPEC && -f $SPEC ]] && SPEC_ARGS=(--spec "$SPEC")
 python3 -m spatio.walkday.result "$SESSION" --wall-gate-m "$WALL_GATE_M" --wall-gate-state "$WALL_GATE_STATE" \
-  --patch-source "$PATCH_SOURCE"
+  --patch-source "$PATCH_SOURCE" --patch-origin "$PATCH_ORIGIN" ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
 rc=$?
 [[ $rc == 3 ]] && stop result "could not build walk_result.json (see output above)"
 echo

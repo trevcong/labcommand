@@ -6,7 +6,8 @@
 # List every attempt, failed ones included: the series needs three CONSECUTIVE
 # counted runs, and dropping a failure would hide it. spatio.series orders them
 # by each walk_result's recorded_at (the bag's start time), not by this list.
-# Writes <sessions-root>/series/<series-id>/series.{md,json}.
+# Writes <sessions-root>/series/<series-id>/series.{md,json} (the walk-day verdict:
+# spatio.series plus spatio.walkday.seriesgate G1/G2) and spatio_series/ (its own).
 # Exit codes are spatio.series compare's own: 0 PASS, 3 FAIL, 4 INCOMPLETE,
 #   5 NOT_EVALUABLE, 6 REPLAY_ONLY (no physical evidence), 1 inputs rejected
 #   (e.g. missing or tied recorded_at), 2 unreadable input (a run never scored)
@@ -22,11 +23,11 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --sessions-root) ROOT=$2; shift 2 ;;
     --series-id) SERIES_ID=$2; shift 2 ;;
-    -*) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    -*) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
     *) RUNS+=("$1"); shift ;;
   esac
 done
-[[ ${#RUNS[@]} -ge 1 ]] || { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[[ ${#RUNS[@]} -ge 1 ]] || { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [[ -n $SERIES_ID ]] || SERIES_ID="$(IFS=+; echo "${RUNS[*]}")"
 [[ $SERIES_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.+-]*$ ]] || { echo "bad series id: $SERIES_ID" >&2; exit 2; }
 
@@ -48,16 +49,27 @@ if [[ $MISSING == 1 ]]; then
 fi
 
 OUT="$ROOT/series/$SERIES_ID"
-mkdir -p "$OUT"
-python3 -m spatio.series compare "${FILES[@]}" --out "$OUT" --series-id "$SERIES_ID"
+STAGED="$OUT/spatio_series"   # spatio.series' own verdict; the walk-day gate writes the final one
+mkdir -p "$STAGED"
+rm -f "$OUT/series.md" "$OUT/series.json" "$STAGED/series.md" "$STAGED/series.json"   # never leave an old verdict
+python3 -m spatio.series compare "${FILES[@]}" --out "$STAGED" --series-id "$SERIES_ID"
 rc=$?
 case $rc in
   0|3|4|5|6) ;;
   1) echo "!! spatio.series rejected the inputs (exit 1; see the message above)" >&2; exit 1 ;;
   *) echo "!! spatio.series could not read the inputs (exit $rc)" >&2; exit "$rc" ;;
 esac
+# Walk-day rules spatio.series does not know (seriesgate.py docstring): the same
+# walk-day settings and driver config in every run (G1), and a run counts only
+# with both of the spec's preselected wall patches verified (G2).
+python3 -m spatio.walkday.seriesgate "$STAGED" "$OUT" "${FILES[@]}"
+rc=$?
+case $rc in
+  0|3|4|5|6) ;;
+  *) echo "!! walk-day series gate failed (exit $rc); no series verdict written" >&2; exit "$rc" ;;
+esac
 VERDICT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$OUT/series.json")"
-[[ $VERDICT == NOT_EVALUABLE ]] && echo "!! NOT-EVALUABLE series: the runs do not share one config/FAST-LIO revision (see series.md)"
+[[ $VERDICT == NOT_EVALUABLE ]] && echo "!! NOT-EVALUABLE series: the runs do not share one config, FAST-LIO revision, walk-day settings or driver config (see series.md)"
 echo "========================================================================"
 echo "SERIES $SERIES_ID: $VERDICT"
 echo "table: $OUT/series.md"

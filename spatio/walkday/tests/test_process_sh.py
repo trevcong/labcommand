@@ -81,6 +81,87 @@ class ProcessShTest(unittest.TestCase):
             json.dump({"spec_id": "x", "config_sha256": "0" * 64}, f)
         self.assert_stopped(self.sh(self.rec, "r5", "--spec", spec), "r5", "spec")
 
+    def driver(self, text, name="rig7_driver.yaml"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def bad_spec(self):
+        spec = os.path.join(self.tmp, "spec.json")
+        with open(spec, "w") as f:
+            json.dump({"spec_id": "x", "config_sha256": "0" * 64}, f)
+        return spec
+
+    def test_driver_config_is_hashed_checked_and_kept(self):
+        # Review P2 (process.sh:59): a two-config run (JT128: FAST-LIO config +
+        # the driver's jt128_post.yaml). Synthetic rig7 topics, not JT128's. The
+        # bad spec stops the run right after stage 1, as B5 stops the JT128 sample.
+        write_rec(self.rec, mcap_counts={"/rig7/points": 3, "/rig7/inertial": 5})
+        drv = self.driver("lidar:\n  - driver:\n      source_type: 2\n    ros:\n"
+                          "      ros_send_point_cloud_topic: /rig7/raw_points\n"
+                          '      ros_send_imu_topic: "/rig7/inertial"\n')
+        self.assert_stopped(self.sh(self.rec, "d1", "--driver-config", drv, "--spec", self.bad_spec()), "d1", "spec")
+        logs = os.path.join(self.root, "d1", "logs")
+        with open(os.path.join(logs, "provenance.json")) as f:
+            prov = json.load(f)
+        import hashlib
+        with open(drv, "rb") as f:
+            want = hashlib.sha256(f.read()).hexdigest()
+        with open(os.path.join(self.rec, "rig7_fastlio.yaml"), "rb") as f:
+            want_cfg = hashlib.sha256(f.read()).hexdigest()
+        self.assertEqual(prov["driver_config"]["sha256"], want)
+        self.assertEqual(prov["driver_config"]["topics_in_bag"], ["/rig7/inertial"])
+        self.assertEqual(prov["fastlio_config"]["sha256"], want_cfg)
+        self.assertTrue(os.path.isfile(os.path.join(logs, "driver_config.rig7_driver.yaml")))
+        rep = self.report("d1")
+        self.assertEqual(rep["provenance"]["driver_config"]["sha256"], want)
+        self.assertEqual(rep["provenance"]["fastlio_config"]["sha256"], want_cfg)
+        md = open(os.path.join(self.root, "d1", "walkday.md")).read()
+        self.assertIn(want, md)
+        self.assertIn(want_cfg, md)
+
+    def test_driver_config_that_cannot_belong_to_the_recording_stops(self):
+        write_rec(self.rec, mcap_counts={"/rig7/points": 3, "/rig7/inertial": 5})
+        cases = {
+            "d2": os.path.join(self.rec, "rig7_fastlio.yaml"),                             # the FAST-LIO config itself
+            "d3": self.driver('common:\n  lid_topic: "/rig7/points"\n', "other_fastlio.yaml"),  # a FAST-LIO config
+            "d4": self.driver("ros:\n  ros_send_imu_topic: /elsewhere/imu\n", "d4.yaml"),       # topics not in bag
+            "d5": self.driver("lidar:\n  - driver:\n      source_type: 2\n", "d5.yaml"),          # declares no topic
+            "d6": self.driver("", "d6.yaml"),                                                  # empty
+        }
+        for run_id, drv in cases.items():
+            proc = self.sh(self.rec, run_id, "--driver-config", drv)
+            self.assert_stopped(proc, run_id, "config")
+            self.assertNotIn("[2/9]", proc.stdout)
+        self.assertEqual(self.sh(self.rec, "d7", "--driver-config", "/nonexistent.yaml").returncode, 3)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "d7")))
+
+    def test_settings_identity_recorded_and_bad_settings_refused(self):
+        write_rec(self.rec, mcap_counts={"/rig7/points": 3, "/rig7/inertial": 5})
+        conf = os.path.join(HERE, "..", "walkday.conf")
+        with open(conf) as f:
+            text = f.read()
+        self.assertIn("MAP_VOXEL_M=0.03", text)          # the edits below must really apply
+        self.assertIn("MAX_HOLD_SPEED_M_S=0.10", text)
+        # A setting left empty: a usage/setup error before any session exists.
+        empty = os.path.join(self.tmp, "empty.conf")
+        with open(empty, "w") as f:
+            f.write(text.replace("MAP_VOXEL_M=0.03", "MAP_VOXEL_M="))
+        self.assertEqual(self.sh(self.rec, "s1", "--settings", empty).returncode, 3)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "s1")))
+        # A comment edit keeps the identity; a value edit changes it.
+        shas = []
+        for run_id, body in (("s2", text), ("s3", "# reworded comment\n" + text),
+                             ("s4", text.replace("MAX_HOLD_SPEED_M_S=0.10", "MAX_HOLD_SPEED_M_S=0.12"))):
+            path = os.path.join(self.tmp, run_id + ".conf")
+            with open(path, "w") as f:
+                f.write(body)
+            self.assert_stopped(self.sh(self.rec, run_id, "--settings", path, "--spec", self.bad_spec()), run_id, "spec")
+            shas.append(self.report(run_id)["provenance"]["settings_sha256"])
+        self.assertEqual(shas[0], shas[1])
+        self.assertNotEqual(shas[0], shas[2])
+
     def test_existing_session_is_never_overwritten(self):
         write_rec(self.rec)
         os.makedirs(os.path.join(self.root, "r6"))
