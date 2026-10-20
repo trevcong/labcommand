@@ -147,7 +147,21 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 - **Observation rows stay immutable**, as v1 (`store.py:368-372`). v2 adds nothing that updates them. Derived values (pose, map-frame position) are computed per revision, not stored back.
 - **Raw inputs are bound by hash** [proposal]: sessions gain `source_recording_sha256`, alongside v1's `trajectory_sha256` and `map_pcd_sha256`. Ingest refuses an observation whose `derived_from` names bytes that do not hash to the recorded value, the same pattern as `_check_map` (`wall_scoring.py:297-314`).
 - **Derivations name their code**: `method`, `method_version`, `params_sha256` on trajectory revisions, map revisions, alignments and re-extracted observations.
-- **The code contradicts strict immutability in one place:** the purge deletes camera rows under the 30-day retention policy (DESIGN §8, `store.py:1825` on). v2 keeps the purge, because the retention policy is Trevor's privacy rule, and records each deletion instead: `purged_observations(observation_id, kind, session_id, sensor_kind, acquired_at, recorded_txn, purged_txn, row_sha256)`. The tombstone holds no image data. A historical query that would have used a purged row returns `complete = False` and lists the purged ids. It never quietly gives a different answer.
+- **The code contradicts strict immutability in one place:** the purge deletes camera rows under the 30-day retention policy (DESIGN §8, `store.py:1825` on). v2 keeps the purge, because the retention policy is Trevor's privacy rule, and records each deletion instead, in two tombstone tables:
+  - `purged_observations(observation_id, kind, session_id, sensor_kind, acquired_at, recorded_txn, purged_txn, row_sha256)`, one row per deleted observation;
+  - `purged_associations(interpretation_id, observation_id, object_id, recorded_txn, purged_txn)`, one row per deleted interpretation, retracted or not. This is the part v1 loses: its cascade deletes the interpretation, and `objects.purged_sightings` keeps only a per-object count at purge time, so it cannot say which object an observation supported at an earlier `known_at`.
+
+  Neither table holds image data, a label, a confidence or geometry. Rows in `retractions` (§2.2) are never purged. Their targets may be deleted, but the retraction stays, so an association's retracted state at any `known_at` can still be worked out.
+
+  **When an answer is incomplete.** `object_status(X, now, known_at)` returns `complete = False` and lists in `purged_ids` every purged observation D with a tombstoned association A where all of these hold:
+  - `A.object_id = X`;
+  - `A.recorded_txn ≤ known_at`, and A has no retraction with `retracted_txn ≤ known_at`;
+  - `D.recorded_txn ≤ known_at`, and D has no retraction with `retracted_txn ≤ known_at`;
+  - `D.acquired_at ≤ now`.
+
+  `purged_txn` is not compared. A purge is not a retraction: the evidence was known and is now missing, both before and after the purge. The tombstone does not keep the inputs to v1's sighting gates (confidences, pose validity). Pose validity depends on the trajectory revision anyway (§2.3). So the flag means "this answer **may** have depended on purged evidence". It can over-report and never under-reports. In the other direction, the status reason uses the same set: X with no retained sighting and a non-empty `purged_ids` is `UNKNOWN / no_retained_sightings` (v1 DESIGN §6 step 2), never `never_seen`.
+
+  A historical query never quietly gives a different answer.
 
 ### 2.7 Unaligned sessions stay separate
 
@@ -161,7 +175,7 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 `object_status(object_id, now, known_at=None, frame=None) -> ObjectStatus` [proposal]:
 
 - `frame=None` means "the frame of the newest sighting". A reference frame may be named. Only aligned evidence takes part then.
-- The return adds `known_at` (the `txn_id` used), `frame`, `revisions_used`, `complete` and `purged_ids` to v1's fields. `measured` and `hypothesis` stay separate sub-records (v1 invariant I16).
+- The return adds `known_at` (the `txn_id` used), `frame`, `revisions_used`, `complete`, `purged_ids` and `purged_unattributed` (§2.9) to v1's fields. v1's `purged_sightings` becomes `len(purged_ids) + purged_unattributed` at `known_at`. `measured` and `hypothesis` stay separate sub-records (v1 invariant I16).
 - A **report** is canonical JSON of statuses plus a fingerprint: `schema_version`, `constants_sha256` (a hash of every constant in DESIGN §5 and v2's new ones), `known_at`, `now`. Regenerating a report on a store whose `constants_sha256` differs raises `ReproducibilityError`. It never recomputes the answer under new thresholds.
 
 ### 2.9 Migration from v1
@@ -171,6 +185,7 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 - Each v1 map becomes `map_revisions` revision 1. Each session's `trajectory_sha256` becomes trajectory revision 1. Every v1 observation becomes a `map`-frame observation bound to revision 1, because v1 stored map-frame poses.
 - Transactions are synthesized in `created_at` order (ties by table, then id). v1 `retracted_at` becomes a retraction row ordered the same way. Every synthesized transaction is flagged `knowledge_basis = 'migrated'`, because v1 wall times were never a knowledge record: `known_at` before the migration point is approximate.
 - `thumbnail_gc` may or may not exist (§1). The migration accepts both.
+- A v1 file that has already purged rows keeps only `objects.purged_sightings`; which observations and associations were lost cannot be recovered. The migration copies each non-zero count into `purged_unattributed(object_id, n, recorded_txn)`, with `recorded_txn` set to the migration transaction. For every `known_at` at or after it, that object reports `complete = False` with `purged_unattributed = n` and no ids it cannot name. Its reason stays `no_retained_sightings` when nothing is retained, as in v1.
 
 ## 3. Acceptance scenarios (future tests)
 
@@ -220,6 +235,24 @@ These are written to become `spatio/memory/tests/test_v2_*.py`, one test per cas
 
 `test_V2_3c_constants_change_refuses`
 - Given R from a store whose constants hash is H. Opening a store with any changed constant and regenerating R raises `ReproducibilityError`.
+
+`test_V2_3d_purge_after_identity_correction`
+- Given a camera detection D at `t0`, attributed to X by a model interpretation (K1). At K2, one transaction retracts it and adds an operator interpretation linking D to Y. At K3, `purge_expired` deletes D. X and Y have no other evidence. Every query below runs on the store after K3, with `now = t0 + 10`.
+
+  | Query | Expected |
+  |---|---|
+  | X at K1 | `UNKNOWN / no_retained_sightings`, `complete = False`, `purged_ids == [D]` |
+  | X at K2, K3 | `UNKNOWN / never_seen`, `complete = True`, `purged_ids == []` |
+  | Y at K1 | `UNKNOWN / never_seen`, `complete = True` |
+  | Y at K2, K3 | `UNKNOWN / no_retained_sightings`, `complete = False`, `purged_ids == [D]` |
+
+- Control, on a copy of the store taken before K3: X at K1 and Y at K2 are both `CURRENT`, with `measured.observation_id == D`.
+- The column set of `purged_observations` and `purged_associations` contains no label, confidence, thumbnail path or geometry column.
+- The retraction written at K2 still exists after K3.
+
+`test_V2_3e_purge_flag_respects_now_and_observation_retraction`
+- D as in V2-3d, attributed to X only, purged at K3. X at `now = t0 − 1` has `complete = True` (D was not yet acquired).
+- A second camera detection E of X at `t0 + 5`, retracted as an observation at K4 and purged at K5. X at `known_at ≥ K4` does not list E in `purged_ids`.
 
 ### V2-4. A trajectory correction makes no false "moved"
 
@@ -276,6 +309,10 @@ The drift investigation's lesson in test form: a pose error must not read as an 
 - After migration, for every object and every `now` the fixtures use, v2 `object_status(..., known_at=None)` equals v1's `ObjectStatus` field for field (v2's added fields aside). `describe()` text is identical.
 - The v1 file is unchanged (byte hash).
 
+`test_V2_6b_migrated_purge_stays_incomplete`
+- Given a v1 database after I27's purge, so X has `purged_sightings = 1` and no rows.
+- After migration, X at `known_at=None` is `UNKNOWN / no_retained_sightings`, `purged_sightings == 1`, `complete = False`, `purged_unattributed == 1`, `purged_ids == []`, as v1 reports it.
+
 ## 4. Deferred, deliberately
 
 These are out of v2 and not designed here:
@@ -292,4 +329,6 @@ Also unchanged from v1: no object merge or split, no named places, a single loca
 2. Set the alignment gates for a cart against a building map: fit, basin margin and held-out residual. The rig values are placeholders.
 3. Set `MOVED_SIGMA_K` (3 proposed) for the comparability predicate.
 4. Allow observation retraction (§2.2)? I recommend yes, operator-only.
-5. Retention against reproducibility: confirm that a purge may make an old report `complete = False`, rather than keeping images longer.
+5. Retention against reproducibility: confirm that a purge may make an old report `complete = False`, rather than keeping images longer. Two parts of this conflict with the workplan's wording that "derived records are kept locally for 30 days" (v1 DESIGN §8), so they need your decision, not my assumption:
+   - `purged_associations` keeps an object association, which is a derived record, past 30 days. It holds ids and transaction numbers only.
+   - A retraction's free-text `reason` stays after its target is purged. That text may name what the image showed. The alternative is to blank `reason` in the purge, keeping the row.
