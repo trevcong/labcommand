@@ -107,6 +107,10 @@ if [[ $have_sha != "$want_sha" ]]; then
   dk run --rm --name "spatio-mark-$RUN_ID" --network none -v "$VOL:/rec" "$IMAGE_TAG" sh -c "echo $want_sha > /rec/.spatio_loaded"
 fi
 
+# Tool revision as staged into the container (later edits don't reach it).
+TOOL_REV="$(git -C "$HERE" rev-parse HEAD)"
+[[ -n $(git -C "$HERE" status --porcelain -- .) ]] && TOOL_REV="$TOOL_REV-dirty" || true
+
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/spatio-stage.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/tools" "$STAGE/cfg"
@@ -146,8 +150,6 @@ if [[ $MODE == historical ]]; then
 fi
 
 # Provenance and run details (outside the contract manifest).
-TOOL_REV="$(git -C "$HERE" rev-parse HEAD)"
-[[ -n $(git -C "$HERE" status --porcelain -- .) ]] && TOOL_REV="$TOOL_REV-dirty" || true
 dk run --rm --name "spatio-prov-$RUN_ID" --network none "$IMAGE_TAG" cat /opt/spatio/provenance.json > "$SESSION/logs/image_provenance.json"
 python3 - "$SESSION/logs/run_params.json" <<EOF
 import json, sys
