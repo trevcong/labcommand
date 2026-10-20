@@ -125,6 +125,11 @@ def test_window_mean_not_first_and_last_pose(tmp_path):
         (19, 0.06),
         (20, 0.06),
     ]
+    # Extend the start hold to 10 s for the new protocol; preserve the
+    # first/last five-second means and every original numerical assertion.
+    samples = samples[:6] + [(t, 0.02) for t in range(6, 11)] + [
+        (t + 5, x) for t, x in samples[6:]
+    ] + [(t, 0.06) for t in range(26, 31)]
     rows = [(float(t), x, 0.0, 0.0, *quat) for t, x in samples]
     report = _score(tmp_path, rows)
     returned = report["return_to_start"]
@@ -221,7 +226,7 @@ def test_nonfinite_gap_limit_cannot_pass_a_gap(tmp_path):
 
 
 def test_gap_just_over_the_threshold_can_be_relaxed(tmp_path):
-    rows = insert_time_gap(hold_and_square(offset=(0.05, 0.0, 0.0)), after_t=10.0, extra_s=1.5)
+    rows = insert_time_gap(hold_and_square(offset=(0.05, 0.0, 0.0)), after_t=15.0, extra_s=1.5)
     blocked = _score(tmp_path / "default", rows)
     assert blocked["result"] == "NOT-EVALUABLE"
     allowed = _score(tmp_path / "wide", rows, max_gap_s=3.0)
@@ -269,7 +274,8 @@ def test_trajectory_shorter_than_two_windows_is_not_evaluable(tmp_path):
 
 def test_intermediate_stop_is_sanity_only(tmp_path):
     quat = yaw_quat(0.0)
-    samples = []
+    # Ten seconds parked, with intermediate-stop timestamps unchanged.
+    samples = [(t, 0.0, 0.0, 0.0) for t in range(-4, 0)]
     for t in range(0, 7):
         samples.append((t, 0.0, 0.0, 0.0))
     for t, x in ((7, 1.0), (8, 2.0), (9, 3.0), (10, 4.0)):
@@ -282,7 +288,7 @@ def test_intermediate_stop_is_sanity_only(tmp_path):
         samples.append((t, 4.2, 0.0, 0.0))
     for t, x in ((25, 3.0), (26, 2.0), (27, 1.0), (28, 0.0), (29, 0.0), (30, 0.0), (31, 0.0), (32, 0.0)):
         samples.append((t, x, 0.0, 0.0))
-    for t in range(33, 41):
+    for t in range(33, 44):
         samples.append((t, 0.04, 0.0, 0.0))
     rows = [(float(t), x, y, z, *quat) for t, x, y, z in samples]
     stops = {

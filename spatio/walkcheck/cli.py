@@ -15,6 +15,11 @@ from spatio.walkcheck.defaults import (
 )
 from spatio.walkcheck.evaluate import SessionDirError, evaluate_session
 from spatio.walkcheck.trajectory import ThresholdError
+from spatio.walkcheck.holds import (
+    MIN_HOLD_S, MAX_HOLD_SPEED_M_S, MAX_ANGULAR_SPEED_DEG_S, SIGNIFICANT_MOTION_M,
+    SIGNIFICANT_ROTATION_DEG, MAX_IMU_GAP_S, MAX_ACCEL_DEVIATION_M_S2,
+    GRAVITY_M_S2,
+)
 
 _EXIT = {"PASS": 0, "FAIL": 1, "NOT-EVALUABLE": 2}
 
@@ -34,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
         "--stationary-window",
         type=float,
         default=STATIONARY_WINDOW_S,
-        help="Seconds averaged at the start and at the end (default 5)",
+        help="Seconds averaged inside the first/last detected holds (default 5)",
     )
     parser.add_argument(
         "--max-gap",
@@ -68,14 +73,36 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=MAX_ENDPOINT_SPEED_M_S,
         help=(
-            "Largest mean speed inside an endpoint window, in metres per second. "
+            "Largest trajectory step speed for hold detection, in metres per second. "
             "Over this, the walk is NOT-EVALUABLE (default 0.10)"
         ),
     )
+    parser.add_argument("--imu-file", help="Optional CSV in trajectory clock: t,gx,gy,gz,ax,ay,az; rad/s and m/s² including gravity. Defaults to session/imu.csv if present.")
+    for option, default, help_text in (
+        ("max-hold-speed", MAX_HOLD_SPEED_M_S, "Maximum trajectory step speed for holds, m/s"),
+        ("min-hold", MIN_HOLD_S, "Minimum sustained hold duration, seconds"),
+        ("max-angular-speed", MAX_ANGULAR_SPEED_DEG_S, "Maximum pose/IMU angular speed, deg/s"),
+        ("significant-motion", SIGNIFICANT_MOTION_M, "Motion flag threshold, metres"),
+        ("significant-rotation", SIGNIFICANT_ROTATION_DEG, "Rotation flag and hold excursion limit, degrees"),
+        ("max-imu-gap", MAX_IMU_GAP_S, "Maximum IMU timestamp gap, seconds"),
+        ("max-accel-deviation", MAX_ACCEL_DEVIATION_M_S2, "Maximum acceleration magnitude deviation from gravity, m/s²"),
+        ("gravity", GRAVITY_M_S2, "Expected gravity magnitude, m/s²"),
+    ):
+        parser.add_argument("--" + option, type=float, default=default,
+                            help=f"PROVISIONAL: {help_text} (default {default:g})")
     args = parser.parse_args(argv)
     try:
         report = evaluate_session(
             args.session_dir,
+            min_hold_s=args.min_hold,
+            max_hold_speed_m_s=args.max_hold_speed,
+            max_angular_speed_deg_s=args.max_angular_speed,
+            significant_motion_m=args.significant_motion,
+            significant_rotation_deg=args.significant_rotation,
+            max_imu_gap_s=args.max_imu_gap,
+            max_accel_deviation_m_s2=args.max_accel_deviation,
+            gravity_m_s2=args.gravity,
+            imu_file=args.imu_file,
             stationary_window_s=args.stationary_window,
             max_gap_s=args.max_gap,
             min_path_length_m=args.min_path_length,
@@ -101,6 +128,9 @@ def _summary(report: dict) -> str:
     reason_text = ""
     if reasons:
         reason_text = "  reasons: " + ",".join(reasons)
+    holds = report.get("holds") or {}
+    if holds.get("flags"):
+        reason_text += "  flags: " + ",".join(holds["flags"])
     walls = report.get("walls") or {}
     wall_text = ""
     if walls.get("status") == "OK":

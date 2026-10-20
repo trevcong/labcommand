@@ -73,7 +73,7 @@ def hold_and_square(
     offset=(0.05, 0.0, 0.0),
     duration: float = 40.0,
     rate: float = 10.0,
-    hold: float = 6.0,
+    hold: float = 10.0,
     end_yaw_deg: float = 0.0,
     start_yaw_deg: float = 0.0,
 ):

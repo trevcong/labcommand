@@ -49,7 +49,7 @@ def render_markdown(report: dict) -> str:
         "",
         "The end of the path was not moved onto the start. "
         "The return error is the gap between the mean position of a fixed "
-        "start window and the mean position of a fixed end window.",
+        "window inside the first sustained hold and a fixed window inside the last hold.",
         "",
     ]
     if HISTORICAL_LABEL in report.get("notes", []):
@@ -59,6 +59,25 @@ def render_markdown(report: dict) -> str:
         lines.append("Reasons: " + ", ".join(report["reasons"]) + ".")
         lines.append("")
 
+    holds = report.get("holds") or {}
+    lines.append("## Detected holds (PROVISIONAL)")
+    lines.append("")
+    if holds:
+        lines.append(f"Method: {holds['method']}. Minimum duration: {holds['minimum_duration_s']:g} s.")
+        for label in ("start", "end"):
+            hold = holds.get(label)
+            if hold:
+                lines.append(
+                    f"- {label.capitalize()} hold: {hold['t_start']:.3f}–{hold['t_end']:.3f} s; "
+                    f"duration {hold['duration_s']:.3f} s ({hold['samples']} poses)."
+                )
+        for flag in holds.get("flags", []):
+            lines.append(f"- Flag: {flag}.")
+        if "possible_repositioning" in holds.get("flags", []):
+            lines.append("An intermediate hold at another pose may be repositioning or an intentional stop. The first hold remains the start.")
+    else:
+        lines.append("Holds could not be detected from the input.")
+    lines.append("")
     returned = report.get("return_to_start")
     lines.append("## Return to start")
     lines.append("")
