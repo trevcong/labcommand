@@ -324,7 +324,8 @@ public enum TrailReadout {
         if let gate = w.wallGate {
             var value = gate
             if let p95 = w.wallP95Cm { value += " · p95 \(metres(p95 / 100))" }
-            rows.append(Row(label: "Walls (proposed)", value: value))
+            // The gate's status (proposed, provisional, …) is walkcheck's own label, in the note.
+            rows.append(Row(label: "Wall gate", value: value))
         }
         return rows
     }

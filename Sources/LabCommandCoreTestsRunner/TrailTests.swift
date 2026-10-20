@@ -507,7 +507,7 @@ func testTrailWalkcheckParse() {
     expect(rows["Verdict"] == "FAIL", "verdict row")
     expect(rows["Return error"] == "12.3 cm · need < 10.0 cm", "return error row, got \(rows["Return error"] ?? "nil")")
     expect(rows["  horizontal"] == "3.0 cm" && rows["  vertical"] == "1.5 cm" && rows["  heading"] == "0.8°", "parts rows")
-    expect(rows["Walls (proposed)"] == "FAIL · p95 5.1 cm", "wall row, got \(rows["Walls (proposed)"] ?? "nil")")
+    expect(rows["Wall gate"] == "FAIL · p95 5.1 cm", "wall row, got \(rows["Wall gate"] ?? "nil")")
     let note = TrailReadout.walkcheckNote(fail, accuracyLabel: TrailSession.notEvaluatedLabel)
     expect(note.contains("first 5 s") && note.contains("not aligned"), "the note says how the return error was measured")
     expect(note.contains("proposed, not yet approved by Trevor"), "the note says the wall gate is proposed")
