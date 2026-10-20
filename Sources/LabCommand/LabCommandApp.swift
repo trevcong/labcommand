@@ -128,6 +128,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return false
         }
         if textView { return false }
+        // Trail replay: left/right step one second, space plays or pauses.
+        if appState.dest == .trail, let trail = appState.trail {
+            switch keyCode {
+            case 123: trail.step(-1)
+            case 124: trail.step(1)
+            case 49: trail.toggle()
+            default: return false
+            }
+            return true
+        }
         switch keyCode {
         case 123:
             appState.stepOverlay(-1)

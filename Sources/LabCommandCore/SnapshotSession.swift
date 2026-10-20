@@ -4,10 +4,13 @@ import Foundation
 public enum LaunchMode: Equatable, Sendable {
     case rig
     case snapshots(directoryA: String, directoryB: String)
+    /// Trajectory replay of one session folder (`LABCOMMAND_TRAIL_SESSION`). Isolated like snapshots.
+    case trail(session: String)
     case configurationError(String)
 
     public static let variableA = "LC_SNAPSHOT_A"
     public static let variableB = "LC_SNAPSHOT_B"
+    public static let variableTrail = TrailLaunch.sessionVariable
 
     public var isolates: Bool {
         if case .rig = self { return false }
@@ -17,6 +20,17 @@ public enum LaunchMode: Equatable, Sendable {
     public static func resolve(_ environment: [String: String]) -> LaunchMode {
         let aRaw = environment[variableA]
         let bRaw = environment[variableB]
+        if let trailRaw = environment[variableTrail] {
+            // One local mode per launch. Both set is a mistake, not a choice.
+            if aRaw != nil || bRaw != nil {
+                return .configurationError("Launch configuration error. Set \(variableTrail) or LC_SNAPSHOT_A/B, not both.")
+            }
+            let session = trailRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if session.isEmpty {
+                return .configurationError("Trail configuration error. \(variableTrail) is empty.")
+            }
+            return .trail(session: session)
+        }
         if aRaw == nil, bRaw == nil { return .rig }
         let a = aRaw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let b = bRaw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -222,6 +236,7 @@ public struct SnapshotSession: Equatable, Sendable {
         case rig
         case failed(String)
         case load(directoryA: String, directoryB: String)
+        case trail(session: String)
     }
 
     public func begin(rig: () -> Void) -> Begin {
@@ -233,6 +248,8 @@ public struct SnapshotSession: Equatable, Sendable {
             return .failed(message)
         case .snapshots(let directoryA, let directoryB):
             return .load(directoryA: directoryA, directoryB: directoryB)
+        case .trail(let session):
+            return .trail(session: session)
         }
     }
 

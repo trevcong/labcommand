@@ -35,6 +35,10 @@ struct CommandCenterView: View {
                 ForEach(Dest.navCases) { d in
                     navItem(d)
                 }
+                // Only a trail launch has a session to replay.
+                if state.trail != nil {
+                    navItem(.trail)
+                }
             }
 
             Spacer(minLength: 12)
@@ -171,6 +175,12 @@ struct CommandCenterView: View {
             case .workspace: rigWorkspace
             case .settings: SettingsView()
             case .liveRoom: LiveRoomPage()
+            case .trail:
+                if let trail = state.trail {
+                    TrailReplayView(player: trail)
+                } else {
+                    LiveRoomPage()
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -2,11 +2,13 @@ import Foundation
 import Combine
 import LabCommandCore
 
-/// App destinations. Rig, Settings, and the live room.
+/// App destinations. Rig, Settings, and the live room. Trail replay is only reachable from a
+/// trail launch (`LABCOMMAND_TRAIL_SESSION`), so it stays out of `navCases`.
 enum Dest: String, CaseIterable, Identifiable {
     case workspace
     case settings
     case liveRoom
+    case trail
 
     var id: String { rawValue }
 
@@ -17,6 +19,7 @@ enum Dest: String, CaseIterable, Identifiable {
         case .workspace: return "Rig"
         case .settings: return "Settings"
         case .liveRoom: return "Room"
+        case .trail: return "Trail"
         }
     }
 
@@ -80,6 +83,9 @@ final class AppState: ObservableObject {
     let live: FoxgloveLiveClient
     /// Launch mode. Named apart from `session`, which is the capture spec.
     let launch: SnapshotSession
+    /// Trajectory replay. Set only for a trail launch; its playhead publishes on its own so
+    /// 60 Hz playback does not redraw everything that observes AppState.
+    let trail: TrailPlayer?
 
     /// Live room socket. Nil in fixture mode: the view reads `fixture` instead.
     /// A snapshot launch isolates the network, so it leaves this nil too.
@@ -122,6 +128,11 @@ final class AppState: ObservableObject {
     ) {
         let launch = SnapshotSession(environment: environment)
         self.launch = launch
+        if case .trail = launch.mode {
+            self.trail = TrailPlayer(startFraction: TrailLaunch.startFraction(environment))
+        } else {
+            self.trail = nil
+        }
         let roomLaunch = LiveRoomLaunch.parse(environment)
         self.roomLaunch = roomLaunch
         let endpointStore = RoomMemoryEndpointStore(environment: environment, defaults: .standard)
@@ -160,6 +171,10 @@ final class AppState: ObservableObject {
         // for the room page. Do not open Room by setting `opensRoom`: that skips probes.
         if launch.isolates && !roomLaunch.opensRoom {
             dest = .workspace
+        }
+        // A trail launch opens on the replay, whatever the room variable says.
+        if trail != nil {
+            dest = .trail
         }
         recomputeStatusDots()
         watchRoomDots()
@@ -291,6 +306,7 @@ final class AppState: ObservableObject {
     var localHeadline: String? {
         guard launch.isolates else { return nil }
         if let localFailure { return localFailure }
+        if trail != nil { return TrailPlayer.localLine }
         if overlayTimeline == nil { return ChangeOverlay.readingLine }
         return ChangeOverlay.localSessionLine
     }
@@ -356,7 +372,9 @@ final class AppState: ObservableObject {
     }
 
     func start() {
-        if launch.isolates {
+        if trail != nil {
+            logLine(TrailPlayer.localLine)
+        } else if launch.isolates {
             logLine(ChangeOverlay.localSessionLine)
         }
         let skipsProbes = roomLaunch.skipsProbes
@@ -371,6 +389,14 @@ final class AppState: ObservableObject {
                 let loaded = SnapshotFiles.load(directoryA: directoryA, directoryB: directoryB)
                 await self?.applySnapshot(loaded)
             }
+        case .trail(let raw):
+            let directory = TrailSession.resolveDirectory(
+                raw,
+                resources: Bundle.main.resourceURL,
+                cwd: FileManager.default.currentDirectoryPath
+            )
+            logLine("trail session: \(directory)")
+            trail?.load(directory: directory)
         }
         if roomLaunch.startsClient, room != nil {
             applyRoomAdmission(startIfNeeded: true)

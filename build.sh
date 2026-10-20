@@ -54,6 +54,14 @@ if [[ -f "${ROOT}/fixtures/pointclouds/mid360-frame.pcd" ]]; then
   cp -f "${ROOT}/fixtures/pointclouds/mid360-frame.pcd" "${APP}/Contents/Resources/fixtures/pointclouds/"
 fi
 
+# Synthetic trail session for LABCOMMAND_TRAIL_SESSION=fixture
+TRAIL="${ROOT}/fixtures/trail/synthetic-loop"
+if [[ -d "${TRAIL}" ]]; then
+  echo "==> Copying trail fixture to app bundle"
+  mkdir -p "${APP}/Contents/Resources/fixtures/trail/synthetic-loop"
+  cp -f "${TRAIL}/"* "${APP}/Contents/Resources/fixtures/trail/synthetic-loop/"
+fi
+
 codesign -s - --force --deep "${APP}" 2>/dev/null || true
 
 echo "Built  ${APP}"
