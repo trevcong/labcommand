@@ -16,6 +16,8 @@
 #                     original run, and copy the recording's historical map
 #   --historical-map FILE  map to copy for --historical (relative to <recording>)
 #   --max-seconds N   hard limit for the container run (default 3600)
+#   --fastdds-profile FILE  Fast DDS XML profile for every node in the container
+#                     (e.g. configs/fastdds_big_shm.xml for large PointCloud2)
 #
 # Isolation: --network none, private ROS_DOMAIN_ID, recording mounted read-only
 # (as a named volume copy), CPU/memory/pids limits, all capabilities dropped.
@@ -31,7 +33,7 @@ MEM=8g
 usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [[ $# -ge 2 ]] || usage
 REC_ARG=$1 RUN_ID=$2; shift 2
-RATE=1.0 DURATION="" CONFIG="" CONFIG_NOTE="" MODE=replay HIST_MAP="" MAX_SECONDS=3600
+RATE=1.0 DURATION="" CONFIG="" CONFIG_NOTE="" MODE=replay HIST_MAP="" MAX_SECONDS=3600 DDS_PROFILE=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --rate) RATE=$2; shift 2 ;;
@@ -41,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     --historical) MODE=historical; shift ;;
     --historical-map) HIST_MAP=$2; shift 2 ;;
     --max-seconds) MAX_SECONDS=$2; shift 2 ;;
+    --fastdds-profile) DDS_PROFILE=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -106,6 +109,11 @@ trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/tools" "$STAGE/cfg"
 cp "$HERE"/*.py "$HERE"/run_in_container.sh "$STAGE/tools/"
 [[ -n $CONFIG ]] && cp "$CONFIG" "$STAGE/cfg/config.yaml"
+DDS_ENV=()
+if [[ -n $DDS_PROFILE ]]; then
+  cp "$DDS_PROFILE" "$STAGE/cfg/fastdds.xml"
+  DDS_ENV=(-e FASTRTPS_DEFAULT_PROFILES_FILE=/cfg/fastdds.xml -e FASTDDS_DEFAULT_PROFILES_FILE=/cfg/fastdds.xml)
+fi
 
 CONTAINER="spatio-replay-$RUN_ID"
 mkdir -p "$SESSION"
@@ -116,7 +124,7 @@ dk create --name "$CONTAINER" \
   -e ROS_DOMAIN_ID=$DOMAIN_ID -e ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST -e ROS_LOG_DIR=/out/logs/ros \
   -e MODE="$MODE" -e LIDAR="$LIDAR" -e IMU="$IMU" -e RATE="$RATE" -e DURATION="$DURATION" \
   -e TIMESTAMP_UNIT="$TS_UNIT" -e HIST_PATH_TOPIC="$HIST_PATH_TOPIC" -e MAP_VOXEL=0.03 \
-  -v "$VOL:/rec:ro" \
+  ${DDS_ENV[@]+"${DDS_ENV[@]}"} -v "$VOL:/rec:ro" \
   "$IMAGE_TAG" timeout --signal=TERM --kill-after=60 "$MAX_SECONDS" \
   bash /opt/spatio/tools/run_in_container.sh >/dev/null
 dk cp "$STAGE/tools" "$CONTAINER:/opt/spatio/tools"
@@ -148,6 +156,7 @@ json.dump({
   "duration_s": "${DURATION:-all}", "ros_domain_id": $DOMAIN_ID,
   "recording_volume": "$VOL", "bag_sha256": "$want_sha",
   "limits": {"cpus": $CPUS, "memory": "$MEM", "shm": "1g", "pids": 1024, "max_seconds": $MAX_SECONDS},
+  "fastdds_profile": "${DDS_PROFILE:-default}",
   "fastlio_param_overrides": {"runtime_pos_log_enable": True} if "$MODE" == "replay" else {},
   "map": "map.pcd = copied map_saver.py (0.03 m voxel) fed offline from recorded /cloud_registered" if "$MODE" == "replay" else "map.pcd = copy of recording's $HIST_MAP",
 }, open(sys.argv[1], "w"), indent=2)

@@ -1,0 +1,60 @@
+# RECONSTRUCTED JT128 config -- NOT the config of the original 2026-08-26 run.
+# The original (slam_jt128_launch.py / post_jt128_launch.py and any yaml they
+# used) was copied as 0-byte files. This file is FAST_LIO_ROS2 2fffc57
+# config/velodyne.yaml with only these changes:
+#   forced by the bag data (measured with inspect_bag / point dumps):
+#     lid_topic /slam/points, imu_topic /slam/imu        (topics in the bag)
+#     scan_line 128        ring values 0..124 (step 4); handler drops ring >= scan_line
+#     timestamp_unit 0     per-point 'time' runs 0..0.100 s per scan -> seconds
+#   guesses (stated, unverified):
+#     extrinsic_T [0,0,0], R = I   lidar and IMU messages share frame_id hesai_lidar
+#   output-only (no effect on the estimate):
+#     dense_publish_en false, path_en true   (same as mid360.yaml; keeps the output bag small)
+# Everything else (blind 2.0, point_filter_num 4, covariances, extrinsic_est_en
+# false, ...) is velodyne.yaml as copied.
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 4
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+
+        common:
+            lid_topic:  "/slam/points"
+            imu_topic:  "/slam/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 2
+            scan_line: 128
+            scan_rate: 10
+            timestamp_unit: 0
+            blind: 2.0
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+            extrinsic_est_en:  false
+            extrinsic_T: [ 0., 0., 0.]
+            extrinsic_R: [ 1., 0., 0.,
+                        0., 1., 0.,
+                        0., 0., 1.]
+
+        publish:
+            path_en:  true
+            scan_publish_en:  true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: true
+            interval: -1
