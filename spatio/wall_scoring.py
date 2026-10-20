@@ -1,7 +1,8 @@
 """Shared wall acceptance for walk-day and series adapt.
 
 Evidence comes only from the supplied reports and explicit preselection spec.
-Whole-map doubled flags remain decisive, even for possible solid-object faces.
+The whole-map doubled-wall flag is a warning only: it cannot tell a ghost wall
+from two faces of a solid object. Doubled walls are decided on the patches.
 """
 
 from __future__ import annotations
@@ -13,6 +14,12 @@ import os
 
 PATCH_ORIGINS = ("preselected", "auto_suggested")
 REQUIRED_PATCHES = 2
+# Provisional (Trevor, 2026-10-20): guard band under the 5 cm wall gate. On a
+# patch that would otherwise pass, p95 and both 80% bands must be at most this.
+# Above it and up to the gate the patch is not checkable (never a pass); p95
+# or separation over the gate still fails. Revisit after real walks.
+PASS_MAX_M = 0.040
+PASS_MAX_LABEL = "provisional guard band (Trevor 2026-10-20, revisit after real walks)"
 
 
 class WallScoringError(Exception):
@@ -48,7 +55,9 @@ def effective_gate_check(p, wallpatch, gate_m):
     """Re-check one MEASURED patch against the stricter of gate_m and the patch tool's gate.
 
     The patch tool's pass flags were computed at its own gate, so a stricter
-    requested gate must be applied to the measured numbers here.
+    requested gate must be applied to the measured numbers here. A would-be
+    pass also needs p95 and both bands at most the pass limit (PASS_MAX_M or
+    a stricter gate); between that and the gate it is not evaluable.
     Returns ([(flag_key, failure)], not_evaluable_reasons).
     """
     name = p.get("name")
@@ -72,6 +81,12 @@ def effective_gate_check(p, wallpatch, gate_m):
         # Same fail-safe as the patch tool, on would-be passes only (the tool
         # leaves stepped_band_m null otherwise): a band at least as wide as the
         # gate could hold two surfaces that far apart, so "not doubled" is unproven.
+        # The pass limit is the guard band's lower edge: never looser than either gate.
+        limit = min(g for g in (PASS_MAX_M, _tool_gate(wallpatch, "pass_max_m"), p95_gate, sep_gate)
+                    if g is not None)
+        if p95 is not None and p95 > limit:
+            unknown.append(f"patch {name}: p95 {p95 * 100:.2f} cm > pass limit {limit * 100:g} cm "
+                           f"and within the gate, not checkable")
         for key in ("core_band_m", "stepped_band_m"):
             band = _num(residuals.get(key))
             if band is None:
@@ -79,12 +94,16 @@ def effective_gate_check(p, wallpatch, gate_m):
             elif band >= sep_gate:
                 unknown.append(f"patch {name}: {key} {band * 100:.2f} cm >= effective gate "
                                f"{sep_gate * 100:g} cm, single surface unproven")
+            elif band > limit:
+                unknown.append(f"patch {name}: {key} {band * 100:.2f} cm > pass limit {limit * 100:g} cm "
+                               f"and under the gate, not checkable")
     return failures, unknown
 
 
 def wall_evidence(walkcheck: dict, wallpatch, gate_m: float):
-    """Measure both whole-map and patch gates without accepting provenance.
+    """Measure the whole-map p95 gate and the patch gates without accepting provenance.
 
+    The whole-map doubled-wall flag only adds a warning (Trevor, 2026-10-20).
     Returns (p95_m, doubled_suspected True/False/None, failures, notes, patches, warnings).
     """
     failures, notes, patches, warnings = [], [], [], []
@@ -95,22 +114,19 @@ def wall_evidence(walkcheck: dict, wallpatch, gate_m: float):
     doubled = []
     if whole.get("status") == "OK":
         p95 = _cm_to_m(whole.get("p95_point_to_plane_cm"))
-        d = whole.get("doubled_wall")
-        doubled.append(d if isinstance(d, bool) else None)
-        if not isinstance(d, bool):
-            notes.append("whole-map doubled-wall evidence missing")
         if p95 is None:
             doubled.append(None)
             notes.append("whole-map p95 missing")
         elif p95 > gate_m:
             failures.append(f"whole-map wall p95 {p95 * 100:.1f} cm > gate {gate_m * 100:g} cm")
         if whole.get("doubled_wall") is True:
-            failures.append("whole-map check suspects a doubled wall")
             warnings.append(
                 "whole-map check suspects a doubled wall (revisit separation "
                 f"{whole.get('revisit_separation_cm')} cm, largest {whole.get('max_revisit_separation_cm')} cm). "
                 "It cannot tell a ghost wall from two faces of a real object (pillar, crate, thin wall): "
-                "inspect topdown.png. Conservatively treated as FAIL by the shared wall rule.")
+                "inspect topdown.png. Warning only: doubled walls are decided on the scoring wall patches.")
+        elif not isinstance(whole.get("doubled_wall"), bool):
+            warnings.append("whole-map doubled-wall flag missing (warning only)")
     else:
         doubled.append(None)
         notes.append(f"whole-map wall check not evaluable: {whole.get('reason')}")

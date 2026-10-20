@@ -11,6 +11,7 @@ import os
 
 import numpy as np
 
+from spatio.wall_scoring import PASS_MAX_LABEL, PASS_MAX_M
 from spatio.wallpatch.doubled import (
     CONFIDENT_SEPARATION_M,
     MIN_PEAK_MASS,
@@ -42,6 +43,8 @@ from spatio.wallpatch.util import write_json
 
 # Provisional: approved for now, revisit after a taped walk.
 # The 0.05 m numbers are the workplan gates. They did not change.
+# PASS_MAX_M (0.04 m, shared with spatio.wall_scoring) is the guard band's
+# lower edge: a would-be single-wall pass needs p95 and both bands at most it.
 P95_GATE_M = 0.05
 SEPARATION_GATE_M = 0.05
 GATE_LABEL = "provisional (approved for now, revisit after real data)"
@@ -112,6 +115,8 @@ def measure_map(map_path, patches_path, out_dir, accuracy_label=None, verbose=Fa
             "p95_point_to_plane_max_m": P95_GATE_M,
             "revisit_separation_max_m": SEPARATION_GATE_M,
             "label": GATE_LABEL,
+            "pass_max_m": PASS_MAX_M,
+            "pass_max_label": PASS_MAX_LABEL,
         },
         "doubled_wall_rule": {
             "text": RULE_TEXT,
@@ -283,6 +288,13 @@ def _measure_one(name, points, spec, invalid_reason):
         step_reason = stepped_band_reason(stepped, SEPARATION_GATE_M)
         if step_reason is not None:
             return _blank(name, n_cropped, step_reason, spec)
+        # Provisional guard band. A single wall passes only at or under
+        # PASS_MAX_M. A doubled=true patch is left alone: it is never a pass
+        # downstream, and blanking it would hide its doubled-wall failure.
+        if doubled == "false":
+            guard = _guard_band_reason(fit_stats["p95_abs_m"], fit_stats["core_band_m"], stepped)
+            if guard is not None:
+                return _blank(name, n_cropped, guard, spec)
     else:
         stepped = None
     across, vertical, mask = _slice_frame(points, plane_point, normal)
@@ -329,6 +341,22 @@ def _measure_one(name, points, spec, invalid_reason):
             "mask": mask,
         },
     }
+
+
+def _guard_band_reason(p95, core, stepped):
+    """Why a would-be single-wall pass is not checkable, or None when it passes."""
+    over = [
+        "%s %.4f m" % (label, value)
+        for label, value in (("p95", p95), ("80% band", core), ("stepped 80% band", stepped))
+        if float(value) > PASS_MAX_M
+    ]
+    if not over:
+        return None
+    return (
+        "%s above the provisional %.3f m pass limit and within the %.2f m gate; "
+        "inside the guard band the patch is not checkable, so it is not evaluable"
+        % (", ".join(over), PASS_MAX_M, SEPARATION_GATE_M)
+    )
 
 
 def _blank(name, n_cropped, reason, spec):
@@ -448,6 +476,10 @@ def _markdown(report):
             gates["p95_point_to_plane_max_m"],
             gates["revisit_separation_max_m"],
         ),
+        "",
+        "Guard band (%s): a single wall passes only with p95 and both 80%% bands "
+        "<= %.3f m. Above that and within the gate it is not checkable (not evaluable)."
+        % (gates["pass_max_label"], gates["pass_max_m"]),
         "",
         "Doubled-wall rule: %s" % report["doubled_wall_rule"]["text"],
         "",

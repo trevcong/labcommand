@@ -26,10 +26,11 @@ Run status (stricter than spatio.series W1, never looser):
   run can never count. An unreadable gate file is bad input (exit 3).
   Otherwise status uses spatio.wall_scoring, also used by spatio.series adapt.
   PASS requires a passing trajectory, complete verified preselected patches,
-  whole-map and patch gates, and no whole-map or patch doubled-wall suspicion.
+  whole-map p95 and patch gates, and no doubled wall on the patches.
   Zero verified patches and auto-suggested patches are NOT_EVALUABLE. The
-  whole-map flag can mistake solid-object faces for doubled walls; it remains
-  conservatively decisive in both paths, with that limitation shown as a warning.
+  whole-map doubled-wall flag can mistake solid-object faces for doubled walls,
+  so in both paths it is a warning only. A patch in the provisional guard band
+  (p95 or an 80% band over 4.0 cm, within the 5 cm gate) is NOT_EVALUABLE.
   A wall-patch report whose map_sha256 is not this run's map.pcd is bad input (exit 3).
 
 Acceptance provenance (extra walk_result.json keys; spatio.series ignores them,

@@ -223,9 +223,11 @@ class ResultTest(unittest.TestCase):
         self.assertEqual(w["status"], "FAIL")
         self.assertTrue(w["walls"]["doubled_wall_suspected"])
 
-    def test_solid_pillar_keeps_the_stricter_shared_failure(self):
+    def test_solid_pillar_is_a_warning_not_a_failure(self):
         # Since fd3cf19 the whole-map check reports the two faces of a 0.5 m pillar
-        # as a ~50 cm doubled wall. Keep series adapt's stricter failure in both paths.
+        # as a ~50 cm doubled wall. Round 7 (Trevor, 2026-10-20): that is a WARNING
+        # again in both paths; only the scoring wall patches decide doubled walls.
+        # (Reverts b1b7922's FAIL / doubled_wall_suspected True assertions.)
         rng = np.random.default_rng(2)
         pillar = [vertical_wall(2.25, "x", 1500, 1.75, 2.25, 0, 2.4, 0.004, rng),
                   vertical_wall(2.75, "x", 1500, 1.75, 2.25, 0, 2.4, 0.004, rng),
@@ -234,12 +236,14 @@ class ResultTest(unittest.TestCase):
         s = make_session(self.tmp, "rpillar", xyz=np.vstack([four_wall_room()] + pillar))
         wc = json.loads((s / "walkcheck.json").read_text())
         self.assertTrue(wc["walls"]["doubled_wall"])          # the whole-map flag fires
-        self.assertEqual(run(s), 1)
-        self.assertEqual(self.walk(s)["status"], "FAIL")
-        self.assertTrue(self.walk(s)["walls"]["doubled_wall_suspected"])
+        self.assertEqual(run(s), 0)
+        self.assertEqual(self.walk(s)["status"], "PASS")
+        self.assertFalse(self.walk(s)["walls"]["doubled_wall_suspected"])
         report = json.loads((s / "walkday.json").read_text())
         self.assertTrue(report["walls"]["whole_map_doubled_flag"])
-        self.assertTrue(any("cannot tell a ghost wall" in x for x in report["walls"]["warnings"]))
+        self.assertTrue(any("cannot tell a ghost wall" in x and "Warning only" in x
+                            for x in report["walls"]["warnings"]))
+        self.assertFalse(any("doubled" in x for x in self.walk(s)["reasons"]))
         self.assertIn("WARNING", (s / "walkday.md").read_text())
 
     def test_missing_wall_patches_is_not_evaluable(self):

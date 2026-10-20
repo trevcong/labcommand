@@ -94,11 +94,13 @@ walkcheck. It retains the original verdict in `walkcheck_result` and the
 source path in `walkcheck_source`, preserves nulls and reasons, and validates
 the converted result using the existing series rules.
 
-Walkcheck's PASS does not gate on doubled walls. Both converters retain the
-stricter whole-map doubled-wall failure as well as the patch gates. This can
-fail a sharp room containing a solid pillar: the whole-map detector cannot
-distinguish its faces from ghost walls. That limitation remains visible in
-warnings; it is not silently waived. Zero verified preselected patches forces
+Walkcheck's PASS does not gate on doubled walls. Both converters use the
+shared `spatio.wall_scoring` rule: doubled walls are decided on the scoring
+wall patches, and the whole-map doubled-wall flag is a warning only (Trevor,
+2026-10-20), because its detector cannot tell a solid pillar's faces from
+ghost walls. A patch that would pass needs p95 and both 80% bands at most the
+provisional 4.0 cm pass limit; between that and the 5 cm gate it is not
+checkable (NOT_EVALUABLE). Zero verified preselected patches forces
 NOT_EVALUABLE, with any diagnostic wall failures retained in the reasons.
 Other missing required measurements also force
 NOT_EVALUABLE. A producer failure is never upgraded to PASS. Contradictory or

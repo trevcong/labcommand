@@ -29,7 +29,8 @@ def test_invalid_wall_gate_is_rejected(gate):
 
 @pytest.mark.parametrize("case,expected", [
     ("sharp", "PASS"), ("other_walk", "PASS"), ("return_fail", "FAIL"),
-    ("gap", "NOT_EVALUABLE"), ("pillar", "FAIL"),
+    # Round 7: the whole-map doubled flag is a warning again; pillar was FAIL (b1b7922).
+    ("gap", "NOT_EVALUABLE"), ("pillar", "PASS"),
     ("no_report", "NOT_EVALUABLE"), ("empty", "NOT_EVALUABLE"),
     ("auto", "NOT_EVALUABLE"), ("no_spec", "NOT_EVALUABLE"),
     ("one_verified", "NOT_EVALUABLE"), ("zero_verified", "NOT_EVALUABLE"),
@@ -41,7 +42,8 @@ def test_invalid_wall_gate_is_rejected(gate):
     ("patch_separation_fail", "FAIL"), ("patch_doubled", "FAIL"),
     ("gate_boundary", "PASS"), ("explicit_gate", "FAIL"),
     ("strict_gate_patch_p95", "FAIL"), ("strict_gate_band", "NOT_EVALUABLE"),
-    ("strict_gate_clean", "PASS"),
+    ("strict_gate_clean", "PASS"), ("guard_band_review", "NOT_EVALUABLE"),
+    ("guard_band_p95", "NOT_EVALUABLE"), ("guard_band_edge", "PASS"),
 ])
 def test_converter_wall_parity(tmp_path, case, expected):
     xyz = four_wall_room(seed=17 if case == "other_walk" else 3)
@@ -111,6 +113,13 @@ def test_converter_wall_parity(tmp_path, case, expected):
             wp["patches"][1]["residuals"]["p95_abs_m"] = .01545
         elif case == "strict_gate_band":
             wp["patches"][1]["residuals"]["core_band_m"] = .012
+    elif case.startswith("guard_band"):
+        # Review repro numbers (sp-rv-m1final3): tool flags True at its 5 cm gate.
+        b = {"guard_band_review": dict(p95_abs_m=.0329, core_band_m=.04888, stepped_band_m=.04963),
+             "guard_band_p95": dict(p95_abs_m=.0450, core_band_m=.02, stepped_band_m=.02),
+             "guard_band_edge": dict(p95_abs_m=.04, core_band_m=.04, stepped_band_m=.04)}[case]
+        wp["patches"][1]["residuals"].update(b)
+        assert wp["patches"][1]["gate_p95_pass"] is wp["patches"][1]["gate_separation_pass"] is True
     elif case == "patch_doubled":
         wp["patches"][1]["doubled"] = "true"
         wp["patches"][1]["separation_m"] = .08
@@ -149,6 +158,11 @@ def test_converter_wall_parity(tmp_path, case, expected):
         assert any("doubled wall" in reason for reason in adapted["reasons"])
     if case == "strict_gate_patch_p95":
         assert any("p95 1.5" in r and "effective gate 1 cm" in r for r in adapted["reasons"])
+    if case in ("guard_band_review", "guard_band_p95"):
+        assert any("pass limit 4 cm" in r for r in adapted["reasons"])
+        assert adapted["wall_patches"]["verified"] == [wp["patches"][0]["name"]]
+    if case == "pillar":
+        assert adapted["walls"]["doubled_wall_suspected"] is False
     if case.startswith("strict_gate"):
         names = [p["name"] for p in wp["patches"]]
         expect = names if case == "strict_gate_clean" else names[:1]
@@ -277,3 +291,71 @@ def test_tool_fail_without_stepped_band_stays_fail(tmp_path):
     status, reasons, verified = _strict_verdict(tmp_path, report, .05)
     assert status == "FAIL", reasons
     assert verified == ["A"]
+
+
+def test_guard_band_review_case_is_not_evaluable(tmp_path):
+    # sp-rv-m1final3: offset sheets 5.2 cm apart, 5 mm noise, -4 deg hint. The patch
+    # tool before Round 7 said MEASURED, doubled=false, both gates True.
+    (tmp_path / "map.pcd").write_bytes(b"synthetic map")
+    report = _strict_report(tmp_path / "map.pcd", {"p95_abs_m": .032896, "core_band_m": .048876,
+                                                   "stepped_band_m": .049625})
+    status, reasons, verified = _strict_verdict(tmp_path, report, .05)
+    assert status == "NOT_EVALUABLE"
+    assert any("core_band_m 4.89 cm > pass limit 4 cm" in r for r in reasons)
+    assert any("stepped_band_m 4.96 cm > pass limit 4 cm" in r for r in reasons)
+    assert verified == ["A"]
+
+
+@pytest.mark.parametrize("key,value,expected", [
+    ("p95_abs_m", .040, "PASS"), ("p95_abs_m", .0401, "NOT_EVALUABLE"),
+    ("p95_abs_m", .050, "NOT_EVALUABLE"), ("p95_abs_m", .0501, "FAIL"),
+    ("core_band_m", .040, "PASS"), ("core_band_m", .0401, "NOT_EVALUABLE"),
+    ("core_band_m", .050, "NOT_EVALUABLE"), ("core_band_m", .0501, "NOT_EVALUABLE"),
+    ("stepped_band_m", .040, "PASS"), ("stepped_band_m", .0401, "NOT_EVALUABLE"),
+    ("stepped_band_m", .050, "NOT_EVALUABLE"), ("stepped_band_m", .0501, "NOT_EVALUABLE"),
+])
+def test_guard_band_boundaries(tmp_path, key, value, expected):
+    # <= 4.0 cm PASS; 4.0 < x <= 5.0 not checkable; p95 > 5 cm FAIL. A band never
+    # fails: a thick or noisy band stays not checkable (kept from g8safe).
+    (tmp_path / "map.pcd").write_bytes(b"synthetic map")
+    residuals = {"p95_abs_m": .005, "core_band_m": .004, "stepped_band_m": .004, key: value}
+    report = _strict_report(tmp_path / "map.pcd", residuals)
+    status, reasons, verified = _strict_verdict(tmp_path, report, .05)
+    assert status == expected, reasons
+    assert verified == (["A", "B"] if expected == "PASS" else ["A"])
+
+
+def test_guard_band_uses_the_stricter_reported_pass_limit(tmp_path):
+    (tmp_path / "map.pcd").write_bytes(b"synthetic map")
+    report = _strict_report(tmp_path / "map.pcd", {"p95_abs_m": .035, "core_band_m": .004,
+                                                   "stepped_band_m": .004})
+    assert _strict_verdict(tmp_path, report, .05)[0] == "PASS"
+    report["gates"]["pass_max_m"] = .03
+    status, reasons, _ = _strict_verdict(tmp_path, report, .05)
+    assert status == "NOT_EVALUABLE"
+    assert any("pass limit 3 cm" in r for r in reasons)
+    # A looser reported limit never relaxes the shared 4 cm one.
+    report["gates"]["pass_max_m"] = .05
+    report["patches"][1]["residuals"]["p95_abs_m"] = .045
+    assert _strict_verdict(tmp_path, report, .05)[0] == "NOT_EVALUABLE"
+
+
+def test_whole_map_doubled_flag_is_only_a_warning(tmp_path):
+    (tmp_path / "map.pcd").write_bytes(b"synthetic map")
+    spec, _ = write_spec(tmp_path / "spec.json", ["A", "B"])
+    report = _strict_report(tmp_path / "map.pcd", {"p95_abs_m": .005, "core_band_m": .004,
+                                                   "stepped_band_m": .004})
+    prov = patch_provenance("preselected", spec, None, report, None, gate_m=.05)
+    for flag in (True, None):
+        walkcheck = {"walls": {"status": "OK", "p95_point_to_plane_cm": .485, "doubled_wall": flag,
+                               "revisit_separation_cm": 50, "max_revisit_separation_cm": 52}}
+        _, doubled, failures, notes, _, warnings = score_walls(walkcheck, report, .05, prov,
+                                                               map_path=str(tmp_path / "map.pcd"))
+        assert wall_verdict("PASS", [], doubled, failures, notes) == ("PASS", [])
+        assert doubled is False
+        assert any("warning only" in w.lower() for w in warnings)
+    # The scoring patches still fail a run: a doubled patch B is FAIL.
+    report["patches"][1].update(doubled="true", separation_m=.08, gate_separation_pass=False)
+    _, doubled, failures, notes, _, _ = score_walls(walkcheck, report, .05, prov,
+                                                    map_path=str(tmp_path / "map.pcd"))
+    assert wall_verdict("PASS", [], doubled, failures, notes)[0] == "FAIL"

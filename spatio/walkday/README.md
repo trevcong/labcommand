@@ -37,9 +37,13 @@ Running `spatio.series compare` directly skips G1 and G2, so walk day always use
 
 The wall rule is in `spatio/wall_scoring.py`, shared with `spatio.series adapt`.
 Both require the spec's verified preselected patches, whole-map p95 and patch
-gates, and no whole-map or patch doubled-wall suspicion. Zero verified patches
-is NOT_EVALUABLE. The whole-map flag remains conservatively decisive even
-though a solid pillar can trigger it; the report also warns about that limitation.
+gates, and no doubled wall on the patches. Zero verified patches is
+NOT_EVALUABLE. The whole-map doubled-wall flag is a warning only (Trevor,
+2026-10-20): a solid pillar can trigger it, so only the scoring patches decide
+doubled walls. Provisional guard band per patch: p95 and both 80% bands
+<= 4.0 cm (`wall_scoring.PASS_MAX_M`) can pass; above 4.0 cm and within the
+5 cm gate the patch is not checkable (NOT_EVALUABLE, never PASS); p95 or
+separation over 5 cm fails. A band of 5 cm or more stays not checkable.
 
 Sessions go to `~/Developer/spatio-data/walkday/<run-id>/` (`--sessions-root` or `SPATIO_WALKDAY_ROOT`). g2 refuses to write under `spatio-data/sessions`, which holds the earlier replays of the test samples.
 

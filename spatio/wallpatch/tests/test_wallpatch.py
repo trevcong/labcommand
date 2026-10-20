@@ -16,8 +16,8 @@ import numpy as np
 
 from spatio.wallpatch.doubled import _histogram, _smooth, analyze_distances, reconcile_axes
 from spatio.wallpatch.errors import MapShaMismatch, WallpatchError
-from spatio.wallpatch.geometry import box_axes, crop_points, parse_box
-from spatio.wallpatch.measure import _measure_one, measure_map
+from spatio.wallpatch.geometry import box_axes, crop_points, fit_plane, parse_box
+from spatio.wallpatch.measure import _guard_band_reason, _measure_one, measure_map
 from spatio.wallpatch.numbers import parse_real, parse_suggest_n, parse_voxel_m
 from spatio.wallpatch.pcd import (
     DEFAULT_CHUNK,
@@ -214,10 +214,17 @@ class WallpatchTests(unittest.TestCase):
                 [_box("outliers", (0, 0, 0), (0, 1, 0), (0.6, 0.6, 0.6))],
             )
         patch = report["patches"][0]
-        self.assertEqual(patch["status"], "MEASURED")
-        self.assertEqual(patch["n_measured"], n_in + n_out)
-        self.assertLess(patch["plane"]["angle_from_hint_deg"], 2.0)
-        offset = abs(float(np.dot(patch["plane"]["point_m"], patch["plane"]["normal"])))
+        # Round 7 (Trevor's provisional guard band): p95 here is 4.24 cm, above
+        # the 4 cm pass limit and within the 5 cm gate, so the patch is not
+        # checkable. It used to be MEASURED with both gates passing. The fit
+        # itself is still checked below on the same points.
+        self.assertEqual(patch["status"], "NOT_EVALUABLE")
+        self.assertEqual(patch["n_cropped"], n_in + n_out)
+        self.assertIn("p95 0.042", patch["reasons"][0])
+        self.assertIn("provisional 0.040 m pass limit", patch["reasons"][0])
+        fitted = fit_plane(points, np.array([0.0, 1.0, 0.0]))
+        self.assertLess(fitted["angle_from_hint_deg"], 2.0)
+        offset = abs(float(np.dot(fitted["point"], fitted["normal"])))
         self.assertLess(offset, 0.01)
 
     def test_box_crop_exact_counts(self):
@@ -1161,6 +1168,48 @@ class WallpatchTests(unittest.TestCase):
         self.assertIs(patch["gate_p95_pass"], True)
         self.assertIs(patch["gate_separation_pass"], True)
         self.assertLess(patch["residuals"]["stepped_band_m"], 0.05)
+
+    def test_noisy_offset_sheets_review_case_never_passes(self):
+        # sp-rv-m1final3: sheets 5.2 cm apart, 10 cm overlap, join at +0.1 m,
+        # 5 mm Gaussian noise on the wall normal (default_rng(3)), hint -4 deg.
+        # Before Round 7 the z case was MEASURED, doubled=false, both gates True
+        # (80% band 4.888 cm, stepped band 4.963 cm, p95 3.29 cm).
+        points = _offset_sheets(0.052, 0.1, 0.1, 0.0)
+        points[:, 1] += np.random.default_rng(3).normal(0.0, 0.005, len(points))
+        theta = np.radians(-4.0)
+        hints = {
+            "z-4": (np.sin(theta), np.cos(theta), 0.0),
+            "x-4": (0.0, np.cos(theta), np.sin(theta)),
+        }
+        for label, hint in sorted(hints.items()):
+            with tempfile.TemporaryDirectory() as directory:
+                report, _out = _measure(
+                    directory, points, [_box(label, (0, 0, 0), hint, (0.6, 0.2, 0.6))]
+                )
+            patch = report["patches"][0]
+            self.assertFalse(
+                patch["gate_p95_pass"] is True
+                and patch["gate_separation_pass"] is True
+                and patch["doubled"] == "false",
+                label,
+            )
+            self.assertEqual(report["gates"]["pass_max_m"], 0.04)
+            self.assertIn("provisional", report["gates"]["pass_max_label"])
+        # The z case is caught by the guard band itself, not by the 5 cm checks.
+        spec =(np.zeros(3), np.asarray(hints["z-4"]), np.array([0.6, 0.2, 0.6]))
+        patch = _measure_one("z-4", crop_points(points, *spec), spec, None)
+        self.assertEqual(patch["status"], "NOT_EVALUABLE")
+        self.assertIn("80% band 0.0489 m, stepped 80% band 0.0496 m", patch["reasons"][0])
+        self.assertIn("provisional 0.040 m pass limit", patch["reasons"][0])
+
+    def test_guard_band_boundaries(self):
+        # <= 4.0 cm passes; above it the would-be pass is not checkable.
+        self.assertIsNone(_guard_band_reason(0.04, 0.04, 0.04))
+        for values in ((0.0401, 0.01, 0.01), (0.01, 0.0401, 0.01), (0.01, 0.01, 0.0401),
+                       (0.05, 0.01, 0.01)):
+            reason = _guard_band_reason(*values)
+            self.assertIsNotNone(reason, values)
+            self.assertIn("not evaluable", reason)
 
 
 def _offset_sheets(separation, layout, position, turn_deg):
