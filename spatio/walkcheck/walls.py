@@ -9,6 +9,20 @@ the gap is a large part of a 30 cm cell. Those cells are measured before
 they would have been discarded. Dropping them left a thin sliver that
 could pass the gate after a small shift.
 
+A wall that runs along the voxel diagonal has the same failure for a
+different reason. The points inside one cell are about as deep as they
+are wide, so the cell's own normal is noise. The cell is dropped, or
+called a floor, and pairing never sees the two sheets. The headline then
+keeps a thin sliver of one sheet. Those cells are measured again with a
+normal fit on a wider neighborhood. Cells that already have a reliable
+normal are left as they were.
+
+A gap wider than 40 cm used to be thrown away after it was measured.
+Each sheet is then a thin plane, the residual looks sharp, and the gate
+passes. Pairing now keeps that gap. The search goes one cell past the
+wider normal fit, so a gap that has just left that ball is still seen.
+A pair farther out than the search is not scored.
+
 This is a geometric estimate. Two real parallel surfaces look the same as
 drift. The number does not change the walk verdict.
 """
@@ -21,7 +35,6 @@ import numpy as np
 
 from spatio.walkcheck.defaults import (
     PROPOSED_WALL_LABEL,
-    WALL_DOUBLE_MAX_M,
     WALL_DOUBLE_MIN_M,
     WALL_GATE_CM,
     WALL_LATERAL_MAX_M,
@@ -29,6 +42,7 @@ from spatio.walkcheck.defaults import (
     WALL_LAYER_P95_MAX_M,
     WALL_MAX_ABS_NZ,
     WALL_MIN_CELL_POINTS,
+    WALL_NORMAL_SUPPORT_M,
     WALL_PARALLEL_DEG,
     WALL_PLANARITY_MIN,
     WALL_VOXEL_M,
@@ -60,7 +74,10 @@ def wall_sharpness(
         "method": (
             f"voxel PCA, {voxel_m:.2f} m cells, two grids half a cell apart, "
             "vertical patches only, no downsampling. "
-            "A cell with two thin sheets is kept even when one plane does not fit."
+            "A cell with two thin sheets is kept even when one plane does not fit. "
+            "A cell whose own normal is noise is measured again on a wider neighborhood. "
+            "A stacked pair the search can see is a double even when the gap "
+            "is wider than 40 cm."
         ),
     }
     if len(finite) < min_cell_points:
@@ -142,17 +159,23 @@ def _phase(points, voxel, origin, planarity_min, max_abs_nz, min_cell_points) ->
     ends = np.empty_like(starts)
     ends[:-1] = starts[1:]
     ends[-1] = len(sorted_points)
-    big = (ends - starts) >= min_cell_points
-    starts = starts[big]
-    ends = ends[big]
+
+    all_blocks: dict[tuple[int, int, int], np.ndarray] = {}
+    big_cells: list[tuple[int, int, int]] = []
+    for start, end in zip(starts, ends):
+        cell = tuple(int(v) for v in ijk_sorted[start])
+        all_blocks[cell] = sorted_points[start:end]
+        if end - start >= min_cell_points:
+            big_cells.append(cell)
+    support_offsets = _support_offsets(voxel, WALL_NORMAL_SUPPORT_M)
 
     residuals: list[np.ndarray] = []
     patches: list[tuple] = []
     separations: list[float] = []
     parallel_cos = math.cos(math.radians(WALL_PARALLEL_DEG))
 
-    for start, end in zip(starts, ends):
-        block = sorted_points[start:end]
+    for cell in big_cells:
+        block = all_blocks[cell]
         centroid = block.mean(axis=0)
         centered = block - centroid
         # np.dot, not @. On this Mac, Accelerate warns "divide by zero" for
@@ -171,30 +194,49 @@ def _phase(points, voxel, origin, planarity_min, max_abs_nz, min_cell_points) ->
         signed = np.dot(centered, normal)
         if not np.isfinite(signed).all():
             continue
-        # Floors and ceilings are not wall evidence.
-        if abs(float(normal[2])) > max_abs_nz:
+        # A confident floor stays a floor. A weak vertical "normal" is the
+        # diagonal-wall case: the cell is a blob, and the smallest axis can
+        # point up by chance. That one gets a second look below.
+        vertical_normal = abs(float(normal[2])) <= max_abs_nz
+        weak_normal = planarity < planarity_min
+        if not vertical_normal and not weak_normal:
             continue
         # Two sheets make the cell look thick, so the single-plane test
         # fails and the cell used to be dropped. A later shift can then
         # leave only a thin sliver, which passes. Look first.
-        layer = _layer_separation(signed, min_cell_points)
+        layer = None
+        residual = signed
+        if vertical_normal:
+            layer = _layer_separation(signed, min_cell_points)
+        single_plane = vertical_normal and not weak_normal
+        if not single_plane and layer is None and weak_normal:
+            wider = _sheets_from_support(
+                cell,
+                block,
+                all_blocks,
+                support_offsets,
+                min_cell_points,
+                max_abs_nz,
+                planarity_min,
+            )
+            if wider is not None:
+                layer, residual = wider
         if layer is not None:
             separations.append(layer)
-        single_plane = planarity >= planarity_min
         if not single_plane and layer is None:
             continue
-        residuals.append(np.abs(signed))
+        residuals.append(np.abs(residual))
         if not single_plane:
             continue
-        cell = tuple(int(v) for v in ijk_sorted[start])
         patches.append((cell, centroid.astype(np.float64, copy=True), normal))
 
     by_cell = {cell: (centroid, normal) for cell, centroid, normal in patches}
+    pair_radius = _pair_radius(voxel)
     for cell, centroid, normal in patches:
         i, j, k = cell
-        for di in (-1, 0, 1):
-            for dj in (-1, 0, 1):
-                for dk in (-1, 0, 1):
+        for di in range(-pair_radius, pair_radius + 1):
+            for dj in range(-pair_radius, pair_radius + 1):
+                for dk in range(-pair_radius, pair_radius + 1):
                     if di == 0 and dj == 0 and dk == 0:
                         continue
                     other_key = (i + di, j + dj, k + dk)
@@ -213,12 +255,11 @@ def _phase(points, voxel, origin, planarity_min, max_abs_nz, min_cell_points) ->
                     along = float(np.dot(delta, normal))
                     lateral = float(np.linalg.norm(delta - along * normal))
                     separation = abs(along)
-                    # In-plane offsets past one cell are the same sheet, seen
-                    # from a slightly tilted normal. Only stacked sheets count.
-                    if (
-                        lateral < WALL_LATERAL_MAX_M
-                        and WALL_LAYER_P95_MAX_M < separation <= WALL_DOUBLE_MAX_M
-                    ):
+                    # In-plane offsets are the same sheet, seen from a
+                    # slightly tilted normal. Only stacked sheets count.
+                    # There is no upper cap: a wider gap is still two sheets.
+                    # The loop radius is what limits how far this looks.
+                    if lateral < WALL_LATERAL_MAX_M and separation > WALL_LAYER_P95_MAX_M:
                         separations.append(separation)
 
     if not residuals:
@@ -241,8 +282,92 @@ def _phase(points, voxel, origin, planarity_min, max_abs_nz, min_cell_points) ->
     }
 
 
+def _pair_radius(voxel: float) -> int:
+    """How many cells away the other sheet of the same wall can sit.
+
+    One cell is 30 cm. The old 40 cm cap sat inside that one step, so a
+    45 cm gap was in the neighbor loop and was then discarded. Pairing
+    looks one cell past the wider normal fit, so a gap that has just
+    left that ball is still seen.
+    """
+    if voxel <= 0.0:
+        return 1
+    return max(1, int(math.ceil((WALL_NORMAL_SUPPORT_M + voxel) / voxel)))
+
+
+def _support_offsets(voxel: float, support_m: float) -> list[tuple[int, int, int]]:
+    """Cell offsets whose centers fall inside the wider normal fit."""
+    if voxel <= 0.0 or support_m <= 0.0:
+        return [(0, 0, 0)]
+    radius = int(math.ceil(support_m / voxel))
+    limit2 = support_m * support_m + 1e-12
+    step2 = voxel * voxel
+    offsets = []
+    for di in range(-radius, radius + 1):
+        for dj in range(-radius, radius + 1):
+            for dk in range(-radius, radius + 1):
+                if (di * di + dj * dj + dk * dk) * step2 <= limit2:
+                    offsets.append((di, dj, dk))
+    return offsets
+
+
+def _sheets_from_support(
+    cell: tuple[int, int, int],
+    block: np.ndarray,
+    all_blocks: dict[tuple[int, int, int], np.ndarray],
+    offsets: list[tuple[int, int, int]],
+    min_cell_points: int,
+    max_abs_nz: float,
+    planarity_min: float,
+) -> tuple[float, np.ndarray] | None:
+    """Two thin sheets around one cell, seen with a wider normal.
+
+    The cell's own normal is noise. The fit uses every point within the
+    support radius, including cells too small to score on their own, so a
+    sheet split across a voxel corner is still visible. The residual is
+    this cell's points against that plane, which sits between the sheets.
+    """
+    i, j, k = cell
+    parts = []
+    for di, dj, dk in offsets:
+        other = all_blocks.get((i + di, j + dj, k + dk))
+        if other is not None:
+            parts.append(other)
+    if not parts:
+        return None
+    gathered = parts[0] if len(parts) == 1 else np.concatenate(parts)
+    if len(gathered) < min_cell_points:
+        return None
+    centroid = gathered.mean(axis=0)
+    centered = gathered - centroid
+    cov = np.dot(centered.T, centered) / float(len(gathered))
+    if not np.isfinite(cov).all():
+        return None
+    evals, evecs = np.linalg.eigh(cov)
+    lam0, lam1, lam2 = (float(v) for v in evals)
+    if not np.isfinite(lam2) or lam2 <= 1e-12:
+        return None
+    planarity = (lam1 - lam0) / lam2
+    normal = evecs[:, 0]
+    if not np.isfinite(normal).all():
+        return None
+    if planarity < planarity_min or abs(float(normal[2])) > max_abs_nz:
+        return None
+    signed = np.dot(centered, normal)
+    if not np.isfinite(signed).all():
+        return None
+    separation = _layer_separation(signed, min_cell_points)
+    # Under the doubled-wall minimum this is thickness, not a second sheet.
+    if separation is None or separation <= WALL_DOUBLE_MIN_M:
+        return None
+    cell_signed = np.dot(block - centroid, normal)
+    if not np.isfinite(cell_signed).all():
+        return None
+    return separation, cell_signed
+
+
 def _layer_separation(signed: np.ndarray, min_points: int) -> float | None:
-    """Separation of two thin sheets inside one cell, or None."""
+    """Separation of two thin sheets along one normal, or None."""
     if signed.size < min_points:
         return None
     center_a = float(np.percentile(signed, 25))
@@ -266,7 +391,9 @@ def _layer_separation(signed: np.ndarray, min_points: int) -> float | None:
         center_a, center_b = center_b, center_a
         mask = ~mask
     separation = center_b - center_a
-    if not (WALL_LAYER_P95_MAX_M < separation <= WALL_DOUBLE_MAX_M):
+    # No upper cap. Two thin sheets inside this point set are a double
+    # however far apart they sit. A 40 cm ceiling used to drop them.
+    if separation <= WALL_LAYER_P95_MAX_M:
         return None
     fraction = float(mask.mean())
     if fraction < WALL_LAYER_MIN_FRACTION or fraction > 1.0 - WALL_LAYER_MIN_FRACTION:

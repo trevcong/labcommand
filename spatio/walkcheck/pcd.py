@@ -42,7 +42,7 @@ def read_pcd_xyz(path: Path) -> np.ndarray:
     if count == 0:
         return np.zeros((0, 3), dtype=np.float64)
     if mode == "ascii":
-        xyz = _read_ascii(raw[offset:], names, count)
+        xyz = _read_ascii(raw[offset:], names, header["counts"], count)
     elif mode == "binary":
         xyz = _read_binary(raw[offset:], header, count)
     else:
@@ -119,8 +119,33 @@ def _parse_header(lines: list[str]) -> dict:
     }
 
 
-def _read_ascii(blob: bytes, names: list[str], count: int) -> np.ndarray:
-    cols = [names.index(axis) for axis in ("x", "y", "z")]
+def _xyz_columns(names: list[str], counts: list[int]) -> list[int]:
+    """Column of each coordinate. COUNT is how many columns a field occupies.
+
+    A field index is not a column index. FIELDS `descriptor x y z` with
+    COUNT `3 1 1 1` puts x at column 3, not column 1. x, y, and z themselves
+    are one column each. A wider coordinate is rejected rather than guessed.
+    """
+    cursor = 0
+    start: dict[str, int] = {}
+    for name, field_count in zip(names, counts):
+        if field_count < 1:
+            raise PcdError(f"PCD field {name} has COUNT {field_count}")
+        if name in ("x", "y", "z") and name not in start:
+            if field_count != 1:
+                raise PcdError(
+                    f"PCD field {name} has COUNT {field_count}; only 1 is supported"
+                )
+            start[name] = cursor
+        cursor += field_count
+    missing = [axis for axis in ("x", "y", "z") if axis not in start]
+    if missing:
+        raise PcdError("PCD has no x y z fields")
+    return [start[axis] for axis in ("x", "y", "z")]
+
+
+def _read_ascii(blob: bytes, names: list[str], counts: list[int], count: int) -> np.ndarray:
+    cols = _xyz_columns(names, counts)
     if not blob.strip():
         raise PcdError("ascii PCD has a header count but no data")
     try:

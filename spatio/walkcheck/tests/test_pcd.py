@@ -62,6 +62,79 @@ def test_binary_compressed_is_rejected(tmp_path: Path):
         read_pcd_xyz(path)
 
 
+def test_ascii_count_is_a_column_width(tmp_path: Path):
+    """Codex P2. COUNT shifts later columns. A field index is not a column.
+
+    FIELDS descriptor x y z, COUNT 3 1 1 1, row 9 8 7 1 2 3 used to return
+    [8, 7, 1]. The coordinates are [1, 2, 3]. A wide field after z does
+    not move x, y, or z. A coordinate with COUNT other than 1 is rejected
+    rather than guessed.
+    """
+    counted = tmp_path / "counted.pcd"
+    counted.write_text(
+        "\n".join(
+            [
+                "VERSION 0.7",
+                "FIELDS descriptor x y z",
+                "SIZE 4 4 4 4",
+                "TYPE F F F F",
+                "COUNT 3 1 1 1",
+                "WIDTH 2",
+                "HEIGHT 1",
+                "POINTS 2",
+                "DATA ascii",
+                "9 8 7 1 2 3",
+                "4 5 6 7 8 9",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    got = read_pcd_xyz(counted)
+    assert got == pytest.approx(np.array([[1.0, 2.0, 3.0], [7.0, 8.0, 9.0]]))
+
+    trailing = tmp_path / "trailing.pcd"
+    trailing.write_text(
+        "\n".join(
+            [
+                "FIELDS x y z extra",
+                "SIZE 4 4 4 4",
+                "TYPE F F F F",
+                "COUNT 1 1 1 3",
+                "WIDTH 1",
+                "HEIGHT 1",
+                "POINTS 1",
+                "DATA ascii",
+                "1 2 3 9 8 7",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert read_pcd_xyz(trailing) == pytest.approx(np.array([[1.0, 2.0, 3.0]]))
+
+    wide_x = tmp_path / "wide-x.pcd"
+    wide_x.write_text(
+        "\n".join(
+            [
+                "FIELDS x y z",
+                "SIZE 4 4 4",
+                "TYPE F F F",
+                "COUNT 3 1 1",
+                "WIDTH 1",
+                "HEIGHT 1",
+                "POINTS 1",
+                "DATA ascii",
+                "1 2 3 4 5",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(PcdError, match="COUNT"):
+        read_pcd_xyz(wide_x)
+
+
 def test_missing_xyz_is_rejected(tmp_path: Path):
     path = tmp_path / "no-xyz.pcd"
     path.write_text(
