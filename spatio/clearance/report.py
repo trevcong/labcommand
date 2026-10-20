@@ -42,8 +42,9 @@ def build_report(results, zones_data, walk_id, supplied=None):
     """Join result records to their map geometry; reject inconsistent summaries.
 
     supplied: sha256 of the current recording, extrinsics, trajectory and scans
-    (None = not given). A changed trajectory, extrinsics or zone geometry is a
-    hard error; see provenance.check."""
+    (None = not given). The current scans hash is required. Missing or changed
+    bound inputs or changed zone geometry are hard errors; see provenance.check.
+    """
     walk_id = text(walk_id, "walk_id")
     # The classifier requires a nonempty scene. Presentation also supports a
     # walk with no declared zones, without weakening that classifier contract.
@@ -264,14 +265,14 @@ def main(argv=None):
     parser.add_argument("--extrinsics", type=Path,
                         help="current extrinsics; required when the results are bound to them")
     parser.add_argument("--recording", type=Path, help="recording to recheck (optional)")
-    parser.add_argument("--scans", type=Path, help="scans to recheck (optional)")
+    parser.add_argument("--scans", type=Path, required=True,
+                        help="current scans; must match the results' ray evidence hash")
     args = parser.parse_args(argv)
     try:
         supplied = {name: None if path is None else prov.sha256_path(path) for name, path in (
             ("recording", args.recording), ("extrinsics", args.extrinsics),
             ("trajectory", args.trajectory))}
-        supplied["scans"] = None if args.scans is None else prov.canonical_sha256(
-            load_json(args.scans))
+        supplied["scans"] = prov.canonical_sha256(load_json(args.scans))
         result = build_report(load_json(args.results), load_json(args.zones), args.walk_id,
                               supplied)
         encoded, rendered = json_text(result), markdown_report(result)
