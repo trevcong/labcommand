@@ -237,6 +237,77 @@ func testTrailPCDRejects() {
                    contains: "overflow", "WIDTH × HEIGHT overflows")
 }
 
+// MARK: - Bounds
+
+func testTrailBoundsRejectAbsurdValues() {
+    let tMax = TrailBounds.maxAbsTime, cMax = TrailBounds.maxAbsCoordinate
+    expect(tMax == 4_102_444_800 && cMax == 10_000, "provisional bounds: year 2100 in seconds, 10 km")
+
+    // At the limit is accepted, both signs, and everything derived from it stays usable.
+    let widest = try! TrailTrajectory.parseTUM(
+        "\(-tMax) \(-cMax) \(-cMax) \(-cMax) 0 0 0 1\n\(tMax) \(cMax) \(cMax) \(cMax) 0 0 0 1\n")
+    let summary = widest.summary
+    expect(close(summary.duration, 2 * tMax) && summary.pathLength.isFinite && summary.meanRateHz != nil,
+           "the widest accepted trail has a finite duration and length")
+    expect(TrailReadout.clock(summary.duration) == "2279136:00:00", "its duration formats, got \(TrailReadout.clock(summary.duration))")
+    let middle = widest.sample(atElapsed: summary.duration / 2)!
+    let fraction = middle.elapsed / summary.duration
+    expect(fraction.isFinite && close(fraction, 0.5), "the playhead fraction stays finite, got \(fraction)")
+    expect(!TrailReadout.rows(summary: summary, sample: middle).isEmpty, "readout rows build")
+    // Real stamps: relative (JT128 replay) and epoch seconds (Mid-360 replay).
+    _ = try! TrailTrajectory.parseTUM("912.479 3.7 3.9 0.2 0 0 0 1\n1786223931.864 28.17 18.92 2.44 0 0 0 1\n")
+
+    // Just past the limit fails on its line.
+    let ok = "1.0 0 0 0 0 0 0 1\n"
+    expectTUMError(ok + "\(tMax.nextUp) 0 0 0 0 0 0 1\n", line: 2, contains: "outside", "t just past year 2100")
+    expectTUMError("\((-tMax).nextDown) 0 0 0 0 0 0 1\n", line: 1, contains: "outside", "t just before -year 2100")
+    expectTUMError(ok + "2 \(cMax.nextUp) 0 0 0 0 0 1\n", line: 2, contains: "x 10000.000000000002 m is outside", "x just past 10 km")
+    expectTUMError(ok + "2 0 \((-cMax).nextDown) 0 0 0 0 1\n", line: 2, contains: "y -10000.000000000002 m is outside", "y just past -10 km")
+    expectTUMError(ok + "2 0 0 \(cMax.nextUp) 0 0 0 1\n", line: 2, contains: "z 10000.000000000002 m is outside", "z just past 10 km")
+
+    // The earlier crash inputs. A 1e19 s span trapped TrailReadout.clock; ±1e308 stamps made
+    // the trail-colour fraction NaN; ±1e308 positions reached the raster's inf/inf.
+    expectTUMError("0 0 0 0 0 0 0 1\n1e19 0 0 0 0 0 0 1\n", line: 2, contains: "timestamp 1e+19 s is outside", "1e19 s span")
+    expectTUMError("-1e308 0 0 0 0 0 0 1\n1e308 0 0 0 0 0 0 1\n", line: 1, contains: "timestamp -1e+308", "±1e308 stamps")
+    expectTUMError("0 -1e308 -1e308 0 0 0 0 1\n1 1e308 1e308 0 0 0 0 1\n", line: 1, contains: "x -1e+308 m", "±1e308 positions")
+    expectTUMError(ok + "2 0 1e20 0 0 0 0 1\n", line: 2, contains: "y 1e+20 m", "1e20 m position")
+    // Wrong units say so.
+    expectTUMError(ok + "1786223931864 0 0 0 0 0 0 1\n", line: 2, contains: "seconds expected", "millisecond stamp")
+    expectTUMError(ok + "1.786223931864e18 0 0 0 0 0 0 1\n", line: 2, contains: "seconds expected", "nanosecond stamp")
+    // A bad line costs the whole file, never a silent skip.
+    expectTUMError(ok + "2 0 0 0 0 0 0 1\n3 0 0 1e5 0 0 0 1\n4 0 0 0 0 0 0 1\n", line: 3, contains: "z 100000.0 m", "one bad line mid-file")
+
+    // The PCD reader uses the same rule but drops and counts, as it does a NaN point.
+    let far: [Float] = [1, 1, 1, 1e20, 0, 0, .greatestFiniteMagnitude, 0, 0, 0, 0, -10_001, 10_000, -10_000, 10_000]
+    let header = "VERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\nPOINTS 5\nDATA "
+    let binary = try! TrailMapCloud.decode(pcd(header + "binary\n", floats(far)))
+    let kept = [Point3D(x: 1, y: 1, z: 1), Point3D(x: 10_000, y: -10_000, z: 10_000)]
+    expect(binary.points == kept && binary.dropped == 3, "binary drops 1e20, Float.max and -10001, got \(binary.points)")
+    let rows = "1 1 1\n1e20 0 0\n3.4028235e38 0 0\n0 0 -10001\n10000 -10000 10000\n"
+    let ascii = try! TrailMapCloud.decode(Data((header + "ascii\n" + rows).utf8))
+    expect(ascii.points == kept && ascii.dropped == 3, "ascii drops the same three, got \(ascii.points)")
+    let line = TrailReadout.mapLine(binary, raster: TrailRaster.build(map: binary.points, trajectory: nil))
+    expect(line.contains("3 NaN or out-of-range dropped"), "the map line counts them, got \(line)")
+
+    // The view shows the parser's error: a bad trail opens map-only with it listed.
+    let fm = FileManager.default
+    let badTrail = tempDirectory("bounds-bad-trail")
+    try! Data((ok + "1.786223931864e18 0 0 0 0 0 0 1\n").utf8).write(to: badTrail.appendingPathComponent("trajectory.tum"))
+    try! TrailFixture.binaryPCD(TrailFixture.mapPoints()).write(to: badTrail.appendingPathComponent("map.pcd"))
+    let session = try! TrailSession.load(directory: badTrail.path)
+    expect(session.trajectory == nil && session.map != nil, "an out-of-bounds trail opens map-only")
+    expect(session.problems.contains { $0.hasPrefix("trajectory.tum line 2: timestamp") && $0.contains("seconds expected") },
+           "the bounds error is listed, got \(session.problems)")
+    try! fm.removeItem(at: badTrail.appendingPathComponent("map.pcd"))
+    do {
+        _ = try TrailSession.load(directory: badTrail.path)
+        expect(false, "an out-of-bounds trail with no map does not open")
+    } catch {
+        expect("\(error)".contains("trajectory.tum line 2: timestamp"), "the refusal names the line, got \(error)")
+    }
+    try? fm.removeItem(at: badTrail)
+}
+
 // MARK: - Raster
 
 func testTrailRasterLayers() {
@@ -312,8 +383,13 @@ func testTrailRasterMapOnlyAndEmpty() {
     let hugeFit = TrailRaster.build(map: huge, trajectory: nil)
     expect(hugeFit.binned == clean.binned && hugeFit.width == clean.width && hugeFit.height == clean.height,
            "1e20 and Float.max returns are skipped, got \(hugeFit.binned) binned vs \(clean.binned)")
-    // A trail whose extent overflows Double still gives a raster.
-    let wide = try! TrailTrajectory.parseTUM("0 -1e308 -1e308 0 0 0 0 1\n1 1e308 1e308 0 0 0 0 1\n")
+    // A trail whose extent overflows Double still gives a raster. `parseTUM` now refuses this
+    // file (testTrailBoundsRejectAbsurdValues); `build` is public, so a trail made in code still
+    // reaches it and its own guard stays.
+    func far(_ t: Double, _ v: Double) -> TrailPose {
+        TrailPose(t: t, position: TrailPoint(x: v, y: v, z: 0), qx: 0, qy: 0, qz: 0, qw: 1)
+    }
+    let wide = TrailTrajectory(poses: [far(0, -1e308), far(1, 1e308)])
     let wideFit = TrailRaster.build(map: points, trajectory: wide)
     expect(wideFit.width >= 1 && wideFit.height >= 1 && wideFit.footprint.count == wideFit.width * wideFit.height,
            "a ±1e308 trail gives a raster, got \(wideFit.width) × \(wideFit.height)")
@@ -644,6 +720,8 @@ func runTrailTests() {
     print("  trail: map.pcd offsets from SIZE×COUNT, F8, NaN dropped, even 1-in-N decimation"); passed()
     testTrailPCDRejects()
     print("  trail: map.pcd truncated, compressed, missing DATA/z, line-count mismatch fail clearly"); passed()
+    testTrailBoundsRejectAbsurdValues()
+    print("  trail: one bounds rule — TUM |t| ≤ year 2100 s and |xyz| ≤ 10 km or the line fails; PCD drops and counts"); passed()
     testTrailRasterLayers()
     print("  trail: top-down raster — wall band at cart height, open floor faint, trail always inside"); passed()
     testTrailRasterMapOnlyAndEmpty()

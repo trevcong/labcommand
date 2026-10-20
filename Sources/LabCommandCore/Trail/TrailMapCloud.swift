@@ -16,7 +16,8 @@ public struct TrailMapCloud: Equatable, Sendable {
     public var format: Format
     /// POINTS from the header.
     public var declared: Int
-    /// Points with a NaN or infinite coordinate. They are left out.
+    /// Points with a NaN, infinite, or out-of-bounds (`TrailBounds`) coordinate. They are left out:
+    /// one stray return does not refuse the whole map.
     public var dropped: Int
     /// 1 keeps every point. N keeps one in N (a map bigger than `maxKept`).
     public var stride: Int
@@ -170,7 +171,7 @@ public struct TrailMapCloud: Equatable, Sendable {
             var row = 0
             while row < header.points {
                 let p = Point3D(x: read(x, row), y: read(y, row), z: read(z, row))
-                if p.x.isFinite, p.y.isFinite, p.z.isFinite {
+                if TrailBounds.contains(p) {
                     points.append(p)
                 } else {
                     dropped += 1
@@ -205,8 +206,9 @@ public struct TrailMapCloud: Equatable, Sendable {
             guard let px = Float(values[x.column]), let py = Float(values[y.column]), let pz = Float(values[z.column]) else {
                 throw TrailError.pcd("data line \(row + 1): x/y/z is not a number")
             }
-            if px.isFinite, py.isFinite, pz.isFinite {
-                points.append(Point3D(x: px, y: py, z: pz))
+            let p = Point3D(x: px, y: py, z: pz)
+            if TrailBounds.contains(p) {
+                points.append(p)
             } else {
                 dropped += 1
             }

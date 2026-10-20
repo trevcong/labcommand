@@ -347,7 +347,7 @@ public enum TrailReadout {
     public static func mapLine(_ map: TrailMapCloud, raster: TrailRaster) -> String {
         var line = "\(map.points.count) pts \(map.format.rawValue)"
         if map.stride > 1 { line += " (1 in \(map.stride) of \(map.declared))" }
-        if map.dropped > 0 { line += " · \(map.dropped) NaN dropped" }
+        if map.dropped > 0 { line += " · \(map.dropped) NaN or out-of-range dropped" }
         line += String(format: " · %.0f cm cells", raster.cellSize * 100)
         return line
     }

@@ -94,6 +94,7 @@ public struct TrailTrajectory: Equatable, Sendable {
 
     /// Parses TUM text. Blank lines and `#` comments are skipped. Poses stay in file order:
     /// a timestamp that repeats or goes backward is an error, never a silent sort.
+    /// A stamp or position outside `TrailBounds` is an error on its line.
     public static func parseTUM(_ text: String) throws -> TrailTrajectory {
         var poses: [TrailPose] = []
         var lineNumber = 0
@@ -113,6 +114,14 @@ public struct TrailTrajectory: Equatable, Sendable {
                     throw TrailError.tum(line: lineNumber, "'\(field)' is not a finite number")
                 }
                 values.append(value)
+            }
+            // Absurd stamps and positions stop here, so nothing derived from them can trap.
+            // The quaternion needs no bound: the unit-length check below caps it.
+            if let problem = TrailBounds.timeProblem(values[0])
+                ?? TrailBounds.coordinateProblem("x", values[1])
+                ?? TrailBounds.coordinateProblem("y", values[2])
+                ?? TrailBounds.coordinateProblem("z", values[3]) {
+                throw TrailError.tum(line: lineNumber, problem)
             }
             let (qx, qy, qz, qw) = (values[4], values[5], values[6], values[7])
             let norm = (qx * qx + qy * qy + qz * qz + qw * qw).squareRoot()
