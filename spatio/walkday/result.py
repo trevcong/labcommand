@@ -20,6 +20,10 @@ session has no walk_result.json and series.sh refuses it; walkday.md/json then
 say why (stopped at result: rejected ...).
 
 Run status (stricter than spatio.series W1, never looser):
+  NOT_EVALUABLE first unless logs/input_gate.json is gate.py's report saying
+  evaluable with no blocker (input_gate_blockers). A missing, blocked (e.g.
+  B2 CLOCK_RESET) or contradictory gate withholds the return error, so the
+  run can never count. An unreadable gate file is bad input (exit 3).
   PASS only if the walk checker says PASS (return error < 0.10 m with parked,
   continuous, moving endpoints; no end-onto-start alignment), no measured wall
   patch is doubled, the whole-map 95th-percentile point-to-plane residual is
@@ -64,6 +68,7 @@ import sys
 from datetime import datetime, timezone
 
 from spatio.replay.recording import RecordingError, recorded_at
+from spatio.walkday.gate import SCHEMA as GATE_SCHEMA
 from spatio.walkday.provenance import WALKCHECK_PARAMS, check_identity, effective_identity
 from spatio.series.validate import (
     PLACEMENT_TOLERANCE_M,
@@ -261,6 +266,26 @@ def _same_box(want, got, tol=1e-9):
         return False
 
 
+def input_gate_blockers(gate):
+    """Why logs/input_gate.json is not a clean pass. Empty = it is.
+
+    A clean pass is gate.py's own report saying evaluable with no blocker. A
+    missing report is not evidence: scoring never assumes stage 2 passed."""
+    if gate is None:
+        return ["no input gate (logs/input_gate.json missing), so the input was never checked"]
+    if gate.get("schema") != GATE_SCHEMA:
+        return [f"logs/input_gate.json is not a {GATE_SCHEMA} report"]
+    blocking = gate.get("blocking")
+    if not isinstance(blocking, list):
+        return ["logs/input_gate.json has no blocking list"]
+    why = [f"input gate: {b}" for b in blocking]
+    if gate.get("evaluable") is not True:
+        why = why or ["input gate: evaluable is %s" % gate.get("evaluable")]
+    elif why:
+        why.insert(0, "input gate says evaluable but lists blockers")
+    return why
+
+
 def _sha_file(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -353,7 +378,12 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str,
     raw_return = {"d3_m": d3, "horizontal_m": horiz, "vertical_m": vert,
                   "heading_deg": _num(rts.get("heading_error_deg"))}
     reasons = list(wc.get("reasons") or [])
-    if wc_result == "NOT-EVALUABLE":
+    gate_why = input_gate_blockers(gate)
+    if gate_why:
+        status = "NOT_EVALUABLE"
+        d3 = horiz = vert = None   # blocked or unchecked input: the return error is not a measurement
+        reasons = gate_why + reasons
+    elif wc_result == "NOT-EVALUABLE":
         status = "NOT_EVALUABLE"
         d3 = horiz = vert = None   # an unparked/unreadable endpoint is not a measurement
         reasons = reasons or ["walkcheck NOT-EVALUABLE"]
@@ -428,6 +458,7 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str,
                   "failures": wall_fail, "notes": wall_notes, "warnings": wall_warn,
                   "whole_map_doubled_flag": (wc.get("walls") or {}).get("doubled_wall")},
         "input_gate": None if gate is None else {k: gate.get(k) for k in ("evaluable", "blocking", "warnings")},
+        "input_gate_blockers": gate_why,
         "manifest": {k: manifest.get(k) for k in ("sensor", "fastlio_revision", "config_file",
                                                   "config_sha256", "image", "source_recording")},
         "wall_patches": wall_patches,
@@ -561,7 +592,7 @@ def render(report: dict) -> str:
           f"- path {_f(report['path_length_m'], 1, ' m')} in {_f(report['duration_s'], 1, ' s')}; "
           f"drift {_f(report['drift_pct_of_path'], 1, ' % of path', 2)}",
           f"- walk checker: {report['walkcheck_result']} (details: walkcheck.md, topdown.png)"]
-    if report["walkcheck_result"] == "NOT-EVALUABLE":
+    if report["walkcheck_result"] == "NOT-EVALUABLE" or report.get("input_gate_blockers"):
         L.append("- The number above is shown for diagnosis only; it is not a valid measurement.")
     truth = report.get("synthetic_truth")
     if truth:
@@ -623,10 +654,9 @@ def render(report: dict) -> str:
     if not report["physical_accuracy_evaluated"]:
         L.append(f"- label: {report['accuracy_label']}")
     gate = report.get("input_gate")
-    if gate:
-        L += ["", "## Input check (x1 bag timing)", ""]
-        L += [f"- BLOCKED: {b}" for b in gate.get("blocking") or []] or ["- no blocking problems"]
-        L += [f"- warning: {x}" for x in gate.get("warnings") or []]
+    L += ["", "## Input check (x1 bag timing)", ""]
+    L += [f"- NOT PASSED: {b}" for b in report.get("input_gate_blockers") or []] or ["- no blocking problems"]
+    L += [f"- warning: {x}" for x in (gate or {}).get("warnings") or []]
     m = report["manifest"]
     L += ["", "## Provenance", "",
           f"- recording: {m['source_recording']}",

@@ -10,9 +10,10 @@ replaces `verdict` and `counted_run_ids`, spatio.series' own verdict stays in
 
 Rules, applied on top of spatio.series R0-R5. They never upgrade a verdict:
   G1. Every run carries a valid walk-day settings identity, and all runs share
-      it and the same driver_config_sha256 (null = none given). Otherwise the
-      verdict is NOT_EVALUABLE: a changed setting starts a new series (as R1
-      does for a changed FAST-LIO config).
+      it, the same driver_config_sha256 (null = none given) and the same frozen
+      spec, wall_patches.spec_sha256 (null = none given). Otherwise the
+      verdict is NOT_EVALUABLE: a changed setting or experiment starts a new
+      series (as R1 does for a changed FAST-LIO config).
   G2. A run counts only if spatio.series counts it AND its wall_patches show
       both (all, at least two) of the frozen spec's preselected patches
       verified (spatio.walkday.result.acceptance_blockers). When spatio.series
@@ -36,12 +37,13 @@ from spatio.series.validate import InputRejected, Unreadable, load_walk_result
 from spatio.walkday.provenance import check_identity
 from spatio.walkday.result import acceptance_blockers
 
-SETTINGS_CHANGE_REASON = "a changed walk-day setting or driver config starts a new series (walk-day rule G1)"
+SETTINGS_CHANGE_REASON = ("a changed walk-day setting, driver config or frozen spec starts a new series "
+                          "(walk-day rule G1)")
 RULES_MD = """## Walk-day checks (spatio.walkday.seriesgate)
 
 These rules come after spatio.series' R0-R5 above and can only make the verdict stricter.
 
-- G1. Every run must carry the same walk-day settings identity (the effective walkday.conf values: hold, endpoint, gap, path and wall limits, playback rate, map voxel, ...) and the same driver config sha256. If not, the verdict is NOT_EVALUABLE.
+- G1. Every run must carry the same walk-day settings identity (the effective walkday.conf values: hold, endpoint, gap, path and wall limits, playback rate, map voxel, ...), the same driver config sha256 and the same frozen spec (wall_patches.spec_sha256). If not, the verdict is NOT_EVALUABLE.
 - G2. A run counts only when spatio.series counts it and every preselected wall patch in the frozen spec (at least two) was measured, not doubled, and within both gates. Runs scored on auto-suggested patches never count. When spatio.series said PASS, the triple is found again under G2. If no triple remains, the verdict is FAIL.
 """
 
@@ -66,6 +68,9 @@ def gate(staged: dict, paths):
     settings = {i: (raw[i].get("walkday_settings") if check_identity(raw[i].get("walkday_settings")) else None)
                 for i in raw}
     drivers = {i: raw[i].get("driver_config_sha256") for i in raw}
+    specs = {i: (raw[i]["wall_patches"].get("spec_sha256") if isinstance(raw[i].get("wall_patches"), dict) else None)
+             for i in raw}
+    specs = {i: None if s is None else str(s) for i, s in specs.items()}   # null = no frozen spec
     mixed = []
     unknown = [i for i, s in settings.items() if s is None]
     if unknown:
@@ -78,6 +83,9 @@ def gate(staged: dict, paths):
     if len(set(drivers.values())) > 1:
         mixed.append("driver_config_sha256 values differ: %s." % ", ".join(
             "%s %s" % (i, d) for i, d in drivers.items()))
+    if len(set(specs.values())) > 1:
+        mixed.append("wall_patches.spec_sha256 values differ (frozen experiment spec): %s." % ", ".join(
+            "%s %s" % (i, d) for i, d in specs.items()))
 
     new_runs = []
     for run in runs:
@@ -86,6 +94,7 @@ def gate(staged: dict, paths):
         s = settings[run["run_id"]]
         run["walkday_settings_sha256"] = None if s is None else s["sha256"]
         run["driver_config_sha256"] = drivers[run["run_id"]]
+        run["spec_sha256"] = specs[run["run_id"]]
         run["wall_patch_blockers"] = why
         if why:
             run["counts_toward_series"] = False
@@ -121,7 +130,8 @@ def gate(staged: dict, paths):
         "spatio_series_verdict": base,
         "walkday_gate": {"rules": ["G1", "G2"], "mixed": mixed,
                          "settings_sha256": sorted({s["sha256"] for s in settings.values() if s}),
-                         "driver_config_sha256": sorted({str(d) for d in drivers.values()})},
+                         "driver_config_sha256": sorted({str(d) for d in drivers.values()}),
+                         "spec_sha256": sorted({str(d) for d in specs.values()})},
     })
     return report
 
@@ -137,8 +147,9 @@ def render(report: dict) -> str:
     for m in report["walkday_gate"]["mixed"]:
         lines.append("- G1: %s" % m)
     for r in report["runs"]:
-        lines.append("- %s: settings %s, driver config %s, wall patches: %s" % (
+        lines.append("- %s: settings %s, driver config %s, spec %s, wall patches: %s" % (
             r["run_id"], (r["walkday_settings_sha256"] or "MISSING")[:12], r["driver_config_sha256"],
+            (r["spec_sha256"] or "none")[:12],
             "; ".join(r["wall_patch_blockers"]) or "both preselected patches verified"))
     return "\n".join(lines) + "\n"
 

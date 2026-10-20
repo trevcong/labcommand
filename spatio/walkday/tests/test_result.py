@@ -24,7 +24,7 @@ import numpy as np
 from spatio.walkcheck.synthetic import (doubled_wall, four_wall_room, hold_and_square, insert_time_gap,
                                       vertical_wall, write_pcd_binary, write_tum)
 from spatio.wallpatch.cli import main as wallpatch_main
-from spatio.walkday import provenance, result, seriesgate
+from spatio.walkday import gate, provenance, result, seriesgate
 
 CONFIG_SHA = "ab" * 32
 REPO = Path(__file__).resolve().parents[3]
@@ -62,10 +62,10 @@ def write_provenance(session, settings=TEST_SETTINGS, driver_sha=None, config_sh
         "fastlio_config": {"file": "/x.yaml", "sha256": config_sha}, "driver_config": driver}))
 
 
-def write_spec(path, names=PATCH_NAMES, boxes=None):
+def write_spec(path, names=PATCH_NAMES, boxes=None, spec_id="test"):
     """A spec holding only what result.py reads: wall_patches. Returns (path, sha256)."""
     boxes = boxes or [None] * len(names)
-    Path(path).write_text(json.dumps({"spec_id": "test", "wall_patches": [
+    Path(path).write_text(json.dumps({"spec_id": spec_id, "wall_patches": [
         {"name": n, "description": "test", "box_map_frame": b} for n, b in zip(names, boxes)]}))
     return str(path), hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -83,6 +83,20 @@ def write_recording(rec, starting_ns=None):
     return rec
 
 
+def write_gate(session, findings=()):
+    """logs/input_gate.json as process.sh stage 2 writes it: gate.py's own
+    verdict on a small x1 report (arbitrary topic names). Extra x1 findings,
+    such as a CLOCK_RESET error, make it a blocked gate."""
+    lidar, imu = "/test/lidar", "/test/imu"
+    bt = {"schema": "spatio.bagtiming/1",
+          "topics": [{"name": lidar, "count": 100, "header": {}}, {"name": imu, "count": 2000, "header": {}}],
+          "findings": list(findings),
+          "imu_coverage": [{"lidar_topic": lidar, "imu_topic": imu, "scans": 100, "evaluable_scans": 100}]}
+    out = gate.evaluate(bt, lidar, imu)
+    (Path(session) / "logs" / "input_gate.json").write_text(json.dumps(out))
+    return out
+
+
 def quiet(fn, *a):
     with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
         return fn(*a)
@@ -95,6 +109,7 @@ def make_session(root, run_id, offset=(0.05, 0.0, 0.0), xyz=None, gap=False, eva
     (s / "logs").mkdir(parents=True)
     if settings is not None:
         write_provenance(s, settings, driver_sha)
+    write_gate(s)                      # a clean stage-2 input gate; tests replace or remove it
     rows = hold_and_square(offset=offset)
     if gap:
         rows = insert_time_gap(rows, after_t=20.0, extra_s=3.0)
@@ -536,6 +551,73 @@ class ResultTest(unittest.TestCase):
         self.assertEqual(rep["stopped_at"], "result")
         self.assertIn("input_gate.json", rep["reasons"][0])
         self.assertNotIn("PASS", (s / "walkday.md").read_text())
+
+    def test_blocked_input_gate_is_not_evaluable_and_never_counts(self):
+        # Review P1 (result.py:308): a valid gate report saying evaluable=false
+        # (x1 CLOCK_RESET) was loaded but ignored, so re-scoring still gave PASS.
+        spec = write_spec(Path(self.tmp) / "spec.json")
+        runs = [self.preselected(f"ig{i}", spec=spec)[0] for i in range(3)]
+        self.assertEqual(self.series_sh(runs, "ig")[1], "PASS")
+        blocked = write_gate(runs[2], [{"severity": "error", "code": "CLOCK_RESET",
+                                        "text": "/test/lidar header time went back 2.0 s"}])
+        self.assertEqual((blocked["evaluable"], len(blocked["blocking"])), (False, 1))
+        self.assertEqual(run(runs[2], "--patch-origin", "preselected", "--spec", spec[0]), 2)
+        w = self.walk(runs[2])
+        self.assertEqual(w["status"], "NOT_EVALUABLE")
+        self.assertIsNone(w["return_error"]["d3_m"])              # withheld, not a measurement
+        self.assertIn("CLOCK_RESET", w["reasons"][0])
+        load_walk_result(str(runs[2] / "walk_result.json"))
+        md = (runs[2] / "walkday.md").read_text()
+        self.assertIn("**NOT-EVALUABLE**", md)
+        self.assertIn("NOT PASSED: input gate: B2 x1 error CLOCK_RESET", md)
+        # spatio.series R5: three attempts and no counting triple is FAIL.
+        rc, verdict, out = self.series_sh(runs, "ig")
+        self.assertEqual((verdict, rc), ("FAIL", VERDICT_EXIT["FAIL"]), out)
+        final = self.final_and_staged("ig")[0]
+        self.assertNotIn("ig2", final["counted_run_ids"])
+        self.assertFalse(next(r for r in final["runs"] if r["run_id"] == "ig2")["counts_toward_series"])
+        # Only gate.py's own clean verdict passes; a contradictory or foreign report does not.
+        clean = write_gate(runs[0])
+        self.assertEqual(result.input_gate_blockers(clean), [])
+        for bad in (dict(clean, blocking=["B3 x"]), dict(clean, evaluable=False), dict(clean, evaluable="true"),
+                    dict(clean, blocking=None), dict(clean, schema="other/1")):
+            self.assertTrue(result.input_gate_blockers(bad), bad)
+
+    def test_missing_input_gate_is_not_evaluable(self):
+        # Stage 2 never ran or its report was lost: the input was never checked.
+        s = make_session(self.tmp, "nogate")
+        self.assertEqual(run(s), 0)
+        (s / "logs" / "input_gate.json").unlink()
+        self.assertEqual(run(s), 2)
+        w = self.walk(s)
+        self.assertEqual(w["status"], "NOT_EVALUABLE")
+        self.assertIsNone(w["return_error"]["d3_m"])
+        self.assertIn("input_gate.json missing", w["reasons"][0])
+        load_walk_result(str(s / "walk_result.json"))
+        self.assertIn("**NOT-EVALUABLE**", (s / "walkday.md").read_text())
+
+    def test_mixed_frozen_specs_make_the_series_not_evaluable(self):
+        # Review P2 (seriesgate.py:66): three runs, each matching its own
+        # physical reference and frozen spec, with the same settings and
+        # config. Two different experiments are not one series.
+        spec_a = write_spec(Path(self.tmp) / "spec_a.json", spec_id="route-a")
+        spec_b = write_spec(Path(self.tmp) / "spec_b.json", spec_id="route-b")
+        self.assertNotEqual(spec_a[1], spec_b[1])
+        runs = [self.preselected(f"sp{i}", spec=spec_b if i == 1 else spec_a)[0] for i in range(3)]
+        for s in runs:
+            self.assertEqual(self.walk(s)["status"], "PASS")
+            self.assertEqual(result.acceptance_blockers(self.walk(s)["wall_patches"]), [])
+        self.assertEqual(self.walk(runs[1])["wall_patches"]["spec_sha256"], spec_b[1])
+        rc, verdict, out = self.series_sh(runs, "sp")
+        self.assertEqual((verdict, rc), ("NOT_EVALUABLE", VERDICT_EXIT["NOT_EVALUABLE"]), out)
+        final, staged = self.final_and_staged("sp")
+        self.assertEqual(staged["verdict"], "PASS")
+        self.assertEqual(final["counted_run_ids"], [])
+        self.assertIn("spec_sha256 values differ", " ".join(final["reasons"]))
+        self.assertEqual(final["walkday_gate"]["spec_sha256"], sorted([spec_a[1], spec_b[1]]))
+        # The same frozen spec throughout is one series.
+        same = [self.preselected(f"sq{i}", spec=spec_b)[0] for i in range(3)]
+        self.assertEqual(self.series_sh(same, "sq")[1], "PASS")
 
     def test_provenance_config_hash_must_match_the_manifest(self):
         # Replay's manifest hashes the same --config path process.sh hashed

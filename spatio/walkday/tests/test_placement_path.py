@@ -17,7 +17,7 @@ from pathlib import Path
 
 from spatio.series.cli import VERDICT_EXIT
 from spatio.walkcheck.synthetic import four_wall_room, hold_and_square, write_pcd_binary, write_tum
-from spatio.walkday.tests.test_result import TEST_SETTINGS, walkcheck_args, write_recording
+from spatio.walkday.tests.test_result import TEST_SETTINGS, walkcheck_args, write_gate, write_recording
 
 REPO = Path(__file__).resolve().parents[3]
 SPEC_FILL = REPO / "spatio" / "walkday" / "synth" / "spec_fill.json"
@@ -73,6 +73,7 @@ class PlacementPathTest(unittest.TestCase):
         spec = self.named_spec if preselected else self.spec
         s = self.tmp / "sessions" / run_id
         (s / "logs").mkdir(parents=True)
+        write_gate(s)                         # stage 2's input gate, clean
         write_tum(s / "trajectory.tum", hold_and_square(offset=(0.04, 0.0, 0.0)))
         write_pcd_binary(s / "map.pcd", four_wall_room())
         ref = s / "logs" / "physical_reference.input.json"
