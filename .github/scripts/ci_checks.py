@@ -51,7 +51,7 @@ def check_fixtures(root):
     print(f'Committed fixtures present; {count} hand goldens identical byte-for-byte')
 
 
-def summarize_report(path, kind):
+def summarize_report(path, kind, require_rosbags=False):
     title = 'CTest entries' if kind == 'ctest' else 'pytest cases'
     try:
         root = ET.parse(path).getroot()
@@ -67,6 +67,7 @@ def summarize_report(path, kind):
         return f'### {title}\n\nNot run/report missing or invalid: {escape(str(error))}\n', False
 
     counts = Counter()
+    rosbags = Counter()
     reasons = Counter()
     skipped_names = set()
     problems = []
@@ -76,6 +77,11 @@ def summarize_report(path, kind):
         skipped = case.find('skipped')
         output = case.findtext('system-out', '')
         failed = case.find('failure') is not None or case.find('error') is not None
+        # A module-level importorskip has name=test_rosbags and no classname;
+        # executed cases carry the module in classname.
+        module_parts = case.get('classname', '').split('.')
+        if kind == 'pytest' and (name == 'test_rosbags' or 'test_rosbags' in module_parts):
+            rosbags['failed' if failed else 'skipped' if skipped is not None else 'passed'] += 1
         if failed:
             counts['failed'] += 1
         elif skipped is not None:
@@ -104,6 +110,18 @@ def summarize_report(path, kind):
     lines = [f'### {title}', '',
              f'{len(cases)} total: {counts["passed"]} passed, {counts["failed"]} failed, '
              f'{counts["skipped"]} skipped.', '']
+    if kind == 'pytest':
+        if rosbags['failed']:
+            status = 'FAIL'
+        elif rosbags['skipped'] or not rosbags['passed']:
+            status = 'SKIPPED'
+        else:
+            status = 'PASS'
+        detail = (f'{rosbags["passed"]} passed, {rosbags["failed"]} failed, '
+                  f'{rosbags["skipped"]} skipped' if rosbags else 'not collected')
+        lines += [f'rosbags independent CDR cross-check: **{status}** ({detail}).', '']
+        if require_rosbags and status != 'PASS':
+            problems.append('Required rosbags cross-check did not complete without failures or skips')
     if kind == 'ctest':
         lines += [f'Nested skipped cases: {nested_total} (separate from CTest entry totals).', '']
     lines += [f'- {count} × {escape(reason)}' for reason, count in sorted(reasons.items())]
@@ -118,13 +136,15 @@ def main():
     fixtures.add_argument('root', type=Path)
     summary = sub.add_parser('summary')
     summary.add_argument('reports', type=Path)
+    summary.add_argument('--require-rosbags', action='store_true',
+                         help='fail when the independent CDR cross-check is absent, skipped, or failed')
     args = parser.parse_args()
     if args.command == 'fixtures':
         check_fixtures(args.root)
         return 0
     ok = True
     for kind in ('pytest', 'ctest'):
-        text, valid = summarize_report(args.reports / f'{kind}.xml', kind)
+        text, valid = summarize_report(args.reports / f'{kind}.xml', kind, args.require_rosbags)
         print(text)
         ok = ok and valid
     print('The initial spark/ pytest pass skips ROS and unset C++ executables. '
