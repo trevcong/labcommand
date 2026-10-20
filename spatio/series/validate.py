@@ -636,7 +636,7 @@ def _check_absurd_numbers(
 
     This is the one parser rule for an absurd combination. It does not add a
     minimum path, a minimum duration, a minimum gap, or a window length.
-    Four checks:
+    Five checks:
 
     - each measured return component must fit inside d3, and both together
       must match it;
@@ -644,13 +644,17 @@ def _check_absurd_numbers(
     - when both endpoint windows are present, the end window must start
       after the start window ends. A shared instant counts as overlap;
     - a duration of exactly 0 cannot sit beside a moving claim, a positive
-      path length, or endpoint windows that span a positive time.
+      path length, or endpoint windows that span a positive time;
+    - a measured duration cannot be shorter than the time those windows
+      cover. A duration equal to that span still fits. A null duration is
+      not measured.
     """
     if error is not None:
         _check_components(error, errors)
         _check_endpoint_windows(error, errors)
     _check_zero_path(path_length, validity, errors)
     _check_zero_duration(duration, path_length, validity, error, errors)
+    _check_duration_covers_span(duration, error, errors)
 
 
 def _check_zero_path(
@@ -676,9 +680,10 @@ def _check_zero_duration(
 ) -> None:
     """Reject a measured duration of exactly 0 that contradicts the run.
 
-    Called only from _check_absurd_numbers. Exact 0 is the cutoff. A positive
-    duration is not compared with the window span, and this is not a
-    must-move minimum. A null duration is not measured.
+    Called only from _check_absurd_numbers. Exact 0 is the cutoff for this
+    check. A positive duration that is shorter than the window span is
+    rejected by _check_duration_covers_span. Neither check is a minimum
+    duration. A null duration is not measured.
     """
     if duration is None or duration != 0.0:
         return
@@ -696,6 +701,36 @@ def _check_zero_duration(
         "duration_s is 0 while %s; a measured duration of 0 cannot sit beside that claim"
         % " and ".join(claims)
     )
+
+
+def _check_duration_covers_span(
+    duration: Optional[float],
+    error: Optional[ReturnError],
+    errors: List[str],
+) -> None:
+    """Reject a measured duration shorter than the endpoint-window span.
+
+    Called only from _check_absurd_numbers. The span is the end of the end
+    window minus the start of the start window, so the check compares two
+    lengths. It does not assume the clock starts at zero. A duration equal
+    to the span still fits. One missing window is not a span. A null
+    duration is not measured, and a duration of exactly 0 is left to
+    _check_zero_duration. This is not a minimum duration.
+    """
+    # Exact 0 is already rejected by _check_zero_duration when the span is
+    # positive. This check is the positive-duration case.
+    if duration is None or duration == 0.0:
+        return
+    span = _endpoint_span_s(error)
+    if span is None or span <= 0.0:
+        return
+    # _METRE_MATCH absorbs binary rounding so a duration equal to the span loads.
+    if span - duration > _METRE_MATCH:
+        errors.append(
+            "duration_s is %s while the endpoint windows span %.6f s; "
+            "a run cannot be shorter than the time its endpoint windows cover"
+            % (duration, span)
+        )
 
 
 def _endpoint_span_s(error: Optional[ReturnError]) -> Optional[float]:
