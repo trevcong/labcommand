@@ -18,6 +18,8 @@
 #   --max-seconds N   hard limit for the container run (default 3600)
 #   --fastdds-profile FILE  Fast DDS XML profile for every node in the container
 #                     (e.g. configs/fastdds_big_shm.xml for large PointCloud2)
+#   --map-voxel M     map.pcd voxel size in metres (default 0.03; the original
+#                     JT128 post-process used 0.05)
 #
 # Isolation: --network none, private ROS_DOMAIN_ID, recording mounted read-only
 # (as a named volume copy), CPU/memory/pids limits, all capabilities dropped.
@@ -30,10 +32,10 @@ DOMAIN_ID=87
 CPUS=4
 MEM=8g
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [[ $# -ge 2 ]] || usage
 REC_ARG=$1 RUN_ID=$2; shift 2
-RATE=1.0 DURATION="" CONFIG="" CONFIG_NOTE="" MODE=replay HIST_MAP="" MAX_SECONDS=3600 DDS_PROFILE=""
+RATE=1.0 DURATION="" CONFIG="" CONFIG_NOTE="" MODE=replay HIST_MAP="" MAX_SECONDS=3600 DDS_PROFILE="" MAP_VOXEL=0.03
 while [[ $# -gt 0 ]]; do
   case $1 in
     --rate) RATE=$2; shift 2 ;;
@@ -44,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --historical-map) HIST_MAP=$2; shift 2 ;;
     --max-seconds) MAX_SECONDS=$2; shift 2 ;;
     --fastdds-profile) DDS_PROFILE=$2; shift 2 ;;
+    --map-voxel) MAP_VOXEL=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -123,7 +126,7 @@ dk create --name "$CONTAINER" \
   --pids-limit 1024 --cap-drop ALL --security-opt no-new-privileges \
   -e ROS_DOMAIN_ID=$DOMAIN_ID -e ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST -e ROS_LOG_DIR=/out/logs/ros \
   -e MODE="$MODE" -e LIDAR="$LIDAR" -e IMU="$IMU" -e RATE="$RATE" -e DURATION="$DURATION" \
-  -e TIMESTAMP_UNIT="$TS_UNIT" -e HIST_PATH_TOPIC="$HIST_PATH_TOPIC" -e MAP_VOXEL=0.03 \
+  -e TIMESTAMP_UNIT="$TS_UNIT" -e HIST_PATH_TOPIC="$HIST_PATH_TOPIC" -e MAP_VOXEL="$MAP_VOXEL" \
   ${DDS_ENV[@]+"${DDS_ENV[@]}"} -v "$VOL:/rec:ro" \
   "$IMAGE_TAG" timeout --signal=TERM --kill-after=60 "$MAX_SECONDS" \
   bash /opt/spatio/tools/run_in_container.sh >/dev/null
@@ -158,7 +161,7 @@ json.dump({
   "limits": {"cpus": $CPUS, "memory": "$MEM", "shm": "1g", "pids": 1024, "max_seconds": $MAX_SECONDS},
   "fastdds_profile": "${DDS_PROFILE:-default}",
   "fastlio_param_overrides": {"runtime_pos_log_enable": True} if "$MODE" == "replay" else {},
-  "map": "map.pcd = copied map_saver.py (0.03 m voxel) fed offline from recorded /cloud_registered" if "$MODE" == "replay" else "map.pcd = copy of recording's $HIST_MAP",
+  "map": "map.pcd = copied map_saver.py ($MAP_VOXEL m voxel) fed offline from recorded /cloud_registered" if "$MODE" == "replay" else "map.pcd = copy of recording's $HIST_MAP",
 }, open(sys.argv[1], "w"), indent=2)
 EOF
 echo "$RC" > "$SESSION/logs/container_exit_code"
@@ -166,7 +169,7 @@ echo "$RC" > "$SESSION/logs/container_exit_code"
 # Contract manifest.
 if [[ $MODE == replay ]]; then
   M_REV=$FL_REV M_IMAGE="$IMAGE_TAG@$IMAGE_ID" M_CONFIG=$CONFIG
-  M_NOTES="Offline FAST-LIO re-run on the Mac (colima, aarch64) of the copied recording; played ${LIDAR} + ${IMU} only at rate ${RATE}${DURATION:+, first ${DURATION} s only}. trajectory.tum = recorded /Odometry header stamps. map.pcd = copied map_saver.py (0.03 m voxel) over recorded /cloud_registered. Container exit ${RC}. ${CONFIG_NOTE}"
+  M_NOTES="Offline FAST-LIO re-run on the Mac (colima, aarch64) of the copied recording; played ${LIDAR} + ${IMU} only at rate ${RATE}${DURATION:+, first ${DURATION} s only}. trajectory.tum = recorded /Odometry header stamps. map.pcd = copied map_saver.py (${MAP_VOXEL} m voxel) over recorded /cloud_registered. Container exit ${RC}. ${CONFIG_NOTE}"
 else
   # Original Spark run: revision only known if the recording says so.
   M_REV="$(sed -n 's/^FAST_LIO_ROS2: *//p' "$REC/provenance.txt" 2>/dev/null | head -1 || true)"
