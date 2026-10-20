@@ -81,9 +81,8 @@ No new Trevor approval is needed for these local fixes. Physical acceptance
 and final threshold approval remain future work. This is implementation and
 test evidence, not an independent review of the code.
 
-## Commit limitation
+## Commit status
 
-Changes are uncommitted. `git add -- spatio/series` failed with exit 128:
-`Unable to create '/Users/tconf/Developer/labcommand/.git/worktrees/spatio-fix-series/index.lock': Operation not permitted`.
-The environment does not permit writing this worktree's Git metadata.
-No commit or push was made; no permission bypass was attempted.
+Codex could not write Git metadata in its sandbox, so the orchestrator committed this work as 7ed27fa. Codex made no commit or push.
+
+Note: `explain` exits with the run's own status, so a replay-only PASS exits 0; automation must use `compare` for series acceptance (see README).
