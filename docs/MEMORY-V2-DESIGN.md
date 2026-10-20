@@ -79,7 +79,7 @@ There are three axes. Each comparison uses one of them, and the doc says which.
 
 ### 2.2 Retractions
 
-[proposal] One append-only table replaces v1's in-row `retracted_at`:
+[proposal] One append-only table replaces v1's in-row `retracted_at`. The one exception is that the purge blanks `reason` (§2.6):
 
 `retractions(retraction_id, target_kind, target_id, recorded_txn, reason, retracted_by)`, with `target_kind` one of `interpretation`, `observation`, `alignment`, `trajectory_revision`, `session`.
 
@@ -188,6 +188,8 @@ Absences are `map`-frame observations only [proposal]. A per-scan (`body`-frame)
 
   Neither table holds image data, a label, a confidence or geometry. Rows in `retractions` (§2.2) are never purged. Their targets may be deleted, but the retraction stays, so an association's retracted state at any `known_at` can still be worked out.
 
+  **A retraction's `reason` is blanked at purge** (decision 5, §5). The free text may name what the image showed. When the purge deletes a retraction's target (an observation, or an interpretation deleted in its cascade), it sets that retraction's `reason` to NULL in the same transaction. Every other column stays. This is the only change ever made to a `retractions` row. `reason` is not part of any status or report (§2.8), so blanking it changes no answer at any `known_at`.
+
   **When an answer is incomplete.** `object_status(X, now, known_at)` returns `complete = False` and lists in `purged_ids` every purged observation D with a tombstoned association A where all of these hold:
   - `A.object_id = X`;
   - `A.recorded_txn ≤ known_at`, and A has no retraction with `retracted_txn ≤ known_at`;
@@ -284,7 +286,7 @@ These are written to become `spatio/memory/tests/test_v2_*.py`, one test per cas
 
 - Control, on a copy of the store taken before K3: X at K1 and Y at K2 are both `CURRENT`, with `measured.observation_id == D`.
 - The column set of `purged_observations` and `purged_associations` contains no label, confidence, thumbnail path or geometry column.
-- The retraction written at K2 still exists after K3.
+- The retraction written at K2 still exists after K3, with its `reason` blank (NULL) and every other column unchanged (§2.6).
 
 `test_V2_3e_purge_flag_respects_now_and_observation_retraction`
 - D as in V2-3d, attributed to X only, purged at K3. X at `now = t0 − 1` has `complete = True` (D was not yet acquired).
