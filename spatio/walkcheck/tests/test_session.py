@@ -23,6 +23,52 @@ FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "sample_session"
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def test_serialized_wall_negative_findings_and_no_error_stay_null(tmp_path):
+    session = tmp_path / "sharp"
+    write_session(session, hold_and_square(), xyz=sharp_wall(count=1500, seed=3))
+    report = evaluate_session(session)
+    saved = json.loads((session / "walkcheck.json").read_text())
+    assert saved["result"] == "PASS"
+    assert saved["walls"]["status"] == "OK"
+    assert saved["walls"]["doubled_wall"] is False
+    assert saved["walls"]["parallel_pair_count"] == 0
+    for key in ("revisit_separation_cm", "max_revisit_separation_cm", "closest_parallel_cm"):
+        assert report["walls"][key] is None
+        assert saved["walls"][key] is None
+    assert saved["intermediate_stops"]["error"] is None
+    assert saved["timestamps"]["fault"] is None
+
+
+def test_serialized_unavailable_wall_and_stop_measurements_keep_reasons(tmp_path):
+    session = tmp_path / "missing_map"
+    write_session(session, hold_and_square())
+    (session / "stops.json").write_text(json.dumps([
+        {"name": "one_visit", "visits": [{"t0": 0, "t1": 5}]},
+    ]))
+    evaluate_session(session)
+    saved = json.loads((session / "walkcheck.json").read_text())
+    assert saved["result"] == "NOT-EVALUABLE"
+    for key in ("p95_point_to_plane_cm", "revisit_separation_cm",
+                "max_revisit_separation_cm", "closest_parallel_cm", "doubled_wall"):
+        assert saved["walls"][key]["status"] == "not_measured"
+        assert "missing_map" in saved["walls"][key]["reason"]
+    stop = saved["intermediate_stops"]["stops"][0]
+    assert stop["visits_used"] == 1
+    assert stop["max_mean_separation_cm"]["status"] == "not_measured"
+    assert stop["max_mean_separation_cm"]["reason"]
+    assert saved["intermediate_stops"]["error"] is None
+
+
+def test_complete_fixture_has_no_unavailable_measurements(tmp_path):
+    session = tmp_path / "complete"
+    shutil.copytree(ROOT / "spatio/io/fixtures/map_sharp_wall", session)
+    evaluate_session(session)
+    saved = json.loads((session / "walkcheck.json").read_text())
+    assert saved["result"] == "PASS"
+    assert saved["intermediate_stops"]["error"] is None
+    assert '"status": "not_measured"' not in (session / "walkcheck.json").read_text()
+
+
 def test_writes_the_three_report_files(tmp_path):
     dest = tmp_path / "session"
     write_session(dest, hold_and_square(offset=(0.05, 0.0, 0.0)), xyz=sharp_wall(count=1500, seed=3))

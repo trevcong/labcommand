@@ -4,21 +4,21 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 
 
 def write_json_atomic(path, obj):
     """Write UTF-8 JSON via a temp file in the same directory, then replace."""
     path = Path(path)
-    payload = json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
-    temporary = path.with_name(path.name + ".tmp")
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
     try:
-        temporary.write_text(payload, encoding="utf-8")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, indent=2, ensure_ascii=False, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(str(temporary), str(path))
-    except Exception:
-        if temporary.exists():
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
-        raise
+    finally:
+        temporary.unlink(missing_ok=True)

@@ -11,8 +11,10 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import tum  # noqa: E402
+from spatio.walkcheck.values import measurement_values  # noqa: E402
 
 HEADER = (
     "| Session | Poses | Duration (s) | Path (m) | First→last pose 3D (m) "
@@ -35,7 +37,7 @@ def row(session_dir):
     wc_path = os.path.join(session_dir, "walkcheck.json")
     if os.path.exists(wc_path):
         with open(wc_path) as f:
-            wc = json.load(f)
+            wc = measurement_values(json.load(f))
         verdict = wc.get("result", "?")
         reasons = wc.get("reasons") or []
         if reasons:

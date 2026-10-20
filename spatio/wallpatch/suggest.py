@@ -438,6 +438,7 @@ def _document(map_path, sha, n_points, voxel_m, chosen):
         patches.append(
             {
                 "name": "suggest-%d" % rank,
+                "origin": "auto_suggested",
                 "box_map_frame": {
                     "center_m": [float(v) for v in cand["center"]],
                     "normal_hint": [float(v) for v in cand["normal"]],

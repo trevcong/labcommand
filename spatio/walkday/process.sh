@@ -225,9 +225,14 @@ case $rc in 0|1|2) say "walk checker exit $rc" ;; *) stop walk-check "walkcheck 
 say "[7/9] wall patches (g8)"
 mkdir -p "$SESSION/wallpatch"
 if [[ -n $PATCHES ]]; then
-  PATCH_ORIGIN=preselected
-  PATCH_SOURCE="patches from $PATCHES (chosen for this map)"
-  cp "$PATCHES" "$SESSION/wallpatch/patches.json"
+  cp "$PATCHES" "$SESSION/wallpatch/patches.json" || stop wall-patches "cannot copy patches from $PATCHES"
+  PATCH_SPEC_ARGS=()
+  [[ -n $SPEC ]] && PATCH_SPEC_ARGS=(--spec "$SPEC")
+  PATCH_ORIGIN="$(python3 -m spatio.walkday.patch_origin "$SESSION/wallpatch/patches.json" \
+    ${PATCH_SPEC_ARGS[@]+"${PATCH_SPEC_ARGS[@]}"})" \
+    || stop wall-patches "supplied patches cannot establish preselection (see above)"
+  PATCH_SOURCE="$PATCH_ORIGIN patches from $PATCHES"
+  [[ $PATCH_ORIGIN != auto_suggested ]] || say "auto_suggested patches cannot be labelled preselected; this run cannot count toward a series"
 else
   PATCH_ORIGIN=auto_suggested
   PATCH_SOURCE="auto-suggested from this map (top $SUGGEST_PATCHES), NOT Trevor's preselected patches"
