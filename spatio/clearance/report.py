@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .classify import validate_min_free_rays
 from .model import header, load_json, number, parse_zones, text, vector
+from . import provenance as prov
 
 
 SCHEMA = "spatio.clearance_report.v1"
@@ -37,8 +38,12 @@ def _time_range(value, name):
         raise ValueError(f"{name} must be ordered")
 
 
-def build_report(results, zones_data, walk_id):
-    """Join result records to their map geometry; reject inconsistent summaries."""
+def build_report(results, zones_data, walk_id, supplied=None):
+    """Join result records to their map geometry; reject inconsistent summaries.
+
+    supplied: sha256 of the current recording, extrinsics, trajectory and scans
+    (None = not given). A changed trajectory, extrinsics or zone geometry is a
+    hard error; see provenance.check."""
     walk_id = text(walk_id, "walk_id")
     # The classifier requires a nonempty scene. Presentation also supports a
     # walk with no declared zones, without weakening that classifier contract.
@@ -146,12 +151,18 @@ def build_report(results, zones_data, walk_id):
                         not lower - definition.depth <= margin <= 0 or
                         (measured is None and margin != lower - definition.depth)):
                     raise ValueError(f"{definition.id}: occupied clearance and decision margin disagree")
+            if record["zone_geometry_sha256"] != prov.zone_geometry_sha256(frame, definition):
+                raise ValueError(f"{definition.id}: zone geometry changed since clearance was "
+                                 "computed; recompute clearance")
+            if record["provenance_limitations"] != results["provenance"]["limitations"]:
+                raise ValueError(f"{definition.id}: provenance limitations differ from the result's")
             # Divide before summing to avoid overflowing large finite bounds.
             position = (definition.low / 2 + definition.high / 2).tolist()
             if not all(math.isfinite(x) for x in position):
                 raise ValueError("zone centre must be finite")
             zones.append({"map_position_m": position,
                           "evidence": copy.deepcopy(record)})
+        reuse_limitations = prov.check(results["provenance"], supplied or {})
     except KeyError as error:
         raise ValueError(f"missing result field: {error.args[0]}") from error
     counts = {status: sum(z["evidence"]["status"] == status for z in zones)
@@ -161,6 +172,8 @@ def build_report(results, zones_data, walk_id):
         "claim": results["claim"], "physical_accuracy_evaluated": False,
         "settings": {key: copy.deepcopy(results[key]) for key in SETTINGS},
         "scan_count": scan_count, "scan_time_range": copy.deepcopy(results["scan_time_range"]),
+        "provenance": copy.deepcopy(results["provenance"]),
+        "reuse_limitations": reuse_limitations,
         "position_reference": "Centre of required volume; not an obstacle or viewing pose.",
         "counts": counts, "zone_count": len(zones), "zones": zones,
         "failures": [z for z in zones if z["evidence"]["status"] == "FAIL"],
@@ -196,8 +209,19 @@ def markdown_report(result):
         f"Scans: {result['scan_count']}; scan time range (input seconds): {result['scan_time_range']}.",
         "Counts: " + "; ".join(f"{s.replace('_', ' ')}={result['counts'][s]}" for s in STATUSES) + ".",
         "Map positions (x, y, z), metres: required-volume centres, not obstacle/viewing poses.",
-        "", "## FAIL exceptions", "",
     ]
+    p = result["provenance"]
+    lines += [
+        f"Inputs (sha256): recording {p['recording_sha256']}; extrinsics {p['extrinsics_sha256']}; "
+        f"trajectory {p['trajectory_sha256']}; scans {p['scans_sha256']}.",
+        f"Time basis: {_safe(p['time_basis'])}.",
+    ]
+    limits = [(key, prov.LIMITATIONS[key]) for key in p["limitations"]] + [
+        (key, prov.REUSE_LIMITATIONS[key]) for key in result["reuse_limitations"]]
+    if limits:
+        lines.append("Provenance limitations (apply to every zone, including PASS):")
+        lines += [f"- {_safe(key)}: {_safe(detail)}" for key, detail in limits]
+    lines += ["", "## FAIL exceptions", ""]
     if result["failures"]:
         lines += [
             "| Zone / rule | Observed min hit / required min (m) | Occupied voxel lower bound (m) | Map position | Evidence time | Reason / supplied provision |",
@@ -235,9 +259,21 @@ def main(argv=None):
     parser.add_argument("--zones", type=Path, required=True, help="matching zone definitions")
     parser.add_argument("--walk-id", required=True)
     parser.add_argument("--output", type=Path, required=True, help="new output directory")
+    parser.add_argument("--trajectory", type=Path,
+                        help="current trajectory; required when the results are bound to one")
+    parser.add_argument("--extrinsics", type=Path,
+                        help="current extrinsics; required when the results are bound to them")
+    parser.add_argument("--recording", type=Path, help="recording to recheck (optional)")
+    parser.add_argument("--scans", type=Path, help="scans to recheck (optional)")
     args = parser.parse_args(argv)
     try:
-        result = build_report(load_json(args.results), load_json(args.zones), args.walk_id)
+        supplied = {name: None if path is None else prov.sha256_path(path) for name, path in (
+            ("recording", args.recording), ("extrinsics", args.extrinsics),
+            ("trajectory", args.trajectory))}
+        supplied["scans"] = None if args.scans is None else prov.canonical_sha256(
+            load_json(args.scans))
+        result = build_report(load_json(args.results), load_json(args.zones), args.walk_id,
+                              supplied)
         encoded, rendered = json_text(result), markdown_report(result)
         args.output.mkdir(parents=True, exist_ok=False)
         (args.output / "report.json").write_bytes(encoded.encode("utf-8"))
