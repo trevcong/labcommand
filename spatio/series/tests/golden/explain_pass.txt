@@ -1,0 +1,9 @@
+Run g-pass-1 is PASS.
+The 3D return error is 5.0 cm, which is under the 10.0 cm threshold.
+Horizontal return error is 3.0 cm and vertical return error is 4.0 cm.
+Heading error is 0.4 degrees.
+Duration is 210.0 seconds, path length is 42.0 m, and drift is 0.12% of the path.
+Timestamps are monotonic, resets are 0, the largest gap is 0.11 seconds, and the cart was moving.
+The wall p95 point-to-plane residual is 3.1 cm, a doubled wall is not suspected, and the wall gate of 5.0 cm is proposed, not yet approved by Trevor.
+Physical accuracy was evaluated: the start placement residual is 0.4 cm, the end placement residual is 0.6 cm, the placement tolerance is 1.0 cm, and the heading check is ok.
+This run counts toward a three-run series.
