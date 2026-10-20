@@ -17,6 +17,7 @@ from .model import number, vector
 class Cell:
     free_times: set = field(default_factory=set)
     free_ray_count: int = 0
+    free_rays: set = field(default_factory=set)
     occupied_times: set = field(default_factory=set)
     hits: list = field(default_factory=list)
 
@@ -92,10 +93,16 @@ class EvidenceGrid:
             raise ValueError("scan timestamps must be strictly increasing")
         # Accumulation is monotonic: a later ray never erases a prior hit.
         for hit in scan.hits:
+            # A repeated identical ray samples the same line again, not more of
+            # the voxel: it counts once toward the free-ray minimum. Its hit is
+            # still recorded below, so occupancy evidence is never dropped.
+            ray = (tuple(scan.origin.tolist()), tuple(hit.tolist()))
             for index in self.ray_cells(scan.origin, hit):
                 cell = self.cell(index)
                 cell.free_times.add(scan.timestamp)
-                cell.free_ray_count += 1
+                if ray not in cell.free_rays:
+                    cell.free_rays.add(ray)
+                    cell.free_ray_count += 1
             cell = self.cell(self.index(hit))
             cell.occupied_times.add(scan.timestamp)
             cell.hits.append((scan.timestamp, hit.copy()))

@@ -181,7 +181,10 @@ interpolation through occluders or inference from missing map points.
 
 Each cell retains independent sets of free and occupied timestamps, plus
 occupied hit positions and a free-ray count. A ray contributes once to each
-traversed cell; several rays in one scan count separately. Either observation
+traversed cell; several distinct rays in one scan count separately. An
+identical repeated ray (same origin and hit, in one scan or several) counts
+once toward the free-ray minimum, since it samples the same line again; its
+hit and time are still recorded as occupancy. Either observation
 order produces the same conflict.
 All conflicts are reported by index, both globally and within each zone;
 an occupied cell never becomes free-only. Unknown is implicit.
@@ -233,9 +236,10 @@ every physical point is empty. Thin objects, sparse beams, bad poses, moving
 objects and incorrect first-return inputs can defeat that interpretation.
 Conflicts are retained indefinitely within this one input session; there is
 no aging or moving-object filter. The minimum-ray count is only a provisional
-sampling gate: repeated or duplicate input rays count, independence and
-spatial diversity are not established, and even two rays can miss most of a
-voxel. It is not an operational clearance guarantee.
+sampling gate: identical repeated rays count once, but near-duplicate rays
+still count, independence and spatial diversity are not established, and even
+two rays can miss most of a voxel. A single ray clipping a voxel corner counts
+as that voxel's free evidence when `--min-free-rays 1` is chosen. It is not an operational clearance guarantee.
 
 Boundary cells can cause conservative false alarms, including a reference
 surface sharing a cell with the required volume. A panel at x=2 facing -x
