@@ -24,6 +24,9 @@ MIN_PATH_LENGTH_M = 2.0
 MIN_EXCURSION_M = 0.5
 MIN_WINDOW_SAMPLES = 3
 MIN_POSES = 6
+# PROVISIONAL input-sufficiency floor; not fitted to recordings and not
+# evidence of room coverage or wall quality. Separate from wall-fit limits.
+MIN_MAP_POINTS = 25
 # Largest distance from a sample to its window mean. Over this, the mean
 # is not a parked position. 5 cm is above the measured replay jitter and
 # well below the 30 cm cancellation.
