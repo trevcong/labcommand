@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from spatio.series.report import build_series, explain_text, render_markdown
@@ -185,6 +186,12 @@ class SeriesTest(unittest.TestCase):
     def series_of(self, datas, series_id="series-test"):
         walks = []
         for index, data in enumerate(datas):
+            # Explicit synthetic recording chronology replaces the old implicit
+            # CLI order. Production never invents this metadata.
+            data = dict(data)
+            data.setdefault("recorded_at", (
+                datetime(2030, 1, 1, tzinfo=timezone.utc) + timedelta(hours=index)
+            ).isoformat())
             walks.append(self.load(data, "run-%s.json" % index))
         return build_series(walks, series_id)
 
@@ -1402,16 +1409,16 @@ class SeriesTest(unittest.TestCase):
         self.assertEqual(finished_fail["verdict"], "FAIL")
 
     def test_cli_exit_codes(self):
-        good = self._write("good.json", make_walk("cli-a"))
-        second = self._write("second.json", make_walk("cli-b"))
-        third = self._write("third.json", make_walk("cli-c"))
+        good = self._write("good.json", make_walk("cli-a", recorded_at="2030-01-01T00:00:00Z"))
+        second = self._write("second.json", make_walk("cli-b", recorded_at="2030-01-01T01:00:00Z"))
+        third = self._write("third.json", make_walk("cli-c", recorded_at="2030-01-01T02:00:00Z"))
         bad = self._write(
             "bad.json",
             make_walk("bad", return_error={"d3_m": 0.15, "horizontal_m": 0.09, "vertical_m": 0.12}),
         )
         garbage = self._write_text("garbage.json", "{not json")
         missing = os.path.join(self.tmp.name, "missing.json")
-        failed = self._write("failed.json", make_return_fail("cli-fail"))
+        failed = self._write("failed.json", make_return_fail("cli-fail", recorded_at="2030-01-01T01:00:00Z"))
 
         explain_ok = self._cli(["explain", good])
         self.assertEqual(explain_ok.returncode, 0)
@@ -1448,7 +1455,8 @@ class SeriesTest(unittest.TestCase):
         compare_fail = self._cli(
             ["compare", good, failed, third, "--out", out_fail, "--series-id", "cli-fail"]
         )
-        self.assertEqual(compare_fail.returncode, 0)
+        # Deliberate CLI spec correction: writing a FAIL is no longer success.
+        self.assertEqual(compare_fail.returncode, 3)
         fail_payload = json.loads(Path(out_fail, "series.json").read_text(encoding="utf-8"))
         self.assertEqual(fail_payload["verdict"], "FAIL")
 

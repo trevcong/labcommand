@@ -6,7 +6,7 @@ Counted runs: g-pass-1, g-pass-2, g-pass-3
 
 ## Rules
 
-This report checks the producer's walk_result files again. It does not trust a PASS that the numbers do not support. Attempts are in the order given on the command line.
+This report checks the producer's walk_result files again. It does not trust a PASS that the numbers do not support. Attempts are ordered by recorded_at (recording time), never command-line order. Missing or tied recording times are rejected.
 
 Precedence is input error (exit 1), then NOT_EVALUABLE, then REPLAY_ONLY, then PASS, then INCOMPLETE, then FAIL. A weaker verdict must not hide a stronger problem.
 
@@ -22,11 +22,11 @@ Precedence is input error (exit 1), then NOT_EVALUABLE, then REPLAY_ONLY, then P
 
 ## Comparison
 
-| attempt | run_id | status | return 3D (cm) | horizontal (cm) | vertical (cm) | heading (°) | path (m) | drift (% of path) | wall p95 (cm) | doubled wall? | placement start/end (cm) | physical accuracy evaluated? | counts toward series? | reasons |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | g-pass-1 | PASS | 5.0 | 3.0 | 4.0 | 0.4 | 42.0 | 0.12 | 3.1 | no | 0.4 / 0.6 | yes | yes | - |
-| 2 | g-pass-2 | PASS | 6.0 | 3.6 | 4.8 | 0.8 | 38.5 | 0.16 | 2.8 | no | 0.3 / 0.5 | yes | yes | - |
-| 3 | g-pass-3 | PASS | 3.0 | 1.8 | 2.4 | 1.1 | 45.0 | 0.07 | 2.2 | no | 0.2 / 0.4 | yes | yes | - |
+| attempt | run_id | recorded at (UTC) | status | return 3D (cm) | horizontal (cm) | vertical (cm) | heading (°) | path (m) | drift (% of path) | wall p95 (cm) | doubled wall? | placement start/end (cm) | physical accuracy evaluated? | counts toward series? | reasons |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | g-pass-1 | 2030-01-01T00:00:00+00:00 | PASS | 5.0 | 3.0 | 4.0 | 0.4 | 42.0 | 0.12 | 3.1 | no | 0.4 / 0.6 | yes | yes | - |
+| 2 | g-pass-2 | 2030-01-01T01:00:00+00:00 | PASS | 6.0 | 3.6 | 4.8 | 0.8 | 38.5 | 0.16 | 2.8 | no | 0.3 / 0.5 | yes | yes | - |
+| 3 | g-pass-3 | 2030-01-01T02:00:00+00:00 | PASS | 3.0 | 1.8 | 2.4 | 1.1 | 45.0 | 0.07 | 2.2 | no | 0.2 / 0.4 | yes | yes | - |
 
 ## Retained failed attempts
 
