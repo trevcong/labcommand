@@ -105,8 +105,10 @@ FL_REV="$(docker --context "$DCTX" image inspect -f '{{index .Config.Labels "spa
 # docker-cp'd back out.
 dk() { docker --context "$DCTX" "$@"; }
 VOL="spatio-rec-$(basename "$REC" | tr -c 'A-Za-z0-9_.-\n' '_')"
-BAGFILE="$(cd "$REC/bag" && ls | grep -E '\.(mcap|db3)$' | head -1)"
-want_sha="$(shasum -a 256 "$REC/bag/$BAGFILE" | cut -d' ' -f1)"
+# Cache key: every bag file plus metadata.yaml (not just the first segment).
+BAGFILES=()
+while IFS= read -r f; do BAGFILES+=("$f"); done < <(cd "$REC/bag" && ls | grep -E '\.(mcap|db3)$|^metadata\.yaml$' | sort)
+want_sha="$(cd "$REC/bag" && shasum -a 256 "${BAGFILES[@]}" | shasum -a 256 | cut -d' ' -f1)"
 have_sha="$(dk run --rm --name "spatio-check-$RUN_ID" --network none -v "$VOL:/rec:ro" "$IMAGE_TAG" cat /rec/.spatio_loaded 2>/dev/null || true)"
 if [[ $have_sha != "$want_sha" ]]; then
   echo "== loading $REC into volume $VOL"
@@ -115,7 +117,8 @@ if [[ $have_sha != "$want_sha" ]]; then
   dk create --name "spatio-load-$RUN_ID" --network none -v "$VOL:/rec" "$IMAGE_TAG" true >/dev/null
   dk cp "$REC/." "spatio-load-$RUN_ID:/rec/"
   dk rm "spatio-load-$RUN_ID" >/dev/null
-  got="$(dk run --rm --name "spatio-verify-$RUN_ID" --network none -v "$VOL:/rec:ro" "$IMAGE_TAG" sha256sum "/rec/bag/$BAGFILE" | cut -d' ' -f1)"
+  got="$(dk run --rm --name "spatio-verify-$RUN_ID" --network none -v "$VOL:/rec:ro" -w /rec/bag "$IMAGE_TAG" \
+        sha256sum "${BAGFILES[@]}" | shasum -a 256 | cut -d' ' -f1)"
   [[ $got == "$want_sha" ]] || { echo "bag sha256 mismatch in volume ($got != $want_sha)" >&2; exit 3; }
   dk run --rm --name "spatio-mark-$RUN_ID" --network none -v "$VOL:/rec" "$IMAGE_TAG" sh -c "echo $want_sha > /rec/.spatio_loaded"
 fi
@@ -164,15 +167,20 @@ dk cp "$STAGE/cfg" "$CONTAINER:/cfg"
 set +e
 dk start -a "$CONTAINER"
 RC=$?
-dk cp "$CONTAINER:/out/." "$SESSION/" || echo "WARNING: could not copy /out from $CONTAINER"
+if ! dk cp "$CONTAINER:/out/." "$SESSION/"; then
+  echo "ERROR: could not copy /out from $CONTAINER" >&2; [[ $RC == 0 ]] && RC=4
+fi
 dk rm "$CONTAINER" >/dev/null
 set -e
 mkdir -p "$SESSION/logs"
 echo "== container exit $RC"
 
 if [[ $MODE == historical ]]; then
-  if [[ -f $REC/$HIST_MAP ]]; then cp "$REC/$HIST_MAP" "$SESSION/map.pcd"; else echo "WARNING: no $REC/$HIST_MAP"; fi
+  if [[ -f $REC/$HIST_MAP ]]; then cp "$REC/$HIST_MAP" "$SESSION/map.pcd"; else echo "ERROR: no $REC/$HIST_MAP" >&2; [[ $RC == 0 ]] && RC=4; fi
 fi
+for f in trajectory.tum map.pcd; do
+  [[ -s $SESSION/$f ]] || { echo "ERROR: replay produced no $f" >&2; [[ $RC == 0 ]] && RC=4; }
+done
 
 # Provenance and run details (outside the contract manifest).
 dk run --rm --name "spatio-prov-$RUN_ID" --network none "$IMAGE_TAG" cat /opt/spatio/provenance.json > "$SESSION/logs/image_provenance.json"
@@ -185,7 +193,7 @@ json.dump({
   "playback_topics": ["$LIDAR", "$IMU"], "lidar_msg_type": "$LIDAR_MSG_TYPE", "rate": $RATE,
   "config_file": "$CONFIG",
   "duration_s": "${DURATION:-all}", "ros_domain_id": $DOMAIN_ID,
-  "recording_volume": "$VOL", "bag_sha256": "$want_sha",
+  "recording_volume": "$VOL", "bag_files_sha256": "$want_sha", "bag_files_sha256_definition": "sha256 of the sha256sum listing of bag/*.mcap|*.db3 and metadata.yaml",
   "limits": {"cpus": $CPUS, "memory": "$MEM", "shm": "1g", "pids": 1024, "max_seconds": $MAX_SECONDS},
   "fastdds_profile": "${DDS_PROFILE:-default}",
   "fastlio_param_overrides": {"runtime_pos_log_enable": True} if "$MODE" == "replay" else {},

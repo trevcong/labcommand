@@ -78,7 +78,8 @@ sleep 2
 say "playing $LIDAR $IMU at rate $RATE"
 ros2 bag play "$BAG" --topics "$LIDAR" "$IMU" --rate "$RATE" --disable-keyboard-controls \
     ${DURATION:+--playback-duration "$DURATION"} >"$LOGS/play.log" 2>&1
-say "playback finished (exit $?)"
+PLAY_RC=$?
+say "playback finished (exit $PLAY_RC)"
 
 # Drain: wait until /Odometry has been quiet for 5 s (max 300 s).
 i=0
@@ -94,6 +95,7 @@ say "drained: odom_watch saw $n /Odometry messages"
 
 stop_proc "$REC" recorder 60
 stop_proc "$WATCH" odom_watch 10
+FL_ALIVE=1; kill -0 "$FL" 2>/dev/null || FL_ALIVE=0   # FAST-LIO must still be running here
 stop_proc "$FL" fastlio 120
 trap - EXIT
 cp -a /ws/src/FAST_LIO_ROS2/Log "$LOGS/fastlio_Log" 2>/dev/null || true
@@ -107,5 +109,6 @@ say "building map from recorded /cloud_registered"
 python3 "$T/bag_to_map.py" "$LOGS/output_bag" "$OUT/map.pcd" --voxel "${MAP_VOXEL:-0.03}" \
     --summary "$LOGS/map_summary.json" >>"$LOGS/runner.log" 2>&1
 rc2=$?
-say "done (trajectory rc=$rc1, map rc=$rc2)"
-[[ $rc1 == 0 && $rc2 == 0 ]]
+say "done (playback rc=$PLAY_RC, fastlio alive at end=$FL_ALIVE, trajectory rc=$rc1, map rc=$rc2)"
+# Any failed step fails the replay, even when partial outputs exist.
+[[ $PLAY_RC == 0 && $FL_ALIVE == 1 && $rc1 == 0 && $rc2 == 0 ]]
