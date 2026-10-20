@@ -7,7 +7,9 @@ plain-English walkday.md / walkday.json for Trevor.
 
 The first form reads SESSION/walkcheck.json, SESSION/wallpatch/wallpatch.json,
 SESSION/manifest.json, SESSION/physical_reference.json (only when the manifest
-says physical accuracy was evaluated), SESSION/logs/input_gate.json and, for a
+says physical accuracy was evaluated), SESSION/logs/input_gate.json, the
+recording's bag/metadata.yaml (its starting_time becomes recorded_at, which
+spatio.series uses to order runs; never the processing time) and, for a
 synthetic recording, its SYNTHETIC.json ground truth. The second form records
 a run that stopped before scoring (NOT-EVALUABLE; no walk_result.json).
 
@@ -40,6 +42,7 @@ import os
 import sys
 from datetime import datetime, timezone
 
+from spatio.replay.recording import RecordingError, recorded_at
 from spatio.series.validate import (
     PLACEMENT_TOLERANCE_M,
     REPLAY_LABEL,
@@ -152,7 +155,14 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str):
     if manifest.get("run_id") != run_id:
         raise ResultError(f"manifest run_id {manifest.get('run_id')!r} != folder {run_id!r}")
     evaluated = manifest.get("physical_accuracy_evaluated") is True
-    synthetic = _synthetic_truth(manifest.get("source_recording"))
+    source = manifest.get("source_recording")
+    if not isinstance(source, str) or not source:
+        raise ResultError("manifest has no source_recording, so the recording start time is unknown")
+    try:
+        started = recorded_at(source)
+    except RecordingError as exc:
+        raise ResultError(f"recording start time: {exc}")
+    synthetic = _synthetic_truth(source)
     if synthetic is not None and evaluated:
         raise ResultError("synthetic recording but manifest claims physical accuracy was evaluated")
     reference = None
@@ -198,6 +208,7 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str):
     walk = {
         "schema": WALK_SCHEMA,
         "run_id": run_id,
+        "recorded_at": started,
         "status": status,
         "reasons": [str(r) for r in reasons],
         "physical_accuracy_evaluated": evaluated,
@@ -234,6 +245,7 @@ def build(session: str, gate_m: float, gate_state: str, patch_source: str):
         "run_id": run_id,
         "status": status,
         "reasons": walk["reasons"],
+        "recorded_at": started,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "synthetic": synthetic is not None,
         "accuracy_label": walk["accuracy_label"],
@@ -401,7 +413,9 @@ def render(report: dict) -> str:
         L += [f"- warning: {x}" for x in gate.get("warnings") or []]
     m = report["manifest"]
     L += ["", "## Provenance", "",
-          f"- recording: {m['source_recording']}", f"- sensor: {m['sensor']}",
+          f"- recording: {m['source_recording']}",
+          f"- recorded at {report['recorded_at']} (bag starting_time: recorder clock, first message received)",
+          f"- sensor: {m['sensor']}",
           f"- FAST-LIO {m['fastlio_revision']}, config {m['config_file']} (sha256 {m['config_sha256']})",
           f"- image: {m['image']}", ""]
     return "\n".join(L) + "\n"

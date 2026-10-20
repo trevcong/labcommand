@@ -19,13 +19,19 @@ SPEC="$OUT/spec/SPEC-synthetic.frozen.json"
 mkdir -p "$SY" "$OUT/spec" "$OUT/sessions"
 STAMP="$(date +%Y%m%dT%H%M%S)"
 
-mkrec() {  # name offset seed
-  [[ -d $SY/$1 ]] || "$HERE/make_recording.sh" "$SY/$1" "$2" --seed "$3" || exit 3
+mkrec() {  # name offset seed t0 (synthetic clock; the series orders runs by the bag's start time)
+  [[ -d $SY/$1 ]] || "$HERE/make_recording.sh" "$SY/$1" "$2" --seed "$3" --set "t0=$4" || exit 3
 }
-mkrec pass-a 0.05 11
-mkrec fail 0.15 11
-mkrec pass-b 0.05 12
-mkrec pass-c 0.05 13
+mkrec pass-a 0.05 11 1800000000
+mkrec fail 0.15 11 1800003600
+mkrec pass-b 0.05 12 1800007200
+mkrec pass-c 0.05 13 1800010800
+STARTS="$(for n in pass-a fail pass-b pass-c; do python3 "$WD/../replay/recording.py" recorded-at "$SY/$n" || echo "missing-$n"; done)"
+if [[ $(sort <<<"$STARTS" | uniq | wc -l) -ne 4 || $STARTS == *missing-* ]]; then
+  echo "dryrun: the synthetic recordings in $SY do not have four distinct bag start times" >&2
+  echo "        (built before per-recording t0). Delete $SY and rerun." >&2
+  exit 3
+fi
 
 if [[ ! -f $SPEC ]]; then
   REV="$(git -C "${SPATIO_SRC:-$HOME/Developer/spatio-data/spark-src}/FAST_LIO_ROS2" rev-parse HEAD)"

@@ -6,8 +6,10 @@
 # List every attempt in the order it was walked, failed ones included: the
 # series needs three CONSECUTIVE counted runs, and dropping a failure would hide it.
 # Writes <sessions-root>/series/<series-id>/series.{md,json}.
-# Exit: 0 PASS; 1 FAIL, INCOMPLETE or REPLAY_ONLY (no physical evidence);
-#       2 NOT_EVALUABLE or a run that was never scored; 3 usage error.
+# Exit codes are spatio.series compare's own: 0 PASS, 3 FAIL, 4 INCOMPLETE,
+#   5 NOT_EVALUABLE, 6 REPLAY_ONLY (no physical evidence), 1 inputs rejected
+#   (e.g. missing or tied recorded_at), 2 unreadable input (a run never scored)
+#   or usage error. Note 3 here is FAIL, not process.sh's usage error.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -19,13 +21,13 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --sessions-root) ROOT=$2; shift 2 ;;
     --series-id) SERIES_ID=$2; shift 2 ;;
-    -*) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 3 ;;
+    -*) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
     *) RUNS+=("$1"); shift ;;
   esac
 done
-[[ ${#RUNS[@]} -ge 1 ]] || { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 3; }
+[[ ${#RUNS[@]} -ge 1 ]] || { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [[ -n $SERIES_ID ]] || SERIES_ID="$(IFS=+; echo "${RUNS[*]}")"
-[[ $SERIES_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.+-]*$ ]] || { echo "bad series id: $SERIES_ID" >&2; exit 3; }
+[[ $SERIES_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.+-]*$ ]] || { echo "bad series id: $SERIES_ID" >&2; exit 2; }
 
 FILES=() MISSING=0
 for r in "${RUNS[@]}"; do
@@ -48,15 +50,15 @@ OUT="$ROOT/series/$SERIES_ID"
 mkdir -p "$OUT"
 python3 -m spatio.series compare "${FILES[@]}" --out "$OUT" --series-id "$SERIES_ID"
 rc=$?
-[[ $rc == 0 ]] || { echo "!! spatio.series rejected the inputs (exit $rc)" >&2; exit 2; }
+case $rc in
+  0|3|4|5|6) ;;
+  1) echo "!! spatio.series rejected the inputs (exit 1; see the message above)" >&2; exit 1 ;;
+  *) echo "!! spatio.series could not read the inputs (exit $rc)" >&2; exit "$rc" ;;
+esac
 VERDICT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$OUT/series.json")"
 [[ $VERDICT == NOT_EVALUABLE ]] && echo "!! NOT-EVALUABLE series: the runs do not share one config/FAST-LIO revision (see series.md)"
 echo "========================================================================"
 echo "SERIES $SERIES_ID: $VERDICT"
 echo "table: $OUT/series.md"
 echo "========================================================================"
-case $VERDICT in
-  PASS) exit 0 ;;
-  NOT_EVALUABLE) exit 2 ;;
-  *) exit 1 ;;
-esac
+exit "$rc"

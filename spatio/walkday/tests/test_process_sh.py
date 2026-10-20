@@ -59,6 +59,14 @@ class ProcessShTest(unittest.TestCase):
         write_rec(self.rec, mcap_counts={"/rig7/points": 2, "/rig7/inertial": 5})
         self.assert_stopped(self.sh(self.rec, "r3"), "r3", "copy-check")
 
+    def test_missing_recording_start_time_stops_before_replay(self):
+        # Complete copy and a matching config, but no bag-level starting_time:
+        # the series could not order this run, so stop before the long stages.
+        write_rec(self.rec, mcap_counts={"/rig7/points": 3, "/rig7/inertial": 5}, starting_ns=None)
+        proc = self.sh(self.rec, "r8")
+        self.assert_stopped(proc, "r8", "recording-time")
+        self.assertNotIn("[2/9]", proc.stdout)
+
     def test_config_not_matching_bag_stops(self):
         write_rec(self.rec, mcap_counts={"/rig7/points": 3, "/rig7/inertial": 5})
         cfg = os.path.join(self.tmp, "mid360_like.yaml")
@@ -84,6 +92,12 @@ class ProcessShTest(unittest.TestCase):
         proc = self.sh("r7", "r-missing", script=SERIES)
         self.assertEqual(proc.returncode, 2)
         self.assertIn("NOT-EVALUABLE series", proc.stderr)
+
+    def test_series_usage_error_is_not_fail(self):
+        # spatio.series uses 3 for FAIL, so series.sh usage errors are 2.
+        self.assertEqual(self.sh(script=SERIES).returncode, 2)
+        self.assertEqual(self.sh("r1", "--bogus", script=SERIES).returncode, 2)
+        self.assertEqual(self.sh("r1", "--series-id", "bad id", script=SERIES).returncode, 2)
 
 
 if __name__ == "__main__":

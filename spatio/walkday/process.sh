@@ -3,7 +3,7 @@
 #
 #   spatio/walkday/process.sh <recording-dir> <run-id> [options]
 #
-# Stages: copy check -> x1 bag timing + input gate -> FAST-LIO replay (A)
+# Stages: copy check + recording start time -> x1 bag timing + input gate -> FAST-LIO replay (A)
 #   -> physical reference (g5, only with --placement-cm) -> manifest (g2)
 #   -> walk check (B) -> wall patches (g8) -> raw-scan start->end registration
 #   (information only) -> per-run result + report.
@@ -113,6 +113,10 @@ say "run $RUN_ID  recording $REC  -> $SESSION"
 
 say "[1/9] copy check (bag files vs metadata.yaml)"
 python3 "$REPO/spatio/replay/recording.py" complete "$REC" || stop copy-check "recording copy incomplete or unreadable"
+# The series orders runs by this; result.py reads it again from the recording.
+RECORDED_AT="$(python3 "$REPO/spatio/replay/recording.py" recorded-at "$REC")" \
+  || stop recording-time "bag metadata.yaml has no starting_time; the series orders runs by it"
+say "recording started $RECORDED_AT (bag starting_time: recorder clock, first message received)"
 if [[ -z $CONFIG ]]; then
   CONFIG="$(python3 "$REPO/spatio/replay/recording.py" find-config "$REC")" || stop config "no FAST-LIO config in the recording; pass --config"
 fi

@@ -14,7 +14,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from spatio.series.cli import VERDICT_EXIT
 from spatio.walkcheck.synthetic import four_wall_room, hold_and_square, write_pcd_binary, write_tum
+from spatio.walkday.tests.test_result import write_recording
 
 REPO = Path(__file__).resolve().parents[3]
 SPEC_FILL = REPO / "spatio" / "walkday" / "synth" / "spec_fill.json"
@@ -55,8 +57,9 @@ class PlacementPathTest(unittest.TestCase):
         py("spatio.expspec", "record", "--spec", str(self.spec), "--run-id", run_id,
            "--start-residual-m", str(start_m), "--end-residual-m", str(end_m), "--heading", heading,
            "--operator", "test", "--method", "test", "--out", str(ref))
+        rec = write_recording(self.tmp / "recordings" / run_id)   # its own, later start time
         py("spatio.manifest", "build", str(s), "--run-id", run_id, "--source-recording",
-           str(self.tmp / "rec"), "--sensor", "test sensor", "--fastlio-revision", REV,
+           str(rec), "--sensor", "test sensor", "--fastlio-revision", REV,
            "--config-file", str(self.config), "--image", "test-image", "--notes", "placement path test",
            "--physical-reference", str(ref))
         py("spatio.manifest", "validate", str(s))
@@ -70,8 +73,11 @@ class PlacementPathTest(unittest.TestCase):
 
     def series(self, sessions, name):
         out = self.tmp / "series" / name
-        py("spatio.series", "compare", *[str(s / "walk_result.json") for s in sessions], "--out", str(out))
-        return json.loads((out / "series.json").read_text())["verdict"]
+        rc = py("spatio.series", "compare", *[str(s / "walk_result.json") for s in sessions], "--out", str(out),
+                ok=False).returncode
+        verdict = json.loads((out / "series.json").read_text())["verdict"]
+        self.assertEqual(rc, VERDICT_EXIT[verdict])
+        return verdict
 
     def test_measured_placements_flow_through_to_series_pass(self):
         runs = []

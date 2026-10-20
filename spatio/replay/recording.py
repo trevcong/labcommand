@@ -12,6 +12,8 @@ check compares metadata.yaml with the MCAP files' own summaries.
                                          LIDAR_MSG_TYPE, TS_UNIT, SENSOR_KIND)
     recording.py find-config REC         prints the one FAST-LIO config (*.yaml
                                          with lid_topic) in REC, else exit 2
+    recording.py recorded-at REC         prints the bag's starting_time as ISO
+                                         8601 UTC, else exit 2
 
 Standard library only, except `complete`, which needs the `mcap` package.
 """
@@ -24,6 +26,7 @@ import os
 import re
 import shlex
 import sys
+from datetime import datetime, timedelta, timezone
 
 LIVOX_CUSTOM = "livox_ros_driver2/msg/CustomMsg"
 POINTCLOUD2 = "sensor_msgs/msg/PointCloud2"
@@ -97,6 +100,49 @@ def read_metadata(rec: str) -> dict:
     if not meta["files"]:
         raise RecordingError(f"{path} lists no bag files")
     return meta
+
+
+def parse_starting_time_ns(text: str):
+    """The bag-level starting_time.nanoseconds_since_epoch, or None.
+
+    rosbag2 also writes a starting_time for every file under `files:`; only the
+    one directly under rosbag2_bagfile_information (two-space indent) counts.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if not re.match(r"^  starting_time:\s*$", line):
+            continue
+        for nxt in lines[i + 1:]:
+            if not nxt.strip():
+                continue
+            m = re.match(r"^    nanoseconds_since_epoch:\s*(.+)$", nxt)
+            if not m:
+                return None
+            try:
+                return int(_strip(m.group(1)))
+            except ValueError:
+                return None
+        return None
+    return None
+
+
+def recorded_at(rec: str) -> str:
+    """Recording start from the bag's own metadata.yaml, ISO 8601 UTC.
+
+    This is the recorder host's clock when the first message arrived (receipt
+    time), not sensor time. Never processing time.
+    """
+    path = os.path.join(rec, "bag", "metadata.yaml")
+    try:
+        with open(path, encoding="utf-8") as f:
+            ns = parse_starting_time_ns(f.read())
+    except OSError as exc:
+        raise RecordingError(f"cannot read {path}: {exc}")
+    if ns is None or ns <= 0:
+        raise RecordingError(f"{path} has no positive starting_time.nanoseconds_since_epoch")
+    sec, rem = divmod(ns, 1_000_000_000)
+    stamp = datetime.fromtimestamp(sec, tz=timezone.utc) + timedelta(microseconds=rem // 1000)
+    return stamp.isoformat(timespec="microseconds")
 
 
 def parse_fastlio_config(text: str) -> dict:
@@ -223,6 +269,8 @@ def main(argv=None) -> int:
     p.add_argument("--imu-topic")
     p = sub.add_parser("find-config")
     p.add_argument("rec")
+    p = sub.add_parser("recorded-at")
+    p.add_argument("rec")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "complete":
@@ -230,6 +278,8 @@ def main(argv=None) -> int:
         elif args.cmd == "profile":
             for k, v in profile(args.rec, args.config, args.lidar_topic, args.imu_topic).items():
                 print(f"{k}={shlex.quote(v)}")
+        elif args.cmd == "recorded-at":
+            print(recorded_at(args.rec))
         else:
             print(find_config(args.rec))
     except RecordingError as exc:

@@ -100,6 +100,7 @@ def test_legacy_explain_without_recorded_time_remains_available(tmp_path):
 
 def produced_walkcheck(tmp_path, *, offset=0.05, variant=0, physical=False,
                        map_kind="sharp", gap=False):
+    import numpy as np
     from spatio.walkcheck.evaluate import evaluate_session
     from spatio.walkcheck.synthetic import (
         walking_loop, write_session, sharp_wall, doubled_wall, insert_time_gap,
@@ -122,6 +123,8 @@ def produced_walkcheck(tmp_path, *, offset=0.05, variant=0, physical=False,
         "sharp": lambda: sharp_wall(count=1500, seed=variant),
         "doubled": lambda: doubled_wall(count_per_sheet=1500, seed=variant),
         "tiny": lambda: [[0, 0, 0], [1, 0, 0]],
+        # Enough points for walkcheck's map minimum (#72) but no wall plane.
+        "planeless": lambda: np.random.default_rng(variant).uniform(-3, 3, (200, 3)).tolist(),
         "missing": lambda: None,
     }[map_kind]()
     session = tmp_path / metadata["run_id"]
@@ -160,7 +163,11 @@ def test_adapter_consumes_real_walkcheck_output(tmp_path, offset, variant, statu
 @pytest.mark.parametrize("map_kind,gap,producer,adapted", [
     ("sharp", True, "NOT-EVALUABLE", "NOT_EVALUABLE"),
     ("missing", False, "NOT-EVALUABLE", "NOT_EVALUABLE"),
-    ("tiny", False, "PASS", "NOT_EVALUABLE"),
+    # Since #72 walkcheck itself says NOT-EVALUABLE for a 2-point map; this row
+    # was written against the pre-#72 producer (PASS). "planeless" keeps the
+    # real-output case of a producer PASS whose wall evidence is missing.
+    ("tiny", False, "NOT-EVALUABLE", "NOT_EVALUABLE"),
+    ("planeless", False, "PASS", "NOT_EVALUABLE"),
     ("doubled", False, "PASS", "FAIL"),
 ])
 def test_adapter_never_upgrades_missing_or_failed_evidence(tmp_path, map_kind, gap, producer, adapted):
@@ -176,7 +183,7 @@ def test_adapter_never_upgrades_missing_or_failed_evidence(tmp_path, map_kind, g
     if gap:
         assert walk.return_error.d3_m is None
         assert walk.validity.moving is None
-    if map_kind in ("tiny", "missing"):
+    if map_kind in ("tiny", "planeless", "missing"):
         assert walk.walls.doubled_wall_suspected is None
 
 

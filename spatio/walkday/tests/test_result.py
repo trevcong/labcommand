@@ -5,16 +5,18 @@ parked ends, four-wall room), scored by the real walk checker and wall-patch
 tool, then turned into walk_result.json."""
 
 import hashlib
+import itertools
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 from pathlib import Path
 
-from spatio.series.cli import main as series_main
+from spatio.series.cli import VERDICT_EXIT, main as series_main
 from spatio.series.validate import load_walk_result
 from spatio.walkcheck.cli import main as walkcheck_main
 import numpy as np
@@ -25,6 +27,25 @@ from spatio.wallpatch.cli import main as wallpatch_main
 from spatio.walkday import result
 
 CONFIG_SHA = "ab" * 32
+REPO = Path(__file__).resolve().parents[3]
+SERIES_SH = REPO / "spatio" / "walkday" / "series.sh"
+# Arbitrary recorder clock (2030), not taken from any recording. Each new
+# recording starts 10 minutes after the previous one, in creation order.
+BASE_NS = 1_900_000_000 * 10**9
+_NEXT = itertools.count()
+
+
+def write_recording(rec, starting_ns=None):
+    """A recording folder with only what result.py reads: bag/metadata.yaml."""
+    rec = Path(rec)
+    (rec / "bag").mkdir(parents=True, exist_ok=True)
+    if starting_ns is None:
+        starting_ns = BASE_NS + next(_NEXT) * 600 * 10**9
+    start = "" if starting_ns is False else (
+        "  starting_time:\n    nanoseconds_since_epoch: %d\n" % starting_ns)
+    (rec / "bag" / "metadata.yaml").write_text(
+        "rosbag2_bagfile_information:\n  version: 9\n  storage_identifier: mcap\n" + start)
+    return rec
 
 
 def quiet(fn, *a):
@@ -41,7 +62,9 @@ def make_session(root, run_id, offset=(0.05, 0.0, 0.0), xyz=None, gap=False, eva
         rows = insert_time_gap(rows, after_t=20.0, extra_s=3.0)
     write_tum(s / "trajectory.tum", rows)
     write_pcd_binary(s / "map.pcd", four_wall_room() if xyz is None else xyz)
-    manifest = {"run_id": run_id, "source_recording": source or str(Path(root) / "rec"),
+    if source is None:
+        source = str(write_recording(Path(root) / f"{run_id}.rec"))
+    manifest = {"run_id": run_id, "source_recording": source,
                 "sensor": "test", "fastlio_revision": "abc1234", "config_file": "/x.yaml",
                 "config_sha256": CONFIG_SHA, "image": "img", "created_at": "2026-10-19T00:00:00Z",
                 "notes": "test", "physical_accuracy_evaluated": evaluated}
@@ -169,12 +192,13 @@ class ResultTest(unittest.TestCase):
         self.assertTrue(self.walk(s)["walls"]["doubled_wall_suspected"])
 
     def test_synthetic_source_never_claims_physical_accuracy(self):
-        rec = Path(self.tmp) / "synthrec"
-        rec.mkdir()
+        rec = write_recording(Path(self.tmp) / "synthrec")
         (rec / "SYNTHETIC.json").write_text(json.dumps({"statement": "synthetic",
                                                          "ground_truth": {"true_return_error_3d_m": 0.05}}))
         s = make_session(self.tmp, "rsyn_bad", evaluated=True, reference=ref(), source=str(rec))
         self.assertEqual(run(s), 3)
+        with self.assertRaisesRegex(result.ResultError, "synthetic recording"):
+            result.build(str(s), 0.05, "approved", "test")
         self.assertFalse((s / "walk_result.json").exists())
         s2 = make_session(self.tmp, "rsyn", source=str(rec))
         self.assertEqual(run(s2), 0)
@@ -190,11 +214,71 @@ class ResultTest(unittest.TestCase):
         self.assertFalse((s / "walk_result.json").exists())
         self.assertIn("stopped at", (s / "walkday.md").read_text())
 
+    def test_recorded_at_comes_from_the_recording_metadata(self):
+        rec = write_recording(Path(self.tmp) / "timed.rec", starting_ns=1_950_000_000_123_456_789)
+        s = make_session(self.tmp, "rtime", source=str(rec))
+        self.assertEqual(run(s), 0)
+        want = "2031-10-17T10:40:00.123456+00:00"      # 1950000000 s, never processing time
+        self.assertEqual(self.walk(s)["recorded_at"], want)
+        report = json.loads((s / "walkday.json").read_text())
+        self.assertEqual(report["recorded_at"], want)
+        self.assertNotEqual(report["created_at"][:4], "2031")
+        self.assertEqual(load_walk_result(str(s / "walk_result.json")).recorded_at.isoformat(), want)
+
+    def test_missing_recording_start_time_is_refused(self):
+        for name, rec in (("rnostart", write_recording(Path(self.tmp) / "nostart.rec", starting_ns=False)),
+                          ("rnorec", Path(self.tmp) / "never-copied")):
+            s = make_session(self.tmp, name, source=str(rec))
+            self.assertEqual(run(s), 3)
+            self.assertFalse((s / "walk_result.json").exists())
+            with self.assertRaisesRegex(result.ResultError, "recording start time"):
+                result.build(str(s), 0.05, "approved", "test")
+
     def series(self, sessions):
+        # The exit code must be spatio.series' code for the verdict it wrote.
         out = Path(self.tmp) / "series"
         files = [str(s / "walk_result.json") for s in sessions]
-        self.assertEqual(quiet(series_main, ["compare"] + files + ["--out", str(out)]), 0)
-        return json.loads((out / "series.json").read_text())["verdict"]
+        rc = quiet(series_main, ["compare"] + files + ["--out", str(out)])
+        verdict = json.loads((out / "series.json").read_text())["verdict"]
+        self.assertEqual(rc, VERDICT_EXIT[verdict])
+        return verdict
+
+    def series_sh(self, sessions, series_id):
+        proc = subprocess.run(["bash", str(SERIES_SH), *[s.name for s in sessions],
+                               "--sessions-root", self.tmp, "--series-id", series_id],
+                              capture_output=True, text=True, timeout=120)
+        path = Path(self.tmp) / "series" / series_id / "series.json"
+        verdict = json.loads(path.read_text())["verdict"] if path.exists() else None
+        return proc.returncode, verdict, proc.stdout + proc.stderr
+
+    def test_series_sh_exit_codes_are_spatio_series_codes(self):
+        cases = {
+            "pass": ([dict(evaluated=True, reference=ref())] * 3, "PASS"),
+            "fail": ([dict(evaluated=True, reference=ref()),
+                      dict(evaluated=True, reference=ref(), offset=(0.15, 0.0, 0.0)),
+                      dict(evaluated=True, reference=ref())], "FAIL"),
+            "short": ([dict(evaluated=True, reference=ref())] * 2, "INCOMPLETE"),
+            "replay": ([{}] * 3, "REPLAY_ONLY"),
+        }
+        for name, (kwargs, verdict) in cases.items():
+            runs = [make_session(self.tmp, f"sh-{name}{i}", **kw) for i, kw in enumerate(kwargs)]
+            for s in runs:
+                run(s)
+            rc, got, out = self.series_sh(runs, f"sh-{name}")
+            self.assertEqual(got, verdict, out)
+            self.assertEqual(rc, VERDICT_EXIT[verdict], out)
+            self.assertIn(f"SERIES sh-{name}: {verdict}", out)
+
+    def test_series_sh_rejects_tied_recording_times(self):
+        runs = []
+        for i in range(3):
+            rec = write_recording(Path(self.tmp) / f"tie{i}.rec", starting_ns=BASE_NS - 10**12)
+            runs.append(make_session(self.tmp, f"tie{i}", evaluated=True, reference=ref(), source=str(rec)))
+            self.assertEqual(run(runs[-1]), 0)
+        rc, verdict, out = self.series_sh(runs, "ties")
+        self.assertEqual(rc, 1, out)
+        self.assertIsNone(verdict)
+        self.assertIn("recorded_at", out)
 
     def test_series_pass_needs_three_measured_placements(self):
         runs = [make_session(self.tmp, f"p{i}", evaluated=True, reference=ref()) for i in range(3)]

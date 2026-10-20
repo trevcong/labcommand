@@ -17,7 +17,7 @@ META = """rosbag2_bagfile_information:
   storage_identifier: mcap
   duration:
     nanoseconds: 1000
-  message_count: {total}
+{starting}  message_count: {total}
   topics_with_message_count:
     - topic_metadata:
         name: {lidar}
@@ -39,8 +39,14 @@ META = """rosbag2_bagfile_information:
     - bag_0.mcap
   files:
     - path: bag_0.mcap
+      starting_time:
+        nanoseconds_since_epoch: 1
       message_count: {total}
 """
+
+# Bag-level start: arbitrary, not taken from any recording. The per-file
+# starting_time above is deliberately different so the parser must pick this one.
+START_NS = 2123456789123456789
 
 CONFIG = """/**:
     ros__parameters:
@@ -54,11 +60,13 @@ CONFIG = """/**:
 
 
 def write_rec(root, lidar="/rig7/points", imu="/rig7/inertial", lidar_type="livox_ros_driver2/msg/CustomMsg",
-              n_lidar=3, n_imu=5, cfg_type=1, mcap_counts=None):
+              n_lidar=3, n_imu=5, cfg_type=1, mcap_counts=None, starting_ns=START_NS):
     os.makedirs(os.path.join(root, "bag"))
+    starting = "" if starting_ns is None else (
+        f"  starting_time:\n    nanoseconds_since_epoch: {starting_ns}\n")
     with open(os.path.join(root, "bag", "metadata.yaml"), "w") as f:
         f.write(META.format(lidar=lidar, imu=imu, lidar_type=lidar_type, n_lidar=n_lidar, n_imu=n_imu,
-                            total=n_lidar + n_imu))
+                            total=n_lidar + n_imu, starting=starting))
     with open(os.path.join(root, "rig7_fastlio.yaml"), "w") as f:
         f.write(CONFIG.format(lidar=lidar, imu=imu, lidar_type=cfg_type))
     if mcap_counts is not None:
@@ -151,6 +159,25 @@ class RecordingTest(unittest.TestCase):
             f.truncate(size // 2)
         with self.assertRaises(recording.RecordingError):
             recording.check_complete(self.rec)
+
+    def test_recorded_at_is_the_bag_level_starting_time(self):
+        write_rec(self.rec, starting_ns=START_NS)
+        # 2123456789 s = 2037-04-16T01:06:29Z; nanoseconds truncate to microseconds.
+        self.assertEqual(recording.recorded_at(self.rec), "2037-04-16T01:06:29.123456+00:00")
+        other = os.path.join(self.tmp, "other")
+        write_rec(other, starting_ns=1_000_000_000_000_000_001)
+        self.assertEqual(recording.recorded_at(other), "2001-09-09T01:46:40.000000+00:00")
+
+    def test_recorded_at_missing_or_zero_is_refused(self):
+        write_rec(self.rec, starting_ns=None)       # only the per-file starting_time remains
+        with self.assertRaisesRegex(recording.RecordingError, "starting_time"):
+            recording.recorded_at(self.rec)
+        zero = os.path.join(self.tmp, "zero")
+        write_rec(zero, starting_ns=0)
+        with self.assertRaisesRegex(recording.RecordingError, "starting_time"):
+            recording.recorded_at(zero)
+        with self.assertRaisesRegex(recording.RecordingError, "cannot read"):
+            recording.recorded_at(os.path.join(self.tmp, "nowhere"))
 
     def test_complete_rejects_missing_file(self):
         write_rec(self.rec)
