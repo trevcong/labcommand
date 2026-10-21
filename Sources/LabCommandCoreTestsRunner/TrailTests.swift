@@ -1056,6 +1056,266 @@ func testTrailRescanReloadsOpenedVerdict() {
     try? fm.removeItem(at: root)
 }
 
+// MARK: - Walk-day result (walk_result.json is the verdict, walkcheck.json an input)
+
+/// The shape `python3 -m spatio.walkday.result` writes for walk_result.json, trimmed.
+private func walkResultJSON(runID: String, status: String, d3: Double?, reasons: [String] = []) -> Data {
+    let quoted = reasons.map { "\"\($0)\"" }.joined(separator: ", ")
+    let number = { (v: Double?) in v.map { "\($0)" } ?? "null" }
+    return Data("""
+    {"schema": "spatio.walk_result/1", "run_id": "\(runID)", "status": "\(status)", "reasons": [\(quoted)],
+     "physical_accuracy_evaluated": false, "accuracy_label": "replay demonstrated; physical accuracy not evaluated",
+     "return_error": {"d3_m": \(number(d3)), "horizontal_m": \(number(d3.map { $0 * 0.8 })), "vertical_m": \(number(d3.map { $0 * 0.6 })),
+                      "heading_deg": 0.8, "threshold_m": 0.1, "start_window_s": 5.0, "end_window_s": 5.0},
+     "walls": {"p95_point_to_plane_m": 0.031, "doubled_wall_suspected": false, "gate_m": 0.05, "gate_state": "approved"},
+     "physical_reference": null}
+    """.utf8)
+}
+
+/// walkday.json (spatio.walkday.report/1), trimmed. `blockers` and `placement` are raw JSON.
+private func walkdayReportJSON(runID: String, status: String, walkcheck: String = "PASS", blockers: String = "[]",
+                               placement: String = "null", synthetic: Bool = false,
+                               stoppedAt: String? = nil, reasons: [String] = []) -> Data {
+    let quoted = reasons.map { "\"\($0)\"" }.joined(separator: ", ")
+    let stopped = stoppedAt.map { #", "stopped_at": "\#($0)""# } ?? ""
+    return Data("""
+    {"schema": "spatio.walkday.report/1", "run_id": "\(runID)", "status": "\(status)", "reasons": [\(quoted)],
+     "synthetic": \(synthetic), "walkcheck_result": "\(walkcheck)", "placement": \(placement),
+     "acceptance_blockers": \(blockers), "input_gate_blockers": []\(stopped)}
+    """.utf8)
+}
+
+/// A walk-day run folder: trajectory, map and a current walkcheck PASS written an hour ago,
+/// then the result files now, in the order process.sh writes them.
+private func makeWalkdayRun(_ root: URL, _ name: String, result: Data?, report: Data?) -> URL {
+    let fm = FileManager.default
+    let dir = root.appendingPathComponent(name)
+    try! fm.createDirectory(at: dir.appendingPathComponent("logs"), withIntermediateDirectories: true)
+    try! Data("1 0 0 0 0 0 0 1\n2 1 0 0 0 0 0 1\n3 0.02 0 0 0 0 0 1\n".utf8).write(to: dir.appendingPathComponent("trajectory.tum"))
+    try! Data("x".utf8).write(to: dir.appendingPathComponent("map.pcd"))
+    try! Data("STATIONARY_WINDOW_S=5\n".utf8).write(to: dir.appendingPathComponent("logs/walkday.conf"))
+    try! walkcheckJSON(result: "PASS", returnError: 4).write(to: dir.appendingPathComponent("walkcheck.json"))
+    let earlier = Date(timeIntervalSinceNow: -3600)
+    for file in ["trajectory.tum", "map.pcd", "walkcheck.json"] {
+        try! fm.setAttributes([.modificationDate: earlier], ofItemAtPath: dir.appendingPathComponent(file).path)
+    }
+    if let result { try! result.write(to: dir.appendingPathComponent("walk_result.json")) }
+    if let report { try! report.write(to: dir.appendingPathComponent("walkday.json")) }
+    return dir
+}
+
+/// The walk-day acceptance case: walkcheck passes, the final result is NOT_EVALUABLE
+/// (here, a blocked input gate), and Trail shows NOT_EVALUABLE, not PASS, in both places.
+func testTrailWalkdayResultOverridesWalkcheckPASS() {
+    let root = tempDirectory("walkday-not-evaluable")
+    let reasons = ["input gate: B2 CLOCK_RESET: lidar stamps go backward"]
+    let dir = makeWalkdayRun(root, "walk-oct21",
+                             result: walkResultJSON(runID: "walk-oct21", status: "NOT_EVALUABLE", d3: nil, reasons: reasons),
+                             report: walkdayReportJSON(runID: "walk-oct21", status: "NOT_EVALUABLE", reasons: reasons))
+
+    let session = try! TrailSession.load(directory: dir.path)
+    expect(session.walkcheck?.result == "PASS" && session.walkcheckStale == nil,
+           "the walkcheck input is a current PASS on its own")
+    guard let final = session.walkday else { expect(false, "a walk-day folder reads walk_result.json"); return }
+    expect(final.status == "NOT_EVALUABLE" && final.hasResult, "the opened verdict is walk_result.json's NOT_EVALUABLE, got \(final.status)")
+    expect(final.reasons == reasons, "with its reasons, got \(final.reasons)")
+    expect(TrailReadout.walkdayText(final) == "NOT_EVALUABLE", "the readout shows NOT_EVALUABLE, got \(TrailReadout.walkdayText(final))")
+    expect(TrailReadout.walkdayTone(final) == .warn, "and is not green")
+    let rows = Dictionary(uniqueKeysWithValues: TrailReadout.walkdayRows(final).map { ($0.label, $0.value) })
+    expect(rows["Verdict"] == "NOT_EVALUABLE", "verdict row, got \(rows["Verdict"] ?? "nil")")
+    expect(rows["Return error"] == "withheld (not a measurement)",
+           "the withheld return error is not replaced by the walkcheck's 4 cm, got \(rows["Return error"] ?? "nil")")
+    expect(rows["Walk check (input)"] == "PASS", "the walkcheck PASS is shown as an input")
+    let note = TrailReadout.walkdayNote(final, accuracyLabel: session.accuracyLabel)
+    expect(note.contains("walkcheck.json is one of its inputs, not the verdict") && note.contains("CLOCK_RESET"),
+           "the note names the source and the reason, got \(note)")
+
+    let entry = TrailLibrary.scan(root: root.path).first { $0.name == "walk-oct21" }
+    expect(entry?.walkcheckResult == "PASS", "the list still reads the walkcheck")
+    expect(entry?.walkday?.status == "NOT_EVALUABLE", "but carries the walk-day verdict, got \(entry?.walkday?.status ?? "nil")")
+    expect(entry?.walkday.map(TrailReadout.walkdayText) == "NOT_EVALUABLE" && entry?.walkday.map(TrailReadout.walkdayTone) == .warn,
+           "and the list shows NOT_EVALUABLE, not green")
+
+    // The other way round: walkcheck FAIL, final NOT_EVALUABLE (as in m1-aug08-mid360-final).
+    try! walkcheckJSON(result: "FAIL", returnError: 30).write(to: dir.appendingPathComponent("walkcheck.json"))
+    try! FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)],
+                                           ofItemAtPath: dir.appendingPathComponent("walkcheck.json").path)
+    let failed = try! TrailSession.load(directory: dir.path)
+    expect(failed.walkday?.status == "NOT_EVALUABLE" && failed.walkday.map(TrailReadout.walkdayTone) == .warn,
+           "a walkcheck FAIL under a NOT_EVALUABLE result shows NOT_EVALUABLE")
+    try? FileManager.default.removeItem(at: root)
+}
+
+/// Only a clean, current PASS with its report agreeing is green. Each kind of missing or
+/// stale evidence keeps a walk_result.json PASS from showing acceptance.
+func testTrailWalkdayPASSNeedsEvidence() {
+    let fm = FileManager.default
+    let root = tempDirectory("walkday-pass")
+    func run(_ name: String, result: Data?, report: Data?) -> URL {
+        makeWalkdayRun(root, name, result: result, report: report)
+    }
+    let pass = { (name: String) in walkResultJSON(runID: name, status: "PASS", d3: 0.04) }
+    let agree = { (name: String) in walkdayReportJSON(runID: name, status: "PASS") }
+
+    let clean = run("clean", result: pass("clean"), report: agree("clean"))
+    guard let good = (try? TrailSession.load(directory: clean.path))?.walkday else {
+        expect(false, "a clean PASS folder has a walk-day result"); return
+    }
+    expect(good.isCleanPASS && good.concerns.isEmpty, "a clean PASS has no concerns, got \(good.concerns)")
+    expect(TrailReadout.walkdayText(good) == "PASS" && TrailReadout.walkdayTone(good) == .good, "and is green")
+    let rows = Dictionary(uniqueKeysWithValues: TrailReadout.walkdayRows(good).map { ($0.label, $0.value) })
+    expect(rows["Return error"] == "4.0 cm · need < 10.0 cm" && rows["  horizontal"] == "3.2 cm",
+           "the return error is walk_result.json's, got \(rows["Return error"] ?? "nil")")
+    expect(rows["Blockers"] == "none" && rows["Placement"] == "none recorded", "blockers and placement rows")
+    expect(TrailLibrary.scan(root: root.path).first { $0.name == "clean" }?.walkday?.isCleanPASS == true, "the list agrees")
+
+    func expectNotGreen(_ dir: URL, _ needle: String, _ label: String) {
+        guard let w = (try? TrailSession.load(directory: dir.path))?.walkday else {
+            expect(false, "\(label): no walk-day result"); return
+        }
+        expect(!w.isCleanPASS && TrailReadout.walkdayTone(w) != .good, "\(label): not green")
+        expect(w.concerns.contains { $0.contains(needle) }, "\(label): concerns mention '\(needle)', got \(w.concerns)")
+        let entry = TrailLibrary.scan(root: root.path).first { $0.directory == dir.path }
+        expect(entry?.walkday != nil && entry?.walkday.map(TrailReadout.walkdayTone) != .good, "\(label): the list is not green either")
+    }
+
+    let stale = run("stale", result: pass("stale"), report: agree("stale"))
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: 60)],
+                          ofItemAtPath: stale.appendingPathComponent("walkcheck.json").path)
+    expectNotGreen(stale, "walk_result.json is older than walkcheck.json", "a walkcheck re-run after the result")
+    expect(TrailWalkday.read(directory: stale.path).map(TrailReadout.walkdayText) == "PASS · stale", "and it reads stale")
+    let newerTrajectory = run("newer-trajectory", result: pass("newer-trajectory"), report: agree("newer-trajectory"))
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: 60)],
+                          ofItemAtPath: newerTrajectory.appendingPathComponent("trajectory.tum").path)
+    expectNotGreen(newerTrajectory, "older than trajectory.tum", "a trajectory replaced after the result")
+
+    expectNotGreen(run("no-report", result: pass("no-report"), report: nil), "walkday.json is missing", "no walkday.json")
+    expectNotGreen(run("disagree", result: pass("disagree"), report: walkdayReportJSON(runID: "disagree", status: "FAIL")),
+                   "walkday.json says FAIL", "a report that disagrees")
+    expectNotGreen(run("null-blockers", result: pass("null-blockers"),
+                       report: walkdayReportJSON(runID: "null-blockers", status: "PASS", blockers: "null")),
+                   "acceptance blockers are not recorded", "null blockers (unknown is not none)")
+    expectNotGreen(run("blocked", result: pass("blocked"),
+                       report: walkdayReportJSON(runID: "blocked", status: "PASS", blockers: #"["origin is auto_suggested"]"#)),
+                   "acceptance blocked: origin is auto_suggested", "a listed blocker")
+    expectNotGreen(run("placement", result: pass("placement"),
+                       report: walkdayReportJSON(runID: "placement", status: "PASS",
+                                                 placement: #"{"within_tolerance": false, "problems": ["end_placement_residual_m not measured"], "applied": true}"#)),
+                   "placement not within tolerance", "a placement outside tolerance")
+    expectNotGreen(run("synthetic", result: pass("synthetic"), report: walkdayReportJSON(runID: "synthetic", status: "PASS", synthetic: true)),
+                   "SYNTHETIC", "a synthetic recording")
+    expectNotGreen(run("copied", result: pass("elsewhere"), report: agree("elsewhere")), "is for run elsewhere", "a result copied from another run")
+    expectNotGreen(run("over", result: walkResultJSON(runID: "over", status: "PASS", d3: 0.12), report: agree("over")),
+                   "is not below threshold_m", "a PASS over its threshold")
+    expectNotGreen(run("unmeasured", result: walkResultJSON(runID: "unmeasured", status: "PASS", d3: nil), report: agree("unmeasured")),
+                   "d3_m is not a number", "a PASS without a return error")
+
+    let junk = run("junk", result: Data("{not json".utf8), report: agree("junk"))
+    expectNotGreen(junk, "walk_result.json is not a JSON object", "malformed walk_result.json")
+    expect(TrailWalkday.read(directory: junk.path)?.status == "NOT_EVALUABLE", "an unreadable result is NOT_EVALUABLE")
+    let foreign = run("foreign", result: Data(#"{"schema": "spatio.walk_result/2", "run_id": "foreign", "status": "PASS"}"#.utf8),
+                      report: agree("foreign"))
+    expectNotGreen(foreign, "schema is not spatio.walk_result/1", "a foreign schema")
+    let hyphen = run("hyphen", result: Data(#"{"schema": "spatio.walk_result/1", "run_id": "hyphen", "status": "NOT-EVALUABLE"}"#.utf8),
+                     report: nil)
+    expect(TrailWalkday.read(directory: hyphen.path)?.status == "NOT_EVALUABLE" && TrailWalkday.read(directory: hyphen.path)?.hasResult == false,
+           "walkcheck's hyphen spelling is not a walk_result status")
+
+    try? fm.removeItem(at: root)
+}
+
+/// A walk-day folder without walk_result.json never falls back to the walkcheck verdict.
+func testTrailWalkdayWithoutResultIsNotEvaluable() {
+    let fm = FileManager.default
+    let root = tempDirectory("walkday-no-result")
+
+    // Killed between the walk check and the result: stage files and a walkcheck PASS only.
+    let killed = makeWalkdayRun(root, "killed", result: nil, report: nil)
+    try! Data(#"{"schema": "spatio.walkday.gate/1", "evaluable": true, "blocking": []}"#.utf8)
+        .write(to: killed.appendingPathComponent("logs/input_gate.json"))
+    let k = try! TrailSession.load(directory: killed.path)
+    expect(k.walkcheck?.result == "PASS", "the walkcheck PASS is read")
+    expect(k.walkday?.status == "NOT_EVALUABLE" && k.walkday?.hasResult == false, "but the verdict is NOT_EVALUABLE")
+    expect(k.walkday?.concerns == ["no walk_result.json: the run has not been scored"], "and says why, got \(k.walkday?.concerns ?? [])")
+    expect(k.walkday.map(TrailReadout.walkdayTone) == .warn, "not green")
+    expect(k.walkday.map(TrailReadout.walkdayRows)?.first { $0.label == "Return error" }?.value == "not scored", "no return error shown")
+    expect(TrailLibrary.scan(root: root.path).first { $0.name == "killed" }?.walkday?.status == "NOT_EVALUABLE",
+           "the list shows NOT_EVALUABLE too")
+
+    // A rejected re-score: the old result moved aside, walkday.json says why.
+    let retired = makeWalkdayRun(root, "retired", result: nil,
+                                 report: walkdayReportJSON(runID: "retired", status: "NOT_EVALUABLE", stoppedAt: "result",
+                                                           reasons: ["stopped at result: rejected, no walk_result.json: wall gate disagrees"]))
+    try! walkResultJSON(runID: "retired", status: "PASS", d3: 0.04).write(to: retired.appendingPathComponent("walk_result.json.retired"))
+    let r = TrailWalkday.read(directory: retired.path)
+    expect(r?.status == "NOT_EVALUABLE" && r?.stoppedAt == "result", "a retired PASS is not the verdict, got \(r?.status ?? "nil")")
+    expect(r?.concerns.first?.contains("retired") == true && r?.reasons.first?.contains("rejected") == true, "the reason is the report's")
+
+    // Stopped at the input gate before replay: no trajectory or map, still listed.
+    let stopped = root.appendingPathComponent("stopped-gate")
+    try! fm.createDirectory(at: stopped.appendingPathComponent("logs"), withIntermediateDirectories: true)
+    try! walkdayReportJSON(runID: "stopped-gate", status: "NOT_EVALUABLE", walkcheck: "", stoppedAt: "input-gate",
+                           reasons: ["stopped at input-gate: B2 CLOCK_RESET"]).write(to: stopped.appendingPathComponent("walkday.json"))
+    let s = TrailLibrary.scan(root: root.path).first { $0.name == "stopped-gate" }
+    expect(s != nil && s?.hasTrajectory == false && s?.hasMap == false, "a stopped walk-day run is listed")
+    expect(s?.walkday?.status == "NOT_EVALUABLE" && s?.walkday?.stoppedAt == "input-gate", "with its NOT_EVALUABLE")
+    do {
+        _ = try TrailSession.load(directory: stopped.path)
+        expect(false, "a stopped run has nothing to draw")
+    } catch {
+        expect("\(error)".contains("Walk-day result: NOT_EVALUABLE (stopped at input-gate: B2 CLOCK_RESET)"),
+               "the failure names the walk-day verdict, got \(error)")
+    }
+
+    // A replay folder under sessions/ (logs/ without walk-day files) keeps the walkcheck verdict.
+    let legacy = root.appendingPathComponent("replay")
+    try! fm.createDirectory(at: legacy.appendingPathComponent("logs"), withIntermediateDirectories: true)
+    try! Data("x".utf8).write(to: legacy.appendingPathComponent("logs/runner.log"))
+    try! Data("1 0 0 0 0 0 0 1\n2 1 0 0 0 0 0 1\n".utf8).write(to: legacy.appendingPathComponent("trajectory.tum"))
+    try! walkcheckJSON(result: "PASS", returnError: 4).write(to: legacy.appendingPathComponent("walkcheck.json"))
+    expect(!TrailWalkday.isWalkdayFolder(legacy.path) && (try? TrailSession.load(directory: legacy.path))?.walkday == nil,
+           "a non-walk-day folder has no walk-day verdict")
+    expect(TrailLibrary.scan(root: root.path).first { $0.name == "replay" }?.walkday == nil, "and the list shows its walkcheck")
+    expect(!TrailWalkday.isWalkdayFolder(TrailFixture.directory), "the synthetic-loop fixture is not a walk-day folder")
+
+    try? fm.removeItem(at: root)
+}
+
+/// The tab lists walk-day runs and earlier replays, and reloads when the result changes.
+func testTrailWalkdayRootsAndRescan() {
+    let fm = FileManager.default
+    expect(TrailLibrary.walkdayRoot == NSHomeDirectory() + "/Developer/spatio-data/walkday", "process.sh's default root")
+    expect(TrailLibrary.defaultRoots == [TrailLibrary.walkdayRoot, TrailLibrary.defaultRoot], "walk-day runs, then sessions")
+
+    let base = tempDirectory("walkday-roots")
+    let walkday = base.appendingPathComponent("walkday")
+    let sessions = base.appendingPathComponent("sessions")
+    let run = makeWalkdayRun(walkday, "walk", result: walkResultJSON(runID: "walk", status: "PASS", d3: 0.04),
+                             report: walkdayReportJSON(runID: "walk", status: "PASS"))
+    let replay = sessions.appendingPathComponent("replay")
+    try! fm.createDirectory(at: replay, withIntermediateDirectories: true)
+    try! Data("1 0 0 0 0 0 0 1\n".utf8).write(to: replay.appendingPathComponent("trajectory.tum"))
+    let listed = TrailLibrary.scan(roots: [walkday.path, sessions.path, base.appendingPathComponent("absent").path])
+    expect(Set(listed.map(\.name)) == ["walk", "replay"], "both roots are listed, got \(listed.map(\.name))")
+    expect(TrailLibrary.pickerStart(saved: nil, roots: [base.appendingPathComponent("absent").path, sessions.path]) == sessions.path,
+           "the picker starts in the first root that exists")
+
+    let opened = TrailLibrary.VerdictInputs.read(directory: run.path)
+    expect(opened.walkResult != nil && opened.walkdayReport != nil, "the result files are verdict inputs")
+    let result = run.appendingPathComponent("walk_result.json")
+    try! walkResultJSON(runID: "walk", status: "NOT_EVALUABLE", d3: nil, reasons: ["re-scored"]).write(to: result)
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: 30)], ofItemAtPath: result.path)
+    expect(TrailLibrary.rescanShouldReload(opened: opened, now: TrailLibrary.VerdictInputs.read(directory: run.path)),
+           "a new walk_result.json reloads the opened session")
+    let rewritten = TrailLibrary.VerdictInputs.read(directory: run.path)
+    try! fm.moveItem(at: result, to: run.appendingPathComponent("walk_result.json.retired"))
+    expect(TrailLibrary.rescanShouldReload(opened: rewritten, now: TrailLibrary.VerdictInputs.read(directory: run.path)),
+           "a retired walk_result.json reloads it too")
+    expect(TrailWalkday.read(directory: run.path)?.status == "NOT_EVALUABLE", "and the reload is NOT_EVALUABLE")
+
+    try? fm.removeItem(at: base)
+}
+
 func runTrailTests() {
     testTrailTUMFixtureNumbers()
     print("  trail: TUM fixture — 661 poses, 66 s, 11.98 m, start→end exactly 4.0 cm, epoch stamps keep 0.1 s"); passed()
@@ -1107,6 +1367,14 @@ func runTrailTests() {
     print("  trail: permission-denied and non-UTF8 trajectories make PASS unverifiable in both displays"); passed()
     testTrailRescanReloadsOpenedVerdict()
     print("  trail: rescan reloads the opened session when the trajectory or walkcheck changes"); passed()
+    testTrailWalkdayResultOverridesWalkcheckPASS()
+    print("  trail: walkcheck PASS + walk_result.json NOT_EVALUABLE shows NOT_EVALUABLE in the session and the list"); passed()
+    testTrailWalkdayPASSNeedsEvidence()
+    print("  trail: a walk_result PASS is green only when current, its report agrees and blockers are recorded as none"); passed()
+    testTrailWalkdayWithoutResultIsNotEvaluable()
+    print("  trail: a walk-day folder without walk_result.json is NOT_EVALUABLE, never the walkcheck verdict"); passed()
+    testTrailWalkdayRootsAndRescan()
+    print("  trail: walk-day and sessions roots both listed; rescan reloads when walk_result.json changes"); passed()
     testTrailViewContract()
     print("  trail: view shows label, raw note and walkcheck; Trail is the 4th tab (Room, Settings, Rig, Trail)"); passed()
 }
