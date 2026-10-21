@@ -28,8 +28,10 @@
 #                           (JT128: the Hesai driver's jt128_post.yaml). Not read by
 #                           replay; hashed, checked against the bag, kept in logs/
 #   --patches FILE          the spec's preselected wall patches, boxed on THIS run's
-#                           map (g8 format); default: auto-suggest (labelled NOT
-#                           preselected; such a run never counts toward a series)
+#                           map (g8 format); a file without map_sha256 is bound to
+#                           this run's map only if every box is the spec's fixed box.
+#                           Default: auto-suggest (labelled NOT preselected; such a
+#                           run never counts toward a series)
 #   --sessions-root DIR     default $SPATIO_WALKDAY_ROOT or ~/Developer/spatio-data/walkday
 #   --sensor TEXT           manifest sensor text (default derived from the bag)
 #   --settings FILE         settings (default spatio/walkday/walkday.conf)
@@ -229,7 +231,7 @@ if [[ -n $PATCHES ]]; then
   PATCH_SPEC_ARGS=()
   [[ -n $SPEC ]] && PATCH_SPEC_ARGS=(--spec "$SPEC")
   PATCH_ORIGIN="$(python3 -m spatio.walkday.patch_origin "$SESSION/wallpatch/patches.json" \
-    ${PATCH_SPEC_ARGS[@]+"${PATCH_SPEC_ARGS[@]}"})" \
+    ${PATCH_SPEC_ARGS[@]+"${PATCH_SPEC_ARGS[@]}"} --map "$SESSION/map.pcd")" \
     || stop wall-patches "supplied patches cannot establish preselection (see above)"
   PATCH_SOURCE="$PATCH_ORIGIN patches from $PATCHES"
   [[ $PATCH_ORIGIN != auto_suggested ]] || say "auto_suggested patches cannot be labelled preselected; this run cannot count toward a series"
