@@ -475,7 +475,7 @@ class ResultTest(unittest.TestCase):
         return json.loads((s / "logs" / "provenance.json").read_text())["settings"]
 
     def test_rescoring_with_a_changed_wall_gate_starts_a_new_series(self):
-        # Review P2 (result.py:369): re-scoring one run with a looser wall gate
+        # Review P2: re-scoring one run with a stricter wall gate
         # kept stage 1's WALL_GATE_M and hash, so a mixed series could PASS.
         spec = write_spec(Path(self.tmp) / "spec.json")
         runs = [self.preselected(f"rs{i}", spec=spec)[0] for i in range(3)]
@@ -483,15 +483,15 @@ class ResultTest(unittest.TestCase):
             self.assertEqual(self.walk(s)["walkday_settings"], self.stage1(s))
         self.assertEqual(self.series_sh(runs, "rs-same")[1], "PASS")
         self.assertEqual(run(runs[2], "--patch-origin", "preselected", "--spec", spec[0],
-                             "--wall-gate-m", "0.08"), 0)
+                             "--wall-gate-m", "0.03"), 0)
         got = self.walk(runs[2])["walkday_settings"]
         self.assertTrue(provenance.check_identity(got))
-        self.assertEqual(got["values"]["WALL_GATE_M"], 0.08)
+        self.assertEqual(got["values"]["WALL_GATE_M"], 0.03)
         self.assertNotEqual(got["sha256"], self.stage1(runs[2])["sha256"])
         rep = json.loads((runs[2] / "walkday.json").read_text())["provenance"]
         self.assertEqual(rep["settings_sha256"], got["sha256"])
         self.assertEqual(rep["stage1_settings_sha256"], self.stage1(runs[2])["sha256"])
-        self.assertEqual(rep["settings_changed"], [{"setting": "WALL_GATE_M", "stage1": 0.05, "used": 0.08,
+        self.assertEqual(rep["settings_changed"], [{"setting": "WALL_GATE_M", "stage1": 0.05, "used": 0.03,
                                                     "source": "--wall-gate-m"}])
         self.assertIn("WALL_GATE_M", (runs[2] / "walkday.md").read_text())
         rc, verdict, out = self.series_sh(runs, "rs-mixed")

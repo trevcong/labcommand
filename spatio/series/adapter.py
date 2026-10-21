@@ -6,7 +6,7 @@ import json
 import math
 import os
 
-from spatio.thresholds import WALL_GATE_M
+from spatio.thresholds import WALL_GATE_M, WALL_GATE_STATE
 from spatio.series.validate import (
     InputRejected, Unreadable, REPLAY_LABEL, WALK_SCHEMA, parse_walk_result,
 )
@@ -24,7 +24,7 @@ def read_json(path: str):
 
 def adapt_walkcheck(report: dict, metadata: dict, source_path: str, *,
                     wallpatch=None, patch_origin="auto_suggested", spec_path=None,
-                    patches_file=None, gate_m=WALL_GATE_M, gate_state="proposed") -> dict:
+                    patches_file=None, gate_m=WALL_GATE_M, gate_state=WALL_GATE_STATE) -> dict:
     """Map v1 fields, then apply the existing series validation rules.
 
     Metadata supplies the recording time, revision, configuration hash and
