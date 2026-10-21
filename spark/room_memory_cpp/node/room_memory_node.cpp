@@ -36,6 +36,7 @@
 
 #include "room_memory/generation.hpp"
 #include "room_memory/memory.hpp"
+#include "room_memory/node_main.hpp"
 #include "room_memory/rejectlog.hpp"
 
 namespace {
@@ -352,22 +353,12 @@ private:
 
 }  // namespace
 
+// Exit codes and the FATAL line come from run_node, which tests/test_node_main.cpp drives.
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    std::shared_ptr<RoomMemoryNode> node;
-    try {
-        node = std::make_shared<RoomMemoryNode>();
-        rclcpp::spin(node);
-    } catch (const room_memory::GenerationError&) {
-        // Logged fatal by the constructor: no generation, no publishing.
-        rclcpp::shutdown();
-        return 1;
-    } catch (const std::exception& error) {
-        RCLCPP_FATAL(rclcpp::get_logger("room_memory_cpp"), "room-memory stopped: %s", error.what());
-        node.reset();
-        rclcpp::shutdown();
-        return 1;
-    }
-    rclcpp::shutdown();
-    return 0;
+    return room_memory::run_node(
+        [] { return std::make_shared<RoomMemoryNode>(); },
+        [](const std::shared_ptr<RoomMemoryNode>& node) { rclcpp::spin(node); },
+        [] { rclcpp::shutdown(); },
+        [](const std::string& line) { RCLCPP_FATAL(rclcpp::get_logger("room_memory_cpp"), "%s", line.c_str()); });
 }
