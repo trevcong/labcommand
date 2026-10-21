@@ -1,6 +1,7 @@
 // Voxel layers, bricks, reference persistence and the window engine, ported from
 // spark/room_memory/tests/test_memory.py (including the three Codex regressions of 289afb6),
 // and the rejected-frame throttle of test_rejectlog.py.
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -336,6 +337,186 @@ TEST(reload_restores_epoch_and_bricks) {
     CHECK(restarted.state() == MemoryState::tracking && memory.map_epoch() == 1 && restarted.map_epoch() == 2);
     CHECK(restarted.channel("mid360").reference.to_bricks() == bricks);
     CHECK_EQ(restarted.status(stamp(9), 1.0).n_bricks, static_cast<std::int64_t>(bricks.size()));
+}
+
+TEST(non_rig_failed_build_save_is_counted_and_retried_without_frames) {
+    // Exercise both the epoch write and a reference write after the epoch already succeeded.
+    for (const std::string file : {"map_epoch", "reference-mid360.cdr"}) {
+        TempDir dir;
+        const auto room = dir.path / "lab";
+        const auto blocker = room / (file + ".tmp");
+        std::filesystem::create_directories(blocker);
+        const MemoryConfig config = mid360_config(dir.path.string());
+        RoomMemory memory(config, kStart, kGeneration);
+        CHECK(!memory.save_pending() && memory.save_failed() == 0);
+        build_reference(memory, scenes::room_shell());
+        const bool held = file == "map_epoch";
+        CHECK(memory.state() == (held ? MemoryState::building : MemoryState::tracking));
+        CHECK(memory.map_epoch() == (held ? 0 : 1));
+        CHECK(memory.epoch_held() == held);
+        CHECK(memory.save_pending() && memory.save_failed() == 1);
+        CHECK(memory.save_error().find(blocker.string()) != std::string::npos);
+        CHECK(memory.map_update(stamp(3)).has_value() == !held);
+        CHECK(load_epoch(room / "map_epoch") ==
+              (held ? std::nullopt : std::optional<std::uint64_t>{1}));
+        CHECK(!std::filesystem::exists(room / "reference-mid360.cdr"));
+        memory.close_window(stamp(4));
+        CHECK(memory.save_pending() && memory.save_failed() == 2);
+        CHECK(memory.map_epoch() == (held ? 0 : 1));
+        CHECK(!std::filesystem::exists(room / "reference-mid360.cdr"));
+        std::filesystem::remove(blocker);
+        memory.close_window(stamp(5));  // no new frames or map changes needed for the retry
+        CHECK(!memory.save_pending() && memory.save_failed() == 0 && memory.save_error().empty());
+        CHECK(memory.state() == MemoryState::tracking && memory.map_epoch() == 1 && !memory.epoch_held());
+        CHECK(load_epoch(room / "map_epoch") == memory.map_epoch());
+        CHECK(load_reference(room / "reference-mid360.cdr").second.to_bricks() ==
+              memory.channel("mid360").reference.to_bricks());
+        RoomMemory restarted(config, stamp(6), kGeneration + 1);
+        CHECK(restarted.state() == MemoryState::tracking && restarted.map_epoch() == 2);
+        CHECK(restarted.channel("mid360").reference.to_bricks() == memory.channel("mid360").reference.to_bricks());
+    }
+}
+
+TEST(non_rig_read_only_room_save_retries_and_clears_failures) {
+    if (::geteuid() == 0) throw harness::Skip("root bypasses directory write permissions");
+    TempDir dir;
+    MemoryConfig config = budget_config();
+    config.state_dir = dir.path.string();
+    config.delta_period_s = 1.0;
+    RoomMemory memory(config, kStart, kGeneration);
+    const Cloud cloud = scenes::room_shell();
+    const Cloud partial = partial_shell(cloud);
+    const auto opening = feed(memory, &partial, 0);
+    CHECK(opening && opening->header.map_epoch == 1);
+    const auto room = dir.path / "lab";
+    const auto reference = room / "reference-mid360.cdr";
+    const auto before = harness::read_bytes(reference);
+    // Files are written inside state_dir/room_id, so deny writes on that actual directory.
+    CHECK(::chmod(room.c_str(), 0500) == 0);
+    try {
+        const auto update = feed(memory, &cloud, 1);  // close_window followed by map_update, as in the node
+        CHECK(!update);
+        CHECK(memory.map_epoch() == 1 && load_epoch(room / "map_epoch") == 1);
+        CHECK(memory.channel("mid360").reference.to_bricks() == opening->bricks);
+        CHECK(memory.state() == MemoryState::tracking);
+        CHECK(memory.save_pending() && memory.save_failed() == 1);
+        CHECK(memory.save_error().find((room / "map_epoch.tmp").string()) != std::string::npos);
+        CHECK(harness::read_bytes(reference) == before);
+        CHECK(!feed(memory, nullptr, 2));
+        CHECK(memory.save_pending() && memory.save_failed() == 2);
+        CHECK(memory.map_epoch() == 1 && load_epoch(room / "map_epoch") == 1);
+        CHECK(memory.channel("mid360").reference.to_bricks() == opening->bricks);
+        CHECK(harness::read_bytes(reference) == before);
+    } catch (...) {
+        ::chmod(room.c_str(), 0700);
+        throw;
+    }
+    CHECK(::chmod(room.c_str(), 0700) == 0);
+    const auto update = feed(memory, nullptr, 3);
+    CHECK(update && update->header.map_epoch == 2);
+    CHECK(!memory.save_pending() && memory.save_failed() == 0 && memory.save_error().empty());
+    CHECK(load_epoch(room / "map_epoch") == memory.map_epoch());
+    CHECK(harness::read_bytes(reference) != before);
+    const auto saved = load_reference(reference);
+    CHECK(saved.first.header.map_epoch == memory.map_epoch());
+    CHECK(saved.second.to_bricks() == memory.channel("mid360").reference.to_bricks());
+    RoomMemory restarted(config, stamp(4), kGeneration + 1);
+    CHECK(restarted.channel("mid360").reference.to_bricks() == saved.second.to_bricks());
+}
+
+TEST(non_rig_tracking_save_failure_holds_only_an_unrecorded_epoch) {
+    for (const std::string file : {"map_epoch", "reference-mid360.cdr"}) {
+        TempDir dir;
+        MemoryConfig config = budget_config();
+        config.state_dir = dir.path.string();
+        config.delta_period_s = 1.0;
+        config.keyframe_period_s = 1000.0;
+        RoomMemory memory(config, kStart, kGeneration);
+        const Cloud cloud = scenes::room_shell();
+        const Cloud partial = partial_shell(cloud);
+        const auto opening = feed(memory, &partial, 0);
+        CHECK(opening && opening->header.map_epoch == 1);
+        const auto room = dir.path / "lab";
+        const auto reference = room / "reference-mid360.cdr";
+        const auto before = harness::read_bytes(reference);
+        const auto blocker = room / (file + ".tmp");
+        std::filesystem::create_directory(blocker);
+        const bool held = file == "map_epoch";
+        const auto update = feed(memory, &cloud, 1);
+        CHECK(update.has_value() == !held);
+        if (update) CHECK(update->header.map_epoch == 2);
+        const auto pending_keys = memory.channel("mid360").stats.keys;
+        CHECK(pending_keys.empty() == !held);
+        for (int second = 1; second <= 3; ++second) {
+            if (second > 1) CHECK(!feed(memory, nullptr, second));
+            CHECK(memory.save_pending() && memory.save_failed() == second);
+            CHECK(memory.save_error().find(blocker.string()) != std::string::npos);
+            CHECK(memory.epoch_held() == held);
+            CHECK(memory.map_epoch() == (held ? 1 : 2));
+            CHECK(load_epoch(room / "map_epoch") == memory.map_epoch());
+            CHECK(harness::read_bytes(reference) == before);
+            CHECK(memory.channel("mid360").stats.keys == pending_keys);
+            CHECK((memory.channel("mid360").reference.to_bricks() == opening->bricks) == held);
+        }
+        std::filesystem::remove(blocker);
+        const auto recovered = feed(memory, nullptr, 5);  // beyond the learning budget, no new frames
+        CHECK(recovered.has_value() == held);
+        if (recovered) CHECK(recovered->header.map_epoch == 2);
+        CHECK(memory.map_epoch() == 2 && !memory.epoch_held());
+        CHECK(!memory.save_pending() && memory.save_failed() == 0 && memory.save_error().empty());
+        CHECK(load_epoch(room / "map_epoch") == 2);
+        const auto saved = load_reference(reference);
+        CHECK(saved.first.header.map_epoch == 2);
+        CHECK(saved.second.to_bricks() == memory.channel("mid360").reference.to_bricks());
+        CHECK(saved.second.to_bricks() != opening->bricks);
+        CHECK(memory.channel("mid360").stats.keys.empty());
+        RoomMemory restarted(config, stamp(6), kGeneration + 2);
+        const auto snapshot = restarted.map_update(stamp(6));
+        CHECK(snapshot && msg::MapBricks::from_cdr(*snapshot).header.map_epoch == 3);
+        CHECK(restarted.channel("mid360").reference.to_bricks() == saved.second.to_bricks());
+    }
+}
+
+TEST(startup_truncated_state_names_the_bad_file) {
+    for (const std::string file : {"map_epoch", "reference-mid360.cdr"}) {
+        TempDir dir;
+        const MemoryConfig config = mid360_config(dir.path.string());
+        {
+            RoomMemory memory(config, kStart, kGeneration);
+            build_reference(memory, scenes::room_shell());
+        }
+        const auto bad = dir.path / "lab" / file;
+        std::filesystem::resize_file(bad, 1);  // missing epoch newline / incomplete CDR header
+        const auto before = harness::read_bytes(bad);
+        bool refused = false;
+        try {
+            RoomMemory memory(config, stamp(4), kGeneration + 1);
+        } catch (const std::invalid_argument& error) {
+            CHECK(std::string(error.what()).find(bad.string()) != std::string::npos);
+            refused = true;
+        }
+        CHECK(refused);
+        CHECK(harness::read_bytes(bad) == before);
+    }
+}
+
+TEST(startup_non_rig_save_failure_still_refuses_to_start) {
+    for (const std::string file : {"map_epoch", "reference-mid360.cdr"}) {
+        TempDir dir;
+        const MemoryConfig config = mid360_config(dir.path.string());
+        {
+            RoomMemory memory(config, kStart, kGeneration);
+            build_reference(memory, scenes::room_shell());
+        }
+        const auto blocker = dir.path / "lab" / (file + ".tmp");
+        std::filesystem::create_directory(blocker);
+        CHECK_THROWS(std::runtime_error, RoomMemory(config, stamp(4), kGeneration + 1));
+        try {
+            RoomMemory memory(config, stamp(5), kGeneration + 1);
+        } catch (const std::runtime_error& error) {
+            CHECK(std::string(error.what()).find(blocker.string()) != std::string::npos);
+        }
+    }
 }
 
 // Codex P2: seq restarts at 0, so a restart that kept map_epoch reissued (map_epoch, seq)
