@@ -1072,19 +1072,24 @@ func testTrailRescanReloadsOpenedVerdict() {
 // MARK: - Walk-day result (walk_result.json is the verdict, walkcheck.json an input)
 
 /// The shape `python3 -m spatio.walkday.result` writes for walk_result.json, trimmed.
-/// A `physicalReference` (raw JSON) makes it a physically evaluated result.
+/// A `physicalReference` (raw JSON) makes it a physically evaluated result. `recordsProvenance`
+/// writes what result.py records only when it read wallpatch/patches.json and logs/provenance.json.
 private func walkResultJSON(runID: String, status: String, d3: Double?, reasons: [String] = [],
-                            physicalReference: String? = nil) -> Data {
+                            physicalReference: String? = nil, recordsProvenance: Bool = false) -> Data {
     let quoted = reasons.map { "\"\($0)\"" }.joined(separator: ", ")
     let number = { (v: Double?) in v.map { "\($0)" } ?? "null" }
     let label = physicalReference == nil ? #""replay demonstrated; physical accuracy not evaluated""# : "null"
+    let provenance = #"""
+    , "wall_patches": {"origin": "preselected", "required": [], "verified": [], "problems": [], "patches_sha256": "\#(String(repeating: "a", count: 64))"},
+     "walkday_settings": {"sha256": "\#(String(repeating: "b", count: 64))"}
+    """#
     return Data("""
     {"schema": "spatio.walk_result/1", "run_id": "\(runID)", "status": "\(status)", "reasons": [\(quoted)],
      "physical_accuracy_evaluated": \(physicalReference != nil), "accuracy_label": \(label),
      "return_error": {"d3_m": \(number(d3)), "horizontal_m": \(number(d3.map { $0 * 0.8 })), "vertical_m": \(number(d3.map { $0 * 0.6 })),
                       "heading_deg": 0.8, "threshold_m": 0.1, "start_window_s": 5.0, "end_window_s": 5.0},
      "walls": {"p95_point_to_plane_m": 0.031, "doubled_wall_suspected": false, "gate_m": 0.05, "gate_state": "approved"},
-     "physical_reference": \(physicalReference ?? "null")}
+     "physical_reference": \(physicalReference ?? "null")\(recordsProvenance ? provenance : "")}
     """.utf8)
 }
 
@@ -1346,7 +1351,8 @@ func testTrailWalkdayRootsAndRescan() {
 }
 
 /// Every file the result is scored from counts: a PASS stops being green, in the list and in
-/// the opened session, when the input gate, the wall patches or the placement change or go.
+/// the opened session, when the input gate, the wall patches, the patch selection or provenance
+/// it recorded reading, or the placement change or go.
 func testTrailWalkdayScoringEvidenceChanges() {
     let fm = FileManager.default
     let root = tempDirectory("walkday-evidence")
@@ -1394,6 +1400,26 @@ func testTrailWalkdayScoringEvidenceChanges() {
     opened = TrailLibrary.VerdictInputs.read(directory: patchesGone.path)
     try! fm.removeItem(at: patchesGone.appendingPathComponent("wallpatch/wallpatch.json"))
     expectInvalidated(patchesGone, opened: opened, "gone since the result: wallpatch/wallpatch.json", "deleted wall-patch evidence")
+
+    // result.py reads these only when present, and records that it did; one that was read
+    // and is gone since leaves the PASS without its evidence.
+    for (file, label) in [("wallpatch/patches.json", "deleted patch selection"),
+                          ("logs/provenance.json", "deleted settings provenance")] {
+        let name = "gone-" + (file as NSString).lastPathComponent
+        let dir = makeWalkdayRun(root, name, result: nil, report: nil)
+        for recorded in ["wallpatch/patches.json", "logs/provenance.json"] {
+            let url = dir.appendingPathComponent(recorded)
+            try! Data("{}".utf8).write(to: url)
+            try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)], ofItemAtPath: url.path)
+        }
+        try! walkResultJSON(runID: name, status: "PASS", d3: 0.04, recordsProvenance: true)
+            .write(to: dir.appendingPathComponent("walk_result.json"))
+        try! walkdayReportJSON(runID: name, status: "PASS").write(to: dir.appendingPathComponent("walkday.json"))
+        expect((try? TrailSession.load(directory: dir.path))?.walkday?.isCleanPASS == true, "\(label): green before the change")
+        opened = TrailLibrary.VerdictInputs.read(directory: dir.path)
+        try! fm.removeItem(at: dir.appendingPathComponent(file))
+        expectInvalidated(dir, opened: opened, "scoring evidence is gone since the result: \(file)", label)
+    }
 
     let placed = cleanRun("placement-added")
     opened = TrailLibrary.VerdictInputs.read(directory: placed.path)
@@ -1538,7 +1564,7 @@ func runTrailTests() {
     testTrailWalkdayRootsAndRescan()
     print("  trail: walk-day and sessions roots both listed; rescan reloads when walk_result.json changes"); passed()
     testTrailWalkdayScoringEvidenceChanges()
-    print("  trail: a changed or deleted input gate, wall patch or placement after the result is not green, list and opened"); passed()
+    print("  trail: a changed or deleted input gate, wall patch, recorded patch selection or provenance, or placement after the result is not green, list and opened"); passed()
     testTrailWalkdayReportMustBeCurrent()
     print("  trail: an older walkday.json is not read; an evaluated PASS needs its own placement within 1 cm"); passed()
     testTrailViewContract()

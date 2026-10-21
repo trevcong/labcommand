@@ -16,17 +16,19 @@ public struct TrailWalkday: Equatable, Sendable {
     /// Files only process.sh writes. Any one makes the folder a walk-day folder.
     /// `logs/walkday.conf` is copied before anything else runs.
     public static let markers = [resultFile, retiredFile, reportFile,
-                                 "logs/walkday.conf", "logs/provenance.json", "logs/input_gate.json"]
+                                 "logs/walkday.conf", provenanceFile, inputGateFile]
     public static let inputGateFile = "logs/input_gate.json"
+    public static let provenanceFile = "logs/provenance.json"
     public static let wallpatchFile = "wallpatch/wallpatch.json"
+    public static let patchesFile = "wallpatch/patches.json"
     public static let physicalReferenceFile = "physical_reference.json"
     public static let notAppliedReferenceFile = "logs/physical_reference.not_applied.json"
     /// Every session file `walk_result.json` is scored from: what `result.py` `build()` reads,
     /// and the trajectory walkcheck read. The trajectory is first. A result older than any
     /// of them is stale, and Rescan reloads when any of them changes.
     public static let scoringInputs = [TrailSession.trajectoryFile, TrailSession.mapFile, TrailWalkcheck.file,
-                                       TrailSession.manifestFile, inputGateFile, "logs/provenance.json",
-                                       wallpatchFile, "wallpatch/patches.json",
+                                       TrailSession.manifestFile, inputGateFile, provenanceFile,
+                                       wallpatchFile, patchesFile,
                                        physicalReferenceFile, notAppliedReferenceFile]
 
     /// PASS, FAIL or NOT_EVALUABLE, as `walk_result.json` writes it. NOT_EVALUABLE when that
@@ -93,6 +95,9 @@ public struct TrailWalkday: Equatable, Sendable {
         var resultRunID: String?
         /// Why walk_result.json's own physical_reference is not within tolerance; nil when not evaluated.
         var referenceProblems: [String]?
+        /// Optional inputs result.py records that it read: patches_sha256 for the patch
+        /// selection, walkday_settings for stage 1's provenance.
+        var recordedInputs: [String] = []
         if let data = fm.contents(atPath: path(resultFile)) {
             do {
                 let dict = try object(data, resultFile)
@@ -117,6 +122,8 @@ public struct TrailWalkday: Equatable, Sendable {
                 w.returnHeadingDeg = number(returned?["heading_deg"])
                 w.returnThresholdM = number(returned?["threshold_m"])
                 if w.physicalAccuracyEvaluated { referenceProblems = placementProblems(dict["physical_reference"]) }
+                if (dict["wall_patches"] as? [String: Any])?["patches_sha256"] is String { recordedInputs.append(patchesFile) }
+                if dict["walkday_settings"] is [String: Any] { recordedInputs.append(provenanceFile) }
                 if id != runID {
                     w.concerns.append("\(resultFile) is for run \(id), not this folder (\(runID))")
                 }
@@ -201,8 +208,10 @@ public struct TrailWalkday: Equatable, Sendable {
             if w.synthetic {
                 w.concerns.append("SYNTHETIC recording, never physical evidence")
             }
-            // result.py cannot score PASS without these, so one that is gone was removed since.
+            // result.py cannot score PASS without these, or read the recorded ones, so one that
+            // is gone was removed since.
             var required = [TrailWalkcheck.file, TrailSession.manifestFile, TrailSession.mapFile, inputGateFile, wallpatchFile]
+            required += recordedInputs
             if w.physicalAccuracyEvaluated { required.append(physicalReferenceFile) }
             if let p = w.placement, !p.applied { required.append(notAppliedReferenceFile) }
             let gone = required.filter { !fm.fileExists(atPath: path($0)) }
