@@ -60,7 +60,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from spatio.manifest.jsonio import write_json_atomic
+from spatio.manifest.jsonio import write_json_atomic, write_text_atomic
 from spatio.thresholds import WALL_GATE_M
 from spatio.walkcheck.values import measurement_values
 
@@ -500,7 +500,7 @@ def render(report: dict) -> str:
 def _write(session, name, data):
     path = Path(session) / name
     if isinstance(data, str):
-        path.write_text(data, encoding="utf-8")
+        write_text_atomic(path, data)
     else:
         write_json_atomic(path, data)
 

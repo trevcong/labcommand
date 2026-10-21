@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from spatio.walkcheck.defaults import HISTORICAL_LABEL, PROVISIONAL_LABEL
-from spatio.manifest.jsonio import write_json_atomic
+from spatio.manifest.jsonio import write_json_atomic, write_text_atomic
 from spatio.walkcheck.values import explicit_measurements, measurement_values
 
 
@@ -251,7 +251,7 @@ def render_markdown(report: dict) -> str:
 
 
 def write_markdown(path: Path, report: dict) -> None:
-    path.write_text(render_markdown(report), encoding="utf-8")
+    write_text_atomic(path, render_markdown(report))
 
 
 def _sec(value: float) -> str:

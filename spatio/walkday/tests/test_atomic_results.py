@@ -11,7 +11,8 @@ from spatio.manifest import jsonio
 from spatio.series.adapter import adapt_walkcheck
 from spatio.series.validate import InputRejected
 from spatio.walkcheck.cli import main as walkcheck_main
-from spatio.walkcheck.report import plain, render_markdown, write_json
+from spatio.walkcheck import report as report_module
+from spatio.walkcheck.report import plain, render_markdown, write_json, write_markdown
 from spatio.walkcheck.values import measurement_values
 from spatio.walkday import result
 from spatio.walkday.tests.test_result import quiet, write_gate, write_recording
@@ -152,3 +153,44 @@ def test_readers_reject_invalid_missing_or_nonfinite_values(tmp_path, bad):
         result._load(path)
     with pytest.raises(InputRejected):
         adapt_walkcheck(data, {}, str(path))
+
+
+@pytest.mark.parametrize("earlier", [False, True])
+@pytest.mark.parametrize("operation", ["fsync", "replace"])
+@pytest.mark.parametrize("name,write", [
+    ("walkday.md", lambda path: result._write(path.parent, path.name, "# new report\n")),
+    ("walkcheck.md", lambda path: write_markdown(path, {})),
+])
+def test_markdown_os_failure_preserves_old_report(tmp_path, monkeypatch, earlier, operation, name, write):
+    # Issue #102: Markdown results go through the same temp+fsync+replace helper.
+    target = tmp_path / name
+    previous = b"# earlier report\n"
+    if earlier:
+        target.write_bytes(previous)
+
+    def fail(*args):
+        raise OSError("injected " + operation)
+
+    monkeypatch.setattr(report_module, "render_markdown", lambda report: "# new report\n")
+    monkeypatch.setattr(jsonio.os, operation, fail)
+    with pytest.raises(OSError, match=operation):
+        write(target)
+    assert target.read_bytes() == previous if earlier else not target.exists()
+    assert set(tmp_path.iterdir()) == ({target} if earlier else set())
+
+
+def test_walkcheck_writes_markdown_atomically(tmp_path, monkeypatch):
+    session = tmp_path / "map_sharp_wall"
+    shutil.copytree(FIXTURES / "map_sharp_wall", session)
+    written = []
+    real = jsonio.write_text_atomic
+
+    def spy(path, text):
+        written.append(Path(path).name)
+        real(path, text)
+
+    monkeypatch.setattr(report_module, "write_text_atomic", spy)
+    quiet(walkcheck_main, [str(session)])
+    assert written == ["walkcheck.md"]
+    assert (session / "walkcheck.md").read_text() == render_markdown(json.loads((session / "walkcheck.json").read_text()))
+    assert not list(session.glob("*.tmp"))
