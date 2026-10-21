@@ -11,6 +11,8 @@ public struct TrailWalkday: Equatable, Sendable {
     public static let resultSchema = "spatio.walk_result/1"
     public static let reportSchema = "spatio.walkday.report/1"
     public static let statuses = ["PASS", "FAIL", "NOT_EVALUABLE"]
+    /// `spatio.series` `PLACEMENT_TOLERANCE_M`; result.py never applies a looser one.
+    public static let placementToleranceM = 0.01
     /// Files only process.sh writes. Any one makes the folder a walk-day folder.
     /// `logs/walkday.conf` is copied before anything else runs.
     public static let markers = [resultFile, retiredFile, reportFile,
@@ -80,12 +82,17 @@ public struct TrailWalkday: Equatable, Sendable {
         guard isWalkdayFolder(directory) else { return nil }
         let fm = FileManager.default
         func path(_ name: String) -> String { (directory as NSString).appendingPathComponent(name) }
+        func modified(_ name: String) -> Date? {
+            (try? fm.attributesOfItem(atPath: path(name)))?[.modificationDate] as? Date
+        }
         let runID = URL(fileURLWithPath: directory).lastPathComponent
         var w = TrailWalkday(status: "NOT_EVALUABLE", reasons: [], hasResult: false,
                              physicalAccuracyEvaluated: false, synthetic: false, concerns: [],
                              stale: false, unverifiable: false)
 
         var resultRunID: String?
+        /// Why walk_result.json's own physical_reference is not within tolerance; nil when not evaluated.
+        var referenceProblems: [String]?
         if let data = fm.contents(atPath: path(resultFile)) {
             do {
                 let dict = try object(data, resultFile)
@@ -109,6 +116,7 @@ public struct TrailWalkday: Equatable, Sendable {
                 w.returnVerticalM = number(returned?["vertical_m"])
                 w.returnHeadingDeg = number(returned?["heading_deg"])
                 w.returnThresholdM = number(returned?["threshold_m"])
+                if w.physicalAccuracyEvaluated { referenceProblems = placementProblems(dict["physical_reference"]) }
                 if id != runID {
                     w.concerns.append("\(resultFile) is for run \(id), not this folder (\(runID))")
                 }
@@ -127,7 +135,16 @@ public struct TrailWalkday: Equatable, Sendable {
             w.concerns.append("no \(resultFile): the run has not been scored")
         }
 
-        if let data = fm.contents(atPath: path(reportFile)) {
+        // result.py writes walk_result.json, then walkday.json. An older report is from an
+        // earlier scoring (a re-score interrupted between the two), so none of it is read.
+        let reportOutdated = w.hasResult && {
+            guard let report = modified(reportFile), let result = modified(resultFile) else { return false }
+            return report < result
+        }()
+        if reportOutdated {
+            w.concerns.append("\(reportFile) is older than \(resultFile), so it is from an earlier scoring; "
+                              + "placement and blockers are unknown")
+        } else if let data = fm.contents(atPath: path(reportFile)) {
             do {
                 let dict = try object(data, reportFile)
                 guard dict["schema"] as? String == reportSchema else {
@@ -178,6 +195,9 @@ public struct TrailWalkday: Equatable, Sendable {
             if let p = w.placement, !p.withinTolerance {
                 w.concerns.append("placement not within tolerance" + (p.problems.isEmpty ? "" : ": " + p.problems.joined(separator: "; ")))
             }
+            if let problems = referenceProblems, !problems.isEmpty {
+                w.concerns.append("\(resultFile) physical_reference is not within tolerance: " + problems.joined(separator: "; "))
+            }
             if w.synthetic {
                 w.concerns.append("SYNTHETIC recording, never physical evidence")
             }
@@ -208,6 +228,25 @@ public struct TrailWalkday: Equatable, Sendable {
         guard let threshold = w.returnThresholdM, threshold > 0 else { return "return_error.threshold_m is not a number > 0" }
         guard d3 < threshold else { return "return_error.d3_m \(d3) is not below threshold_m \(threshold)" }
         return nil
+    }
+
+    /// result.py `_placement`, applied to `walk_result.json` `physical_reference`: both residuals
+    /// measured and within the stricter of its tolerance and 1 cm, and the heading check "ok".
+    private static func placementProblems(_ value: Any?) -> [String] {
+        guard let ref = value as? [String: Any] else { return ["physical_reference is missing"] }
+        let limit = number(ref["placement_tolerance_m"]).map { min($0, placementToleranceM) } ?? placementToleranceM
+        var why: [String] = []
+        for key in ["start_placement_residual_m", "end_placement_residual_m"] {
+            if let v = number(ref[key]) {
+                if v > limit { why.append("\(key) " + String(format: "%.2f cm > %g cm", v * 100, limit * 100)) }
+            } else {
+                why.append("\(key) not measured")
+            }
+        }
+        if ref["heading_check"] as? String != "ok" {
+            why.append("heading check is \(ref["heading_check"] as? String ?? "not recorded")")
+        }
+        return why
     }
 
     private static func object(_ data: Data, _ name: String) throws -> [String: Any] {

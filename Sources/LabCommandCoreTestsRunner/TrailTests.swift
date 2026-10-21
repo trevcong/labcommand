@@ -1072,16 +1072,19 @@ func testTrailRescanReloadsOpenedVerdict() {
 // MARK: - Walk-day result (walk_result.json is the verdict, walkcheck.json an input)
 
 /// The shape `python3 -m spatio.walkday.result` writes for walk_result.json, trimmed.
-private func walkResultJSON(runID: String, status: String, d3: Double?, reasons: [String] = []) -> Data {
+/// A `physicalReference` (raw JSON) makes it a physically evaluated result.
+private func walkResultJSON(runID: String, status: String, d3: Double?, reasons: [String] = [],
+                            physicalReference: String? = nil) -> Data {
     let quoted = reasons.map { "\"\($0)\"" }.joined(separator: ", ")
     let number = { (v: Double?) in v.map { "\($0)" } ?? "null" }
+    let label = physicalReference == nil ? #""replay demonstrated; physical accuracy not evaluated""# : "null"
     return Data("""
     {"schema": "spatio.walk_result/1", "run_id": "\(runID)", "status": "\(status)", "reasons": [\(quoted)],
-     "physical_accuracy_evaluated": false, "accuracy_label": "replay demonstrated; physical accuracy not evaluated",
+     "physical_accuracy_evaluated": \(physicalReference != nil), "accuracy_label": \(label),
      "return_error": {"d3_m": \(number(d3)), "horizontal_m": \(number(d3.map { $0 * 0.8 })), "vertical_m": \(number(d3.map { $0 * 0.6 })),
                       "heading_deg": 0.8, "threshold_m": 0.1, "start_window_s": 5.0, "end_window_s": 5.0},
      "walls": {"p95_point_to_plane_m": 0.031, "doubled_wall_suspected": false, "gate_m": 0.05, "gate_state": "approved"},
-     "physical_reference": null}
+     "physical_reference": \(physicalReference ?? "null")}
     """.utf8)
 }
 
@@ -1407,6 +1410,74 @@ func testTrailWalkdayScoringEvidenceChanges() {
     try? fm.removeItem(at: root)
 }
 
+/// walkday.json is only read when it is at least as new as walk_result.json, and a physically
+/// evaluated PASS is judged on walk_result.json's own physical_reference, so an interrupted
+/// re-score cannot borrow an earlier report's "within tolerance".
+func testTrailWalkdayReportMustBeCurrent() {
+    let fm = FileManager.default
+    let root = tempDirectory("walkday-report-current")
+    let tight = #"{"start_placement_residual_m": 0.004, "end_placement_residual_m": 0.006, "heading_check": "ok", "placement_tolerance_m": 0.01}"#
+    let loose = #"{"start_placement_residual_m": 0.004, "end_placement_residual_m": 0.05, "heading_check": "ok", "placement_tolerance_m": 0.01}"#
+    let withinReport = { (name: String) in
+        walkdayReportJSON(runID: name, status: "PASS",
+                          placement: #"{"within_tolerance": true, "problems": [], "applied": true}"#)
+    }
+    func evaluatedRun(_ name: String, reference: String) -> URL {
+        let dir = makeWalkdayRun(root, name, result: walkResultJSON(runID: name, status: "PASS", d3: 0.04, physicalReference: reference),
+                                 report: withinReport(name))
+        let file = dir.appendingPathComponent("physical_reference.json")
+        try! Data(reference.utf8).write(to: file)
+        try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -3600)], ofItemAtPath: file.path)
+        return dir
+    }
+    func expectNotGreen(_ dir: URL, _ needle: String, _ label: String) -> TrailWalkday? {
+        let w = (try? TrailSession.load(directory: dir.path))?.walkday
+        expect(w != nil && w.map(TrailReadout.walkdayTone) != .good, "\(label): not green")
+        expect(w?.concerns.contains { $0.contains(needle) } == true, "\(label): concerns mention '\(needle)', got \(w?.concerns ?? [])")
+        let entry = TrailLibrary.scan(root: root.path).first { $0.directory == dir.path }
+        expect(entry?.walkday != nil && entry?.walkday.map(TrailReadout.walkdayTone) != .good, "\(label): the list is not green either")
+        return w
+    }
+
+    let good = evaluatedRun("evaluated", reference: tight)
+    let g = (try? TrailSession.load(directory: good.path))?.walkday
+    expect(g?.isCleanPASS == true, "an evaluated PASS within 1 cm is green, got \(g?.concerns ?? [])")
+
+    // Re-scored to a 5 cm end residual; interrupted before walkday.json was rewritten.
+    let interrupted = evaluatedRun("interrupted", reference: loose)
+    try! fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -60)],
+                          ofItemAtPath: interrupted.appendingPathComponent("walkday.json").path)
+    let i = expectNotGreen(interrupted, "walkday.json is older than walk_result.json", "an interrupted re-score")
+    expect(i?.placement == nil && i?.acceptanceBlockers == nil, "the earlier report's placement and blockers are not shown")
+    expect(i.map(TrailReadout.walkdayRows)?.first { $0.label == "Placement" }?.value == "none recorded",
+           "the placement row does not say within tolerance")
+    expect(i?.concerns.contains { $0.contains("end_placement_residual_m 5.00 cm > 1 cm") } == true,
+           "and the result's own residual is named, got \(i?.concerns ?? [])")
+
+    // Same result with a current report that wrongly claims within tolerance.
+    _ = expectNotGreen(evaluatedRun("claims-within", reference: loose), "end_placement_residual_m 5.00 cm > 1 cm",
+                       "a 5 cm residual against 1 cm, whatever the report says")
+    _ = expectNotGreen(evaluatedRun("looser-tolerance", reference: #"{"start_placement_residual_m": 0.004, "end_placement_residual_m": 0.015, "heading_check": "ok", "placement_tolerance_m": 0.02}"#),
+                       "end_placement_residual_m 1.50 cm > 1 cm", "a looser recorded tolerance is not applied")
+    _ = expectNotGreen(evaluatedRun("unmeasured-end", reference: #"{"start_placement_residual_m": 0.004, "end_placement_residual_m": null, "heading_check": "ok", "placement_tolerance_m": 0.01}"#),
+                       "end_placement_residual_m not measured", "an unmeasured end residual")
+    _ = expectNotGreen(evaluatedRun("heading-off", reference: #"{"start_placement_residual_m": 0.004, "end_placement_residual_m": 0.006, "heading_check": "off", "placement_tolerance_m": 0.01}"#),
+                       "heading check is off", "a heading check that is off")
+    _ = expectNotGreen(evaluatedRun("no-reference", reference: "null"), "physical_reference is missing",
+                       "an evaluated result without its reference")
+
+    // An equal time is the producer's order within the clock's resolution: still current.
+    let same = makeWalkdayRun(root, "same-time", result: walkResultJSON(runID: "same-time", status: "PASS", d3: 0.04),
+                              report: walkdayReportJSON(runID: "same-time", status: "PASS"))
+    let now = Date()
+    for file in ["walk_result.json", "walkday.json"] {
+        try! fm.setAttributes([.modificationDate: now], ofItemAtPath: same.appendingPathComponent(file).path)
+    }
+    expect(TrailWalkday.read(directory: same.path)?.isCleanPASS == true, "a report written in the same instant is current")
+
+    try? fm.removeItem(at: root)
+}
+
 func runTrailTests() {
     testTrailTUMFixtureNumbers()
     print("  trail: TUM fixture — 661 poses, 66 s, 11.98 m, start→end exactly 4.0 cm, epoch stamps keep 0.1 s"); passed()
@@ -1468,6 +1539,8 @@ func runTrailTests() {
     print("  trail: walk-day and sessions roots both listed; rescan reloads when walk_result.json changes"); passed()
     testTrailWalkdayScoringEvidenceChanges()
     print("  trail: a changed or deleted input gate, wall patch or placement after the result is not green, list and opened"); passed()
+    testTrailWalkdayReportMustBeCurrent()
+    print("  trail: an older walkday.json is not read; an evaluated PASS needs its own placement within 1 cm"); passed()
     testTrailViewContract()
     print("  trail: view shows label, raw note and walkcheck; Trail is the 4th tab (Room, Settings, Rig, Trail)"); passed()
 }
