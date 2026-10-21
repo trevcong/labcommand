@@ -3,6 +3,49 @@
 One command per recording, one per series. Plain-English runbook:
 `~/Developer/lc-tasks/plans/SPATIO-walkday-runbook.md`.
 
+For a short parked–push–return preflight, inspect a **local recording and an
+existing replay session**, without ROS, Docker, or contacting the rig:
+
+```sh
+python3 -m spatio.preflight /path/to/recording --session /path/to/replay-session \
+  --lidar-topic /livox/lidar --parked 1792500000 1792500030 \
+  --parked 1792500060 1792500075 --json /tmp/preflight.json < /dev/null
+```
+
+Replace the example timestamps with the operator-labeled start and end parked
+intervals, in **absolute trajectory/lidar header seconds**. The two clocks must
+already correspond; preflight does not align or correct them. Intervals are
+independent of detected holds, so failed holds still yield jitter measurements.
+Pose jitter requires trajectory coverage at both interval edges within the
+configured `MAX_GAP_S`, as well as no larger gap between poses inside the interval.
+The command prints a short summary and writes strict JSON with all topic rates,
+gaps, timestamp regressions/duplicates and header–receipt offsets, saved replay
+status, pose jitter (position, rotation, step speed), Livox CustomMsg scan-centroid
+spread, and whether each parked interval contains a sustained detected hold.
+Centroid spread includes changing scene sampling; it is not per-point accuracy.
+Other cloud types or the timing-only decoder fallback explicitly lack this metric.
+Centroids are calculated only for scans in the parked intervals; timing, frame
+consistency and missing XYZ/header counts still inspect the whole bag.
+
+Settings default to this folder's `walkday.conf`; use `--settings FILE` for the
+recording's settings. They are parsed as numeric assignments, never executed.
+`--max-hold-speed M_S` explicitly overrides that value. The JSON records the
+effective speed after the existing endpoint-speed cap, the source, and the bare
+walkcheck default (0.02 m/s versus the shipped conf's 0.10 m/s). All other hold
+defaults and the existing detector are reused; IMU quietness is not used by this
+trajectory-based check. These settings remain provisional.
+
+The saved `logs/container_exit_code`, `logs/run_params.json`, replay manifest,
+trajectory and map are inspected; no replay is launched. A walk-day session's
+`logs/replay_manifest.json` is preferred over its rebuilt manifest. Source bag
+paths must match; this check does not revalidate content hashes. Missing, failed,
+invalid and historical replay evidence are reported separately. Exit 0 means a
+diagnostic report was written (including failures), and exit 2 means invalid
+input (including corrupt or truncated MCAP) or an output error. Invalid replay
+duration metadata is reported as invalid replay evidence within the diagnostic
+report. This tool gives no readiness PASS or physical-accuracy
+verdict and does not replace the walk-day input gate or measured loop protocol.
+
 ```sh
 spatio/walkday/process.sh <recording-dir> <run-id> [--start-placement-cm Y --placement-cm X --heading ok --spec FROZEN --patches FILE]
 spatio/walkday/process.sh <recording-dir> <run-id> --config FASTLIO.yaml --driver-config DRIVER.yaml   # two-config run (JT128: jt128_fastlio.yaml + jt128_post.yaml)
