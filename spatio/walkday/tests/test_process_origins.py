@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from spatio.walkday.patch_origin import classify
+from spatio.walkday.patch_origin import classify, main as patch_origin_main
 from spatio.walkday.tests.test_result import quiet, write_recording
 from spatio.wallpatch.cli import main as wallpatch_main
 
@@ -284,3 +284,29 @@ def test_one_auto_patch_prevents_aggregate_preselection(tmp_path):
     doc = {"patches": [{"name": "a", "origin": "preselected"},
                        {"name": "b", "origin": "auto_suggested"}]}
     assert classify(doc) == "auto_suggested"
+
+
+@pytest.mark.parametrize("marker", ["missing_recording", "absent", "directory", "file"])
+def test_synthetic_flag_requires_recording_marker(process_harness, capsys, marker):
+    _, _, rec, spec, patches, _ = process_harness
+    _preselected_without_sha(patches)
+    before = patches.read_bytes()
+    marker_path = rec / "SYNTHETIC.json"
+    if marker == "directory":
+        marker_path.mkdir()
+    elif marker == "file":
+        _mark_synthetic(process_harness)
+    args = [str(patches), "--spec", str(spec), "--map", str(FIXTURE / "map.pcd"), "--synthetic"]
+    if marker != "missing_recording":
+        args += ["--recording", str(rec)]
+    code = patch_origin_main(args)
+    if marker == "file":
+        assert code == 0
+        bound = json.loads(patches.read_text())
+        assert bound["map_sha256"] == hashlib.sha256((FIXTURE / "map.pcd").read_bytes()).hexdigest()
+        assert all(p["origin"] == "preselected" for p in bound["patches"])
+    else:
+        assert code == 1
+        assert "--synthetic requires --recording with a SYNTHETIC.json marker file" in capsys.readouterr().err
+        assert patches.read_bytes() == before
+    assert not list(patches.parent.glob("*.tmp"))

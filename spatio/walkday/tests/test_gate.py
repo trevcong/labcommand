@@ -1,6 +1,9 @@
+import json
 import unittest
 
-from spatio.walkday.gate import evaluate
+import pytest
+
+from spatio.walkday.gate import evaluate, main
 
 L, I = "/cartA/scan", "/cartA/imu"
 
@@ -57,6 +60,35 @@ class GateTest(unittest.TestCase):
     def test_gate_uses_given_topics_not_defaults(self):
         # The same report checked against Livox default names must block.
         self.assertFalse(evaluate(report(), "/livox/lidar", "/livox/imu")["evaluable"])
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity", "1e999"])
+@pytest.mark.parametrize("field", ["coverage", "header"])
+@pytest.mark.parametrize("earlier", [False, True])
+def test_nonfinite_timing_fails_clearly_without_replacing_gate(tmp_path, capsys, token, field, earlier):
+    bt = report()
+    if field == "coverage":
+        bt["imu_coverage"][0]["covered"] = "NONFINITE"
+        location = "bagtiming.imu_coverage[0].covered"
+    else:
+        bt["topics"][0]["header"]["max_gap_s"] = "NONFINITE"
+        location = "bagtiming.topics[0].header.max_gap_s"
+    source = tmp_path / "bagtiming.json"
+    source.write_text(json.dumps(bt).replace('"NONFINITE"', token))
+    target = tmp_path / "input_gate.json"
+    previous = b'{"evaluable": false, "earlier": true}\n'
+    if earlier:
+        target.write_bytes(previous)
+    # The public evaluator also rejects the invalid evidence, before it can be
+    # copied to imu_coverage or silently disappear into a warning string.
+    with pytest.raises(ValueError, match="non-finite numeric value"):
+        evaluate(json.loads(source.read_text()), L, I)
+    assert main([str(source), "--lidar", L, "--imu", I, "--out", str(target)]) == 3
+    error = capsys.readouterr().err
+    assert "gate: non-finite numeric value at " + location in error
+    assert "Traceback" not in error
+    assert target.read_bytes() == previous if earlier else not target.exists()
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 if __name__ == "__main__":
