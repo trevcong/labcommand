@@ -79,6 +79,15 @@ REC="$(cd "$REC_ARG" && pwd)"
 [[ -f $SETTINGS ]] || die "settings not found: $SETTINGS"
 # shellcheck source=walkday.conf
 source "$SETTINGS"
+python3 - "$WALL_GATE_M" <<'PY' || exit 2
+import sys
+from spatio.thresholds import wall_gate
+try:
+    wall_gate(sys.argv[1])
+except ValueError as exc:
+    print(f"process.sh: WALL_GATE_M: {exc}", file=sys.stderr)
+    sys.exit(2)
+PY
 case $HEADING in ok|off|not_checked) ;; *) die "--heading must be ok, off or not_checked" ;; esac
 [[ -z $START_CM || -n $END_CM ]] || die "--start-placement-cm needs --placement-cm"
 if [[ -n $END_CM ]]; then

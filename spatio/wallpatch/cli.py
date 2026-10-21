@@ -6,7 +6,7 @@ import argparse
 import os
 import sys
 
-from spatio.thresholds import WALL_GATE_M
+from spatio.thresholds import WALL_GATE_M, wall_gate
 from spatio.wallpatch.errors import WallpatchError
 from spatio.wallpatch.measure import measure_map
 from spatio.wallpatch.suggest import suggest_map
@@ -71,7 +71,7 @@ def _parser():
     )
     measure.add_argument(
         "--wall-gate-m",
-        type=float,
+        type=wall_gate,
         default=WALL_GATE_M,
         help="p95 and separation gate in metres (default %g, spatio.thresholds)" % WALL_GATE_M,
     )

@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import sys
 
+from spatio.thresholds import wall_gate
+
 from spatio.walkcheck.defaults import (
     MAX_ENDPOINT_SPEED_M_S,
     MAX_ENDPOINT_SPREAD_M,
@@ -87,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--wall-gate-m",
-        type=float,
+        type=wall_gate,
         default=WALL_GATE_M,
         help=(
             "PROVISIONAL: wall p95 gate in metres, reported only; it does not change "

@@ -13,7 +13,8 @@ spatio.series uses to order runs; never the processing time) and, for a
 synthetic recording, its SYNTHETIC.json ground truth. The second form records
 a run that stopped before scoring (NOT-EVALUABLE; no walk_result.json).
 
-Exit codes: 0 PASS, 1 FAIL, 2 NOT-EVALUABLE, 3 bad or contradictory input.
+Exit codes: 0 PASS, 1 FAIL, 2 NOT-EVALUABLE (also a gate above the ceiling),
+3 bad or contradictory input.
 Either form first moves an earlier walk_result.json aside (walk_result.json.retired;
 deleted again when a new one is written). So after exit 3 or a stopped run the
 session has no walk_result.json and series.sh refuses it; walkday.md/json then
@@ -46,7 +47,9 @@ spatio.walkday.seriesgate enforces them):
     (--wall-gate-m, --wall-gate-state) used its values; recomputed from the
     values used when one differs, so a re-scored run starts a new series.
     walkday.json/md list each changed setting. A walkcheck.json that does not
-    record its parameters cannot be checked (exit 3).
+    record its parameters cannot be checked (exit 3). Recorded wall gates must
+    be positive, finite, at most WALL_GATE_M, and consistent across the earlier
+    stages. Re-scoring their measured values at a stricter gate is allowed.
   driver_config_sha256: the sensor driver config (process.sh --driver-config).
 """
 
@@ -61,7 +64,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from spatio.manifest.jsonio import write_json_atomic, write_text_atomic
-from spatio.thresholds import WALL_GATE_M
+from spatio.thresholds import WALL_GATE_M, WALL_GATE_STATE, wall_gate
 from spatio.walkcheck.values import measurement_values
 
 from spatio.wall_scoring import (
@@ -162,11 +165,47 @@ def _settings_used(prov, walkcheck, gate_m, gate_state):
     return effective_identity(prov["settings"], used)
 
 
+def _check_recorded_wall_gates(walkcheck, wallpatch, requested_gate_m):
+    """Require valid, consistent stage gates before re-scoring measurements.
+
+    A stricter result gate is allowed: score_walls rechecks measured values
+    against the effective gate. Missing patch reports remain not evaluable.
+    """
+    def recorded(report, block, key, source, scale=1.0):
+        values = report.get(block)
+        value = _num(values.get(key)) if isinstance(values, dict) else None
+        if value is None:
+            raise ResultError(f"{source}: missing or invalid {block}.{key}")
+        try:
+            return wall_gate(value / scale)
+        except ValueError as exc:
+            raise ResultError(f"{source}: {block}.{key}: {exc}") from exc
+
+    gate = recorded(walkcheck, "parameters", "wall_gate_m", "walkcheck.json")
+    if requested_gate_m > gate:
+        raise ResultError("--wall-gate-m exceeds the recorded walkcheck.json wall gate; "
+                          "rescoring must be stricter-only")
+    for block, key in (("parameters", "wall_gate_cm"), ("walls", "proposed_gate_cm")):
+        # Producers round centimetres to nine decimal places.
+        cm = recorded(walkcheck, block, key, "walkcheck.json", 100.0)
+        if round(cm * 100.0, 9) != round(gate * 100.0, 9):
+            raise ResultError(f"walkcheck.json: {block}.{key} disagrees with parameters.wall_gate_m")
+    if wallpatch is not None:
+        p95 = recorded(wallpatch, "gates", "p95_point_to_plane_max_m", "wallpatch.json")
+        separation = recorded(wallpatch, "gates", "revisit_separation_max_m", "wallpatch.json")
+        band = recorded(wallpatch, "doubled_wall_rule", "pass_needs_band_under_m", "wallpatch.json")
+        if p95 != separation or p95 != band:
+            raise ResultError("wallpatch.json: recorded p95, separation and band gates disagree")
+        if p95 != gate:
+            raise ResultError("wallpatch.json: recorded gate disagrees with walkcheck.json parameters.wall_gate_m")
+
+
 def build(session: str, gate_m: float, gate_state: str, patch_source: str,
           patch_origin: str = "auto_suggested", spec_path=None):
     wc = _load(os.path.join(session, "walkcheck.json"))
     manifest = _load(os.path.join(session, "manifest.json"))
     wp = _load(os.path.join(session, "wallpatch", "wallpatch.json"), required=False)
+    _check_recorded_wall_gates(wc, wp, gate_m)
     gate = _load(os.path.join(session, "logs", "input_gate.json"), required=False)
     prov = _provenance(session, manifest)
     run_id = os.path.basename(os.path.normpath(session))
@@ -524,7 +563,7 @@ def _parser():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("session")
     ap.add_argument("--wall-gate-m", type=float, default=WALL_GATE_M)
-    ap.add_argument("--wall-gate-state", choices=("approved", "proposed"), default="approved")
+    ap.add_argument("--wall-gate-state", choices=("approved", "proposed"), default=WALL_GATE_STATE)
     ap.add_argument("--patch-source", default="auto-suggested from this map, NOT Trevor's preselected patches")
     ap.add_argument("--patch-origin", choices=PATCH_ORIGINS, default="auto_suggested",
                     help="preselected only when the patches file holds the spec's preselected patches")
@@ -540,9 +579,13 @@ def main(argv=None) -> int:
         print(f"result: no session folder {args.session}", file=sys.stderr)
         return 3
     _retire(args.session)
+    rejection_exit = 3
     try:
         if not (math.isfinite(args.wall_gate_m) and args.wall_gate_m > 0):
             raise ResultError("--wall-gate-m must be a positive number")
+        if args.wall_gate_m > WALL_GATE_M:
+            rejection_exit = 2
+            raise ResultError(f"--wall-gate-m must be <= {WALL_GATE_M:g} m (stricter-only)")
         if args.stopped_at:
             report = stopped(args.session, args.stopped_at, args.reason)
         else:
@@ -557,7 +600,7 @@ def main(argv=None) -> int:
         report = stopped(args.session, "result", f"rejected, no walk_result.json: {exc}")
         _write(args.session, "walkday.json", report)
         _write(args.session, "walkday.md", render(report))
-        return 3
+        return rejection_exit
     _write(args.session, "walkday.json", report)
     _write(args.session, "walkday.md", render(report))
     print(f"{report['run_id']}: {report['status'].replace('_', '-')}"
