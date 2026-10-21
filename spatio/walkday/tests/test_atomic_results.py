@@ -1,6 +1,7 @@
 """S2 persistence failures and the explicit missing-measurement hand-off."""
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -8,7 +9,10 @@ import numpy as np
 import pytest
 
 from spatio.manifest import jsonio
+from spatio.series import cli as series_cli
 from spatio.series.adapter import adapt_walkcheck
+from spatio.series.tests.test_fixes import produced_walkcheck, timed, wall_args, write_result
+from spatio.series.tests.test_series import make_walk
 from spatio.series.validate import InputRejected
 from spatio.walkcheck.cli import main as walkcheck_main
 from spatio.walkcheck import report as report_module
@@ -194,3 +198,101 @@ def test_walkcheck_writes_markdown_atomically(tmp_path, monkeypatch):
     assert written == ["walkcheck.md"]
     assert (session / "walkcheck.md").read_text() == render_markdown(json.loads((session / "walkcheck.json").read_text()))
     assert not list(session.glob("*.tmp"))
+
+
+def fail_while_pending(monkeypatch, operation, target):
+    """Make os.<operation> fail, but only while target's temp file exists.
+
+    That hits the fsync of target's own temp file and its replace, not an earlier
+    write in the same command or the directory fsync after the rename."""
+    target = Path(target)
+    real = getattr(os, operation)
+
+    def fail(*args):
+        if list(target.parent.glob(target.name + ".*.tmp")):
+            raise OSError("injected " + operation)
+        return real(*args)
+
+    monkeypatch.setattr(jsonio.os, operation, fail)
+
+
+def spy_writes(monkeypatch, module):
+    """Record the file names module writes through the atomic helpers."""
+    written = []
+    for helper in ("write_json_atomic", "write_text_atomic"):
+        if hasattr(module, helper):
+            def spy(path, value, real=getattr(jsonio, helper)):
+                written.append(Path(path).name)
+                real(path, value)
+            monkeypatch.setattr(module, helper, spy)
+    return written
+
+
+def series_inputs(tmp_path):
+    return [write_result(tmp_path, timed(make_walk("run-%d" % i), i)) for i in range(3)]
+
+
+def test_series_compare_writes_verdict_atomically(tmp_path, monkeypatch, capsys):
+    # Issue #115: the series verdict goes through the temp+fsync+replace helper.
+    written = spy_writes(monkeypatch, series_cli)
+    out = tmp_path / "series"
+    assert series_cli.main(["compare", *series_inputs(tmp_path), "--out", str(out)]) == 0
+    assert written == ["series.md", "series.json"]
+    report = json.loads((out / "series.json").read_text(encoding="utf-8"))
+    assert report["verdict"] == "PASS"
+    # Same bytes as the in-place writer it replaces.
+    assert (out / "series.json").read_text(encoding="utf-8") == json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+    assert sorted(p.name for p in out.iterdir()) == ["series.json", "series.md"]
+
+
+@pytest.mark.parametrize("earlier", [False, True])
+@pytest.mark.parametrize("operation", ["fsync", "replace"])
+@pytest.mark.parametrize("name", ["series.md", "series.json"])
+def test_series_compare_os_failure_preserves_old_verdict(tmp_path, monkeypatch, capsys, earlier, operation, name):
+    out = tmp_path / "series"
+    out.mkdir()
+    target = out / name
+    previous = b"earlier verdict\n"
+    if earlier:
+        target.write_bytes(previous)
+    inputs = series_inputs(tmp_path)
+    fail_while_pending(monkeypatch, operation, target)
+    assert series_cli.main(["compare", *inputs, "--out", str(out)]) == 2
+    assert "injected " + operation in capsys.readouterr().err
+    assert target.read_bytes() == previous if earlier else not target.exists()
+    assert not list(out.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("earlier", [False, True])
+@pytest.mark.parametrize("operation", ["fsync", "replace"])
+def test_series_explain_os_failure_preserves_old_summary(tmp_path, monkeypatch, capsys, earlier, operation):
+    walk = series_inputs(tmp_path)[0]
+    target = tmp_path / "out" / "explain.txt"
+    target.parent.mkdir()
+    previous = b"earlier summary\n"
+    if earlier:
+        target.write_bytes(previous)
+    written = spy_writes(monkeypatch, series_cli)
+    fail_while_pending(monkeypatch, operation, target)
+    assert series_cli.main(["explain", walk, "--out", str(target)]) == 2
+    assert written == ["explain.txt"]
+    assert target.read_bytes() == previous if earlier else not target.exists()
+    assert list(target.parent.iterdir()) == ([target] if earlier else [])
+
+
+@pytest.mark.parametrize("earlier", [False, True])
+@pytest.mark.parametrize("operation", ["fsync", "replace"])
+def test_series_adapt_os_failure_preserves_old_result(tmp_path, monkeypatch, capsys, earlier, operation):
+    _, _, report_path, meta_path = produced_walkcheck(tmp_path)
+    target = tmp_path / "out" / "walk_result.json"
+    target.parent.mkdir()
+    previous = b'{"earlier": true}\n'
+    if earlier:
+        target.write_bytes(previous)
+    written = spy_writes(monkeypatch, series_cli)
+    fail_while_pending(monkeypatch, operation, target)
+    assert series_cli.main(["adapt", str(report_path), "--metadata", str(meta_path),
+                            "--out", str(target), *wall_args(report_path)]) == 2
+    assert written == ["walk_result.json"]
+    assert target.read_bytes() == previous if earlier else not target.exists()
+    assert list(target.parent.iterdir()) == ([target] if earlier else [])
