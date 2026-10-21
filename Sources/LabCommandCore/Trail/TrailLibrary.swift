@@ -287,14 +287,17 @@ public enum TrailLibrary {
     }
 
     /// Modification times of the files an opened verdict was read from.
-    /// A nil date means the file was absent. Rescan uses this to notice a replacement,
-    /// a new report, or a deletion, and to leave playback alone when nothing changed.
+    /// A nil date, or a name missing from `scoringEvidence`, means the file was absent. Rescan
+    /// uses this to notice a replacement, a new report, or a deletion, and to leave playback
+    /// alone when nothing changed.
     public struct VerdictInputs: Equatable, Sendable {
         public var trajectory: Date?
         public var map: Date?
         public var walkcheck: Date?
         public var walkResult: Date?
         public var walkdayReport: Date?
+        /// The rest of `TrailWalkday.scoringInputs`, by file name; an absent file has no key.
+        public var scoringEvidence: [String: Date]
 
         public static func read(directory: String) -> VerdictInputs {
             func modified(_ name: String) -> Date? {
@@ -306,7 +309,10 @@ public enum TrailLibrary {
                 map: modified(TrailSession.mapFile),
                 walkcheck: modified(TrailWalkcheck.file),
                 walkResult: modified(TrailWalkday.resultFile),
-                walkdayReport: modified(TrailWalkday.reportFile))
+                walkdayReport: modified(TrailWalkday.reportFile),
+                scoringEvidence: Dictionary(uniqueKeysWithValues: TrailWalkday.scoringInputs
+                    .filter { ![TrailSession.trajectoryFile, TrailSession.mapFile, TrailWalkcheck.file].contains($0) }
+                    .compactMap { name in modified(name).map { (name, $0) } }))
         }
     }
 

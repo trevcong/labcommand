@@ -15,6 +15,17 @@ public struct TrailWalkday: Equatable, Sendable {
     /// `logs/walkday.conf` is copied before anything else runs.
     public static let markers = [resultFile, retiredFile, reportFile,
                                  "logs/walkday.conf", "logs/provenance.json", "logs/input_gate.json"]
+    public static let inputGateFile = "logs/input_gate.json"
+    public static let wallpatchFile = "wallpatch/wallpatch.json"
+    public static let physicalReferenceFile = "physical_reference.json"
+    public static let notAppliedReferenceFile = "logs/physical_reference.not_applied.json"
+    /// Every session file `walk_result.json` is scored from: what `result.py` `build()` reads,
+    /// and the trajectory walkcheck read. The trajectory is first. A result older than any
+    /// of them is stale, and Rescan reloads when any of them changes.
+    public static let scoringInputs = [TrailSession.trajectoryFile, TrailSession.mapFile, TrailWalkcheck.file,
+                                       TrailSession.manifestFile, inputGateFile, "logs/provenance.json",
+                                       wallpatchFile, "wallpatch/patches.json",
+                                       physicalReferenceFile, notAppliedReferenceFile]
 
     /// PASS, FAIL or NOT_EVALUABLE, as `walk_result.json` writes it. NOT_EVALUABLE when that
     /// file is missing or cannot be read.
@@ -40,7 +51,7 @@ public struct TrailWalkday: Equatable, Sendable {
     public var inputGateBlockers: [String]?
     /// Why the verdict cannot be shown as a current acceptance. Empty for a clean result.
     public var concerns: [String]
-    /// `walk_result.json` is older than the trajectory, the map or the walk check.
+    /// `walk_result.json` is older than one of `scoringInputs`.
     public var stale: Bool
     /// The trajectory the result scored is missing or unusable.
     public var unverifiable: Bool
@@ -170,12 +181,18 @@ public struct TrailWalkday: Equatable, Sendable {
             if w.synthetic {
                 w.concerns.append("SYNTHETIC recording, never physical evidence")
             }
+            // result.py cannot score PASS without these, so one that is gone was removed since.
+            var required = [TrailWalkcheck.file, TrailSession.manifestFile, TrailSession.mapFile, inputGateFile, wallpatchFile]
+            if w.physicalAccuracyEvaluated { required.append(physicalReferenceFile) }
+            if let p = w.placement, !p.applied { required.append(notAppliedReferenceFile) }
+            let gone = required.filter { !fm.fileExists(atPath: path($0)) }
+            if !gone.isEmpty {
+                w.concerns.append("scoring evidence is gone since the result: " + gone.joined(separator: ", "))
+            }
         }
 
         if w.hasResult {
-            let freshness = TrailWalkcheck.freshness(
-                of: resultFile, against: [TrailSession.trajectoryFile, TrailSession.mapFile, TrailWalkcheck.file],
-                directory: directory)
+            let freshness = TrailWalkcheck.freshness(of: resultFile, against: scoringInputs, directory: directory)
             if let reason = freshness.reason {
                 w.concerns.append(reason)
                 w.stale = true
