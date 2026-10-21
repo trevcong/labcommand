@@ -11,11 +11,13 @@ python3 -m spatio.memory.ingest /data/walk-001 \
   --recording-dir /data/recording-001 \
   --code-revision <40-lowercase-hex-commit-id> \
   --database /data/evidence.sqlite \
-  --clearance /data/clearance/report.json /data/zones.json < /dev/null
+  --clearance /data/clearance/report.json /data/zones.json \
+              /data/scans.json /data/extrinsics.yaml < /dev/null
 ```
 
 Omit `--clearance` when no clearance result is available. Its first file is
-the classifier's `schema_version: 1` report, not the presentation report.
+the classifier's `schema_version: 1` report, not the presentation report; the
+others are the zones, scans and extrinsics that report was computed from.
 Success prints an `IngestResult` as JSON; refusal exits 2. The result includes
 native session/revision/observation IDs, newly inserted observation IDs,
 skipped items and the new transaction ID (`null` on a no-op).
@@ -40,8 +42,11 @@ The wallpatch report must bind the actual map hash; its `map_path` is ignored.
 Optional clearance requires matching recording and trajectory hashes, matching
 zone geometry, no provenance limitations, and scan times inside the TUM span.
 The existing clearance validator checks counts, coverage and PASS evidence.
-The two-file API validates the recorded scans/extrinsics hashes structurally;
-it cannot independently rehash those source files. `walk_id` and `frame_id`
+Clearance is `(report.json, zones.json, scans.json, extrinsics)`, not the
+plan's two-file tuple: the report's own scans/extrinsics hashes cannot vouch
+for themselves. As in the clearance report CLI, the current scans (canonical
+JSON) and extrinsics (file or tree bytes) are rehashed, and stale results after
+a scan or calibration change are refused. `walk_id` and `frame_id`
 are not database IDs. Interpreting the clearance boxes in R1 assumes the
 clearance frame is the bound trajectory's FAST-LIO map frame; the hash binding
 alone does not prove that frame convention.
@@ -83,7 +88,9 @@ transaction and reuses the session, T1 and R1.
 The `derived_from` key is
 `recording:<sha>|source:<wallpatch|clearance>|item:<name>|record:<sha>`.
 The record hash covers one item, excluding `figure`; report creation time and
-paths are not part of it. Regenerating presentation output does not duplicate
+paths are not part of it. A clearance record hash also covers the verified
+recording, trajectory, scans and extrinsics hashes and the time basis, so an
+identical zone rederived from changed inputs conflicts rather than no-ops. Regenerating presentation output does not duplicate
 evidence. Changed item content, stored values, session identity or revision
 provenance is a conflict. A retracted session is refused: its evidence is
 retracted and needs an operator. Re-processing the same recording under a new
