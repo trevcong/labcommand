@@ -69,13 +69,14 @@ def spread(xyz):
             "max_radius_m": float(radius.max())}
 
 
-def scan_centroid(msg, kind):
+def scan_points(msg, kind):
     if kind == "livox_ros_driver2/msg/CustomMsg":
-        xyz = [[get(p, axis, float("nan")) for axis in "xyz"]
-               for p in get(msg, "points", [])]
-        xyz = np.asarray(xyz, dtype=float).reshape(-1, 3)
-    else:
-        return None
+        for point in get(msg, "points", []):
+            yield [get(point, axis, float("nan")) for axis in "xyz"]
+
+
+def scan_centroid(msg, kind):
+    xyz = np.asarray(list(scan_points(msg, kind)), dtype=float).reshape(-1, 3)
     xyz = xyz[np.isfinite(xyz).all(axis=1)]
     return xyz.mean(axis=0) if len(xyz) else None
 
@@ -110,6 +111,10 @@ def replay_result(session, recording, trajectory_error):
             raise ValueError("replay source_recording does not match the inspected bag files")
         if type(params.get("container_exit")) is not int or params["container_exit"] != 0:
             raise ValueError("run_params container_exit disagrees with saved exit status")
+        duration = params.get("duration_s", "unknown")
+        if (type(duration) not in (str, int, float)
+                or isinstance(duration, float) and not math.isfinite(duration)):
+            raise ValueError("run_params duration_s must be a string or finite number")
         if trajectory_error:
             raise ValueError(trajectory_error)
         columns = read_pcd(str(session / "map.pcd"))
@@ -118,7 +123,7 @@ def replay_result(session, recording, trajectory_error):
             raise ValueError("replay map is empty or contains non-finite points")
         result["map_points"] = len(xyz)
         result["mode"] = params.get("mode")
-        result["requested_duration_s"] = params.get("duration_s", "unknown")
+        result["requested_duration_s"] = duration
         if params.get("mode") == "replay":
             result["status"] = "succeeded"
         elif params.get("mode") == "historical":
@@ -144,13 +149,23 @@ def score(recording, session, parked, *, lidar_topic, settings=SETTINGS, hold_sp
         for topic, receipt, msg in reader.records():
             if topic == lidar_topic:
                 stamp = header_ns(msg)
-                center = scan_centroid(msg, reader.topic_info[topic]["type"])
+                kind = reader.topic_info[topic]["type"]
                 frames.add(str(get(get(msg, "header"), "frame_id", "")))
-                if stamp is not None and center is not None:
-                    scan_times.append(stamp / 1e9)
-                    centroids.append(center)
-                else:
+                if stamp is None:
                     missing_xyz += 1
+                elif any(start <= stamp / 1e9 <= end for start, end in parked):
+                    center = scan_centroid(msg, kind)
+                    if center is None:
+                        missing_xyz += 1
+                    else:
+                        scan_times.append(stamp / 1e9)
+                        centroids.append(center)
+                else:
+                    # Preserve the whole-bag missing-data count, but stop at
+                    # the first usable point outside the labeled windows.
+                    if not any(all(math.isfinite(v) for v in point)
+                               for point in scan_points(msg, kind)):
+                        missing_xyz += 1
             yield topic, receipt, msg
 
     timing = analyze(records(), reader.topic_info)
@@ -171,12 +186,16 @@ def score(recording, session, parked, *, lidar_topic, settings=SETTINGS, hold_sp
     for name, (start, end) in zip(("start", "end"), parked):
         segment = {"name": name, "t_start_s": start, "t_end_s": end}
         segment["pose_jitter"] = unavailable(error or "parked interval lacks trajectory coverage")
-        segment["hold"] = unavailable(error or "hold detection unavailable")
+        segment["hold"] = unavailable(error or "parked interval lacks trajectory coverage")
         if not error:
             mask = (t >= start) & (t <= end)
             covered = (t[0] <= start and t[-1] >= end
                        and np.count_nonzero(mask) >= defaults.MIN_WINDOW_SAMPLES)
             if covered:
+                covered = (t[mask][0] - start <= kwargs["max_gap_s"]
+                           and end - t[mask][-1] <= kwargs["max_gap_s"])
+            if covered:
+                segment["hold"] = unavailable("hold detection unavailable")
                 times, points, rotations = t[mask], xyz[mask], q[mask]
                 if np.any(np.diff(times) > kwargs["max_gap_s"]):
                     segment["pose_jitter"] = unavailable("trajectory gap inside parked interval")
@@ -270,8 +289,10 @@ def main(argv=None):
         report = score(args.recording, args.session, args.parked, lidar_topic=args.lidar_topic,
                        settings=args.settings, hold_speed=args.max_hold_speed)
         write_json_atomic(args.json, report)
-    except (OSError, ValueError) as exc:
-        print(f"preflight: {exc}", file=sys.stderr)
+    except Exception as exc:
+        # MCAP/decoder failures can use exception types outside ValueError.
+        # Keep invalid input on the documented CLI exit path, as bagtiming does.
+        print(f"preflight: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     print(summary(report))
     return 0

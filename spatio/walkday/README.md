@@ -16,12 +16,16 @@ Replace the example timestamps with the operator-labeled start and end parked
 intervals, in **absolute trajectory/lidar header seconds**. The two clocks must
 already correspond; preflight does not align or correct them. Intervals are
 independent of detected holds, so failed holds still yield jitter measurements.
+Pose jitter requires trajectory coverage at both interval edges within the
+configured `MAX_GAP_S`, as well as no larger gap between poses inside the interval.
 The command prints a short summary and writes strict JSON with all topic rates,
 gaps, timestamp regressions/duplicates and header–receipt offsets, saved replay
 status, pose jitter (position, rotation, step speed), Livox CustomMsg scan-centroid
 spread, and whether each parked interval contains a sustained detected hold.
 Centroid spread includes changing scene sampling; it is not per-point accuracy.
 Other cloud types or the timing-only decoder fallback explicitly lack this metric.
+Centroids are calculated only for scans in the parked intervals; timing, frame
+consistency and missing XYZ/header counts still inspect the whole bag.
 
 Settings default to this folder's `walkday.conf`; use `--settings FILE` for the
 recording's settings. They are parsed as numeric assignments, never executed.
@@ -37,7 +41,9 @@ trajectory and map are inspected; no replay is launched. A walk-day session's
 paths must match; this check does not revalidate content hashes. Missing, failed,
 invalid and historical replay evidence are reported separately. Exit 0 means a
 diagnostic report was written (including failures), and exit 2 means invalid
-input or an output error. This tool gives no readiness PASS or physical-accuracy
+input (including corrupt or truncated MCAP) or an output error. Invalid replay
+duration metadata is reported as invalid replay evidence within the diagnostic
+report. This tool gives no readiness PASS or physical-accuracy
 verdict and does not replace the walk-day input gate or measured loop protocol.
 
 ```sh

@@ -222,3 +222,101 @@ def test_cli_summary_and_strict_json(packet, tmp_path):
     assert "Replay: succeeded" in result.stdout
     assert "hold=True" in result.stdout
     assert json.loads(output.read_text())["schema"] == "spatio.preflight/1"
+
+
+@pytest.mark.parametrize("damage", ["truncated", "bad_magic"])
+def test_cli_corrupt_mcap_exits_2(packet, tmp_path, damage):
+    bag, session, _ = packet
+    data = bag.read_bytes()
+    bag.write_bytes(data[:len(data) // 2] if damage == "truncated" else b"corrupt!" + data[8:])
+    output = tmp_path / "preflight.json"
+    result = subprocess.run([sys.executable, "-m", "spatio.preflight", str(bag),
+        "--session", str(session), "--lidar-topic", "/livox/lidar",
+        "--parked", "1000", "1010", "--parked", "1030", "1040", "--json", str(output)],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2, result.stderr
+    assert "preflight:" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("edge", ["start", "end"])
+@pytest.mark.parametrize("gap,measured", [(1., True), (1.1, False)])
+def test_parked_interval_edge_coverage(packet, edge, gap, measured):
+    bag, session, _ = packet
+    # Whole-trajectory coverage and interior spacing are valid. Only the
+    # distance from the label boundary to its first/last pose varies.
+    path = session / "trajectory.tum"
+    data = np.loadtxt(path)
+    if edge == "start":
+        data = data[(data[:, 0] < 1001) | (data[:, 0] >= 1001 + gap)]
+    else:
+        data = data[(data[:, 0] <= 1009 - gap) | (data[:, 0] > 1009)]
+    np.savetxt(path, data)
+    segment = run((bag, session, [(1001., 1009.), (1030., 1040.)]))["parked"][0]
+    assert segment["pose_jitter"]["status"] == ("measured" if measured else "not_measured")
+    if not measured:
+        assert "coverage" in segment["pose_jitter"]["reason"]
+        assert segment["hold"] == preflight.unavailable("parked interval lacks trajectory coverage")
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_nonfinite_replay_duration_is_invalid_evidence(packet, constant):
+    _, session, _ = packet
+    (session / "logs/run_params.json").write_text(
+        '{"mode": "replay", "container_exit": 0, "duration_s": ' + constant + '}')
+    report = run(packet)
+    assert report["replay"]["status"] == "invalid"
+    assert "duration_s" in report["replay"]["reason"]
+    assert report["parked"][0]["pose_jitter"]["status"] == "measured"
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize("duration", ["all", "30", 30., 0])
+def test_replay_duration_preserved(packet, duration):
+    _, session, _ = packet
+    (session / "logs/run_params.json").write_text(json.dumps({
+        "mode": "replay", "container_exit": 0, "duration_s": duration}))
+    replay = run(packet)["replay"]
+    assert replay["status"] == "succeeded"
+    assert replay["requested_duration_s"] == duration
+
+
+def test_outside_labels_report_missing_coverage(packet):
+    bag, session, _ = packet
+    report = run((bag, session, [(990., 999.), (1041., 1050.)]))
+    assert report["detected_holds"]["intervals"]
+    for segment in report["parked"]:
+        assert segment["hold"] == preflight.unavailable("parked interval lacks trajectory coverage")
+
+
+@pytest.mark.parametrize("fault", ["none", "missing_xyz", "frame"])
+def test_centroids_only_use_parked_scans_but_diagnostics_cover_whole_bag(packet, monkeypatch, fault):
+    original_records = preflight.BagReader.records
+    original_centroid = preflight.scan_centroid
+    calls = []
+
+    def records(reader):
+        for topic, receipt, msg in original_records(reader):
+            if topic == "/livox/lidar" and preflight.header_ns(msg) == 1020 * NS:
+                if fault == "missing_xyz":
+                    for point in msg.points:
+                        point.x = float("nan")
+                elif fault == "frame":
+                    msg.header.frame_id = "different_frame"
+            yield topic, receipt, msg
+
+    def centroid(msg, kind):
+        calls.append(preflight.header_ns(msg) / NS)
+        return original_centroid(msg, kind)
+
+    monkeypatch.setattr(preflight.BagReader, "records", records)
+    monkeypatch.setattr(preflight, "scan_centroid", centroid)
+    report = run(packet)
+    assert len(calls) == 202
+    assert all(1000 <= t <= 1010 or 1030 <= t <= 1040 for t in calls)
+    assert report["timing"]["topics"][0]["count"] == 401
+    assert report["scans_without_xyz_or_header"] == (1 if fault == "missing_xyz" else 0)
+    for segment in report["parked"]:
+        assert segment["scan_centroid_spread"]["status"] == (
+            "not_measured" if fault == "frame" else "measured")
