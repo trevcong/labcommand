@@ -32,6 +32,7 @@ import os
 import re
 import sys
 
+from spatio.manifest.jsonio import write_json_atomic
 from spatio.replay.recording import RecordingError, read_metadata
 
 SCHEMA = "spatio.walkday.provenance/1"
@@ -192,9 +193,7 @@ def main(argv=None) -> int:
     except (ProvenanceError, OSError) as exc:
         print(f"provenance: {exc}", file=sys.stderr)
         return 2
-    with open(a.out, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    write_json_atomic(a.out, data)
     print(f"walk-day settings sha256 {data['settings']['sha256']}")
     print(f"FAST-LIO config {data['fastlio_config']['file']} sha256 {data['fastlio_config']['sha256']}")
     d = data["driver_config"]

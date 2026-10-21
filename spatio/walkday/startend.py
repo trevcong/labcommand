@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import json
 import os
 import struct
 import sys
@@ -29,6 +28,8 @@ import sys
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
+
+from spatio.manifest.jsonio import write_json_atomic
 
 SCHEMA = "spatio.walkday.startend/1"
 NOTE = ("information only; not part of PASS/FAIL. Raw end-hold scans registered to raw "
@@ -270,8 +271,7 @@ def main(argv=None):
         print(f"startend: {exc}", file=sys.stderr)
         return 3
     os.makedirs(a.out_dir, exist_ok=True)
-    with open(os.path.join(a.out_dir, "startend.json"), "w") as f:
-        json.dump(out, f, indent=1)
+    write_json_atomic(os.path.join(a.out_dir, "startend.json"), out)
     if out["computed"]:
         r, fl = out["registration"], out["fastlio_relative"]
         print(f"raw-scan start->end (info only): {r['translation_m'] * 100:.1f} cm, yaw {r['yaw_deg']:+.2f} deg, "

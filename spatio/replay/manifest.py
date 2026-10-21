@@ -13,8 +13,15 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import hashlib
-import json
 import os
+import sys
+from pathlib import Path
+
+# replay.sh invokes this file directly, including from outside the repo root.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from spatio.manifest.jsonio import write_json_atomic
 
 CONTRACT_KEYS = (
     "run_id", "source_recording", "sensor", "fastlio_revision", "config_file",
@@ -71,9 +78,7 @@ def main():
     m = build_manifest(args.run_id, args.source_recording, args.sensor,
                        args.fastlio_revision, args.config_file, cfg_sha,
                        args.image, args.notes)
-    with open(os.path.join(args.session_dir, "manifest.json"), "w") as f:
-        json.dump(m, f, indent=2)
-        f.write("\n")
+    write_json_atomic(os.path.join(args.session_dir, "manifest.json"), m)
     print(f"wrote {args.session_dir}/manifest.json")
 
 

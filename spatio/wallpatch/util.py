@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import os
 
 import numpy as np
+
+from spatio.manifest.jsonio import write_json_atomic
 
 
 def to_builtin(obj):
@@ -37,7 +38,4 @@ def write_json(path, doc):
     parent = os.path.dirname(os.path.abspath(path))
     if parent and not os.path.isdir(parent):
         os.makedirs(parent)
-    text = json.dumps(to_builtin(doc), indent=2, allow_nan=False)
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.write("\n")
+    write_json_atomic(path, to_builtin(doc))

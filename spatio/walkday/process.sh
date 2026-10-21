@@ -240,7 +240,7 @@ if [[ -n $PATCHES ]]; then
   cp "$PATCHES" "$SESSION/wallpatch/patches.json" || stop wall-patches "cannot copy patches from $PATCHES"
   PATCH_SPEC_ARGS=()
   [[ -n $SPEC ]] && PATCH_SPEC_ARGS=(--spec "$SPEC")
-  [[ $SYNTHETIC == 1 ]] && PATCH_SPEC_ARGS+=(--synthetic)
+  [[ $SYNTHETIC == 1 ]] && PATCH_SPEC_ARGS+=(--synthetic --recording "$REC")
   PATCH_ORIGIN="$(python3 -m spatio.walkday.patch_origin "$SESSION/wallpatch/patches.json" \
     ${PATCH_SPEC_ARGS[@]+"${PATCH_SPEC_ARGS[@]}"} --map "$SESSION/map.pcd")" \
     || stop wall-patches "supplied patches cannot establish preselection (see above)"

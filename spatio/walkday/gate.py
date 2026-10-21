@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 
 from spatio.manifest.jsonio import write_json_atomic
@@ -30,7 +31,21 @@ from spatio.manifest.jsonio import write_json_atomic
 SCHEMA = "spatio.walkday.input_gate/1"
 
 
+def _require_finite(value, path="bagtiming"):
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"non-finite numeric value at {path}")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _require_finite(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _require_finite(item, f"{path}[{index}]")
+
+
 def evaluate(bt: dict, lidar: str, imu: str) -> dict:
+    # Coverage is copied into the output; header values also affect the verdict
+    # or become warning text. Never let NaN/inf pass as usable timing evidence.
+    _require_finite(bt)
     blocking, warnings = [], []
     topics = {t.get("name"): t for t in bt.get("topics", [])}
     for role, name in (("lidar", lidar), ("imu", imu)):
@@ -96,8 +111,12 @@ def main(argv=None) -> int:
     if not isinstance(bt, dict) or bt.get("schema") != "spatio.bagtiming/1":
         print("gate: not a spatio.bagtiming/1 report", file=sys.stderr)
         return 3
-    out = evaluate(bt, args.lidar, args.imu)
-    write_json_atomic(args.out, out)
+    try:
+        out = evaluate(bt, args.lidar, args.imu)
+        write_json_atomic(args.out, out)
+    except ValueError as exc:
+        print(f"gate: {exc}", file=sys.stderr)
+        return 3
     for line in out["blocking"]:
         print(f"INPUT BLOCKED: {line}", file=sys.stderr)
     for line in out["warnings"]:

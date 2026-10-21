@@ -66,8 +66,12 @@ def main(argv=None):
     parser.add_argument("--map", help="this run's map.pcd: binds synthetic sha-less spec boxes")
     parser.add_argument("--synthetic", action="store_true",
                         help="recording is marked SYNTHETIC.json; allow binding sha-less spec boxes")
+    parser.add_argument("--recording", help="recording directory; required with --synthetic")
     args = parser.parse_args(argv)
     try:
+        if args.synthetic and (not args.recording or
+                               not (Path(args.recording) / "SYNTHETIC.json").is_file()):
+            raise ValueError("--synthetic requires --recording with a SYNTHETIC.json marker file")
         document = json.loads(Path(args.patches).read_text(encoding="utf-8"))
         origin = classify(document, args.spec)
         if origin == "preselected":

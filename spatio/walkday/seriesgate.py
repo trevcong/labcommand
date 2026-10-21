@@ -31,6 +31,7 @@ import json
 import os
 import sys
 
+from spatio.manifest.jsonio import write_json_atomic, write_text_atomic
 from spatio.series.cli import VERDICT_EXIT
 from spatio.series.report import order_walks, render_markdown
 from spatio.series.validate import InputRejected, Unreadable, load_walk_result
@@ -169,11 +170,8 @@ def main(argv=None) -> int:
         print("rejected: %s" % exc, file=sys.stderr)
         return 1
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "series.md"), "w", encoding="utf-8") as f:
-        f.write(render(report))
-    with open(os.path.join(out_dir, "series.json"), "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    write_text_atomic(os.path.join(out_dir, "series.md"), render(report))
+    write_json_atomic(os.path.join(out_dir, "series.json"), report)
     print("%s %s" % (report["verdict"], os.path.join(out_dir, "series.md")))
     return VERDICT_EXIT[report["verdict"]]
 
