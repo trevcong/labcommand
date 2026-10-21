@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 
 from spatio.manifest.jsonio import write_json_atomic
+from spatio.wall_scoring import _same_box
+from spatio.wallpatch.pcd import sha256_file
 
 
 def classify(document, spec_path=None):
@@ -37,15 +39,37 @@ def classify(document, spec_path=None):
     return "preselected"
 
 
+def bind_spec_boxes(document, spec_path, map_path):
+    """Give a sha-less preselected file this run's map sha256.
+
+    Allowed only when the frozen spec fixes every patch box and each supplied
+    box is the spec's box: those boxes were chosen before any run, so they hold
+    on every run's map. A file that names a map_sha256 keeps it.
+    """
+    if document.get("map_sha256") is not None:
+        return
+    spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    boxes = {p["name"].strip(): p.get("box_map_frame") for p in spec["wall_patches"]}
+    for patch in document["patches"]:
+        box = boxes[patch["name"].strip()]
+        if box is None or not _same_box(box, patch.get("box_map_frame")):
+            raise ValueError(f"patch {patch['name']}: no map_sha256, and its box is not "
+                             "the frozen spec's fixed box")
+    document["map_sha256"] = sha256_file(map_path)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("patches")
     parser.add_argument("--spec")
+    parser.add_argument("--map", help="this run's map.pcd: binds a sha-less file whose boxes are the spec's")
     args = parser.parse_args(argv)
     try:
         document = json.loads(Path(args.patches).read_text(encoding="utf-8"))
         origin = classify(document, args.spec)
         if origin == "preselected":
+            if args.map:
+                bind_spec_boxes(document, args.spec, args.map)
             for patch in document["patches"]:
                 patch["origin"] = origin
             write_json_atomic(args.patches, document)
