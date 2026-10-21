@@ -66,10 +66,13 @@ public struct TrailSession: Equatable, Sendable {
     public var walkcheckUnverifiable: Bool
     /// Optional `topdown.png` written by walkcheck.
     public var topdownPath: String?
+    /// The final verdict in a walk-day folder (`TrailWalkday`); nil in other folders. When
+    /// set, `walkcheck` is an input to it and is not shown as the verdict.
+    public var walkday: TrailWalkday?
 
     public init(directory: String, trajectory: TrailTrajectory?, map: TrailMapCloud?, manifest: TrailManifest?, problems: [String],
                 walkcheck: TrailWalkcheck? = nil, walkcheckStale: String? = nil, walkcheckUnverifiable: Bool = false,
-                topdownPath: String? = nil) {
+                topdownPath: String? = nil, walkday: TrailWalkday? = nil) {
         self.directory = directory
         self.trajectory = trajectory
         self.map = map
@@ -79,6 +82,7 @@ public struct TrailSession: Equatable, Sendable {
         self.walkcheckStale = walkcheckStale
         self.walkcheckUnverifiable = walkcheckUnverifiable
         self.topdownPath = topdownPath
+        self.walkday = walkday
     }
 
     public var name: String {
@@ -140,8 +144,14 @@ public struct TrailSession: Equatable, Sendable {
             problems.append("\(manifestFile) missing")
         }
 
+        let walkday = TrailWalkday.read(directory: directory)
         guard trajectory != nil || map != nil else {
-            throw TrailError.session("Nothing to show in \(directory): " + problems.joined(separator: "; "))
+            var text = "Nothing to show in \(directory): " + problems.joined(separator: "; ")
+            if let walkday {
+                text += ". Walk-day result: \(TrailReadout.walkdayText(walkday))"
+                if !walkday.reasons.isEmpty { text += " (" + walkday.reasons.joined(separator: "; ") + ")" }
+            }
+            throw TrailError.session(text)
         }
 
         // Walkcheck is optional: absent is not a problem, unreadable is.
@@ -164,7 +174,7 @@ public struct TrailSession: Equatable, Sendable {
         return TrailSession(directory: directory, trajectory: trajectory, map: map, manifest: manifest, problems: problems,
                             walkcheck: walkcheck, walkcheckStale: walkcheckStale,
                             walkcheckUnverifiable: walkcheckUnverifiable,
-                            topdownPath: fm.fileExists(atPath: topdown) ? topdown : nil)
+                            topdownPath: fm.fileExists(atPath: topdown) ? topdown : nil, walkday: walkday)
     }
 
     /// The folder named by `LABCOMMAND_TRAIL_SESSION`. `fixture` is the synthetic loop:

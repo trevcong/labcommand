@@ -118,11 +118,17 @@ public struct TrailWalkcheck: Equatable, Sendable {
     ///
     /// Modification times only, once the trajectory parses: a copy that keeps an old time is missed.
     public static func freshness(directory: String) -> Freshness {
+        freshness(of: file, against: [TrailSession.trajectoryFile, TrailSession.mapFile], directory: directory)
+    }
+
+    /// The same rule for any verdict file `scoredFile` in `directory`, scored from `inputs`
+    /// (the trajectory first). `TrailWalkday` uses it for `walk_result.json`.
+    static func freshness(of scoredFile: String, against inputs: [String], directory: String) -> Freshness {
         let fm = FileManager.default
         func modified(_ name: String) -> Date? {
             (try? fm.attributesOfItem(atPath: (directory as NSString).appendingPathComponent(name)))?[.modificationDate] as? Date
         }
-        guard let scored = modified(file) else { return Freshness(reason: nil, unverifiable: false) }
+        guard let scored = modified(scoredFile) else { return Freshness(reason: nil, unverifiable: false) }
         let trajectory = TrailSession.trajectoryFile
         if modified(trajectory) == nil {
             return Freshness(
@@ -132,13 +138,13 @@ public struct TrailWalkcheck: Equatable, Sendable {
         if let unusable = unusableTrajectory(directory: directory) {
             return Freshness(reason: unusable, unverifiable: true)
         }
-        let newer = [trajectory, TrailSession.mapFile].filter { name in
+        let newer = inputs.filter { name in
             // A missing map is not a newer file. The trajectory was checked above.
             modified(name).map { scored < $0 } ?? false
         }
         guard !newer.isEmpty else { return Freshness(reason: nil, unverifiable: false) }
         return Freshness(
-            reason: "\(file) is older than \(newer.joined(separator: " and ")); its verdict may be for earlier files",
+            reason: "\(scoredFile) is older than \(newer.joined(separator: " and ")); its verdict may be for earlier files",
             unverifiable: false)
     }
 
@@ -181,7 +187,10 @@ public struct TrailSessionEntry: Equatable, Sendable, Identifiable {
     public var walkcheckStale: Bool
     /// True when `trajectory.tum` is missing or unusable, so the verdict cannot be checked. Never green.
     public var walkcheckUnverifiable: Bool
-    /// Newest of the trajectory and map modification times.
+    /// The final verdict in a walk-day folder. When set, the list shows it, not the walkcheck.
+    public var walkday: TrailWalkday?
+    /// Newest of the trajectory and map modification times (the walk-day report's in a run
+    /// that stopped before either was written).
     public var modified: Date
     public var id: String { directory }
 }
@@ -195,6 +204,14 @@ public enum TrailLibrary {
     public static var defaultRoot: String {
         NSHomeDirectory() + "/Developer/spatio-data/sessions"
     }
+
+    /// Where `spatio/walkday/process.sh` writes walk-day runs by default.
+    public static var walkdayRoot: String {
+        NSHomeDirectory() + "/Developer/spatio-data/walkday"
+    }
+
+    /// The roots the Trail tab lists, walk-day runs first.
+    public static var defaultRoots: [String] { [walkdayRoot, defaultRoot] }
 
     static func isDirectory(_ path: String) -> Bool {
         var isDir: ObjCBool = false
@@ -215,8 +232,21 @@ public enum TrailLibrary {
         return isDirectory(root) ? root : nil
     }
 
+    /// `pickerStart` with the first of `roots` that exists.
+    public static func pickerStart(saved: String?, roots: [String]) -> String? {
+        pickerStart(saved: saved, root: roots.first(where: isDirectory) ?? roots.first ?? "")
+    }
+
+    /// Every root's sessions, newest first.
+    public static func scan(roots: [String]) -> [TrailSessionEntry] {
+        roots.flatMap { scan(root: $0) }.sorted { a, b in
+            a.modified != b.modified ? a.modified > b.modified : a.directory < b.directory
+        }
+    }
+
     /// Subfolders of `root` holding a trajectory or a map, newest first. Empty folders
-    /// (a replay still starting) are left out; they have nothing to open yet.
+    /// (a replay still starting) are left out; they have nothing to open yet. A walk-day
+    /// run that stopped before writing either is listed, so its verdict is seen.
     public static func scan(root: String) -> [TrailSessionEntry] {
         let fm = FileManager.default
         guard let names = try? fm.contentsOfDirectory(atPath: root) else { return [] }
@@ -228,8 +258,10 @@ public enum TrailLibrary {
             let map = (directory as NSString).appendingPathComponent(TrailSession.mapFile)
             let hasTrajectory = fm.fileExists(atPath: tum)
             let hasMap = fm.fileExists(atPath: map)
-            guard hasTrajectory || hasMap else { continue }
-            let modified = [tum, map]
+            let walkday = TrailWalkday.read(directory: directory)
+            guard hasTrajectory || hasMap || walkday != nil else { continue }
+            let report = (directory as NSString).appendingPathComponent(TrailWalkday.reportFile)
+            let modified = (hasTrajectory || hasMap ? [tum, map] : [report])
                 .compactMap { (try? fm.attributesOfItem(atPath: $0))?[.modificationDate] as? Date }
                 .max() ?? .distantPast
             let walkcheck = fm.contents(atPath: (directory as NSString).appendingPathComponent(TrailWalkcheck.file))
@@ -245,6 +277,7 @@ public enum TrailLibrary {
                 walkcheckResult: walkcheck?.result,
                 walkcheckStale: freshness.reason != nil,
                 walkcheckUnverifiable: freshness.unverifiable,
+                walkday: walkday,
                 modified: modified
             ))
         }
@@ -254,12 +287,17 @@ public enum TrailLibrary {
     }
 
     /// Modification times of the files an opened verdict was read from.
-    /// A nil date means the file was absent. Rescan uses this to notice a replacement,
-    /// a new report, or a deletion, and to leave playback alone when nothing changed.
+    /// A nil date, or a name missing from `scoringEvidence`, means the file was absent. Rescan
+    /// uses this to notice a replacement, a new report, or a deletion, and to leave playback
+    /// alone when nothing changed.
     public struct VerdictInputs: Equatable, Sendable {
         public var trajectory: Date?
         public var map: Date?
         public var walkcheck: Date?
+        public var walkResult: Date?
+        public var walkdayReport: Date?
+        /// The rest of `TrailWalkday.scoringInputs`, by file name; an absent file has no key.
+        public var scoringEvidence: [String: Date]
 
         public static func read(directory: String) -> VerdictInputs {
             func modified(_ name: String) -> Date? {
@@ -269,7 +307,12 @@ public enum TrailLibrary {
             return VerdictInputs(
                 trajectory: modified(TrailSession.trajectoryFile),
                 map: modified(TrailSession.mapFile),
-                walkcheck: modified(TrailWalkcheck.file))
+                walkcheck: modified(TrailWalkcheck.file),
+                walkResult: modified(TrailWalkday.resultFile),
+                walkdayReport: modified(TrailWalkday.reportFile),
+                scoringEvidence: Dictionary(uniqueKeysWithValues: TrailWalkday.scoringInputs
+                    .filter { ![TrailSession.trajectoryFile, TrailSession.mapFile, TrailWalkcheck.file].contains($0) }
+                    .compactMap { name in modified(name).map { (name, $0) } }))
         }
     }
 

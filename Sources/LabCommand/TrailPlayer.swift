@@ -26,11 +26,12 @@ final class TrailPlayer: ObservableObject {
 
     @Published private(set) var phase: Phase = .empty
     @Published private(set) var session: TrailSession?
-    /// Session folders under `root`, newest first.
+    /// Session folders under `roots`, newest first.
     @Published private(set) var entries: [TrailSessionEntry] = []
     /// The folder being shown or loaded.
     @Published private(set) var directory: String?
-    let root = TrailLibrary.defaultRoot
+    /// Walk-day runs first, then the earlier replays.
+    let roots = TrailLibrary.defaultRoots
     @Published private(set) var raster: TrailRaster?
     @Published private(set) var mapImage: CGImage?
     @Published private(set) var mapLine: String?
@@ -97,7 +98,7 @@ final class TrailPlayer: ObservableObject {
 
     // MARK: Picking a session
 
-    /// The Trail tab appeared: list the root, and in a normal launch reopen the last folder once.
+    /// The Trail tab appeared: list the roots, and in a normal launch reopen the last folder once.
     func appeared() {
         rescan()
         guard restoresLastSession, !restored, phase == .empty else { return }
@@ -107,15 +108,15 @@ final class TrailPlayer: ObservableObject {
         }
     }
 
-    /// Re-lists the sessions root. Replays write new folders while the app is open.
-    /// Also reloads the session on screen when its trajectory, map or walkcheck has changed
+    /// Re-lists the session roots. Replays write new folders while the app is open.
+    /// Also reloads the session on screen when its trajectory, map, walkcheck or walk-day result has changed
     /// since it was read, so a cached green PASS cannot outlive those files.
     func rescan() {
-        let root = root
+        let roots = roots
         let open = directory
         let opened = openedVerdictInputs
         Task.detached(priority: .utility) { [weak self] in
-            let found = TrailLibrary.scan(root: root)
+            let found = TrailLibrary.scan(roots: roots)
             let reload: String?
             if let open {
                 let now = TrailLibrary.VerdictInputs.read(directory: open)
@@ -150,7 +151,7 @@ final class TrailPlayer: ObservableObject {
             "fixture", resources: Bundle.main.resourceURL, cwd: FileManager.default.currentDirectoryPath))
     }
 
-    /// NSOpenPanel for a session folder. Starts beside the last session, else in the sessions root.
+    /// NSOpenPanel for a session folder. Starts beside the last session, else in the first root that exists.
     func chooseFolder() {
         let panel = NSOpenPanel()
         panel.title = "Open a session folder"
@@ -160,7 +161,7 @@ final class TrailPlayer: ObservableObject {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = false
-        if let start = TrailLibrary.pickerStart(saved: defaults.string(forKey: TrailLibrary.lastSessionKey), root: root) {
+        if let start = TrailLibrary.pickerStart(saved: defaults.string(forKey: TrailLibrary.lastSessionKey), roots: roots) {
             panel.directoryURL = URL(fileURLWithPath: start, isDirectory: true)
         }
         guard panel.runModal() == .OK, let url = panel.url else { return }

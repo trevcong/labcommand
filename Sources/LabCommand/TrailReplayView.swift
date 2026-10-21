@@ -72,12 +72,12 @@ struct TrailReplayView: View {
             .font(LabTheme.t(11, .medium))
             .buttonStyle(QuietButton())
             if shown.isEmpty {
-                Text("No sessions with trajectory.tum or map.pcd in \(abbreviated(player.root)).")
+                Text("No sessions with trajectory.tum or map.pcd in \(rootsLine).")
                     .font(LabTheme.t(11))
                     .foregroundStyle(LabTheme.faint)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text(abbreviated(player.root))
+                Text(rootsLine)
                     .font(LabTheme.mono(10))
                     .foregroundStyle(LabTheme.faint)
                     .lineLimit(1)
@@ -107,7 +107,12 @@ struct TrailReplayView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 4)
-                if let verdict = entry.walkcheckResult {
+                // In a walk-day folder the list shows the final verdict, never the walkcheck input.
+                if let final = entry.walkday {
+                    Text(TrailReadout.walkdayText(final))
+                        .font(LabTheme.mono(10))
+                        .foregroundStyle(verdictTint(TrailReadout.walkdayTone(final)))
+                } else if let verdict = entry.walkcheckResult {
                     Text(TrailReadout.verdictText(verdict, stale: entry.walkcheckStale, unverifiable: entry.walkcheckUnverifiable))
                         .font(LabTheme.mono(10))
                         .foregroundStyle(verdictTint(TrailReadout.verdictTone(verdict, stale: entry.walkcheckStale, unverifiable: entry.walkcheckUnverifiable)))
@@ -140,12 +145,47 @@ struct TrailReplayView: View {
         (path as NSString).abbreviatingWithTildeInPath
     }
 
+    private var rootsLine: String {
+        player.roots.map(abbreviated).joined(separator: " · ")
+    }
+
+    // MARK: - Walk-day result
+
+    private func walkdaySection(_ w: TrailWalkday, session: TrailSession) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(text: "Walk-day result")
+            InstrumentWell {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(TrailReadout.walkdayRows(w)) { row in
+                        if row.label == "Verdict" {
+                            HStack {
+                                Text("Verdict").font(LabTheme.t(12)).foregroundStyle(LabTheme.dim)
+                                Spacer(minLength: 8)
+                                Text(row.value)
+                                    .font(LabTheme.mono(12))
+                                    .fontWeight(.semibold)
+                                    .foregroundStyle(verdictTint(TrailReadout.walkdayTone(w)))
+                            }
+                        } else {
+                            readoutRow(row)
+                        }
+                    }
+                    Text(TrailReadout.walkdayNote(w, accuracyLabel: session.accuracyLabel))
+                        .font(LabTheme.t(10))
+                        .foregroundStyle(LabTheme.faint)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 2)
+                }
+            }
+        }
+    }
+
     // MARK: - Walk check
 
     private func walkcheckSection(_ w: TrailWalkcheck, session: TrailSession) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                SectionLabel(text: "Walk check")
+                SectionLabel(text: session.walkday == nil ? "Walk check" : "Walk check (input)")
                 Spacer(minLength: 4)
                 if session.topdownPath != nil {
                     Button("topdown.png") { showsTopdown = true }
@@ -163,7 +203,10 @@ struct TrailReplayView: View {
                                 Text(row.value)
                                     .font(LabTheme.mono(12))
                                     .fontWeight(.semibold)
-                                    .foregroundStyle(verdictTint(TrailReadout.verdictTone(w.result, stale: session.walkcheckStale != nil, unverifiable: session.walkcheckUnverifiable)))
+                                    // An input to the walk-day verdict is never coloured as one.
+                                    .foregroundStyle(session.walkday == nil
+                                        ? verdictTint(TrailReadout.verdictTone(w.result, stale: session.walkcheckStale != nil, unverifiable: session.walkcheckUnverifiable))
+                                        : LabTheme.dim)
                             }
                         } else {
                             readoutRow(row)
@@ -174,6 +217,12 @@ struct TrailReplayView: View {
                         .foregroundStyle(LabTheme.faint)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.top, 2)
+                    if let walkday = session.walkday {
+                        Text(TrailReadout.walkcheckInputNote(w, walkday: walkday))
+                            .font(LabTheme.t(10))
+                            .foregroundStyle(LabTheme.warn)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
         }
@@ -254,6 +303,10 @@ struct TrailReplayView: View {
                     accuracyBadge(label)
                         .padding(.top, 2)
                 }
+            }
+
+            if let session, let walkday = session.walkday {
+                walkdaySection(walkday, session: session)
             }
 
             if let session, let walkcheck = session.walkcheck {
