@@ -18,7 +18,7 @@ from spatio.walkcheck.cli import main as walkcheck_main
 from spatio.walkcheck import report as report_module
 from spatio.walkcheck.report import plain, render_markdown, write_json, write_markdown
 from spatio.walkcheck.values import measurement_values
-from spatio.walkday import result
+from spatio.walkday import gate, result
 from spatio.walkday.tests.test_result import quiet, write_gate, write_recording
 from spatio.wallpatch.cli import main as wallpatch_main
 
@@ -294,5 +294,44 @@ def test_series_adapt_os_failure_preserves_old_result(tmp_path, monkeypatch, cap
     assert series_cli.main(["adapt", str(report_path), "--metadata", str(meta_path),
                             "--out", str(target), *wall_args(report_path)]) == 2
     assert written == ["walk_result.json"]
+    assert target.read_bytes() == previous if earlier else not target.exists()
+    assert list(target.parent.iterdir()) == ([target] if earlier else [])
+
+
+def bagtiming(tmp_path):
+    lidar, imu = "/test/lidar", "/test/imu"
+    bt = {"schema": "spatio.bagtiming/1",
+          "topics": [{"name": lidar, "count": 100, "header": {}}, {"name": imu, "count": 2000, "header": {}}],
+          "findings": [],
+          "imu_coverage": [{"lidar_topic": lidar, "imu_topic": imu, "scans": 100, "evaluable_scans": 100}]}
+    path = tmp_path / "bagtiming.json"
+    path.write_text(json.dumps(bt))
+    return bt, [str(path), "--lidar", lidar, "--imu", imu]
+
+
+def test_input_gate_writes_atomically(tmp_path, monkeypatch, capsys):
+    # Issue #115: result.py decides from input_gate.json whether a run is scored.
+    bt, argv = bagtiming(tmp_path)
+    target = tmp_path / "logs" / "input_gate.json"
+    target.parent.mkdir()
+    written = spy_writes(monkeypatch, gate)
+    assert gate.main(argv + ["--out", str(target)]) == 0
+    assert written == ["input_gate.json"]
+    assert json.loads(target.read_text()) == gate.evaluate(bt, argv[2], argv[4])
+    assert list(target.parent.iterdir()) == [target]
+
+
+@pytest.mark.parametrize("earlier", [False, True])
+@pytest.mark.parametrize("operation", ["fsync", "replace"])
+def test_input_gate_os_failure_preserves_old_gate(tmp_path, monkeypatch, capsys, earlier, operation):
+    _, argv = bagtiming(tmp_path)
+    target = tmp_path / "logs" / "input_gate.json"
+    target.parent.mkdir()
+    previous = b'{"earlier": true}\n'
+    if earlier:
+        target.write_bytes(previous)
+    fail_while_pending(monkeypatch, operation, target)
+    with pytest.raises(OSError, match=operation):
+        gate.main(argv + ["--out", str(target)])
     assert target.read_bytes() == previous if earlier else not target.exists()
     assert list(target.parent.iterdir()) == ([target] if earlier else [])
