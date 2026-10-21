@@ -500,20 +500,33 @@ class EvidenceStore:
             raise
         conn.execute("RELEASE write")
 
+    def _uncommitted(self) -> int:
+        """The first txn_id not yet committed: the open transaction's, if any."""
+        return self._txn if self._txn is not None else 1 << 62
+
     def latest_txn(self) -> int:
-        """The newest committed transaction id, 0 for an empty store."""
-        row = self.connection.execute("SELECT max(txn_id) FROM transactions").fetchone()
+        """The newest committed transaction id, 0 for an empty store. The open
+        transaction, if any, is not committed and is never reported."""
+        row = self.connection.execute(
+            "SELECT max(txn_id) FROM transactions WHERE txn_id < ?", (self._uncommitted(),)
+        ).fetchone()
         return int(row[0] or 0)
 
-    def known_at_wall(self, wall_time: float) -> Optional[int]:
-        """The newest transaction with ``recorded_at <= wall_time`` (§2.1), else None."""
+    def known_at_wall(self, wall_time: float) -> int:
+        """The newest committed transaction with ``recorded_at <= wall_time`` (§2.1).
+        0, the empty history, when there is none: never None, which queries read
+        as the newest transaction."""
         row = self.connection.execute(
-            "SELECT max(txn_id) FROM transactions WHERE recorded_at <= ?",
-            (_finite(wall_time, "wall_time"),),
+            "SELECT max(txn_id) FROM transactions WHERE recorded_at <= ? AND txn_id < ?",
+            (_finite(wall_time, "wall_time"), self._uncommitted()),
         ).fetchone()
-        return None if row[0] is None else int(row[0])
+        return int(row[0] or 0)
 
     def _resolve(self, known_at: Optional[int]) -> int:
+        # Inside an open transaction the connection sees uncommitted rows, and a
+        # purge's deletes, at every known_at, so no answer there could be reproduced.
+        if self._txn is not None:
+            raise ValidationError("queries are not answered inside an open transaction")
         latest = self.latest_txn()
         if known_at is None:
             return latest

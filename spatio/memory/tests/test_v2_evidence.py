@@ -191,7 +191,7 @@ def test_transactions_monotonic_wall_floor_and_known_at_wall(store, clock):
 
     with clock.reads_forbidden():
         assert store.latest_txn() == 3
-        assert store.known_at_wall(W0 + 99) is None
+        assert store.known_at_wall(W0 + 99) == 0
         assert store.known_at_wall(W0 + 100) == 2
         assert store.known_at_wall(W0 + 150) == 2
         assert store.known_at_wall(W0 + 1e6) == 3
@@ -335,6 +335,70 @@ def test_correction_is_one_transaction(store, clock):
         assert (at_k1["label"], at_k1["source_kind"]) == ("chair", "model")
         assert (at_k2["label"], at_k2["source_kind"]) == ("stool", "operator")
         assert support(store, "X", known_at=k1) == support(store, "X", known_at=k2) == [d]
+
+
+def test_known_at_wall_before_history_is_empty_not_latest(store, clock):
+    """Review P1: a wall time before every transaction resolves to the empty
+    history (0), never to None, which queries read as the newest transaction."""
+    clock.t = W0 + 100
+    _, r1 = seed(store)
+    d = detect(store, "S1", T0, map_revision_id=r1)
+    with clock.reads_forbidden():
+        k = store.known_at_wall(W0 + 99)
+        assert k == 0
+        answer = store.evidence_for("X", NOW, k)
+        assert answer["known_at"] == 0 and answer["support"] == []
+        assert store.open_look_again("X", k) == []
+        assert support(store, "X", known_at=store.known_at_wall(W0 + 100)) == [d]
+
+
+def test_no_query_inside_an_open_transaction(store, clock):
+    """Review P1: inside a correction the connection sees its uncommitted rows, so
+    a read there could give an answer no later replay of its known_at reproduces."""
+    _, r1 = seed(store)
+    d = detect(store, "S1", T0, map_revision_id=r1, label="chair")
+    k1 = store.latest_txn()
+    (chair,) = interpretation_ids(store, d)
+    clock.t = W0 + 50
+    before = canonical_json(store.evidence_for("X", NOW, k1))
+
+    queries = (
+        lambda k: store.evidence_for("X", NOW, k),
+        lambda k: store.active_interpretations(d, k),
+        lambda k: store.is_invalid("interpretation", chair, k),
+        lambda k: store.active_trajectory_revision("S1", k),
+        lambda k: store.is_frame_current(r1, k),
+        lambda k: store.compare_positions(d, d, k),
+        lambda k: store.open_look_again("X", k),
+    )
+
+    def refused_inside(k2):
+        # The open transaction is not committed history.
+        assert store.latest_txn() == k1
+        assert store.known_at_wall(W0 + 1e6) == k1
+        for query in queries:
+            for k in (None, k1, k2):
+                with pytest.raises(ValidationError, match="open transaction"):
+                    query(k)
+
+    with pytest.raises(RuntimeError):
+        with store.transaction(OPERATOR, "correct_label") as k2:
+            store.retract("interpretation", chair, "is a stool", retracted_by=OPERATOR)
+            refused_inside(k2)
+            raise RuntimeError("abort")
+    assert store.latest_txn() == k1
+    assert canonical_json(store.evidence_for("X", NOW, k1)) == before
+
+    with store.transaction(OPERATOR, "correct_label") as k2:
+        store.retract("interpretation", chair, "is a stool", retracted_by=OPERATOR)
+        refused_inside(k2)
+        store.add_interpretation(d, "X", "stool", 1.0, source_kind="operator", writer=OPERATOR)
+        refused_inside(k2)
+    assert store.latest_txn() == k2 == k1 + 1
+    assert canonical_json(store.evidence_for("X", NOW, k1)) == before
+    assert support(store, "X", known_at=k2) == [d]
+    (label,) = store.active_interpretations(d, k2)
+    assert label["label"] == "stool"
 
 
 # 5 ---------------------------------------------------------------------------
