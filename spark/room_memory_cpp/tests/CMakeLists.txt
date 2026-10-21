@@ -34,7 +34,7 @@ cmake_host_system_information(RESULT HOST_CORES QUERY NUMBER_OF_LOGICAL_CORES)
 set(THREAD_COUNTS 1 3 ${HOST_CORES})
 list(REMOVE_DUPLICATES THREAD_COUNTS)
 
-foreach(suite goldens core messages memory generation cli guard imu state objects)
+foreach(suite goldens core messages memory generation cli guard imu state objects node_main)
   add_executable(test_${suite} test_${suite}.cpp)
   target_link_libraries(test_${suite} PRIVATE room_memory_test_support)
 endforeach()
@@ -57,6 +57,7 @@ add_test(NAME guard COMMAND test_guard)
 add_test(NAME imu COMMAND test_imu)
 add_test(NAME state COMMAND test_state)
 add_test(NAME objects COMMAND test_objects)
+add_test(NAME node_main COMMAND test_node_main)
 
 # The installed binary itself, byte for byte, on both change-detection fixtures.
 foreach(sensor jt128 mid360)
