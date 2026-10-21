@@ -20,7 +20,10 @@ from spatio.walkcheck.report import plain, render_markdown, write_json, write_ma
 from spatio.walkcheck.values import measurement_values
 from spatio.walkday import gate, result
 from spatio.walkday.tests.test_result import quiet, write_gate, write_recording
+from spatio.wallpatch import measure
 from spatio.wallpatch.cli import main as wallpatch_main
+from spatio.wallpatch.pcd import write_binary_pcd
+from spatio.wallpatch.tests.test_wallpatch import _box, _two_sheets, _write_patches
 
 FIXTURES = Path(__file__).resolve().parents[2] / "io" / "fixtures"
 
@@ -335,3 +338,55 @@ def test_input_gate_os_failure_preserves_old_gate(tmp_path, monkeypatch, capsys,
         gate.main(argv + ["--out", str(target)])
     assert target.read_bytes() == previous if earlier else not target.exists()
     assert list(target.parent.iterdir()) == ([target] if earlier else [])
+
+
+def wallpatch_inputs(tmp_path, earlier):
+    """Map, patches and out dir for measure_map; out/wallpatch.md holds earlier if given."""
+    map_path, patches_path, out = tmp_path / "map.pcd", tmp_path / "patches.json", tmp_path / "out"
+    write_binary_pcd(str(map_path), _two_sheets(separation=0.06, sigma=0.005, n_each=2000, seed=7))
+    _write_patches(str(patches_path), str(map_path), [_box("double", (0, 0, 0), (0, 1, 0), (0.6, 0.2, 0.6))])
+    if earlier is not None:
+        out.mkdir()
+        (out / "wallpatch.md").write_bytes(earlier)
+    return str(map_path), str(patches_path), out
+
+
+def test_wallpatch_measure_writes_markdown_atomically(tmp_path, monkeypatch):
+    # Issue #115: wallpatch.md goes through the temp+fsync+replace helper.
+    map_path, patches_path, out = wallpatch_inputs(tmp_path, None)
+    written = spy_writes(monkeypatch, measure)
+    report = measure.measure_map(map_path, patches_path, str(out))
+    assert written == ["wallpatch.md"]
+    assert (out / "wallpatch.md").read_text(encoding="utf-8") == measure._markdown(report)
+    assert not list(out.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("earlier", [False, True])
+def test_wallpatch_render_failure_preserves_old_report(tmp_path, monkeypatch, earlier):
+    # The report is rendered before the file is touched, so a failing render
+    # cannot leave an empty wallpatch.md in place of the earlier one.
+    previous = b"# earlier wallpatch report\n"
+    map_path, patches_path, out = wallpatch_inputs(tmp_path, previous if earlier else None)
+
+    def broken(report):
+        raise RuntimeError("injected render")
+
+    monkeypatch.setattr(measure, "_markdown", broken)
+    with pytest.raises(RuntimeError, match="injected render"):
+        measure.measure_map(map_path, patches_path, str(out))
+    target = out / "wallpatch.md"
+    assert target.read_bytes() == previous if earlier else not target.exists()
+    assert not list(out.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("earlier", [False, True])
+@pytest.mark.parametrize("operation", ["fsync", "replace"])
+def test_wallpatch_os_failure_preserves_old_report(tmp_path, monkeypatch, earlier, operation):
+    previous = b"# earlier wallpatch report\n"
+    map_path, patches_path, out = wallpatch_inputs(tmp_path, previous if earlier else None)
+    target = out / "wallpatch.md"
+    fail_while_pending(monkeypatch, operation, target)
+    with pytest.raises(OSError, match=operation):
+        measure.measure_map(map_path, patches_path, str(out))
+    assert target.read_bytes() == previous if earlier else not target.exists()
+    assert not list(out.glob("*.tmp"))
