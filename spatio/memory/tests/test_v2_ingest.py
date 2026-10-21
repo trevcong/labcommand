@@ -64,12 +64,21 @@ def run(tmp_path):
     measure_map(session / "map.pcd", patches, session / "wallpatch")
     zones, _, scans = four_statuses()
     parse_zones(zones)
-    result = clearance_report(zones, scans, .1, [0, 0, 0], .02, inputs={
+    extrinsics = tmp_path / "extrinsics.yaml"
+    extrinsics.write_text("lidar_to_base: identity")
+    clearance = (tmp_path / "clearance.json", write(tmp_path / "zones.json", zones),
+                 write(tmp_path / "scans.json", scans), extrinsics)
+    write(clearance[0], classify(session, recording, clearance))
+    return session, recording, clearance
+
+
+def classify(session, recording, clearance):
+    """Classifier report.json from the clearance files' current bytes."""
+    zones, scans = (json.loads(p.read_text()) for p in clearance[1:3])
+    return clearance_report(zones, scans, .1, [0, 0, 0], .02, inputs={
         "recording": provenance.sha256_path(recording),
         "trajectory": provenance.sha256_path(session / "trajectory.tum"),
-        "extrinsics": "a" * 64, "time_basis": "sensor seconds"})
-    clearance = (write(tmp_path / "clearance.json", result), write(tmp_path / "zones.json", zones))
-    return session, recording, clearance
+        "extrinsics": provenance.sha256_path(clearance[3]), "time_basis": "sensor seconds"})
 
 
 @pytest.fixture
@@ -300,6 +309,54 @@ def test_clearance_bad_provenance_or_measurement_refused(store, run, problem, me
     assert snapshot(store) == before
 
 
+@pytest.mark.parametrize("change,message", [
+    ("scans file", "scans changed"),
+    ("extrinsics file", "extrinsics changed"),
+    ("recorded scans", "scans changed"),
+    ("recorded extrinsics", "extrinsics changed")])
+def test_clearance_scans_or_extrinsics_mismatch_refused(store, run, change, message):
+    # The results' own scans/extrinsics hashes must not be their only check.
+    if change == "scans file":
+        edit(run[2][2], lambda d: d["scans"][0].update(timestamp=100.5))
+    elif change == "extrinsics file":
+        run[2][3].write_text("lidar_to_base: recalibrated")
+    else:
+        name = change.split()[1] + "_sha256"
+        edit(run[2][0], lambda d: d["provenance"].update({name: "1" * 64}))
+    before = snapshot(store)
+    with pytest.raises(IngestRefused, match=message):
+        ingest(store, run)
+    assert snapshot(store) == before
+
+
+@pytest.mark.parametrize("change", ["scans", "extrinsics"])
+def test_clearance_rederived_from_changed_inputs_conflicts(store, run, change):
+    first = ingest(store, run)
+    rows = observations(store)
+    before = snapshot(store)
+    if change == "scans":
+        # A scan with no hits adds no rays: every zone record is unchanged.
+        edit(run[2][2], lambda d: d["scans"].append(
+            {"timestamp": 103.5, "origin": [50, 50, 50], "hits": []}))
+    else:
+        run[2][3].write_text("lidar_to_base: recalibrated")
+    old = json.loads(run[2][0].read_text())
+    write(run[2][0], classify(run[0], run[1], run[2]))
+    assert json.loads(run[2][0].read_text())["zones"] == old["zones"]
+    with pytest.raises(IngestRefused, match="conflicting derived_from item: .*source:clearance"):
+        ingest(store, run)
+    assert snapshot(store) == before and observations(store) == rows
+    assert store.latest_txn() == first.transaction_id
+
+
+@pytest.mark.parametrize("count", [2, 3, 5])
+def test_clearance_without_scans_and_extrinsics_refused(store, run, tmp_path, count):
+    paths = (*run[2], tmp_path / "extra.json")[:count]
+    with pytest.raises(IngestRefused, match="clearance must be .*scans.json, extrinsics"):
+        ingest_walkday(store, run[0], run[1], CODE, paths)
+    assert store.latest_txn() == 0
+
+
 def test_only_measured_patches_and_pass_zones_ingested(store, run):
     result = ingest(store, run)
     rows = observations(store)
@@ -336,7 +393,7 @@ def test_series_output_refused_as_evidence(store, run, tmp_path):
     with pytest.raises(IngestRefused, match="series output: aggregate verdicts, no geometry"):
         ingest_walkday(store, series, run[1], CODE)
     with pytest.raises(IngestRefused, match="clearance schema"):
-        ingest_walkday(store, run[0], run[1], CODE, (series / "series.json", run[2][1]))
+        ingest_walkday(store, run[0], run[1], CODE, (series / "series.json", *run[2][1:]))
     assert store.latest_txn() == 0
 
 
@@ -428,6 +485,18 @@ def test_cli_success_noop_and_input_database_protection(run, tmp_path):
     os.link(database, hardlink)
     refused = subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL)
     assert refused.returncode == 2 and "hard link" in refused.stderr
+
+
+def test_cli_clearance_rehashes_scans_and_extrinsics(run, tmp_path):
+    command = [sys.executable, "-m", "spatio.memory.ingest", str(run[0]),
+               "--recording-dir", str(run[1]), "--code-revision", CODE,
+               "--database", str(tmp_path / "cli.sqlite"), "--clearance", *map(str, run[2])]
+    first = subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    assert first.returncode == 0, first.stderr
+    assert len(json.loads(first.stdout)["inserted_observation_ids"]) == 3
+    run[2][3].write_text("lidar_to_base: recalibrated")
+    refused = subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    assert refused.returncode == 2 and "extrinsics changed" in refused.stderr
 
 
 def test_changed_measurement_to_skipped_is_conflict(store, run):

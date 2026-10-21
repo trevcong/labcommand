@@ -149,6 +149,12 @@ def _fingerprint(manifest, recording):
             raise IngestRefused("source_fingerprint bag hash mismatch")
 
 
+def _clearance_paths(clearance):
+    if isinstance(clearance, (str, bytes, os.PathLike)) or len(clearance) != 4:
+        raise IngestRefused("clearance must be (report.json, zones.json, scans.json, extrinsics)")
+    return tuple(map(_path, clearance))
+
+
 def _prepare(session_dir, recording_dir, code_revision, clearance):
     if not isinstance(code_revision, str) or not re.fullmatch(r"[0-9a-f]{40}", code_revision):
         raise IngestRefused("code_revision must be 40 lowercase hex characters")
@@ -187,12 +193,16 @@ def _prepare(session_dir, recording_dir, code_revision, clearance):
              built_by="spatio.walkday", **method)
     observations, skipped, identities, record_keys = [], [], set(), []
 
-    def record_key(source, item, record):
+    def record_key(source, item, record, inputs=None):
         _text(item, "item identity")
         if "|" in item or (source, item) in identities:
             raise IngestRefused("duplicate or ambiguous item identity")
         identities.add((source, item))
-        record_hash = provenance.canonical_sha256({k: v for k, v in record.items() if k != "figure"})
+        content = {k: v for k, v in record.items() if k != "figure"}
+        # Bound input identities: rederiving an unchanged record from changed
+        # scans or calibration is a different derivation, hence a conflict.
+        record_hash = provenance.canonical_sha256(
+            content if inputs is None else {"record": content, "inputs": inputs})
         key = f"recording:{raw_hash}|source:{source}|item:{item}|record:{record_hash}"
         record_keys.append(key)
         return key
@@ -235,18 +245,20 @@ def _prepare(session_dir, recording_dir, code_revision, clearance):
         add("wallpatch", key, "detection", box, patch["residuals"]["p95_abs_m"], report["gates"])
 
     if clearance is not None:
-        result_path, zones_path = map(_path, clearance)
+        result_path, zones_path, scans_path, extrinsics_path = _clearance_paths(clearance)
         results, zones_data = _json(result_path), _json(zones_path)
         if results.get("schema_version") != 1 or "schema" in results:
             raise IngestRefused("unsupported clearance schema (expected classifier report.json)")
         p = results["provenance"]
         if p["limitations"]:
             raise IngestRefused("clearance provenance limitations must be empty")
-        # The two-file API cannot re-read scans/extrinsics. Their recorded hashes
-        # are structurally validated, not claimed as independently reverified.
-        checked = build_report(results, zones_data, sid, {
-            "recording": raw_hash, "trajectory": hashes["trajectory.tum"],
-            "scans": p["scans_sha256"], "extrinsics": p["extrinsics_sha256"]})
+        # Rehash the current scans and calibration, as the clearance report CLI
+        # does; the results' own recorded hashes cannot vouch for themselves.
+        _members(extrinsics_path)
+        inputs = {"recording": raw_hash, "trajectory": hashes["trajectory.tum"],
+                  "scans": provenance.canonical_sha256(_json(scans_path)),
+                  "extrinsics": provenance.sha256_path(extrinsics_path)}
+        checked = build_report(results, zones_data, sid, inputs)
         _text(p["time_basis"], "clearance time_basis")
         times = checked["scan_time_range"]
         if times is not None and not start <= times[0] <= times[1] <= end:
@@ -254,7 +266,7 @@ def _prepare(session_dir, recording_dir, code_revision, clearance):
         definitions = {z.id: z for z in parse_zones(zones_data)[1]}
         params = {k: results[k] for k in ("voxel_size_m", "grid_origin", "uncertainty_m", "min_free_rays")}
         for zone in results["zones"]:
-            key = record_key("clearance", zone["id"], zone)
+            key = record_key("clearance", zone["id"], zone, dict(inputs, time_basis=p["time_basis"]))
             if zone["status"] != "PASS":
                 skipped.append(f"clearance:{zone['id']}:{zone['status']}")
                 continue
@@ -276,13 +288,14 @@ def _existing(connection, table, identity, values):
 def ingest_walkday(store, session_dir, recording_dir, code_revision, clearance=None):
     """Append one validated run atomically. An identical re-ingest writes nothing.
 
-    clearance is (classifier report.json, zones.json). The store must be opened
+    clearance is (classifier report.json, zones.json, scans.json, extrinsics):
+    the current scans and calibration are rehashed against the results. The store must be opened
     outside input trees; the CLI checks this before opening/creating a database.
     """
     try:
         inputs = [_path(session_dir), _path(recording_dir)]
         if clearance is not None:
-            inputs.extend(map(_path, clearance))
+            inputs.extend(_clearance_paths(clearance))
         for database in store.connection.execute("PRAGMA database_list"):
             if database[2]:
                 _protect(database[2], inputs)
@@ -346,7 +359,8 @@ def main(argv=None):
     parser.add_argument("--recording-dir", type=Path, required=True)
     parser.add_argument("--code-revision", required=True)
     parser.add_argument("--database", type=Path, required=True)
-    parser.add_argument("--clearance", type=Path, nargs=2, metavar=("REPORT", "ZONES"))
+    parser.add_argument("--clearance", type=Path, nargs=4,
+                        metavar=("REPORT", "ZONES", "SCANS", "EXTRINSICS"))
     args = parser.parse_args(argv)
     try:
         inputs = [args.session_dir, args.recording_dir, *(args.clearance or ())]
