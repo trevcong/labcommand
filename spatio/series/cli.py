@@ -12,10 +12,10 @@ Exit 6: REPLAY_ONLY.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 
+from spatio.manifest.jsonio import write_json_atomic, write_text_atomic
 from spatio.series.report import build_series, default_series_id, explain_text, render_markdown
 from spatio.series.validate import InputRejected, Unreadable, load_walk_result
 from spatio.thresholds import WALL_GATE_M, WALL_GATE_STATE, wall_gate
@@ -81,8 +81,7 @@ def _explain(args: argparse.Namespace) -> int:
     text = explain_text(walk)
     if args.out:
         try:
-            with open(args.out, "w", encoding="utf-8") as handle:
-                handle.write(text)
+            write_text_atomic(args.out, text)
         except OSError as exc:
             print("unreadable: %s: %s" % (args.out, exc), file=sys.stderr)
             return 2
@@ -102,11 +101,8 @@ def _compare(args: argparse.Namespace) -> int:
             return 2
         md_path = os.path.join(args.out, "series.md")
         json_path = os.path.join(args.out, "series.json")
-        with open(md_path, "w", encoding="utf-8") as handle:
-            handle.write(markdown)
-        with open(json_path, "w", encoding="utf-8") as handle:
-            json.dump(report, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
+        write_text_atomic(md_path, markdown)
+        write_json_atomic(json_path, report)
     except OSError as exc:
         print("unreadable: %s: %s" % (args.out, exc), file=sys.stderr)
         return 2
@@ -124,9 +120,7 @@ def _adapt(args: argparse.Namespace) -> int:
         gate_m=args.wall_gate_m, gate_state=args.wall_gate_state,
     )
     try:
-        with open(args.out, "w", encoding="utf-8") as handle:
-            json.dump(result, handle, indent=2, allow_nan=False)
-            handle.write("\n")
+        write_json_atomic(args.out, result)
     except OSError as exc:
         raise Unreadable(args.out, str(exc)) from exc
     print("%s %s" % (result["status"], args.out))

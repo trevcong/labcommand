@@ -25,6 +25,8 @@ import argparse
 import json
 import sys
 
+from spatio.manifest.jsonio import write_json_atomic
+
 SCHEMA = "spatio.walkday.input_gate/1"
 
 
@@ -95,8 +97,7 @@ def main(argv=None) -> int:
         print("gate: not a spatio.bagtiming/1 report", file=sys.stderr)
         return 3
     out = evaluate(bt, args.lidar, args.imu)
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2)
+    write_json_atomic(args.out, out)
     for line in out["blocking"]:
         print(f"INPUT BLOCKED: {line}", file=sys.stderr)
     for line in out["warnings"]:

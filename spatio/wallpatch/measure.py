@@ -12,6 +12,7 @@ import os
 
 import numpy as np
 
+from spatio.manifest.jsonio import write_text_atomic
 from spatio.thresholds import WALL_GATE_M
 from spatio.wall_scoring import PASS_MAX_LABEL, PASS_MAX_M
 from spatio.wallpatch.doubled import (
@@ -141,8 +142,7 @@ def measure_map(map_path, patches_path, out_dir, accuracy_label=None, verbose=Fa
         "patches": measured,
     }
     write_json(os.path.join(out_dir, "wallpatch.json"), report)
-    with open(os.path.join(out_dir, "wallpatch.md"), "w", encoding="utf-8") as handle:
-        handle.write(_markdown(report))
+    write_text_atomic(os.path.join(out_dir, "wallpatch.md"), _markdown(report))
     if verbose:
         _print_summary(report, out_dir)
     return report
