@@ -32,7 +32,7 @@ from spatio.walkcheck.holds import (
 
 from spatio.walkcheck.pcd import PcdError, read_pcd_xyz
 from spatio.walkcheck.plot import write_topdown
-from spatio.walkcheck.report import plain, render_markdown, write_json
+from spatio.walkcheck.report import plain, write_json, write_markdown
 from spatio.walkcheck.trajectory import (
     ThresholdError,
     check_scoring_thresholds,
@@ -359,7 +359,7 @@ def evaluate_session(
     report = plain(report)
     if write:
         write_json(session / "walkcheck.json", report)
-        (session / "walkcheck.md").write_text(render_markdown(report), encoding="utf-8")
+        write_markdown(session / "walkcheck.md", report)
         write_topdown(
             session / "topdown.png",
             map_xyz,
