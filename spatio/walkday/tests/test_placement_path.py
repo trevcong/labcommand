@@ -121,6 +121,106 @@ class PlacementPathTest(unittest.TestCase):
         self.assertAlmostEqual(walk["physical_reference"]["placement_tolerance_m"], 0.01)
         return walk
 
+    def rescore_candidate(self, run_id):
+        # Real-shaped session and physical-reference path, with fabricated map,
+        # trajectory and placement measurements. No Docker or physical proof.
+        s, rc = self.scored_run(run_id, 0.003, 0.006, preselected=True)
+        self.assertEqual(rc, 0)
+        rc = py("spatio.walkday.result", str(s), "--spec", str(self.named_spec), ok=False).returncode
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.check_placement(s)["status"], "NOT_EVALUABLE")
+        (s / "logs" / "walkday.conf").write_text(
+            "".join(f"{k}={v}\n" for k, v in TEST_SETTINGS.items()))
+        patches = self.tmp / (run_id + ".patches.json")
+        doc = json.loads((s / "wallpatch" / "patches.json").read_text())
+        for patch in doc["patches"]:
+            patch["origin"] = "preselected"
+        patches.write_text(json.dumps(doc))
+        return s, patches
+
+    def rescore(self, session, patches, *extra):
+        return subprocess.run(
+            ["bash", str(REPO / "spatio/walkday/process.sh"), "--rescore", str(session),
+             "--patches", str(patches), *extra],
+            env=dict(os.environ, SPATIO_WALK_SPEC=str(self.named_spec)),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+
+    def test_rescore_makes_preselected_real_shaped_session_count(self):
+        s, patches = self.rescore_candidate("rescore-ok")
+        self.assertNotEqual(self.series([s], "before-rescore"), "PASS")
+        self.assertEqual(self.last["counted_run_ids"], [])
+        self.assertFalse(self.last["runs"][0]["counts_toward_series"])
+        preserved = ["map.pcd", "trajectory.tum", "manifest.json", "walkcheck.json",
+                     "physical_reference.json", "logs/provenance.json", "logs/input_gate.json",
+                     "logs/walkday.conf"]
+        before = {name: (s / name).read_bytes() for name in preserved}
+        supplied = patches.read_bytes()
+        # The measurement must be regenerated, not reused from the first score.
+        (s / "wallpatch" / "wallpatch.json").write_text("{broken stale measurement")
+        proc = self.rescore(s, patches)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("[9/9] result", (s / "logs/process.log").read_text())
+        walk = self.check_placement(s)
+        self.assertEqual(walk["status"], "PASS")
+        self.assertEqual(walk["wall_patches"]["verified"], PRESELECTED)
+        self.assertEqual(walk["wall_patches"]["origin"], "preselected")
+        self.assertEqual(json.loads((s / "wallpatch/patches.json").read_text()), json.loads(supplied))
+        self.assertEqual(patches.read_bytes(), supplied)
+        for name, data in before.items():
+            self.assertEqual((s / name).read_bytes(), data, name)
+        for stage in ("[1/9]", "[2/9]", "[3/9]", "[6/9]", "[8/9]"):
+            self.assertNotIn(stage, proc.stdout)
+        self.assertEqual(self.series([s], "after-rescore"), "INCOMPLETE")
+        self.assertTrue(self.last["runs"][0]["counts_toward_series"])
+        self.assertEqual(self.last["runs"][0]["count_blockers"], [])
+        # Reusing the installed patch file is supported too.
+        proc = self.rescore(s, s / "wallpatch/patches.json", "--spec", str(self.named_spec))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_rescore_refuses_wrong_or_missing_map_sha_and_retires_old_pass(self):
+        s, patches = self.rescore_candidate("rescore-bad-sha")
+        valid = json.loads(patches.read_text())
+        for sha in ("0" * 64, None):
+            with self.subTest(sha=sha):
+                patches.write_text(json.dumps(valid))
+                proc = self.rescore(s, patches)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                passed = (s / "walk_result.json").read_bytes()
+                measured = (s / "wallpatch/wallpatch.json").read_bytes()
+                invalid = dict(valid)
+                if sha is None:
+                    del invalid["map_sha256"]
+                else:
+                    invalid["map_sha256"] = sha
+                patches.write_text(json.dumps(invalid))
+                proc = self.rescore(s, patches)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("map_sha256", proc.stdout + proc.stderr)
+                self.assertIn("map_sha256", (s / "logs/process.log").read_text())
+                self.assertNotIn("[9/9]", proc.stdout)
+                self.assertFalse((s / "walk_result.json").exists())
+                self.assertEqual((s / "walk_result.json.retired").read_bytes(), passed)
+                self.assertEqual((s / "wallpatch/wallpatch.json").read_bytes(), measured)
+                report = json.loads((s / "walkday.json").read_text())
+                self.assertEqual(report["stopped_at"], "wall-patches")
+                self.assertEqual(report["status"], "NOT_EVALUABLE")
+                self.assertEqual(json.loads((s / "wallpatch/patches.json").read_text()), invalid)
+
+    def test_rescore_measure_failure_cannot_reuse_old_measurement_or_pass(self):
+        s, patches = self.rescore_candidate("rescore-measure-failure")
+        proc = self.rescore(s, patches)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        measured = (s / "wallpatch/wallpatch.json").read_bytes()
+        doc = json.loads(patches.read_text())
+        doc["schema"] = "unsupported-schema"
+        patches.write_text(json.dumps(doc))
+        proc = self.rescore(s, patches)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("wall-patch measurement failed", proc.stdout)
+        self.assertNotIn("[9/9]", proc.stdout)
+        self.assertFalse((s / "walk_result.json").exists())
+        self.assertEqual((s / "wallpatch/wallpatch.json").read_bytes(), measured)
+
     def test_measured_placements_on_preselected_patches_flow_through_to_series_pass(self):
         runs = []
         for i in range(3):

@@ -2,6 +2,10 @@
 # Walk day: score one copied recording from start to finish.
 #
 #   spatio/walkday/process.sh <recording-dir> <run-id> [options]
+#   spatio/walkday/process.sh --rescore SESSION --patches FILE [--spec FROZEN]
+#                           [--settings FILE]
+# Rescore reuses the existing map, walk check and placement evidence; no replay.
+# Its default settings are SESSION/logs/walkday.conf.
 #
 # Stages: copy check + recording start time -> x1 bag timing + input gate -> FAST-LIO replay (A)
 #   -> physical reference (g5, only with --placement-cm) -> manifest (g2)
@@ -45,17 +49,57 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
-usage() { sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; exit 3; }
+usage() { sed -n '2,/^set -uo pipefail/{ /^set -uo pipefail/d; s/^# \{0,1\}//; p; }' "$0"; exit 3; }
 die() { echo "process.sh: $*" >&2; exit 3; }
 
+log_session() {
+  # A temporary FIFO works where opening Bash's /dev/fd process-substitution
+  # path is denied. Close the writer and drain tee before returning to callers.
+  local log_tmp
+  log_tmp="$(mktemp -d "${TMPDIR:-/tmp}/spatio-process.XXXXXX")" || die "cannot create log pipe directory"
+  mkfifo "$log_tmp/pipe" || { rmdir "$log_tmp"; die "cannot create log pipe"; }
+  exec 3>&1 4>&2
+  tee -a "$SESSION/logs/process.log" < "$log_tmp/pipe" &
+  LOG_PID=$!
+  exec > "$log_tmp/pipe" 2>&1
+  rm "$log_tmp/pipe"
+  rmdir "$log_tmp"
+  trap 'rc=$?; exec 1>&3 2>&4 3>&- 4>&-; wait "$LOG_PID" || { [[ $rc != 0 ]] || rc=3; }; exit "$rc"' EXIT
+}
+
+say() { echo "== [walkday $(date +%H:%M:%S)] $*"; }
+stop() {  # stage reason
+  echo
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo "!! NOT-EVALUABLE: stopped at $1"
+  echo "!! $2"
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  # "written": result.py already wrote the report with its own reason (exit 3).
+  [[ ${3:-} == written ]] || python3 -m spatio.walkday.result "$SESSION" --stopped-at "$1" --reason "$2" >/dev/null
+  echo "report: $SESSION/walkday.md"
+  exit 2
+}
+
 [[ $# -ge 2 ]] || usage
-REC_ARG=$1 RUN_ID=$2; shift 2
+RESCORE=0
+if [[ $1 == --rescore ]]; then
+  RESCORE=1
+  [[ -d $2 ]] || die "session folder not found: $2"
+  SESSION="$(cd "$2" && pwd)"
+else
+  REC_ARG=$1 RUN_ID=$2
+fi
+shift 2
 END_CM="" START_CM="" HEADING=not_checked SPEC="${SPATIO_WALK_SPEC:-}" OPERATOR="${USER:-unknown}"
 METHOD="tape measure from the cart reference point to the floor marks"
 CONFIG="" DRIVER_CONFIG="" PATCHES="" SENSOR="" SETTINGS="$HERE/walkday.conf"
 ROOT="${SPATIO_WALKDAY_ROOT:-$HOME/Developer/spatio-data/walkday}"
+[[ $RESCORE == 0 ]] || SETTINGS="$SESSION/logs/walkday.conf"
 while [[ $# -gt 0 ]]; do
   [[ $# -ge 2 ]] || usage
+  if [[ $RESCORE == 1 ]]; then
+    case $1 in --patches|--spec|--settings) ;; *) usage ;; esac
+  fi
   case $1 in
     --placement-cm) END_CM=$2 ;;
     --start-placement-cm) START_CM=$2 ;;
@@ -74,9 +118,6 @@ while [[ $# -gt 0 ]]; do
   shift 2
 done
 
-[[ $RUN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "run-id must match [A-Za-z0-9][A-Za-z0-9_.-]*"
-[[ -d $REC_ARG ]] || die "recording folder not found: $REC_ARG"
-REC="$(cd "$REC_ARG" && pwd)"
 [[ -f $SETTINGS ]] || die "settings not found: $SETTINGS"
 # shellcheck source=walkday.conf
 source "$SETTINGS"
@@ -89,6 +130,11 @@ except ValueError as exc:
     print(f"process.sh: WALL_GATE_M: {exc}", file=sys.stderr)
     sys.exit(2)
 PY
+
+if [[ $RESCORE == 0 ]]; then
+[[ $RUN_ID =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "run-id must match [A-Za-z0-9][A-Za-z0-9_.-]*"
+[[ -d $REC_ARG ]] || die "recording folder not found: $REC_ARG"
+REC="$(cd "$REC_ARG" && pwd)"
 case $HEADING in ok|off|not_checked) ;; *) die "--heading must be ok, off or not_checked" ;; esac
 [[ -z $START_CM || -n $END_CM ]] || die "--start-placement-cm needs --placement-cm"
 if [[ -n $END_CM ]]; then
@@ -119,21 +165,9 @@ SESSION="$ROOT/$RUN_ID"
 [[ -e $SESSION ]] && die "session exists, refusing to overwrite: $SESSION"
 mkdir -p "$SESSION/logs"
 cp "$SETTINGS" "$SESSION/logs/walkday.conf"
-exec > >(tee -a "$SESSION/logs/process.log") 2>&1
+log_session
 
 SYNTHETIC=0; [[ -f $REC/SYNTHETIC.json ]] && SYNTHETIC=1
-say() { echo "== [walkday $(date +%H:%M:%S)] $*"; }
-stop() {  # stage reason
-  echo
-  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-  echo "!! NOT-EVALUABLE: stopped at $1"
-  echo "!! $2"
-  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-  # "written": result.py already wrote the report with its own reason (exit 3).
-  [[ ${3:-} == written ]] || python3 -m spatio.walkday.result "$SESSION" --stopped-at "$1" --reason "$2" >/dev/null
-  echo "report: $SESSION/walkday.md"
-  exit 2
-}
 say "run $RUN_ID  recording $REC  -> $SESSION"
 [[ $SYNTHETIC == 1 ]] && say "SYNTHETIC recording: physical accuracy will not be claimed"
 
@@ -234,13 +268,33 @@ python3 -m spatio.walkcheck "$SESSION" --stationary-window "$STATIONARY_WINDOW_S
 rc=$?
 case $rc in 0|1|2) say "walk checker exit $rc" ;; *) stop walk-check "walkcheck could not use the session (exit $rc)" ;; esac
 
+else
+  [[ -n $PATCHES && -f $PATCHES ]] || die "--rescore requires --patches FILE"
+  [[ -n $SPEC && -f $SPEC ]] || die "--rescore requires a frozen spec (--spec or SPATIO_WALK_SPEC)"
+  for required in map.pcd manifest.json walkcheck.json logs/provenance.json logs/input_gate.json; do
+    [[ -s $SESSION/$required ]] || die "rescore input missing: $SESSION/$required"
+  done
+  PATCHES="$(cd "$(dirname "$PATCHES")" && pwd)/$(basename "$PATCHES")"
+  log_session
+  say "rescore $SESSION (existing replay, walk check and physical reference)"
+  # Retire any earlier countable result before replacing its evidence. A failed
+  # copy, origin check or measure must never leave an earlier PASS countable.
+  python3 -m spatio.walkday.result "$SESSION" --stopped-at wall-patches --reason "rescore in progress" >/dev/null
+  rc=$?; [[ $rc == 2 ]] || stop result "cannot retire the previous result"
+  SYNTHETIC=0
+  REF_ARGS=()
+fi
+
 say "[7/9] wall patches (g8)"
 mkdir -p "$SESSION/wallpatch"
 if [[ -n $PATCHES ]]; then
-  cp "$PATCHES" "$SESSION/wallpatch/patches.json" || stop wall-patches "cannot copy patches from $PATCHES"
+  if [[ ! "$PATCHES" -ef "$SESSION/wallpatch/patches.json" ]]; then
+    cp "$PATCHES" "$SESSION/wallpatch/patches.json" || stop wall-patches "cannot copy patches from $PATCHES"
+  fi
   PATCH_SPEC_ARGS=()
   [[ -n $SPEC ]] && PATCH_SPEC_ARGS=(--spec "$SPEC")
   [[ $SYNTHETIC == 1 ]] && PATCH_SPEC_ARGS+=(--synthetic)
+  [[ $RESCORE == 0 ]] || PATCH_SPEC_ARGS+=(--require-map-sha)
   PATCH_ORIGIN="$(python3 -m spatio.walkday.patch_origin "$SESSION/wallpatch/patches.json" \
     ${PATCH_SPEC_ARGS[@]+"${PATCH_SPEC_ARGS[@]}"} --map "$SESSION/map.pcd")" \
     || stop wall-patches "supplied patches cannot establish preselection (see above)"
@@ -256,14 +310,21 @@ if [[ -f $SESSION/wallpatch/patches.json ]]; then
   ACC_LABEL="replay demonstrated; physical accuracy not evaluated"
   [[ ${#REF_ARGS[@]} -gt 0 ]] && ACC_LABEL="physical reference recorded (see physical_reference.json)"
   [[ $SYNTHETIC == 1 ]] && ACC_LABEL="SYNTHETIC recording; $ACC_LABEL"
+  [[ $RESCORE == 0 ]] || ACC_LABEL="rescored existing session; physical reference status: see walk_result.json"
   python3 -m spatio.wallpatch measure "$SESSION" --patches "$SESSION/wallpatch/patches.json" \
     --out "$SESSION/wallpatch" --wall-gate-m "$WALL_GATE_M" --accuracy-label "$ACC_LABEL; patches: $PATCH_SOURCE" \
-    || say "WARNING: wall-patch measurement failed; walls will be not evaluable"
+    || {
+      [[ $RESCORE == 0 ]] || stop wall-patches "wall-patch measurement failed (see above)"
+      say "WARNING: wall-patch measurement failed; walls will be not evaluable"
+    }
 fi
 
+if [[ $RESCORE == 0 ]]; then
 say "[8/9] raw-scan start->end registration (information only, never scored)"
 python3 -m spatio.walkday.startend "$REC/bag" "$SESSION/trajectory.tum" "$SESSION/startend" \
   --lidar "$LIDAR" --hold "$STATIONARY_WINDOW_S" || say "start->end registration not available (see above)"
+
+fi
 
 say "[9/9] result"
 SPEC_ARGS=()

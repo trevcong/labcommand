@@ -66,10 +66,16 @@ def main(argv=None):
     parser.add_argument("--map", help="this run's map.pcd: binds synthetic sha-less spec boxes")
     parser.add_argument("--synthetic", action="store_true",
                         help="recording is marked SYNTHETIC.json; allow binding sha-less spec boxes")
+    parser.add_argument("--require-map-sha", action="store_true",
+                        help="require map_sha256 to match --map before rescoring (no binding)")
     args = parser.parse_args(argv)
     try:
         document = json.loads(Path(args.patches).read_text(encoding="utf-8"))
         origin = classify(document, args.spec)
+        if args.require_map_sha:
+            expected = document.get("map_sha256")
+            if not args.map or not isinstance(expected, str) or expected.lower() != sha256_file(args.map):
+                raise ValueError("patch map_sha256 must match this session's map.pcd sha256")
         if origin == "preselected":
             if document.get("map_sha256") is None and not args.synthetic:
                 raise ValueError("preselected patches require map_sha256 for real recordings")

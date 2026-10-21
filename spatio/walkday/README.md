@@ -6,6 +6,7 @@ One command per recording, one per series. Plain-English runbook:
 ```sh
 spatio/walkday/process.sh <recording-dir> <run-id> [--start-placement-cm Y --placement-cm X --heading ok --spec FROZEN --patches FILE]
 spatio/walkday/process.sh <recording-dir> <run-id> --config FASTLIO.yaml --driver-config DRIVER.yaml   # two-config run (JT128: jt128_fastlio.yaml + jt128_post.yaml)
+spatio/walkday/process.sh --rescore SESSION --patches FILE [--spec FROZEN]
 spatio/walkday/series.sh <run-id> <run-id> <run-id>      # every attempt, failures included
 spatio/walkday/synth/dryrun.sh                           # synthetic end-to-end dry run
 python3 -m unittest discover -s spatio/walkday/tests -t .
@@ -23,8 +24,41 @@ python3 -m unittest discover -s spatio/walkday/tests -t .
 6. **physical reference (g5):** only with `--placement-cm`. It is never applied for a recording that contains `SYNTHETIC.json`.
 7. **manifest (g2):** build plus validate. The replay's own manifest is kept as `logs/replay_manifest.json`.
 8. **walk check (B):** settings come from `walkday.conf`.
-9. **wall patches (g8):** `--patches FILE` holds the frozen spec's preselected patches (same names), boxed on this run's map. A file without `map_sha256` is bound to this run's `map.pcd` only when the frozen spec fixes every box and each box is the spec's (the dry run supplies such a file). Without it, patches are auto-suggested and labelled NOT preselected. Such a run gets diagnostic measurements but its result is NOT_EVALUABLE and it never counts toward a series.
-10. **result:** `result.py` writes `walk_result.json` (the `spatio.series` input), `walkday.md` and `walkday.json`. The settings identity it writes is checked against what was actually used: the walk check's recorded parameters (`walkcheck.json`) and its own `--wall-gate-m`/`--wall-gate-state`. If any differs (for example, re-scoring with `--wall-gate-m 0.08`), the identity is recomputed from the used values and `walkday.md` lists each change. That run then starts a new series. Before scoring, `result.py` moves any earlier `walk_result.json` aside (`walk_result.json.retired`). If the inputs are rejected (exit 3) or the run stops early, no `walk_result.json` remains, so an old PASS can't be counted: `series.sh` refuses the run and `walkday.md` gives the reason. A run is scored only on a clean input gate: if `logs/input_gate.json` is missing, blocked (for example CLOCK_RESET) or contradictory, the run is NOT-EVALUABLE with its return error withheld, so it never counts. Walls are scored by the shared `spatio.wall_scoring` rule (also used by `spatio.series adapt`); a wall-patch report measured on a different `map.pcd` is rejected (exit 3).
+9. **wall patches (g8):** `--patches FILE` holds the frozen spec's preselected patches (same names), boxed on this run's map. Only for a recording marked `SYNTHETIC.json`, a file without `map_sha256` is bound to this run's `map.pcd` only when the frozen spec fixes every box and each box is the spec's (the dry run supplies such a file). Without it, patches are auto-suggested and labelled NOT preselected. Such a run gets diagnostic measurements but its result is NOT_EVALUABLE and it never counts toward a series.
+10. **result:** `result.py` writes `walk_result.json` (the `spatio.series` input), `walkday.md` and `walkday.json`. The settings identity it writes is checked against what was actually used: the walk check's recorded parameters (`walkcheck.json`) and its own `--wall-gate-m`/`--wall-gate-state`. If any differs (for example, using the result CLI with the stricter `--wall-gate-m 0.03`), the identity is recomputed from the used values and `walkday.md` lists each change. That run then starts a new series. Before scoring, `result.py` moves any earlier `walk_result.json` aside (`walk_result.json.retired`). If the inputs are rejected (exit 3) or the run stops early, no `walk_result.json` remains, so an old PASS can't be counted: `series.sh` refuses the run and `walkday.md` gives the reason. A run is scored only on a clean input gate: if `logs/input_gate.json` is missing, blocked (for example CLOCK_RESET) or contradictory, the run is NOT-EVALUABLE with its return error withheld, so it never counts. Walls are scored by the shared `spatio.wall_scoring` rule (also used by `spatio.series adapt`); a wall-patch report measured on a different `map.pcd` is rejected (exit 3).
+
+For a real walk, select the wall names and descriptions in the frozen spec
+before recording. Export `SPATIO_WALK_SPEC=/absolute/path/to/spec.frozen.json`
+(or pass `--spec` to both commands). First run `process.sh` with the measured
+start/end placements and heading, without `--patches`. The resulting map can
+then be boxed at those preselected walls; the initial auto-suggested result is
+`NOT_EVALUABLE` and does not count.
+
+```sh
+export SPATIO_WALK_SPEC=/absolute/path/to/spec.frozen.json
+spatio/walkday/process.sh <recording-dir> <run-id> --start-placement-cm Y --placement-cm X --heading ok
+shasum -a 256 <session>/map.pcd
+# Prepare FILE in the g8 format with the spec's patch names, each box_map_frame,
+# origin "preselected", and top-level map_sha256 equal to the hash above.
+spatio/walkday/process.sh --rescore <session> --patches FILE
+```
+
+`--rescore` copies FILE to `SESSION/wallpatch/patches.json`, checks patch origin
+and names against the frozen spec and requires `map_sha256` to match this
+session's `map.pcd`, then runs wallpatch measure and result. Missing or wrong
+hashes are refused; rescore never fills in a missing hash, even for synthetic
+sessions. Auto-suggested origins remain auto-suggested and cannot count.
+Use the same frozen spec as the physical reference. The map, trajectory,
+manifest, placements, input gate and walk check are reused unchanged. The
+original source recording must remain available for its start time and
+synthetic marker checks. The saved `logs/walkday.conf` supplies `WALL_GATE_M` and
+`WALL_GATE_STATE`; `--settings FILE` overrides that source, subject to the
+existing gate and settings identity checks. Settings for skipped stages are
+not reapplied. Rescore also requires `logs/provenance.json` and
+`logs/input_gate.json`. It accepts only `--patches`, `--spec` and `--settings`.
+It retires the earlier result before replacing patch evidence; a failed copy,
+origin check or measurement leaves no countable `walk_result.json`. Read the
+new `walkday.md`, then rerun `series.sh` with every attempt included.
 
 `process.sh` exit codes: 0 PASS, 1 FAIL, 2 NOT-EVALUABLE, 3 usage.
 
