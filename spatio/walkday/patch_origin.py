@@ -40,11 +40,12 @@ def classify(document, spec_path=None):
 
 
 def bind_spec_boxes(document, spec_path, map_path):
-    """Give a sha-less preselected file this run's map sha256.
+    """Give a sha-less synthetic preselected file this run's map sha256.
 
     Allowed only when the frozen spec fixes every patch box and each supplied
     box is the spec's box: those boxes were chosen before any run, so they hold
-    on every run's map. A file that names a map_sha256 keeps it.
+    on every synthetic run's map. The caller must establish that the recording
+    is synthetic. A file that names a map_sha256 keeps it.
     """
     if document.get("map_sha256") is not None:
         return
@@ -62,12 +63,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("patches")
     parser.add_argument("--spec")
-    parser.add_argument("--map", help="this run's map.pcd: binds a sha-less file whose boxes are the spec's")
+    parser.add_argument("--map", help="this run's map.pcd: binds synthetic sha-less spec boxes")
+    parser.add_argument("--synthetic", action="store_true",
+                        help="recording is marked SYNTHETIC.json; allow binding sha-less spec boxes")
     args = parser.parse_args(argv)
     try:
         document = json.loads(Path(args.patches).read_text(encoding="utf-8"))
         origin = classify(document, args.spec)
         if origin == "preselected":
+            if document.get("map_sha256") is None and not args.synthetic:
+                raise ValueError("preselected patches require map_sha256 for real recordings")
             if args.map:
                 bind_spec_boxes(document, args.spec, args.map)
             for patch in document["patches"]:
