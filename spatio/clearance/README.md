@@ -64,7 +64,8 @@ Present an existing clearance result using its matching zone definitions:
 ```sh
 python3 -m spatio.clearance report \
   --results /path/to/clearance-results/report.json \
-  --zones /path/to/zones.json --walk-id fresh-walk-id \
+  --zones /path/to/zones.json --scans /path/to/scans.json \
+  --walk-id fresh-walk-id \
   --output /private/tmp/clearance-walk-summary
 ```
 
@@ -80,13 +81,19 @@ Reuse is refused (exit 2, nothing written) when any binding fails:
 - The results are bound to a trajectory or extrinsics that is not resupplied,
   or the resupplied file hashes differently.
 - A trajectory or extrinsics is supplied for results bound to none.
-- A supplied recording or scans file hashes differently from the results.
+- The current scans are missing, unreadable or hash differently from the results.
+- A supplied recording hashes differently from the results.
 - The results have no `provenance` block (pre-B2 results), or its limitations
   disagree with its null identities.
 
-An unsupplied recording or scans file is listed in `reuse_limitations`
-(`recording_not_reverified`, `scans_not_reverified`). The output copies
-`provenance` and lists all limitations in the Markdown.
+`--scans` is required for every reuse, including results with missing recording,
+trajectory or extrinsics identities. The current scan document is read and its
+canonical JSON hash must match `scans_sha256`; formatting and object-key order
+do not affect that hash. There is no opt-out. Python callers of `build_report`
+must supply the independently computed current scan hash as `supplied["scans"]`.
+Only an unsupplied recording remains a `reuse_limitations` entry
+(`recording_not_reverified`). The output copies `provenance` and lists all
+limitations in the Markdown.
 
 JSON has `schema: "spatio.clearance_report.v1"`, `walk_id`, `frame_id`,
 `settings`, `scan_count`, `scan_time_range`, `provenance`, `reuse_limitations`,

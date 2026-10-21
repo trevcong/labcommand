@@ -61,6 +61,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from spatio.manifest.jsonio import write_json_atomic
+from spatio.thresholds import WALL_GATE_M
 from spatio.walkcheck.values import measurement_values
 
 from spatio.wall_scoring import (
@@ -518,11 +519,11 @@ def _retire(session):
         os.replace(path, os.path.join(session, RETIRED))
 
 
-def main(argv=None) -> int:
+def _parser():
     ap = argparse.ArgumentParser(prog="spatio.walkday.result", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("session")
-    ap.add_argument("--wall-gate-m", type=float, default=0.05)
+    ap.add_argument("--wall-gate-m", type=float, default=WALL_GATE_M)
     ap.add_argument("--wall-gate-state", choices=("approved", "proposed"), default="approved")
     ap.add_argument("--patch-source", default="auto-suggested from this map, NOT Trevor's preselected patches")
     ap.add_argument("--patch-origin", choices=PATCH_ORIGINS, default="auto_suggested",
@@ -530,7 +531,11 @@ def main(argv=None) -> int:
     ap.add_argument("--spec", help="the frozen spec (its wall_patches are the preselected patches)")
     ap.add_argument("--stopped-at")
     ap.add_argument("--reason", default="")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv=None) -> int:
+    args = _parser().parse_args(argv)
     if not os.path.isdir(args.session):
         print(f"result: no session folder {args.session}", file=sys.stderr)
         return 3

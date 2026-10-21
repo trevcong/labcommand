@@ -183,6 +183,58 @@ def test_copy_failure_stops_before_measurement(process_harness):
     assert not (session / "wallpatch" / "wallpatch.json").exists()
 
 
+def _preselected_without_sha(path):
+    doc = json.loads(path.read_text())
+    del doc["map_sha256"]
+    for patch in doc["patches"]:
+        del patch["origin"]
+    path.write_text(json.dumps(doc))
+    return doc
+
+
+def test_spec_fixed_boxes_without_sha_bind_to_this_runs_map(process_harness):
+    _preselected_without_sha(process_harness[4])
+    proc, session = run_process(process_harness)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    walk = json.loads((session / "walk_result.json").read_text())
+    assert walk["wall_patches"]["origin"] == "preselected"
+    assert len(walk["wall_patches"]["verified"]) == 2
+    copied = json.loads((session / "wallpatch" / "patches.json").read_text())
+    assert copied["map_sha256"] == hashlib.sha256((session / "map.pcd").read_bytes()).hexdigest()
+    assert "map_sha256" not in json.loads(process_harness[4].read_text())
+
+
+@pytest.mark.parametrize("case", ["moved_box", "spec_box_null"])
+def test_sha_less_patches_need_the_specs_fixed_boxes(process_harness, case):
+    spec_path, path = process_harness[3], process_harness[4]
+    doc = _preselected_without_sha(path)
+    if case == "moved_box":
+        doc["patches"][0]["box_map_frame"]["center_m"][0] += 0.01
+        path.write_text(json.dumps(doc))
+    else:
+        spec = json.loads(spec_path.read_text())
+        spec["wall_patches"][0]["box_map_frame"] = None
+        spec_path.write_text(json.dumps(spec))
+    proc, session = run_process(process_harness)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "not the frozen spec's fixed box" in proc.stdout
+    assert "cannot establish preselection" in proc.stdout
+    assert not (session / "walk_result.json").exists()
+
+
+def test_a_named_map_sha_is_kept_not_restamped(process_harness):
+    path = process_harness[4]
+    doc = _preselected_without_sha(path)
+    doc["map_sha256"] = "0" * 64
+    path.write_text(json.dumps(doc))
+    proc, session = run_process(process_harness)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert json.loads((session / "wallpatch" / "patches.json").read_text())["map_sha256"] == "0" * 64
+    walk = json.loads((session / "walk_result.json").read_text())
+    assert walk["wall_patches"]["verified"] == []
+    assert walk["status"] == "NOT_EVALUABLE"
+
+
 def test_one_auto_patch_prevents_aggregate_preselection(tmp_path):
     doc = {"patches": [{"name": "a", "origin": "preselected"},
                        {"name": "b", "origin": "auto_suggested"}]}

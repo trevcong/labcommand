@@ -11,7 +11,11 @@
   "start_marks": "SYNTHETIC: exact start pose from the generator (SYNTHETIC.json ground_truth)",
   "frames": {"cart_mount": "SYNTHETIC: identity, sensor 1.0 m above the floor"},
   "wall_patches": [
-    {"name": "auto-1", "description": "SYNTHETIC: auto-suggested per map", "box_map_frame": null},
-    {"name": "auto-2", "description": "SYNTHETIC: auto-suggested per map", "box_map_frame": null}
+    {"name": "east-wall",
+     "description": "SYNTHETIC: preselected from scene.py geometry, +x outer wall (world x 9.5, y 2.9, 1.0-2.0 m up), clear of the low box, crate and beam",
+     "box_map_frame": {"center_m": [5.5, 2.0, 0.5], "normal_hint": [1.0, 0.0, 0.0], "half_extent_m": [0.5, 0.25, 0.5]}},
+    {"name": "north-wall",
+     "description": "SYNTHETIC: preselected from scene.py geometry, +y outer wall (world x 7.0, y 5.4, 1.0-2.0 m up), clear of the bench and cabinet",
+     "box_map_frame": {"center_m": [3.0, 4.5, 0.5], "normal_hint": [0.0, 1.0, 0.0], "half_extent_m": [0.5, 0.25, 0.5]}}
   ]
 }

@@ -28,8 +28,10 @@
 #                           (JT128: the Hesai driver's jt128_post.yaml). Not read by
 #                           replay; hashed, checked against the bag, kept in logs/
 #   --patches FILE          the spec's preselected wall patches, boxed on THIS run's
-#                           map (g8 format); default: auto-suggest (labelled NOT
-#                           preselected; such a run never counts toward a series)
+#                           map (g8 format); a file without map_sha256 is bound to
+#                           this run's map only if every box is the spec's fixed box.
+#                           Default: auto-suggest (labelled NOT preselected; such a
+#                           run never counts toward a series)
 #   --sessions-root DIR     default $SPATIO_WALKDAY_ROOT or ~/Developer/spatio-data/walkday
 #   --sensor TEXT           manifest sensor text (default derived from the bag)
 #   --settings FILE         settings (default spatio/walkday/walkday.conf)
@@ -218,7 +220,7 @@ say "[6/9] walk check (B)"
 python3 -m spatio.walkcheck "$SESSION" --stationary-window "$STATIONARY_WINDOW_S" --max-gap "$MAX_GAP_S" \
   --min-path-length "$MIN_PATH_LENGTH_M" --min-excursion "$MIN_EXCURSION_M" \
   --max-endpoint-spread "$MAX_ENDPOINT_SPREAD_M" --max-endpoint-speed "$MAX_ENDPOINT_SPEED_M_S" \
-  --max-hold-speed "$MAX_HOLD_SPEED_M_S" --min-hold "$MIN_HOLD_S"
+  --max-hold-speed "$MAX_HOLD_SPEED_M_S" --min-hold "$MIN_HOLD_S" --wall-gate-m "$WALL_GATE_M"
 rc=$?
 case $rc in 0|1|2) say "walk checker exit $rc" ;; *) stop walk-check "walkcheck could not use the session (exit $rc)" ;; esac
 
@@ -229,7 +231,7 @@ if [[ -n $PATCHES ]]; then
   PATCH_SPEC_ARGS=()
   [[ -n $SPEC ]] && PATCH_SPEC_ARGS=(--spec "$SPEC")
   PATCH_ORIGIN="$(python3 -m spatio.walkday.patch_origin "$SESSION/wallpatch/patches.json" \
-    ${PATCH_SPEC_ARGS[@]+"${PATCH_SPEC_ARGS[@]}"})" \
+    ${PATCH_SPEC_ARGS[@]+"${PATCH_SPEC_ARGS[@]}"} --map "$SESSION/map.pcd")" \
     || stop wall-patches "supplied patches cannot establish preselection (see above)"
   PATCH_SOURCE="$PATCH_ORIGIN patches from $PATCHES"
   [[ $PATCH_ORIGIN != auto_suggested ]] || say "auto_suggested patches cannot be labelled preselected; this run cannot count toward a series"
@@ -244,7 +246,7 @@ if [[ -f $SESSION/wallpatch/patches.json ]]; then
   [[ ${#REF_ARGS[@]} -gt 0 ]] && ACC_LABEL="physical reference recorded (see physical_reference.json)"
   [[ $SYNTHETIC == 1 ]] && ACC_LABEL="SYNTHETIC recording; $ACC_LABEL"
   python3 -m spatio.wallpatch measure "$SESSION" --patches "$SESSION/wallpatch/patches.json" \
-    --out "$SESSION/wallpatch" --accuracy-label "$ACC_LABEL; patches: $PATCH_SOURCE" \
+    --out "$SESSION/wallpatch" --wall-gate-m "$WALL_GATE_M" --accuracy-label "$ACC_LABEL; patches: $PATCH_SOURCE" \
     || say "WARNING: wall-patch measurement failed; walls will be not evaluable"
 fi
 

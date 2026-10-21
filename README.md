@@ -84,14 +84,18 @@ scripts/test-all.sh < /dev/null
 ```
 
 The runner executes CI helper unittests, committed-fixture checks, Spatio pytest
-(including `.github/scripts`), Spark pytest, C++ configure/build/CTest, the Swift
-core runner, the `change-detect` build, shared-golden comparison, and Spatio
-fixture regeneration in check-only mode, in that order. The two pytest runs stay
-separate because the trees contain duplicate test module names. Each test stage
-prints its native test counts (CTest is verbose, including nested pytest counts).
-The final summary names every stage as `PASS`, `FAIL`, or `SKIPPED`; the first
-failure stops execution and returns nonzero, with later stages marked not reached.
-Build stages report command success, not test counts.
+(including `.github/scripts`), Spark pytest, the `rosbags` cross-check
+(`scripts/check-rosbags.sh` with `PYTHON`), C++ configure/build/CTest, the Swift core runner,
+the `change-detect` build, shared-golden comparison, and Spatio fixture
+regeneration in check-only mode, in that order. The two pytest runs stay
+separate because the trees contain duplicate test module names. Spark pytest
+skips `test_rosbags.py` when `rosbags` is missing; the `rosbags` stage fails the
+run instead (issue #73). Each test stage prints its native test counts (CTest is
+verbose, including nested pytest counts). The final summary names every stage as
+`PASS`, `FAIL`, or `SKIPPED`; the first failure stops execution and returns
+nonzero, with later stages marked not reached. Build stages report command
+success, not test counts. The last line is `Overall: PASS`, `Overall: FAIL`, or
+`Overall: PARTIAL (...)`.
 
 The default interpreter is `spark/.venv-local/bin/python`. Override `PYTHON` for
 another environment, or `SPATIO_PYTHON` for just Spatio pytest and its fixture
@@ -107,13 +111,15 @@ SPATIO_PYTHON=python3 scripts/test-all.sh < /dev/null
 
 The full runner requires the local C++ prerequisites described below and Swift.
 `ROOM_MEMORY_OPENMP=OFF scripts/test-all.sh` configures without OpenMP if libomp
-is unavailable. `SKIP_CPP=1 scripts/test-all.sh` visibly reports all three C++
-stages as `SKIPPED`, and is only a partial gate. The runner uses fresh absent
+is unavailable. `SKIP_CPP=1 scripts/test-all.sh` reports all three C++ stages
+as `SKIPPED` and is only a partial gate: when every other stage passes it ends
+with `Overall: PARTIAL` and exits 10, never 0. Exit 10 means PARTIAL only; a
+stage failure that returns 10 is reported as exit 1. The runner uses fresh absent
 recording paths for CTest, so the full-recording tests skip; ROS tests and the
 JT128 characterization test also skip without their external prerequisites.
 It does not use Docker, connect to hardware, or launch/install the app.
-An app release build, the optional Swift differential extension, and stricter
-`rosbags` skip enforcement are outside this command's scope.
+An app release build and the optional Swift differential extension are outside
+this command's scope.
 
 Mac, from the repo root:
 

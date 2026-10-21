@@ -17,9 +17,11 @@ travels from -30 cm to +30 cm inside the end window (spread 30 cm, about
 12 cm/s).
 """
 
+from spatio.thresholds import RETURN_GATE_M, WALL_GATE_CM, WALL_GATE_M  # noqa: F401  (re-exported)
+
 STATIONARY_WINDOW_S = 5.0
 MAX_GAP_S = 1.0
-RETURN_PASS_M = 0.10
+RETURN_PASS_M = RETURN_GATE_M
 MIN_PATH_LENGTH_M = 2.0
 MIN_EXCURSION_M = 0.5
 MIN_WINDOW_SAMPLES = 3
@@ -39,7 +41,7 @@ WALL_VOXEL_M = 0.30
 WALL_PLANARITY_MIN = 0.55
 WALL_MAX_ABS_NZ = 0.35
 WALL_MIN_CELL_POINTS = 25
-WALL_GATE_CM = 5.0
+# WALL_GATE_CM / WALL_GATE_M come from spatio.thresholds (imported above).
 WALL_DOUBLE_MIN_M = 0.05
 # Kept as one term of the normal-fit distance below. It is not a cap on
 # doubled sheets. Capping them at 40 cm threw away a gap the checker had

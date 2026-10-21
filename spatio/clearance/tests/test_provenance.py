@@ -68,7 +68,7 @@ def test_changed_input_blocks_reuse(name):
         build_report(result(INPUTS), zones_doc(), "walk", supplied(**{name: "d" * 64}))
 
 
-@pytest.mark.parametrize("name", ["trajectory", "extrinsics"])
+@pytest.mark.parametrize("name", ["trajectory", "extrinsics", "scans"])
 def test_bound_input_must_be_resupplied(name):
     with pytest.raises(ValueError, match=f"bound to {name}"):
         build_report(result(INPUTS), zones_doc(), "walk", supplied(**{name: None}))
@@ -82,7 +82,8 @@ def test_input_supplied_for_unbound_result_is_a_mismatch(name):
 
 def test_recording_supplied_for_unbound_result_is_a_mismatch():
     with pytest.raises(ValueError, match="recording sha256"):
-        build_report(result(), zones_doc(), "walk", {"recording": RECORDING})
+        build_report(result(), zones_doc(), "walk",
+                     {"recording": RECORDING, "scans": prov.canonical_sha256(scans_doc())})
 
 
 def test_translated_zone_with_same_id_rule_and_depth_blocks_reuse():
@@ -127,13 +128,16 @@ def test_missing_timing_and_ray_provenance_is_a_limitation_on_the_pass():
     assert "Provenance limitations (apply to every zone, including PASS):" in rendered
     for key in source["provenance"]["limitations"]:
         assert f"- {key}: {prov.LIMITATIONS[key]}" in rendered
-    out = build_report(source, zones_doc(), "walk")
+    with pytest.raises(ValueError, match="bound to scans"):
+        build_report(source, zones_doc(), "walk")
+    out = build_report(source, zones_doc(), "walk",
+                       {"scans": prov.canonical_sha256(scans_doc())})
     assert out["counts"]["PASS"] == 1
     assert out["zones"][0]["evidence"]["provenance_limitations"] == zone["provenance_limitations"]
-    assert out["reuse_limitations"] == ["scans_not_reverified"]
+    assert out["reuse_limitations"] == []
     rendered = markdown_report(out)
     assert "Provenance limitations (apply to every zone, including PASS):" in rendered
-    assert "no\\_time\\_basis" in rendered and "scans\\_not\\_reverified" in rendered
+    assert "no\\_time\\_basis" in rendered and "scans\\_not\\_reverified" not in rendered
 
 
 def test_time_basis_is_literal_single_line_markdown():
@@ -153,8 +157,8 @@ def test_only_missing_time_basis_is_listed():
 
 
 def test_bound_result_without_resupplied_recording_says_so():
-    out = build_report(result(INPUTS), zones_doc(), "walk", supplied(recording=None, scans=None))
-    assert out["reuse_limitations"] == ["recording_not_reverified", "scans_not_reverified"]
+    out = build_report(result(INPUTS), zones_doc(), "walk", supplied(recording=None))
+    assert out["reuse_limitations"] == ["recording_not_reverified"]
 
 
 @pytest.mark.parametrize("change", [
@@ -167,14 +171,16 @@ def test_limitations_cannot_be_hand_removed(change):
     source = result()
     change(source["provenance"])
     with pytest.raises(ValueError):
-        build_report(source, zones_doc(), "walk")
+        build_report(source, zones_doc(), "walk",
+                     {"scans": prov.canonical_sha256(scans_doc())})
 
 
 def test_zone_limitations_must_match_result():
     source = result()
     source["zones"][0]["provenance_limitations"] = []
     with pytest.raises(ValueError, match="limitations differ"):
-        build_report(source, zones_doc(), "walk")
+        build_report(source, zones_doc(), "walk",
+                     {"scans": prov.canonical_sha256(scans_doc())})
 
 
 @pytest.mark.parametrize("bad", [{"trajectory": "short"}, {"recording": "A" * 64},
@@ -236,11 +242,13 @@ def test_cli_binds_inputs_and_refuses_changed_trajectory(bound_cli):
     assert p["recording_sha256"] == prov.sha256_path(t / "bag")
     assert p["limitations"] == []
     assert str(t) not in (t / "result" / "report.json").read_text()  # hashes, not paths
-    same = ["--trajectory", t / "trajectory.txt", "--extrinsics", t / "extrinsics.yaml"]
-    ok = reuse(t, "ok", *same, "--recording", t / "bag", "--scans", t / "scans.json")
+    same = ["--trajectory", t / "trajectory.txt", "--extrinsics", t / "extrinsics.yaml",
+            "--scans", t / "scans.json"]
+    ok = reuse(t, "ok", *same, "--recording", t / "bag")
     assert ok.returncode == 0, ok.stderr
     assert json.loads((t / "ok" / "report.json").read_text())["reuse_limitations"] == []
-    missing = reuse(t, "missing", "--extrinsics", t / "extrinsics.yaml")
+    missing = reuse(t, "missing", "--extrinsics", t / "extrinsics.yaml",
+                    "--scans", t / "scans.json")
     assert missing.returncode == 2 and "bound to trajectory" in missing.stderr
     assert not (t / "missing").exists()
     (t / "trajectory.txt").write_text("0 0 0 0\n1 1.01 0 0\n")
@@ -251,7 +259,8 @@ def test_cli_binds_inputs_and_refuses_changed_trajectory(bound_cli):
 
 def test_cli_refuses_changed_extrinsics_and_zone(bound_cli):
     t = bound_cli
-    same = ["--trajectory", t / "trajectory.txt", "--extrinsics", t / "extrinsics.yaml"]
+    same = ["--trajectory", t / "trajectory.txt", "--extrinsics", t / "extrinsics.yaml",
+            "--scans", t / "scans.json"]
     (t / "extrinsics.yaml").write_text("lidar: [0, 0, 0.01]\n")
     changed = reuse(t, "extrinsics", *same)
     assert changed.returncode == 2 and "extrinsics changed" in changed.stderr
@@ -261,3 +270,63 @@ def test_cli_refuses_changed_extrinsics_and_zone(bound_cli):
     moved = reuse(t, "zone", *same)
     assert moved.returncode == 2 and "zone geometry changed" in moved.stderr
     assert not (t / "zone").exists()
+
+
+@pytest.mark.parametrize("inputs", [None, INPUTS])
+@pytest.mark.parametrize("scan_identity", [{}, {"scans": None}])
+def test_reuse_requires_current_scan_identity(inputs, scan_identity):
+    current = supplied() if inputs else {}
+    current.pop("scans", None)
+    current.update(scan_identity)
+    with pytest.raises(ValueError, match="bound to scans"):
+        build_report(result(inputs), zones_doc(), "walk", current)
+
+
+def test_reuse_without_any_supplied_inputs_refuses_scans():
+    with pytest.raises(ValueError, match="bound to scans"):
+        build_report(result(), zones_doc(), "walk")
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_cli_reuse_without_scans_is_a_hard_error(bound_cli, changed):
+    t = bound_cli
+    if changed:
+        (t / "scans.json").write_text(json.dumps(
+            scans_doc((10, [-.15, .05, .05], [[.8, .05, .05]]))))
+    done = reuse(t, "without-scans", "--trajectory", t / "trajectory.txt",
+                 "--extrinsics", t / "extrinsics.yaml", "--recording", t / "bag")
+    assert done.returncode == 2 and "--scans" in done.stderr
+    assert not (t / "without-scans").exists()
+
+
+@pytest.mark.parametrize("problem", ["changed", "missing", "malformed", "directory"])
+def test_cli_unverifiable_scans_refused_before_writing(bound_cli, problem):
+    t = bound_cli
+    path = t / "scans.json"
+    if problem == "changed":
+        path.write_text(json.dumps(scans_doc((10, [-.15, .05, .05], [[.8, .05, .05]]))))
+    elif problem == "missing":
+        path.unlink()
+    elif problem == "malformed":
+        path.write_text('{"scans":')
+    else:
+        path.unlink()
+        path.mkdir()
+    done = reuse(t, "bad-scans", "--trajectory", t / "trajectory.txt",
+                 "--extrinsics", t / "extrinsics.yaml", "--scans", path)
+    assert done.returncode == 2
+    assert "scans" in done.stderr
+    assert not (t / "bad-scans").exists()
+
+
+def test_cli_scan_identity_ignores_json_formatting(bound_cli):
+    t = bound_cli
+    scans = json.loads((t / "scans.json").read_text())
+    (t / "scans.json").write_text(json.dumps(
+        dict(reversed(list(scans.items()))), indent=4))
+    done = reuse(t, "reformatted", "--trajectory", t / "trajectory.txt",
+                 "--extrinsics", t / "extrinsics.yaml", "--scans", t / "scans.json")
+    assert done.returncode == 0, done.stderr
+    out = json.loads((t / "reformatted" / "report.json").read_text())
+    assert out["counts"]["PASS"] == 1
+    assert out["reuse_limitations"] == ["recording_not_reverified"]

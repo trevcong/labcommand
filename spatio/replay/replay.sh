@@ -93,10 +93,20 @@ else
   HIST_PATH_TOPIC=""
 fi
 
-IMAGE_TAG="spatio/replay:$(git -C "$DATA/spark-src/FAST_LIO_ROS2" rev-parse --short=7 HEAD)"
+PINNED_REV="$(command cat "$HERE/FASTLIO_REVISION")"
+[[ $PINNED_REV =~ ^[0-9a-f]{40}$ ]] || { echo "invalid pinned FAST-LIO revision: '$PINNED_REV'" >&2; exit 2; }
+IMAGE_TAG="spatio/replay:${PINNED_REV:0:7}"
 IMAGE_ID="$(docker --context "$DCTX" image inspect -f '{{.Id}}' "$IMAGE_TAG")" \
   || { echo "image $IMAGE_TAG missing; run build_image.sh" >&2; exit 2; }
-FL_REV="$(docker --context "$DCTX" image inspect -f '{{index .Config.Labels "spatio.fastlio_revision"}}' "$IMAGE_TAG")"
+# Inspect and run the immutable image ID so a retag cannot change the image
+# between the revision check and replay. No source checkout or spec is needed.
+[[ -n $IMAGE_ID ]] || { echo "empty image ID for $IMAGE_TAG" >&2; exit 2; }
+FL_REV="$(docker --context "$DCTX" image inspect -f '{{index .Config.Labels "spatio.fastlio_revision"}}' "$IMAGE_ID")" \
+  || { echo "cannot read FAST-LIO revision from image $IMAGE_ID; rebuild with build_image.sh" >&2; exit 2; }
+[[ $FL_REV == "$PINNED_REV" ]] || {
+  echo "FAST-LIO image revision '$FL_REV' does not match pinned revision '$PINNED_REV'; rebuild with build_image.sh" >&2
+  exit 2
+}
 
 # colima on this Mac shares no host folders we can use, so bind mounts would
 # silently create empty VM-local dirs. Instead: the recording goes into a named
@@ -109,18 +119,18 @@ VOL="spatio-rec-$(basename "$REC" | tr -c 'A-Za-z0-9_.-\n' '_')"
 BAGFILES=()
 while IFS= read -r f; do BAGFILES+=("$f"); done < <(cd "$REC/bag" && ls | grep -E '\.(mcap|db3)$|^metadata\.yaml$' | sort)
 want_sha="$(cd "$REC/bag" && shasum -a 256 "${BAGFILES[@]}" | shasum -a 256 | cut -d' ' -f1)"
-have_sha="$(dk run --rm --name "spatio-check-$RUN_ID" --network none -v "$VOL:/rec:ro" "$IMAGE_TAG" cat /rec/.spatio_loaded 2>/dev/null || true)"
+have_sha="$(dk run --rm --name "spatio-check-$RUN_ID" --network none -v "$VOL:/rec:ro" "$IMAGE_ID" cat /rec/.spatio_loaded 2>/dev/null || true)"
 if [[ $have_sha != "$want_sha" ]]; then
   echo "== loading $REC into volume $VOL"
   dk volume rm "$VOL" >/dev/null 2>&1 || true
   dk volume create --label spatio.source="$REC" "$VOL" >/dev/null
-  dk create --name "spatio-load-$RUN_ID" --network none -v "$VOL:/rec" "$IMAGE_TAG" true >/dev/null
+  dk create --name "spatio-load-$RUN_ID" --network none -v "$VOL:/rec" "$IMAGE_ID" true >/dev/null
   dk cp "$REC/." "spatio-load-$RUN_ID:/rec/"
   dk rm "spatio-load-$RUN_ID" >/dev/null
-  got="$(dk run --rm --name "spatio-verify-$RUN_ID" --network none -v "$VOL:/rec:ro" -w /rec/bag "$IMAGE_TAG" \
+  got="$(dk run --rm --name "spatio-verify-$RUN_ID" --network none -v "$VOL:/rec:ro" -w /rec/bag "$IMAGE_ID" \
         sha256sum "${BAGFILES[@]}" | shasum -a 256 | cut -d' ' -f1)"
   [[ $got == "$want_sha" ]] || { echo "bag sha256 mismatch in volume ($got != $want_sha)" >&2; exit 3; }
-  dk run --rm --name "spatio-mark-$RUN_ID" --network none -v "$VOL:/rec" "$IMAGE_TAG" sh -c "echo $want_sha > /rec/.spatio_loaded"
+  dk run --rm --name "spatio-mark-$RUN_ID" --network none -v "$VOL:/rec" "$IMAGE_ID" sh -c "echo $want_sha > /rec/.spatio_loaded"
 fi
 
 # Tool revision as staged into the container (later edits don't reach it).
@@ -160,7 +170,7 @@ dk create --name "$CONTAINER" \
   -e TIMESTAMP_UNIT="$TS_UNIT" -e HIST_PATH_TOPIC="$HIST_PATH_TOPIC" -e HIST_ODOM_TOPIC="$HIST_ODOM_TOPIC" \
   -e MAP_VOXEL="$MAP_VOXEL" \
   ${DDS_ENV[@]+"${DDS_ENV[@]}"} -v "$VOL:/rec:ro" \
-  "$IMAGE_TAG" timeout --signal=TERM --kill-after=60 "$MAX_SECONDS" \
+  "$IMAGE_ID" timeout --signal=TERM --kill-after=60 "$MAX_SECONDS" \
   bash /opt/spatio/tools/run_in_container.sh >/dev/null
 dk cp "$STAGE/tools" "$CONTAINER:/opt/spatio/tools"
 dk cp "$STAGE/cfg" "$CONTAINER:/cfg"
@@ -187,7 +197,7 @@ if [[ $MODE == replay && ! -s $SESSION/map_display.pcd ]]; then
 fi
 
 # Provenance and run details (outside the contract manifest).
-dk run --rm --name "spatio-prov-$RUN_ID" --network none "$IMAGE_TAG" cat /opt/spatio/provenance.json > "$SESSION/logs/image_provenance.json"
+dk run --rm --name "spatio-prov-$RUN_ID" --network none "$IMAGE_ID" cat /opt/spatio/provenance.json > "$SESSION/logs/image_provenance.json"
 python3 - "$SESSION/logs/run_params.json" <<EOF
 import json, sys
 json.dump({

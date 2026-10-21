@@ -13,8 +13,8 @@ from pathlib import Path
 
 SCHEMA = "spatio.clearance_provenance.v1"
 # Inputs whose change must block reuse (hard error), and inputs checked when supplied.
-BOUND = ("trajectory", "extrinsics")
-CHECKED_IF_SUPPLIED = ("recording", "scans")
+BOUND = ("trajectory", "extrinsics", "scans")
+CHECKED_IF_SUPPLIED = ("recording",)
 HEX = set("0123456789abcdef")
 
 LIMITATIONS = {
@@ -29,7 +29,6 @@ LIMITATIONS = {
 }
 REUSE_LIMITATIONS = {
     "recording_not_reverified": "recording not resupplied at reuse; its hash was not rechecked",
-    "scans_not_reverified": "scans not resupplied at reuse; ray evidence hash was not rechecked",
 }
 
 
@@ -102,9 +101,10 @@ def build(scans_data, recording=None, extrinsics=None, trajectory=None, time_bas
 def check(provenance, supplied):
     """Hard error unless supplied inputs (sha256 hex or None) match the recorded ones.
 
-    Trajectory and extrinsics are bound: a recorded hash must be resupplied and
-    match, and one supplied for an unbound result is also a mismatch. Recording
-    and scans are compared when supplied. Returns limitation keys for this reuse.
+    Scans must always be resupplied and match. Trajectory and extrinsics are
+    also bound when recorded, and one supplied for an unbound result is a
+    mismatch. Recording is compared when supplied. Returns limitation keys
+    for this reuse.
     """
     if not isinstance(provenance, dict) or provenance.get("schema") != SCHEMA:
         raise ValueError(f"results provenance must have schema {SCHEMA}")

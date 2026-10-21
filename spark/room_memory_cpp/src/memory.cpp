@@ -476,9 +476,13 @@ std::vector<msg::SeqRange> subtract_ranges(const std::vector<msg::SeqRange>& ran
 
 std::pair<msg::MapBricks, VoxelLayer> load_reference(const std::filesystem::path& path) {
     const msg::Bytes data = read_bytes(path);
-    msg::MapBricks message = msg::MapBricks::from_cdr(data);
-    VoxelLayer layer = VoxelLayer::from_bricks(message.bricks);
-    return {std::move(message), std::move(layer)};
+    try {
+        msg::MapBricks message = msg::MapBricks::from_cdr(data);
+        VoxelLayer layer = VoxelLayer::from_bricks(message.bricks);
+        return {std::move(message), std::move(layer)};
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument(path.string() + ": " + error.what());
+    }
 }
 
 // MARK: Candidates
@@ -758,7 +762,7 @@ void RoomMemory::load(const msg::Time& start) {
     // seq restarts at 0, so the restart takes a new epoch: no (map_epoch, seq) sync cursor from
     // before it names a message after it. Saved at once, so the next restart moves on again.
     // Nothing carries the new epoch yet: a start that cannot record it stops here.
-    if (!record_epoch(epoch + 1)) throw std::runtime_error(rig_save_error_);
+    if (!record_epoch(epoch + 1)) throw std::runtime_error(config_.rig_guard ? rig_save_error_ : save_error_);
     map_epoch_ = epoch + 1;
     save(start);
     state_ = msg::MemoryState::tracking;
@@ -780,6 +784,25 @@ void RoomMemory::save(const msg::Time& stamp) {
     const std::vector<std::filesystem::path> all = paths();
     for (std::size_t n = 0; n < all.size(); ++n) {
         save_reference(all[n], channels_[n].reference, header, static_cast<float>(config_.voxel_size));
+    }
+}
+
+void RoomMemory::save_runtime(const msg::Time& stamp) {
+    if (config_.rig_guard) {
+        save(stamp);  // the guard has its own ordered save and retry diagnostics
+        return;
+    }
+    try {
+        save(stamp);
+        save_pending_ = false;
+        if (!epoch_held_) {
+            save_failed_ = 0;
+            save_error_.clear();
+        }
+    } catch (const std::exception& error) {
+        save_pending_ = true;
+        ++save_failed_;
+        save_error_ = error.what();
     }
 }
 
@@ -861,6 +884,8 @@ bool RoomMemory::building() const {
 }
 
 std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
+    // Retry only a previous window's failure, not a save that fails later in this window.
+    if (save_pending_) save_runtime(stamp);
     std::vector<msg::ChangeEvent> events;
     window_estimates_ = 0;
     window_estimate_ms_ = 0.0;
@@ -1007,7 +1032,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         activity_ = std::move(summary);
         last_activity_ns_ = nanoseconds(stamp);
     }
-    // With the guard, the build ends only once the epoch file holds the epoch it takes (else BUILDING
+    // The build ends only once the epoch file holds the epoch it takes (else BUILDING
     // holds, and the next window tries again).
     if (state_ == msg::MemoryState::building && built(now) && record_epoch(map_epoch_ + 1)) {
         state_ = msg::MemoryState::tracking;
@@ -1031,7 +1056,7 @@ std::vector<msg::ChangeEvent> RoomMemory::close_window(const msg::Time& stamp) {
         }
         ++map_epoch_;
         if (guard) guard_built(now);
-        save(stamp);
+        save_runtime(stamp);
     } else if (guard && tracking) {
         guard_step(now, stamp, events);
     }
@@ -1101,7 +1126,7 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
             VoxelLayer fresh = channel.stats.settled(config_.settle_rule());
             if (!fresh.known.empty()) settled.emplace_back(&channel, std::move(fresh));
         }
-        // With the guard, voxels merge only once the epoch file holds the epoch they take: else the
+        // Voxels merge only once the epoch file holds the epoch they take: else the
         // counts, the references and map_epoch stay as they are, and the next window tries again.
         const bool held = !settled.empty() && !record_epoch(map_epoch_ + 1);
         if (!held) {
@@ -1123,7 +1148,7 @@ std::optional<msg::Bytes> RoomMemory::map_update(const msg::Time& stamp) {
     if (!changed && !keyframe_due) return std::nullopt;
     if (changed) {
         ++map_epoch_;
-        save(stamp);
+        save_runtime(stamp);
     }
     std::vector<msg::Brick> bricks = changed ? channels_[map_channel_].reference.to_bricks() : map_bricks_;
     if (!keyframe_due) {
@@ -1842,12 +1867,17 @@ void RoomMemory::load_rig(const std::filesystem::path& room, const std::filesyst
 }
 
 bool RoomMemory::record_epoch(std::uint64_t epoch) {
-    if (!config_.rig_guard || !config_.state_dir) return true;
+    if (!config_.state_dir) return true;
     try {
         save_epoch(epoch_path(*config_.state_dir, config_.room_id), epoch);
     } catch (const std::exception& error) {
-        ++rig_save_failed_;
-        rig_save_error_ = error.what();
+        if (config_.rig_guard) {
+            ++rig_save_failed_;
+            rig_save_error_ = error.what();
+        } else {
+            ++save_failed_;
+            save_error_ = error.what();
+        }
         epoch_held_ = true;
         return false;
     }

@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 
+from spatio.thresholds import WALL_GATE_M
 from spatio.wallpatch.errors import WallpatchError
 from spatio.wallpatch.measure import measure_map
 from spatio.wallpatch.suggest import suggest_map
@@ -31,6 +32,7 @@ def main(argv=None):
                 args.out,
                 accuracy_label=args.accuracy_label,
                 verbose=True,
+                gate_m=args.wall_gate_m,
             )
             return 0
     except WallpatchError as exc:
@@ -66,6 +68,12 @@ def _parser():
         "--accuracy-label",
         default=None,
         help="copied into the report; this tool never sets physical accuracy to true",
+    )
+    measure.add_argument(
+        "--wall-gate-m",
+        type=float,
+        default=WALL_GATE_M,
+        help="p95 and separation gate in metres (default %g, spatio.thresholds)" % WALL_GATE_M,
     )
     return parser
 
