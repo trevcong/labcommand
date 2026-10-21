@@ -217,6 +217,12 @@ struct TrailReplayView: View {
                         .foregroundStyle(LabTheme.faint)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.top, 2)
+                    if let walkday = session.walkday {
+                        Text(TrailReadout.walkcheckInputNote(w, walkday: walkday))
+                            .font(LabTheme.t(10))
+                            .foregroundStyle(LabTheme.warn)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
         }

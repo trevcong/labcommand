@@ -270,6 +270,16 @@ extension TrailReadout {
         return rows
     }
 
+    /// The line under a walkcheck that is an input to `walkday`. When the result withheld the
+    /// return error, walkcheck's number is a diagnosis, as walkday.md says.
+    public static func walkcheckInputNote(_ w: TrailWalkcheck, walkday: TrailWalkday) -> String {
+        var text = "Input to the walk-day verdict above; not the verdict."
+        if walkday.returnD3M == nil, w.error3DCm != nil {
+            text += " The walk-day result withheld the return error, so this number is for diagnosis only; it is not a valid measurement."
+        }
+        return text
+    }
+
     /// Where the verdict comes from, what it is not, and why it is not green.
     public static func walkdayNote(_ w: TrailWalkday, accuracyLabel: String?) -> String {
         var parts = ["Final walk-day verdict (walk_result.json). walkcheck.json is one of its inputs, not the verdict."]

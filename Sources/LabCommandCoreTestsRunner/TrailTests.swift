@@ -571,6 +571,7 @@ func testTrailViewContract() {
            "the sessions list prefers the walk-day verdict over the walkcheck")
     expect(view.contains("session.walkday == nil\n                                        ? verdictTint(TrailReadout.verdictTone(w.result"),
            "a walkcheck that is an input to a walk-day verdict is not coloured as the verdict")
+    expect(view.contains("TrailReadout.walkcheckInputNote(w, walkday: walkday)"), "and says it is an input")
     expect(player.contains("TrailLibrary.scan(roots: roots)") && player.contains("TrailLibrary.defaultRoots"),
            "the tab lists the walk-day root as well as sessions")
 }
@@ -1141,6 +1142,9 @@ func testTrailWalkdayResultOverridesWalkcheckPASS() {
     let note = TrailReadout.walkdayNote(final, accuracyLabel: session.accuracyLabel)
     expect(note.contains("walkcheck.json is one of its inputs, not the verdict") && note.contains("CLOCK_RESET"),
            "the note names the source and the reason, got \(note)")
+    let inputNote = TrailReadout.walkcheckInputNote(session.walkcheck!, walkday: final)
+    expect(inputNote.contains("not the verdict") && inputNote.contains("for diagnosis only; it is not a valid measurement"),
+           "the walkcheck block says its 4 cm is not a measurement here, got \(inputNote)")
 
     let entry = TrailLibrary.scan(root: root.path).first { $0.name == "walk-oct21" }
     expect(entry?.walkcheckResult == "PASS", "the list still reads the walkcheck")
