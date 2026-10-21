@@ -561,6 +561,18 @@ func testTrailViewContract() {
     expect(player.contains("TrailLibrary.lastSessionKey"), "the picked folder is remembered")
     expect(player.contains("TrailLibrary.rescanShouldReload(opened:") && player.contains("load(directory: reload)"),
            "rescan reloads the opened session when its verdict files change")
+    // In a walk-day folder the final verdict is shown, with Core's tone, and the walkcheck is an input.
+    expect(view.contains("TrailReadout.walkdayRows(w)") && view.contains("TrailReadout.walkdayNote(w, accuracyLabel: session.accuracyLabel)")
+            && view.contains("verdictTint(TrailReadout.walkdayTone(w))") && view.contains("verdictTint(TrailReadout.walkdayTone(final))"),
+           "the walk-day block and the sessions list take text and colour from Core")
+    let listWalkday = view.range(of: "if let final = entry.walkday")
+    let listWalkcheck = view.range(of: "} else if let verdict = entry.walkcheckResult")
+    expect(listWalkday != nil && listWalkcheck != nil && listWalkday!.lowerBound < listWalkcheck!.lowerBound,
+           "the sessions list prefers the walk-day verdict over the walkcheck")
+    expect(view.contains("session.walkday == nil\n                                        ? verdictTint(TrailReadout.verdictTone(w.result"),
+           "a walkcheck that is an input to a walk-day verdict is not coloured as the verdict")
+    expect(player.contains("TrailLibrary.scan(roots: roots)") && player.contains("TrailLibrary.defaultRoots"),
+           "the tab lists the walk-day root as well as sessions")
 }
 
 // MARK: - Walkcheck and the sessions folder
