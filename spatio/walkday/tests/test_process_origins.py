@@ -192,8 +192,43 @@ def _preselected_without_sha(path):
     return doc
 
 
-def test_spec_fixed_boxes_without_sha_bind_to_this_runs_map(process_harness):
-    _preselected_without_sha(process_harness[4])
+def _mark_synthetic(harness):
+    (harness[2] / "SYNTHETIC.json").write_text(json.dumps({
+        "statement": "synthetic fixture recording",
+        "ground_truth": {"true_return_error_3d_m": 0.0},
+    }))
+
+
+@pytest.mark.parametrize("null_sha", [False, True])
+def test_real_recording_without_map_sha_stops(process_harness, null_sha):
+    path = process_harness[4]
+    doc = _preselected_without_sha(path)
+    if null_sha:
+        doc["map_sha256"] = None
+        path.write_text(json.dumps(doc))
+    before = path.read_bytes()
+    proc, session = run_process(process_harness)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "map_sha256" in proc.stdout + proc.stderr
+    assert "real recordings" in proc.stdout + proc.stderr
+    assert "cannot establish preselection" in proc.stdout
+    report = json.loads((session / "walkday.json").read_text())
+    assert report["status"] == "NOT_EVALUABLE"
+    assert report["stopped_at"] == "wall-patches"
+    assert not (session / "walk_result.json").exists()
+    assert not (session / "wallpatch" / "wallpatch.json").exists()
+    assert (session / "wallpatch" / "patches.json").read_bytes() == before
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("null_sha", [False, True])
+def test_spec_fixed_boxes_without_sha_bind_to_this_runs_map(process_harness, null_sha):
+    _mark_synthetic(process_harness)
+    doc = _preselected_without_sha(process_harness[4])
+    if null_sha:
+        doc["map_sha256"] = None
+        process_harness[4].write_text(json.dumps(doc))
+    before = process_harness[4].read_bytes()
     proc, session = run_process(process_harness)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     walk = json.loads((session / "walk_result.json").read_text())
@@ -201,11 +236,17 @@ def test_spec_fixed_boxes_without_sha_bind_to_this_runs_map(process_harness):
     assert len(walk["wall_patches"]["verified"]) == 2
     copied = json.loads((session / "wallpatch" / "patches.json").read_text())
     assert copied["map_sha256"] == hashlib.sha256((session / "map.pcd").read_bytes()).hexdigest()
-    assert "map_sha256" not in json.loads(process_harness[4].read_text())
+    if not null_sha:
+        assert "map_sha256" not in json.loads(process_harness[4].read_text())
+    assert process_harness[4].read_bytes() == before
+    report = json.loads((session / "walkday.json").read_text())
+    assert report["synthetic"] is True
+    assert report["physical_accuracy_evaluated"] is False
 
 
 @pytest.mark.parametrize("case", ["moved_box", "spec_box_null"])
 def test_sha_less_patches_need_the_specs_fixed_boxes(process_harness, case):
+    _mark_synthetic(process_harness)
     spec_path, path = process_harness[3], process_harness[4]
     doc = _preselected_without_sha(path)
     if case == "moved_box":
@@ -222,14 +263,18 @@ def test_sha_less_patches_need_the_specs_fixed_boxes(process_harness, case):
     assert not (session / "walk_result.json").exists()
 
 
-def test_a_named_map_sha_is_kept_not_restamped(process_harness):
+@pytest.mark.parametrize("synthetic", [False, True])
+@pytest.mark.parametrize("map_sha", ["0" * 64, "", "g" * 64])
+def test_a_named_map_sha_is_kept_not_restamped(process_harness, synthetic, map_sha):
+    if synthetic:
+        _mark_synthetic(process_harness)
     path = process_harness[4]
     doc = _preselected_without_sha(path)
-    doc["map_sha256"] = "0" * 64
+    doc["map_sha256"] = map_sha
     path.write_text(json.dumps(doc))
     proc, session = run_process(process_harness)
     assert proc.returncode == 2, proc.stdout + proc.stderr
-    assert json.loads((session / "wallpatch" / "patches.json").read_text())["map_sha256"] == "0" * 64
+    assert json.loads((session / "wallpatch" / "patches.json").read_text())["map_sha256"] == map_sha
     walk = json.loads((session / "walk_result.json").read_text())
     assert walk["wall_patches"]["verified"] == []
     assert walk["status"] == "NOT_EVALUABLE"
